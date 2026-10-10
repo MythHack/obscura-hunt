@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
+use reqwest::tls::Certificate;
 use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
@@ -34,10 +35,8 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-fn configured_root_certificates() -> &'static [reqwest::Certificate] {
-    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
-
-    ROOTS.get_or_init(|| {
+fn configured_root_certificates() -> &'static [Certificate] {
+    static ROOTS: LazyLock<Vec<Certificate>> = LazyLock::new(|| {
         let mut certificates = Vec::new();
         for path in configured_root_paths() {
             let bytes = match std::fs::read(&path) {
@@ -47,9 +46,9 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
                     continue;
                 }
             };
-            match reqwest::Certificate::from_pem_bundle(&bytes) {
+            match Certificate::from_pem_bundle(&bytes) {
                 Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match reqwest::Certificate::from_der(&bytes) {
+                _ => match Certificate::from_der(&bytes) {
                     Ok(certificate) => certificates.push(certificate),
                     Err(error) => {
                         tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
@@ -58,7 +57,8 @@ fn configured_root_certificates() -> &'static [reqwest::Certificate] {
             }
         }
         certificates
-    })
+    });
+    ROOTS.as_slice()
 }
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
@@ -1068,9 +1068,10 @@ impl ObscuraHttpClient {
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
+                .tls_backend_rustls()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
-                .danger_accept_invalid_certs(false)
+                .tls_danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
@@ -1081,9 +1082,8 @@ impl ObscuraHttpClient {
             if std::env::var_os("SSL_CERT_FILE").is_some()
                 || std::env::var_os("SSL_CERT_DIR").is_some()
             {
-                for certificate in configured_root_certificates() {
-                    builder = builder.add_root_certificate(certificate.clone());
-                }
+                // Keep configured CAs additive to the platform's trusted roots.
+                builder = builder.tls_certs_merge(configured_root_certificates().iter().cloned());
             }
 
             if let Some(ref proxy) = self.proxy_url {
@@ -2826,11 +2826,18 @@ mod ssrf_tests {
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf_params =
+        let mut leaf_params =
             rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
-        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        // rcgen defaults both subjects to the same CN, making the leaf look
+        // self-issued to platform chain builders despite its different key.
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        leaf_params.use_authority_key_identifier_extension = true;
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
 
         let certs = vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
             leaf_cert.der().to_vec(),
@@ -2840,7 +2847,13 @@ mod ssrf_tests {
                 leaf_key.serialize_der(),
             ),
         );
-        let config = tokio_rustls::rustls::ServerConfig::builder()
+        // The full dependency graph enables both rustls providers. Select this
+        // fixture's provider explicitly without installing a process default.
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .unwrap();
@@ -2872,8 +2885,8 @@ mod ssrf_tests {
         (port, ca_cert.pem())
     }
 
-    // The two configured-roots tests set/rely on SSL_CERT_FILE, which is
-    // cached once per process at client build. They are only correct under
+    // The configured-roots tests set/rely on SSL_CERT_FILE / SSL_CERT_DIR, which
+    // are cached once per process at client build. They are only correct under
     // `cargo nextest` (one process per test), the same constraint the whole
     // workspace already has.
 

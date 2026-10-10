@@ -9,7 +9,6 @@ use selectors::matching::{
     NeedsSelectorFlags,
 };
 use selectors::parser::{self, ParseRelative, SelectorParseErrorKind};
-use selectors::visitor::SelectorVisitor;
 use selectors::{Element, OpaqueElement, SelectorList};
 
 use crate::tree::{DomTree, NodeData, NodeId};
@@ -119,8 +118,6 @@ pub enum PseudoClass {
 }
 
 impl parser::NonTSPseudoClass for PseudoClass {
-    type Impl = ObscuraSelector;
-
     fn is_active_or_hover(&self) -> bool {
         matches!(self, PseudoClass::Hover | PseudoClass::Active)
     }
@@ -134,13 +131,6 @@ impl parser::NonTSPseudoClass for PseudoClass {
                 | PseudoClass::FocusVisible
                 | PseudoClass::FocusWithin
         )
-    }
-
-    fn visit<V>(&self, _visitor: &mut V) -> bool
-    where
-        V: SelectorVisitor<Impl = Self::Impl>,
-    {
-        true
     }
 }
 
@@ -167,9 +157,7 @@ pub enum PseudoElement {
     After,
 }
 
-impl parser::PseudoElement for PseudoElement {
-    type Impl = ObscuraSelector;
-}
+impl parser::PseudoElement for PseudoElement {}
 
 impl ToCss for PseudoElement {
     fn to_css<W: std::fmt::Write>(&self, dest: &mut W) -> std::fmt::Result {
@@ -184,7 +172,7 @@ pub struct ObscuraSelectorParser;
 
 impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
     type Impl = ObscuraSelector;
-    type Error = SelectorParseErrorKind<'i>;
+    type Error = SelectorParseErrorKind;
 
     // Allow `:has()`. The selectors crate gates relative-selector parsing on
     // this (default false), so without it `a:has(p)` failed to parse and the
@@ -222,9 +210,8 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
 
     fn parse_non_ts_pseudo_class(
         &self,
-        _location: cssparser::SourceLocation,
         name: CowRcStr<'i>,
-    ) -> Result<PseudoClass, cssparser::ParseError<'i, Self::Error>> {
+    ) -> Result<PseudoClass, cssparser::ParseError<Self::Error>> {
         match name.as_ref() {
             "hover" => Ok(PseudoClass::Hover),
             "active" => Ok(PseudoClass::Active),
@@ -236,12 +223,9 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "checked" => Ok(PseudoClass::Checked),
             "link" | "any-link" => Ok(PseudoClass::Link),
             "visited" => Ok(PseudoClass::Visited),
-            _ => Err(cssparser::ParseError {
-                kind: cssparser::ParseErrorKind::Custom(
-                    SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
-                ),
-                location: _location,
-            }),
+            _ => Err(cssparser::ParseError::custom(
+                SelectorParseErrorKind::UnsupportedPseudoClassOrElement,
+            )),
         }
     }
 }
@@ -264,7 +248,7 @@ impl<'a> DomElement<'a> {
                 n.as_element()
                     .map(|name| {
                         matches!(
-                            name.local.as_ref(),
+                            &*name.local,
                             "input"
                                 | "button"
                                 | "select"
@@ -529,7 +513,7 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |n| {
                 n.as_element()
                     .map(|name| {
-                        matches!(name.local.as_ref(), "a" | "area" | "link")
+                        matches!(&*name.local, "a" | "area" | "link")
                             && n.get_attribute("href").is_some()
                     })
                     .unwrap_or(false)
@@ -648,8 +632,8 @@ thread_local! {
 const SELECTOR_CACHE_CAP: usize = 256;
 
 fn parse_selector_uncached(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
-    let mut parser_input = cssparser::ParserInput::new(selector);
-    let mut parser = cssparser::Parser::new(&mut parser_input);
+    // cssparser 0.38 owns parser state directly over the borrowed input.
+    let mut parser = cssparser::Parser::new(selector);
     SelectorList::parse(&ObscuraSelectorParser, &mut parser, ParseRelative::No)
         .map_err(|e| format!("Failed to parse selector '{}': {:?}", selector, e))
 }
@@ -988,6 +972,9 @@ impl Matcher {
         );
         let element = DomElement::new(tree, nid);
         context.current_host = Some(DomElement::new(tree, host).opaque());
+        // Logical selector arms must not match the host's ordinary features.
+        // `:host(...)` restores ordinary matching for its argument internally.
+        context.featureless = nid == host;
         selectors::matching::matches_selector(
             &compiled.sel,
             0,
@@ -1104,9 +1091,8 @@ impl CompiledSelector {
     /// Shadow-tree stylesheets use this to retain only `:host` selectors when
     /// matching against the host in their own tree scope.
     pub fn matches_featureless_host(&self) -> bool {
-        self.sel
-            .matches_featureless_host_selector_or_pseudo_element()
-            .contains(parser::FeaturelessHostMatches::FOR_HOST)
+        // `:scope` is not a shadow-host selector in our explicit host scope.
+        self.sel.matches_featureless_host(false).may_match()
     }
 
     /// Whether this selector contains the `::slotted()` pseudo-element and
@@ -1377,7 +1363,7 @@ mod tests {
             SelectorKey::Attribute(attribute) => node.get_attribute(attribute).is_some(),
             SelectorKey::Local(local) => node
                 .as_element()
-                .is_some_and(|element| element.local.as_ref() == local),
+                .is_some_and(|element| &*element.local == local),
         }
     }
 
@@ -1546,7 +1532,7 @@ mod tests {
         let result = tree.query_selector("h1").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
-        assert_eq!(node.as_element().unwrap().local.as_ref(), "h1");
+        assert_eq!(&*node.as_element().unwrap().local, "h1");
     }
 
     #[test]
@@ -1638,7 +1624,7 @@ mod tests {
         let result = tree.query_selector("#outer span").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
-        assert_eq!(node.as_element().unwrap().local.as_ref(), "span");
+        assert_eq!(&*node.as_element().unwrap().local, "span");
     }
 
     #[test]
@@ -1873,6 +1859,14 @@ mod tests {
         assert!(matcher.matches_shadow_host(&tree, host, &qualified, host));
         assert!(!matcher.matches_shadow_host(&tree, host, &rejected, host));
         assert!(!matcher.matches_shadow_host(&tree, other, &plain, host));
+
+        // Mixed logical arms must not expose the host's ordinary classes to
+        // its shadow stylesheet; only the :host argument may match them.
+        let mixed_rejected = tree.compile_rule_selector(":is(:host([hidden]), .active)").unwrap();
+        let mixed_accepted = tree.compile_rule_selector(":where(:host(.active), .missing)").unwrap();
+        assert!(mixed_rejected.matches_featureless_host());
+        assert!(!matcher.matches_shadow_host(&tree, host, &mixed_rejected, host));
+        assert!(matcher.matches_shadow_host(&tree, host, &mixed_accepted, host));
 
         // Parsing support must not make `:host` observable in document scope.
         assert!(!tree.matches_selector(host, ":host").unwrap());

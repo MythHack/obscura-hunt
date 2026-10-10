@@ -144,19 +144,7 @@ pub async fn handle(
                 .get("responseCode")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(200) as u16;
-            let headers: HashMap<String, String> = params
-                .get("responseHeaders")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|h| {
-                            let name = h.get("name")?.as_str()?.to_string();
-                            let value = h.get("value")?.as_str()?.to_string();
-                            Some((name, value))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let headers = crate::server::parse_cdp_response_headers(params);
             // The CDP fulfillRequest body is base64-encoded; decode it — parity
             // with server.rs handle_fetch_resolution (#919). (Binary-safe body
             // transport across the JS boundary remains tracked in #912.)

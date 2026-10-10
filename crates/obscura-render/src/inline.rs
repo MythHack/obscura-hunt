@@ -2712,7 +2712,7 @@ fn collect_node_spans(
             if style.map(|s| s.display == Display::None).unwrap_or(false) {
                 return;
             }
-            if elem.local.as_ref() == "br" {
+            if &*elem.local == "br" {
                 out.push((
                     "\n".to_string(),
                     SpanAttrs {
@@ -3420,7 +3420,7 @@ pub(crate) fn inline_child_ok(
             if style.display == Display::None {
                 return true; // removed from flow; ignore its subtree
             }
-            if elem.local.as_ref() == "br" {
+            if &*elem.local == "br" {
                 *has_text = true;
                 return true;
             }

@@ -1,9 +1,11 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -602,11 +604,11 @@ pub async fn start_with_serve_options_limit_and_ready_file(
             .set_nodelay(true)
             .map_err(|e| error!("set_nodelay on WS stream: {}", e))
             .ok();
-        // Reserve a slot before spawning. `fetch_update` (rather than a load
+        // Reserve a slot before spawning. `try_update` (rather than a load
         // then a store) keeps the check atomic against the accept thread
         // handing off the next stream concurrently.
         let reserved = live_connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < max_connections).then_some(n + 1)
             })
             .is_ok();
@@ -1424,21 +1426,68 @@ fn emit_intercepted_request(
     let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
         crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
     });
-    emit_routed_intercepted_request(intercepted, route, &observers, reply_tx, intercepted_paused);
+    let frame_registry = ctx.pages.iter().find(|page| page.id == intercepted.page_id)
+        .and_then(|page| page.network_frame_registry());
+    emit_routed_intercepted_request(intercepted, route, &observers, frame_registry.as_ref(),
+        &ctx.announced_frames, reply_tx, intercepted_paused);
 }
 
 fn emit_routed_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     route: Option<(&str, Option<String>)>,
     observers: &[String],
+    frame_registry: Option<&Rc<RefCell<obscura_js::ops::RealmStates>>>,
+    announced_frames: &Rc<RefCell<HashMap<String, Vec<String>>>>,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) {
-    let Some((frame_id, session_id)) = route else {
+    let Some((main_frame_id, session_id)) = route else {
         let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
             reason: "Aborted".into(),
         });
         return;
+    };
+    let frame_id = if intercepted.frame_id == 0 {
+        std::borrow::Cow::Borrowed(main_frame_id)
+    } else {
+        let Some(parent_frame_id) = intercepted.parent_frame_id else {
+            let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                reason: "Aborted".into(),
+            });
+            return;
+        };
+        // A navigation temporarily owns its Page outside ctx; its descriptor
+        // was checked by the initiating native op. Live pages can check again.
+        if frame_registry.is_some_and(|registry| registry.borrow().live_frame_owner(intercepted.frame_id)
+            .is_none_or(|(parent, _)| parent != parent_frame_id))
+        {
+            let _ = intercepted.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                reason: "Aborted".into(),
+            });
+            return;
+        }
+        let frame_id = crate::domains::page::child_frame_id(main_frame_id, intercepted.frame_id);
+        let parent_id = if parent_frame_id == 0 { main_frame_id.to_string() }
+            else { crate::domains::page::child_frame_id(main_frame_id, parent_frame_id) };
+        let newly_attached = {
+            let mut announced = announced_frames.borrow_mut();
+            let known = announced.entry(intercepted.page_id.clone()).or_default();
+            if known.contains(&frame_id) { false } else { known.push(frame_id.clone()); true }
+        };
+        if newly_attached {
+            let attached = json!({
+                "method": "Page.frameAttached",
+                "params": {"frameId": frame_id, "parentFrameId": parent_id},
+                "sessionId": session_id,
+            });
+            let _ = reply_tx.send(attached.to_string());
+            for observer in observers {
+                let mut event = attached.clone();
+                event["sessionId"] = json!(observer);
+                let _ = reply_tx.send(event.to_string());
+            }
+        }
+        std::borrow::Cow::Owned(frame_id)
     };
     tracing::info!(
         "INTERCEPTION: requestPaused for {} {} (sending to client)",
@@ -1467,7 +1516,7 @@ fn emit_routed_intercepted_request(
             "wallTime": now,
             "initiator": {"type": "script"},
             "type": intercepted.resource_type,
-            "frameId": frame_id,
+            "frameId": frame_id.as_ref(),
         },
         "sessionId": session_id,
     });
@@ -1483,7 +1532,7 @@ fn emit_routed_intercepted_request(
         "params": {
             "requestId": intercepted.request_id,
             "request": request,
-            "frameId": frame_id,
+            "frameId": frame_id.as_ref(),
             "resourceType": intercepted.resource_type,
             "networkId": intercepted.request_id,
             "responseErrorReason": null,
@@ -1687,6 +1736,31 @@ pub(crate) fn parse_cdp_headers(params: &serde_json::Value) -> Option<HashMap<St
     )
 }
 
+pub(crate) fn parse_cdp_response_headers(params: &serde_json::Value) -> HashMap<String, String> {
+    let mut headers: HashMap<String, String> = HashMap::new();
+    if let Some(entries) = params.get("responseHeaders").and_then(|value| value.as_array()) {
+        for header in entries {
+            let (Some(name), Some(value)) = (
+                header.get("name").and_then(|value| value.as_str()),
+                header.get("value").and_then(|value| value.as_str()),
+            ) else { continue; };
+            if name.eq_ignore_ascii_case("content-security-policy")
+                || name.eq_ignore_ascii_case("x-frame-options")
+            {
+                headers.entry(name.to_ascii_lowercase())
+                    .and_modify(|existing| {
+                        existing.push_str(", ");
+                        existing.push_str(value);
+                    })
+                    .or_insert_with(|| value.to_string());
+            } else {
+                headers.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    headers
+}
+
 fn handle_fetch_resolution(
     text: &str,
     reply_tx: &mpsc::UnboundedSender<String>,
@@ -1721,12 +1795,7 @@ fn handle_fetch_resolution(
                     // hand JS the exact bytes for a binary fulfill (#912).
                     let body = decode_base64(raw_body);
                     let body_base64 = raw_body.to_string();
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
+                    let headers = parse_cdp_response_headers(&req.params);
                     obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
                 }
                 "Fetch.failRequest" => {
@@ -2042,8 +2111,10 @@ async fn process_awaited_with_interception(
         let observers = crate::domains::page::network_observer_sessions(
             ctx, &page.id, &Some(session_id.clone()),
         );
-        Some((page.id.clone(), (page.frame_id.clone(), session_id.clone(), observers)))
+        Some((page.id.clone(), (page.frame_id.clone(), session_id.clone(), observers,
+            page.network_frame_registry())))
     }).collect();
+    let announced_frames = ctx.announced_frames.clone();
     let command = process_cdp_message(text, ctx, reply_tx);
     tokio::pin!(command);
     loop {
@@ -2055,11 +2126,12 @@ async fn process_awaited_with_interception(
                     None => std::future::pending().await,
                 }
             } => {
-                let (route, observers) = routes.get(&intercepted.page_id)
-                    .map(|(frame_id, session_id, observers)| (
-                        Some((frame_id.as_str(), Some(session_id.clone()))), observers.as_slice(),
-                    )).unwrap_or((None, &[]));
-                emit_routed_intercepted_request(intercepted, route, observers, reply_tx, intercepted_paused);
+                let (route, observers, frame_registry) = routes.get(&intercepted.page_id)
+                    .map(|(frame_id, session_id, observers, registry)| (
+                        Some((frame_id.as_str(), Some(session_id.clone()))), observers.as_slice(), registry.as_ref(),
+                    )).unwrap_or((None, &[], None));
+                emit_routed_intercepted_request(intercepted, route, observers, frame_registry,
+                    &announced_frames, reply_tx, intercepted_paused);
             }
             Some(message) = rx.recv() => {
                 if let ServerMessage::Cdp(msg) = &message {
@@ -2288,12 +2360,20 @@ mod tests {
         ctx.sessions.insert("unrelated".into(), other);
         let (resolver, _resolution) = tokio::sync::oneshot::channel();
         let intercepted = obscura_js::ops::InterceptedRequest {
-            request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
+            request_id: "fetch-1".into(), page_id: page.clone(), frame_id: 7, url: "https://example.test/data".into(),
+            parent_frame_id: Some(0),
             method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut paused = HashMap::new();
         super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame-1", Some("driver".into()))), &tx, &mut paused);
+        for session in ["driver", "observer"] {
+            let attached: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(attached["method"], "Page.frameAttached");
+            assert_eq!(attached["params"]["frameId"], "frame-1-frame-7");
+            assert_eq!(attached["params"]["parentFrameId"], "frame-1");
+            assert_eq!(attached["sessionId"], session);
+        }
         let driver: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         let observer: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
@@ -2303,6 +2383,8 @@ mod tests {
         assert_eq!(observer["sessionId"], "observer");
         assert_eq!(pause["method"], "Fetch.requestPaused");
         assert_eq!(pause["sessionId"], "driver");
+        assert_eq!(driver["params"]["frameId"], "frame-1-frame-7");
+        assert_eq!(pause["params"]["frameId"], "frame-1-frame-7");
         assert_eq!(paused.len(), 1);
         assert!(paused.contains_key("fetch-1"));
         assert!(rx.try_recv().is_err());
@@ -3323,6 +3405,8 @@ mod tests {
             let (resolution_tx, resolution_rx) = tokio::sync::oneshot::channel();
             intercept_tx.send(InterceptedRequest {
                 page_id: page_id.clone(),
+                frame_id: 0,
+                parent_frame_id: None,
                 request_id: "pending-test".into(), url: format!("http://{address}/pending"),
                 method: "GET".into(), headers: HashMap::new(), resource_type: "Fetch".into(),
                 resolver: resolution_tx,

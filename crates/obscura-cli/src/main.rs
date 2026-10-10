@@ -1119,6 +1119,7 @@ async fn run_fetch(
     // pages stay fast.
     settle_page(&mut page, wait_secs, wait_is_fixed).await;
 
+    #[cfg(feature = "render")]
     let mut deferred_eval_output = None;
     let initial_controlled_scroll = if eval_at_capture_boundary {
         controlled_scroll_request.as_ref().map(|(x, requested_y)| {
@@ -1163,6 +1164,7 @@ async fn run_fetch(
                 context.save_cookies();
                 return Ok(());
             }
+            #[cfg(feature = "render")]
             if screenshot.is_some() {
                 deferred_eval_output = Some(result);
             }
@@ -1746,7 +1748,7 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
                 append_readable_text_segment(&mut result, &mut pending_space, contents);
             }
             NodeData::Element { name, .. } => {
-                let tag = name.local.as_ref();
+                let tag = &*name.local;
 
                 // Boilerplate elements rarely contain content the user wants to
                 // scrape — strip them so `--dump text` returns the article body

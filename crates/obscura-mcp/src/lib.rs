@@ -1918,7 +1918,7 @@ fn extract_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeId) -> Str
                 append_text_segment(&mut result, &mut pending_space, contents);
             }
             NodeData::Element { name, .. } => {
-                let tag = name.local.as_ref();
+                let tag = &*name.local;
                 if matches!(tag, "script" | "style" | "noscript") {
                     continue;
                 }

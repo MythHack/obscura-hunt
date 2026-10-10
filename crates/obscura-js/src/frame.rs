@@ -65,6 +65,8 @@ impl FrameRealm {
         if let Some(context) = existing {
             let state = realms.borrow().by_frame_id(frame_id)?;
             let origin = state.borrow().inherited_origin.clone().unwrap_or_else(|| origin_of(url));
+            parent.eval_in_realm(&context,
+                "globalThis.__obscura_objects ||= {};").ok()?;
             return Some(Self {
                 context,
                 realms,
@@ -91,7 +93,11 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
+        // A fetched sandbox document has an opaque principal captured when its
+        // browsing context was reserved, even if author code removes sandbox.
+        let opaque = realms.borrow().live_frame_owner(frame_id).is_some()
+            && realms.borrow().frame_is_sandboxed_opaque(frame_id);
+        let origin = if opaque { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -102,6 +108,7 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
+        if opaque { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -126,7 +133,8 @@ impl FrameRealm {
             .run(
                 parent,
                 &format!(
-                    "globalThis.__obscura_frameId = {frame_id};\
+                    "globalThis.__obscura_objects = {{}};\
+                     globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
                      globalThis.__obscura_init();"
                 ),
@@ -193,15 +201,7 @@ impl FrameRealm {
         source_frame_id: u32,
         target_origin: &str,
     ) -> Result<(), String> {
-        self.execute_script(
-            parent,
-            &format!(
-                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id}, {});",
-                encode_json_argument(data_json),
-                encode_json_argument(origin),
-                encode_json_argument(target_origin),
-            ),
-        )
+        parent.deliver_frame_message(self.frame_id, data_json, origin, source_frame_id, target_origin)
     }
 
     pub fn frame_id(&self) -> u32 {
@@ -397,12 +397,6 @@ impl DocumentScript {
                 "text/javascript" | "application/javascript" | "text/ecmascript"
             )
     }
-}
-
-/// Embeds a string in JavaScript source as a literal, so a payload holding
-/// quotes or newlines cannot end the literal and be read as code.
-fn encode_json_argument(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Serializes an origin the way `location.origin` does, using `"null"` for
@@ -818,6 +812,8 @@ mod tests {
                  }), 1);",
             )
             .unwrap();
+        // The host can inspect cleanup without exposing a raw window to page JS.
+        let retained_context = frame.context.clone();
         drop(frame);
         parent.run_event_loop_bounded(100).await.unwrap();
 
@@ -848,20 +844,11 @@ mod tests {
                 .unwrap(),
             serde_json::Value::Null,
         );
-        assert_eq!(
-            parent
-                .evaluate(
-                    "(function(){\
-                       const window = globalThis.__obscura_frameObjects[1]?.window;\
-                       const controller = window?.__staleController;\
-                       return [typeof window, typeof controller,\
-                         controller?.signal?._listeners?.length];\
-                     })()",
-                )
-                .unwrap(),
-            serde_json::json!(["object", "object", 0]),
-            "the retained frame realm did not discard its scheduler listener",
-        );
+        assert_eq!(parent.eval_in_realm(&retained_context, r#"JSON.stringify((() => {
+            const controller = globalThis.__staleController;
+            return [typeof globalThis, typeof controller, controller?.signal?._listeners?.length];
+        })())"#).unwrap(), r#"["object","object",0]"#,
+            "the retained frame realm did not discard its scheduler listener");
     }
 
     #[test]
@@ -1213,13 +1200,8 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].target_frame_id, 0);
         assert_eq!(queued[0].source_frame_id, 1);
-        let script = format!(
-            "globalThis.__obscura_deliverMessage({}, {}, {});",
-            serde_json::to_string(&queued[0].data_json).unwrap(),
-            serde_json::to_string(&queued[0].origin).unwrap(),
-            queued[0].source_frame_id,
-        );
-        parent.execute_script("<frame-message>", &script).unwrap();
+        parent.deliver_frame_message(0, &queued[0].data_json, &queued[0].origin,
+            queued[0].source_frame_id, &queued[0].target_origin).unwrap();
 
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
@@ -1252,14 +1234,8 @@ mod tests {
 
         // Deliver the way `Page` does, now carrying the queued targetOrigin.
         let deliver = |parent: &mut ObscuraJsRuntime, m: &crate::ops::PendingFrameMessage| {
-            let script = format!(
-                "globalThis.__obscura_deliverMessage({}, {}, {}, {});",
-                serde_json::to_string(&m.data_json).unwrap(),
-                serde_json::to_string(&m.origin).unwrap(),
-                m.source_frame_id,
-                serde_json::to_string(&m.target_origin).unwrap(),
-            );
-            parent.execute_script("<frame-message>", &script).unwrap();
+            parent.deliver_frame_message(0, &m.data_json, &m.origin,
+                m.source_frame_id, &m.target_origin).unwrap();
         };
 
         // Restricted to an origin the parent does NOT have -> must be dropped.
@@ -1424,64 +1400,30 @@ mod tests {
         std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
     }
 
-    /// The page realm holds the frame's window and document, so a discarded
-    /// frame leaves the page naming objects from a context the host no longer
-    /// holds. Reading one must be safe. A regression here is an access
-    /// violation that takes the process down, not a failed assertion.
-    ///
-    /// It must also not read as anything: V8 severs a global proxy when its
-    /// context goes, which is the same thing a browser does to a WindowProxy
-    /// when it discards a browsing context.
+    /// A retained facade remains safe after native teardown, but no longer
+    /// exposes the discarded frame's document or globals.
     #[test]
     fn a_discarded_realm_leaves_the_page_safe_to_run() {
-        let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        {
-            let frame = FrameRealm::new(
-                &mut parent,
-                1,
-                0,
-                "https://parent.example/child",
-                "<html><body><h1>Child</h1></body></html>",
-            )
-            .expect("frame realm");
-            frame
-                .execute_script(&mut parent, "globalThis.marker = 'child';")
-                .unwrap();
-            // Reachable from the page while the frame is alive.
-            assert_eq!(
-                parent
-                    .evaluate("globalThis.__obscura_frameObjects[1].window.marker")
-                    .unwrap(),
-                serde_json::json!("child"),
-            );
-        }
+        let mut parent = page("https://parent.example/", "<html><body><iframe></iframe></body></html>");
+        parent.execute_script("retain-child", "globalThis.child = document.querySelector('iframe').contentWindow;").unwrap();
+        let pending = parent.take_pending_frames().pop().unwrap();
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
+            &pending.url, &pending.html).unwrap();
+        frame.execute_script(&mut parent, "globalThis.marker = 'child';").unwrap();
+        assert_eq!(parent.evaluate("child.marker").unwrap(), serde_json::json!("child"));
+        drop(frame);
 
-        // Dropping the realm does not free it, and must not make touching it
-        // unsafe: the page still names its window, so V8 keeps the context
-        // alive and the read still answers. This is exactly why a discarded
-        // frame has to have its entry removed rather than merely dropped, and
-        // what `Page::release_detached_frames` is for.
-        assert_eq!(
-            parent
-                .evaluate("globalThis.__obscura_frameObjects[1].window.marker")
-                .unwrap(),
-            serde_json::json!("child"),
-        );
+        assert_eq!(parent.evaluate(r#"(() => {
+            try { child.marker; return 'allowed'; } catch (error) { return error.name; }
+        })()"#).unwrap(), serde_json::json!("SecurityError"));
         // The page's own DOM work still resolves against the page.
         assert_eq!(
-            parent.evaluate("document.body.innerHTML").unwrap(),
-            serde_json::json!(""),
-        );
-        // Dropping the page's reference is what lets the frame be collected.
-        parent
-            .execute_script("p", "delete globalThis.__obscura_frameObjects[1];")
-            .unwrap();
-        assert_eq!(
-            parent
-                .evaluate("globalThis.__obscura_frameObjects[1] === undefined")
-                .unwrap(),
+            parent.evaluate("document.querySelector('iframe') !== null").unwrap(),
             serde_json::json!(true),
         );
+        parent.execute_script("release-child", &format!("globalThis.__obscura_forgetFrame({});", pending.frame_id)).unwrap();
+        assert_eq!(parent.evaluate("typeof globalThis.__obscura_frameObjects").unwrap(),
+            serde_json::json!("undefined"));
     }
 
     /// A DOM call names the realm it belongs to, so the page reading the
@@ -1491,30 +1433,25 @@ mod tests {
     fn the_page_reads_the_frames_document_through_its_own_object() {
         let mut parent = page(
             "https://parent.example/",
-            "<html><head><title>parent</title></head><body></body></html>",
+            "<html><head><title>parent</title></head><body><iframe></iframe></body></html>",
         );
-        let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            0,
-            "https://parent.example/child",
-            "<html><head><title>BEFORE</title></head><body><p>child</p></body></html>",
-        )
-        .expect("frame realm");
-        frame
-            .execute_script(&mut parent, "document.title = 'RAN-IN-CHILD';")
-            .unwrap();
+        parent.execute_script("initial-child", "document.querySelector('iframe').contentWindow;").unwrap();
+        let pending = parent.take_pending_frames().pop().unwrap();
+        let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
+            &pending.url, &pending.html).unwrap();
+        frame.execute_script(&mut parent,
+            "document.title = 'RAN-IN-CHILD'; document.body.innerHTML = '<p>child</p>';").unwrap();
 
         // Read the frame's document from the *page's* realm.
         assert_eq!(
             parent
-                .evaluate("globalThis.__obscura_frameObjects[1].document.title")
+                .evaluate("document.querySelector('iframe').contentDocument.title")
                 .unwrap(),
             serde_json::json!("RAN-IN-CHILD"),
         );
         assert_eq!(
             parent
-                .evaluate("globalThis.__obscura_frameObjects[1].document.querySelector('p').textContent")
+                .evaluate("document.querySelector('iframe').contentDocument.querySelector('p').textContent")
                 .unwrap(),
             serde_json::json!("child"),
         );
@@ -1545,7 +1482,7 @@ mod tests {
 
         assert_eq!(
             parent
-                .evaluate("globalThis.__obscura_frameObjects[1] === undefined")
+                .evaluate("typeof globalThis.__obscura_frameObjects === 'undefined'")
                 .unwrap(),
             serde_json::json!(true),
             "a cross-origin frame was published to the page"

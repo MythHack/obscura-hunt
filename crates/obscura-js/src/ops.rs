@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -62,6 +63,10 @@ pub enum InterceptResolution {
 pub struct InterceptedRequest {
     pub request_id: String,
     pub page_id: String,
+    /// Native initiating browsing context. Zero is the main realm.
+    pub frame_id: u32,
+    /// Authoritative embedding realm captured at native initiation, absent for main.
+    pub parent_frame_id: Option<u32>,
     pub url: String,
     pub method: String,
     pub headers: HashMap<String, String>,
@@ -85,6 +90,8 @@ pub struct JsNetworkEvent {
     /// Matches the `fetch-{N}` id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
+    /// Native initiating browsing context. Zero is the main realm.
+    pub frame_id: u32,
     /// The interception consumer already received the request start.
     pub intercepted: bool,
     pub url: String,
@@ -218,7 +225,6 @@ pub struct ObscuraState {
     pub pending_frames: Vec<PendingFrame>,
     /// Total URL and HTML bytes held by `pending_frames`.
     pub pending_frame_bytes: usize,
-    pub frame_id_counter: u32,
     /// Which frame this state belongs to; 0 is the page's own realm.
     pub frame_id: u32,
     // postMessage traffic between realms, waiting to be delivered. A realm
@@ -450,7 +456,6 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
-            frame_id_counter: 0,
             frame_id: 0,
             pending_frame_messages: Vec::new(),
             pending_frame_message_bytes: 0,
@@ -560,7 +565,7 @@ pub enum RuntimeEvent {
 pub(crate) fn node_is_script(dom: &DomTree, node_id: NodeId) -> bool {
     dom.with_node(node_id, |node| {
         node.as_element()
-            .map(|name| name.local.as_ref().eq_ignore_ascii_case("script"))
+            .map(|name| str::eq_ignore_ascii_case(&name.local, "script"))
             .unwrap_or(false)
     })
     .unwrap_or(false)
@@ -659,14 +664,12 @@ fn response_body_byte_limit() -> usize {
 }
 
 fn record_js_network_completion(
-    state: &RefCell<OpState>,
+    state: &RefCell<ObscuraState>,
     event: JsNetworkEvent,
     body: &str,
     base64_encoded: bool,
 ) {
-    let state_borrow = state.borrow();
-    let gs = state_borrow.borrow::<SharedState>().clone();
-    let mut gs = gs.borrow_mut();
+    let mut gs = state.borrow_mut();
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
@@ -882,20 +885,29 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+    main_context: Option<v8::Global<v8::Context>>,
     frame_timers: HashMap<u32, FrameTimers>,
 }
 
 struct FrameTimers {
     owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
+    sandboxed_opaque: bool,
+    document_url: Option<String>,
+    document_load_started: bool,
     cancel: Rc<CancelHandle>,
 }
 
 impl RealmStates {
+    pub(crate) fn set_main_context(&mut self, context: v8::Global<v8::Context>) {
+        self.main_context = Some(context);
+    }
+
     pub(crate) fn live_count(&self) -> usize {
         self.entries.len()
     }
 
     pub(crate) fn context(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
+        if self.frame_timers_active(frame_id) != Some(true) { return None; }
         self.entries.iter().find(|(_, id, _)| *id == frame_id)
             .map(|(context, _, _)| context.clone())
     }
@@ -913,7 +925,8 @@ impl RealmStates {
         state: SharedState,
     ) {
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
+            owner: None, sandboxed_opaque: false, document_url: None,
+            document_load_started: false, cancel: CancelHandle::new_rc(),
         });
         self.entries.push((context, frame_id, state));
     }
@@ -927,10 +940,43 @@ impl RealmStates {
     }
 
     fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
-        let generation = parent.borrow().document_generation;
-        self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
-            owner: None, cancel: CancelHandle::new_rc(),
-        }).owner = Some((Rc::downgrade(parent), node, generation));
+        let parent_state = parent.borrow();
+        let generation = parent_state.document_generation;
+        let sandboxed_opaque = parent_state.dom.as_ref()
+            .and_then(|dom| dom.with_node(node, |node| node.get_attribute("sandbox")
+                .map(|tokens| !tokens.split_whitespace().any(|token| token == "allow-same-origin"))))
+            .flatten().unwrap_or(false);
+        self.frame_timers.insert(frame_id, FrameTimers {
+            owner: Some((Rc::downgrade(parent), node, generation)),
+            sandboxed_opaque, document_url: None, document_load_started: false,
+            cancel: CancelHandle::new_rc(),
+        });
+    }
+
+    /// The exact embedding node, only while the complete owner chain is live.
+    pub fn live_frame_owner(&self, frame_id: u32) -> Option<(u32, NodeId)> {
+        if self.frame_timers_active(frame_id) != Some(true) { return None; }
+        let (parent, node, _) = self.frame_timers.get(&frame_id)?.owner.as_ref()?;
+        let parent = parent.upgrade()?;
+        let parent = parent.try_borrow().ok()?;
+        Some((parent.frame_id, *node))
+    }
+
+    /// Snapshot of the sandbox principal at reservation, not a mutable attribute.
+    pub fn frame_is_sandboxed_opaque(&self, frame_id: u32) -> bool {
+        self.frame_timers.get(&frame_id).map_or(true, |frame| frame.sandboxed_opaque)
+    }
+
+    pub fn live_frame_owners(&self) -> Vec<(u32, u32, NodeId)> {
+        self.frame_timers.keys().filter_map(|id| self.live_frame_owner(*id)
+            .map(|(parent, node)| (*id, parent, node))).collect()
+    }
+
+    fn frame_owner_matches(&self, frame_id: u32, parent: &SharedState, node: NodeId) -> bool {
+        self.frame_timers_active(frame_id) == Some(true)
+            && self.frame_timers.get(&frame_id).and_then(|frame| frame.owner.as_ref())
+                .is_some_and(|(owner, owner_node, _)|
+                    owner.as_ptr() == Rc::as_ptr(parent) && *owner_node == node)
     }
 
     fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
@@ -1712,7 +1758,7 @@ fn op_external_stylesheet_set(
     let valid_owner = state.dom.as_ref().is_some_and(|dom| {
         dom.get_node(owner).is_some_and(|node| {
             node.as_element()
-                .is_some_and(|element| matches!(element.local.as_ref(), "link" | "style"))
+                .is_some_and(|element| matches!(&*element.local, "link" | "style"))
         })
     });
     if !valid_owner {
@@ -1859,8 +1905,72 @@ fn op_dom(
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        if cmd == "frame_ancestor_origins" {
+            let registry = registry.borrow();
+            let mut origins = Vec::new();
+            let mut ancestor = shared.clone();
+            for _ in 0..=registry.frame_timers.len() {
+                let (id, origin) = {
+                    let ancestor = ancestor.borrow();
+                    let origin = ancestor.inherited_origin.clone().unwrap_or_else(||
+                        url::Url::parse(&ancestor.url).map(|url| url.origin().ascii_serialization())
+                            .unwrap_or_else(|_| "null".to_string()));
+                    (ancestor.frame_id, origin)
+                };
+                origins.push(origin);
+                if id == 0 {
+                    return serde_json::to_string(&origins).unwrap_or_else(|_| "null".into());
+                }
+                if registry.frame_timers_active(id) != Some(true) { return "null".into(); }
+                ancestor = match registry.frame_timers.get(&id)
+                    .and_then(|frame| frame.owner.as_ref())
+                    .and_then(|(parent, _, _)| parent.upgrade())
+                {
+                    Some(parent) => parent,
+                    None => return "null".into(),
+                };
+            }
+            return "null".into();
+        }
+        if cmd == "frame_is_sandboxed_opaque" {
+            return arg1.parse::<u32>().ok().map_or(true, |id|
+                registry.borrow().frame_is_sandboxed_opaque(id)).to_string();
+        }
+        if cmd == "frame_owner_matches" || cmd == "frame_same_origin" {
+            let registry = registry.borrow();
+            let valid = (|| {
+                let id = arg1.parse::<u32>().ok()?;
+                let node = NodeId::new(arg2.parse::<u32>().ok()?);
+                if !registry.frame_owner_matches(id, &shared, node) { return None; }
+                if cmd == "frame_owner_matches" { return Some(true); }
+                let child = registry.by_frame_id(id)?;
+                let child = child.borrow();
+                let parent = shared.borrow();
+                // Initial blank documents inherit their creator's principal.
+                // Fetched opaque/sandbox documents are never published.
+                if let Some(inherited) = child.inherited_origin.as_deref() {
+                    if registry.frame_is_sandboxed_opaque(id) { return None; }
+                    return Some(if let Some(origin) = parent.inherited_origin.as_deref() {
+                        inherited == origin
+                    } else {
+                        inherited == url::Url::parse(&parent.url).ok()?.origin().ascii_serialization()
+                    });
+                }
+                let parent_origin = url::Url::parse(
+                    parent.inherited_origin.as_deref().unwrap_or(&parent.url)).ok()?.origin();
+                let child_origin = url::Url::parse(&child.url).ok()?.origin();
+                Some(matches!((&parent_origin, &child_origin),
+                    (url::Origin::Tuple(..), url::Origin::Tuple(..)))
+                    && parent_origin == child_origin)
+            })().unwrap_or(false);
+            return valid.to_string();
+        }
         if cmd == "retire_frame" {
-            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            if let Ok(id) = arg1.parse::<u32>() {
+                let mut registry = registry.borrow_mut();
+                if registry.by_frame_id(id).is_none() { registry.forget_frame(id); }
+                else { registry.cancel_frame_timers(id); }
+            }
             return "true".into();
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
@@ -2178,7 +2288,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
                     if n.as_element()
-                        .map(|name| name.local.as_ref() == "html")
+                        .map(|name| &*name.local == "html")
                         .unwrap_or(false)
                     {
                         return cid.index().to_string();
@@ -2286,7 +2396,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let name: String = dom
                 .with_node(NodeId::new(nid), |n| match &n.data {
                     NodeData::Document => "#document".to_string(),
-                    NodeData::Element { name, .. } => name.local.as_ref().to_ascii_uppercase(),
+                    NodeData::Element { name, .. } => str::to_ascii_uppercase(&name.local),
                     NodeData::Text { .. } => "#text".to_string(),
                     NodeData::Comment { .. } => "#comment".to_string(),
                     NodeData::Doctype { name, .. } => name.clone(),
@@ -2367,7 +2477,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
                         if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
+                            str::to_ascii_uppercase(&name.local)
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -2397,7 +2507,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let ns = dom
                 .with_node(NodeId::new(nid), |n| {
-                    n.as_element().map(|name| name.ns.as_ref().to_string())
+                    n.as_element().map(|name| name.ns.to_string())
                 })
                 .flatten()
                 .unwrap_or_default();
@@ -3472,6 +3582,8 @@ fn intercept_fulfill_response(
     let opaque = !internal_load && mode == "no-cors" && cross_origin;
     let visible_headers = if opaque {
         HashMap::new()
+    } else if internal_load {
+        headers.clone()
     } else {
         visible_response_headers(&headers, cross_origin, credentials)
     };
@@ -3485,9 +3597,11 @@ fn intercept_fulfill_response(
     })
 }
 
-#[op2]
+// Only the eight JS arguments count; scope and state are injected by op2.
+#[op2(required(8))]
 #[string]
-async fn op_fetch_url(
+fn op_fetch_url(
+    scope: &mut v8::PinScope,
     state: Rc<RefCell<OpState>>,
     #[string] url: String,
     #[string] method: String,
@@ -3497,22 +3611,58 @@ async fn op_fetch_url(
     #[string] mode: String,
     #[string] credentials: String,
     #[serde] options: FetchOptions,
-) -> Result<String, deno_error::JsErrorBox> {
-    // Keep the existing op arity rather than exceeding deno_core's
-    // async-op code-generation limit with another positional argument.
-    let (destination, cancel_rid) = match options {
-        FetchOptions::Destination(destination) => (destination, None),
-        FetchOptions::Cancelable { cancel_rid, destination } => (destination, Some(cancel_rid)),
-    };
-    let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
-        .map(|resource| resource.0.clone())
-        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
-    let future = fetch_url_inner(state, url, method, headers_json, body, origin, mode, credentials,
-        destination, cancel.clone());
-    match cancel {
-        Some(cancel) => future.or_cancel(cancel).await
-            .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
-        None => future.await,
+) -> impl Future<Output = Result<String, deno_error::JsErrorBox>> + use<> {
+    // The op function belongs to main. Capture the entered/microtask realm
+    // synchronously, before V8 loses that identity while polling native work.
+    let captured = (|| {
+        let owner = fetch_realm_state(scope, &state.borrow())?;
+        let page = state.borrow().borrow::<SharedState>().clone();
+        let registry = state.borrow().borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let (destination, cancel_rid, document_frame) = match options {
+            FetchOptions::Destination(destination) => (destination, None, None),
+            FetchOptions::Cancelable { cancel_rid, destination } => (destination, Some(cancel_rid), None),
+            FetchOptions::FrameDocument { frame_id, destination } => (destination, None, Some(frame_id)),
+        };
+        let (calling_frame, generation) = {
+            let owner = owner.borrow();
+            (owner.frame_id, owner.document_generation)
+        };
+        let frame_id = document_frame.unwrap_or(calling_frame);
+        if let Some(frame_id) = document_frame {
+            let mut registry = registry.borrow_mut();
+            let valid = destination == "Document"
+                && registry.live_frame_owner(frame_id).is_some_and(|(_, node)|
+                    registry.frame_owner_matches(frame_id, &owner, node))
+                && registry.by_frame_id(frame_id).is_none()
+                && method == "GET" && body.is_empty()
+                && registry.frame_timers.get(&frame_id).is_some_and(|frame|
+                    !frame.document_load_started && frame.document_url.as_deref() == Some(url.as_str()));
+            if !valid {
+                return Err(deno_error::JsErrorBox::generic("Invalid iframe document request owner"));
+            }
+            registry.frame_timers.get_mut(&frame_id).unwrap().document_load_started = true;
+        }
+        let initiator = FetchInitiator { frame_id, owner, generation, registry };
+        initiator.ensure_live()?;
+        let parent_frame_id = if frame_id == 0 { None } else {
+            Some(initiator.registry.borrow().live_frame_owner(frame_id)
+                .ok_or_else(|| deno_error::JsErrorBox::generic("Fetch frame owner is unavailable"))?.0)
+        };
+        let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
+            .map(|resource| resource.0.clone())
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
+        Ok((page, initiator, parent_frame_id, destination, cancel))
+    })();
+    async move {
+        let (page, initiator, parent_frame_id, destination, cancel) = captured?;
+        initiator.ensure_live()?;
+        let future = fetch_url_inner(state, page, initiator, url, method, headers_json, body,
+            origin, mode, credentials, destination, parent_frame_id, cancel.clone());
+        match cancel {
+            Some(cancel) => future.or_cancel(cancel).await
+                .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
+            None => future.await,
+        }
     }
 }
 
@@ -3521,13 +3671,62 @@ async fn op_fetch_url(
 enum FetchOptions {
     Destination(String),
     Cancelable { cancel_rid: u32, destination: String },
+    FrameDocument { frame_id: u32, destination: String },
+}
+
+struct FetchInitiator {
+    frame_id: u32,
+    owner: SharedState,
+    generation: u64,
+    registry: Rc<RefCell<RealmStates>>,
+}
+
+impl FetchInitiator {
+    fn ensure_live(&self) -> Result<(), deno_error::JsErrorBox> {
+        let owner = self.owner.try_borrow().map_err(|_| deno_error::JsErrorBox::generic(
+            "Fetch document owner is unavailable"))?;
+        let owner_frame = owner.frame_id;
+        if owner.document_generation != self.generation {
+            return Err(deno_error::JsErrorBox::generic("Fetch document owner was replaced"));
+        }
+        drop(owner);
+        let registry = self.registry.borrow();
+        if owner_frame != 0 && registry.frame_timers_active(owner_frame) != Some(true)
+            || self.frame_id != owner_frame && !registry.live_frame_owner(self.frame_id)
+                .is_some_and(|(_, node)| registry.frame_owner_matches(self.frame_id, &self.owner, node))
+        {
+            return Err(deno_error::JsErrorBox::generic("Fetch frame owner is detached or was replaced"));
+        }
+        Ok(())
+    }
+}
+
+fn fetch_realm_state(scope: &mut v8::PinScope, state: &OpState)
+    -> Result<SharedState, deno_error::JsErrorBox>
+{
+    let current = scope.get_entered_or_microtask_context();
+    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+    if let Some((_, frame_id, realm)) = registry.entries.iter()
+        .find(|(context, _, _)| *context == current)
+    {
+        if registry.frame_timers_active(*frame_id) != Some(true) {
+            return Err(deno_error::JsErrorBox::generic("Calling frame owner is detached or was replaced"));
+        }
+        return Ok(realm.clone());
+    }
+    if registry.main_context.as_ref().is_some_and(|context| *context == current) {
+        return Ok(state.borrow::<SharedState>().clone());
+    }
+    Err(deno_error::JsErrorBox::generic("Unknown calling fetch realm"))
 }
 
 async fn fetch_url_inner(
-    state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
+    state: Rc<RefCell<OpState>>, page: SharedState, initiator: FetchInitiator,
+    url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
-    destination: String, cancel: Option<Rc<CancelHandle>>,
+    destination: String, parent_frame_id: Option<u32>, cancel: Option<Rc<CancelHandle>>,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let frame_id = initiator.frame_id;
     let (resource_type, resource_type_name) = match destination.as_str() {
         "Script" => (ResourceType::Script, "Script"),
         "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
@@ -3545,9 +3744,7 @@ async fn fetch_url_inner(
     );
 
     let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client) = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
+        let mut gs = page.borrow_mut();
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
                 return Ok(serde_json::json!({
@@ -3627,9 +3824,9 @@ async fn fetch_url_inner(
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
     let mut network_guard = FetchNetworkGuard {
-        state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
+        state: Rc::downgrade(&page),
         event: Some(JsNetworkEvent {
-            request_id: request_id.clone(), intercepted: false,
+            request_id: request_id.clone(), frame_id, intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
@@ -3653,6 +3850,8 @@ async fn fetch_url_inner(
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
             page_id,
+            frame_id,
+            parent_frame_id,
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
@@ -3663,6 +3862,10 @@ async fn fetch_url_inner(
             was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
+                resolution if initiator.ensure_live().is_err() => {
+                    drop(resolution);
+                    return Err(deno_error::JsErrorBox::generic("Intercepted fetch owner is detached or was replaced"));
+                }
                 Ok(InterceptResolution::Fulfill {
                     status,
                     headers: h,
@@ -3674,8 +3877,8 @@ async fn fetch_url_inner(
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
-                    record_js_network_completion(&state, JsNetworkEvent {
-                        request_id: request_id.clone(), intercepted: true,
+                    record_js_network_completion(&page, JsNetworkEvent {
+                        request_id: request_id.clone(), frame_id, intercepted: true,
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         resource_type: resource_type_name.to_string(),
@@ -3778,6 +3981,7 @@ async fn fetch_url_inner(
             cached_request_client(proxy_url.as_deref()).map_err(deno_error::JsErrorBox::generic)?
         }
     };
+    initiator.ensure_live()?;
 
     let initial_request_origin = request_origin(&url).unwrap_or_default();
     let page_origin = if origin.is_empty() {
@@ -3899,15 +4103,12 @@ async fn fetch_url_inner(
     // redirect hop without losing the Chrome TLS/client-hint transport.
     #[cfg(feature = "stealth")]
     {
-        let stealth = {
-            let st = state.borrow();
-            let gs = st.borrow::<SharedState>().clone();
-            let client = gs.borrow().stealth_client.clone();
-            client
-        };
+        let stealth = page.borrow().stealth_client.clone();
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
                 state.clone(),
+                page.clone(),
+                initiator,
                 _page_in_flight,
                 stealth,
                 url.clone(),
@@ -4113,11 +4314,23 @@ async fn fetch_url_inner(
     let redirected = redirects_followed > 0;
     let status = response.status().as_u16();
 
-    let resp_headers: std::collections::HashMap<String, String> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
+    let mut resp_headers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (name, value) in response.headers().iter() {
+        let name = name.as_str();
+        let value = value.to_str().unwrap_or("");
+        if matches!(name, "content-security-policy" | "x-frame-options") {
+            // Each enforced policy must survive the single-value JS boundary.
+            resp_headers.entry(name.to_string())
+                .and_modify(|existing| {
+                    existing.push_str(", ");
+                    existing.push_str(value);
+                })
+                .or_insert_with(|| value.to_string());
+        } else {
+            resp_headers.insert(name.to_string(), value.to_string());
+        }
+    }
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -4155,6 +4368,8 @@ async fn fetch_url_inner(
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
+    } else if internal_load {
+        resp_headers.clone()
     } else {
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
@@ -4168,11 +4383,12 @@ async fn fetch_url_inner(
         "headers": script_headers,
     });
     // A resource must not form an ownership cycle with its OpState table.
-    let body_state = Rc::downgrade(&state);
+    let body_state = Rc::downgrade(&page);
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
         let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        initiator.ensure_live()?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -4188,7 +4404,7 @@ async fn fetch_url_inner(
         }
         if let Some(state) = body_state.upgrade() {
             record_js_network_completion(&state, JsNetworkEvent {
-                request_id, intercepted: was_intercepted,
+                request_id, frame_id, intercepted: was_intercepted,
                 error_text: None,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 resource_type: resource_type_name.to_string(),
@@ -4231,6 +4447,8 @@ fn fetch_response(
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     state: Rc<RefCell<OpState>>,
+    page: SharedState,
+    initiator: FetchInitiator,
     page_in_flight: PageInFlightGuard,
     stealth: Arc<StealthHttpClient>,
     url: String,
@@ -4409,6 +4627,8 @@ async fn stealth_fetch_all(
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
     let script_headers = if opaque {
         HashMap::new()
+    } else if internal_load {
+        resp_headers.clone()
     } else {
         visible_response_headers(&resp_headers, final_is_cross_origin, credentials)
     };
@@ -4421,12 +4641,13 @@ async fn stealth_fetch_all(
         "opaque": opaque,
         "headers": script_headers,
     });
-    let body_state = Rc::downgrade(&state);
+    let body_state = Rc::downgrade(&page);
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
         let mut network_guard = network_guard;
         let resp_bytes = response.body.await
             .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+        initiator.ensure_live()?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -5799,13 +6020,53 @@ async fn op_sleep(state: Rc<RefCell<OpState>>, #[number] millis: u64, frame_id: 
     sleep.or_cancel(cancel).await.is_ok()
 }
 
+// A child protocol identity must never alias a later document/runtime's child.
+fn allocate_frame_id() -> Option<u32> {
+    static NEXT_FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT_FRAME_ID.try_update(std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed, |id| id.checked_add(1)).ok()
+}
+
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
 const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-// Hands a fetched frame document to the host and returns the id the frame will
-// have. The realm itself is built later, by whoever owns the runtime. A zero
-// id means the bounded native queue refused the document.
-#[op2(fast)]
+/// Reserve the browsing-context identity before its real Document request.
+#[op2(nofast)]
+fn op_frame_document_begin(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    owner_node: u32,
+    #[string] url: &str,
+) -> Result<u32, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parent = fetch_realm_state(scope, state)?;
+        let node = NodeId::new(owner_node);
+        let connected = parent.borrow().dom.as_ref().is_some_and(|dom|
+            dom.is_connected(node) && dom.with_node(node, |node|
+                matches!(&node.data, NodeData::Element { name, .. } if &*name.local == "iframe")) == Some(true));
+        if !connected {
+            return Err(deno_error::JsErrorBox::generic("Iframe document owner is detached or invalid"));
+        }
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        let active = {
+            let registry = registry.borrow();
+            registry.frame_timers.keys().filter(|id|
+                registry.frame_timers_active(**id) != Some(false)).count()
+        };
+        if active >= max_live_frames() {
+            return Err(deno_error::JsErrorBox::generic("Live frame limit exceeded"));
+        }
+        let frame_id = allocate_frame_id()
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Frame id space exhausted"))?;
+        let mut registry = registry.borrow_mut();
+        registry.own_frame(frame_id, &parent, node);
+        registry.frame_timers.get_mut(&frame_id).unwrap().document_url = Some(url.to_string());
+        Ok(frame_id)
+    })).unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Iframe document reservation failed")))
+}
+
+/// Commit the document under the same owner reservation that initiated its fetch.
+#[op2(nofast)]
 fn op_frame_document_ready(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -5814,60 +6075,80 @@ fn op_frame_document_ready(
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
     owner_node: u32,
-) -> u32 {
-    // Whoever called this is the new frame's parent, which is how a frame
-    // nested two deep gets `parent` pointing at the frame above it rather than
-    // at the page.
-    let parent = realm_state(scope, state);
-    let parent_frame_id = parent.borrow().frame_id;
-    let gs = state.borrow::<SharedState>().clone();
-    let mut gs = gs.borrow_mut();
-    let bytes = url.len().saturating_add(html.len());
-    if gs.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
-        || gs.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
-    {
-        tracing::warn!(
-            "dropping frame document: {} pending documents, {} bytes",
-            gs.pending_frames.len(),
-            gs.pending_frame_bytes,
-        );
-        return 0;
-    }
-    let Some(frame_id) = gs.frame_id_counter.checked_add(1) else {
-        tracing::warn!("frame id space exhausted");
-        return 0;
-    };
-    gs.frame_id_counter = frame_id;
-    gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
-    gs.pending_frames.push(PendingFrame {
-        frame_id,
-        url: url.to_string(),
-        html: html.to_string(),
-        viewport_width,
-        viewport_height,
-        parent_frame_id,
-    });
-    drop(gs);
-    state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut()
-        .own_frame(frame_id, &parent, NodeId::new(owner_node));
-    frame_id
+    frame_id: u32,
+) -> Result<u32, deno_error::JsErrorBox> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parent = fetch_realm_state(scope, state)?;
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        let valid = registry.borrow().frame_owner_matches(frame_id, &parent, NodeId::new(owner_node))
+            && registry.borrow().by_frame_id(frame_id).is_none()
+            && registry.borrow().frame_timers.get(&frame_id).is_some_and(|frame| frame.document_load_started);
+        if !valid {
+            return Err(deno_error::JsErrorBox::generic("Iframe document owner is detached or was replaced"));
+        }
+        let parent_frame_id = parent.borrow().frame_id;
+        let page = state.borrow::<SharedState>().clone();
+        let mut page = page.borrow_mut();
+        let bytes = url.len().saturating_add(html.len());
+        if page.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+            || page.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+        {
+            return Err(deno_error::JsErrorBox::generic("Pending iframe document limit exceeded"));
+        }
+        if page.pending_frames.iter().any(|frame| frame.frame_id == frame_id) {
+            return Err(deno_error::JsErrorBox::generic("Iframe document reservation already committed"));
+        }
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
+        page.pending_frames.push(PendingFrame {
+            frame_id, url: url.to_string(), html: html.to_string(),
+            viewport_width, viewport_height, parent_frame_id,
+        });
+        Ok(frame_id)
+    })).unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Iframe document commit failed")))
 }
 
 // deno_core owns the context-state and module-map slots. Store traced V8 values
 // after them, not Global handles that would keep the context alive after detach.
 const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
 const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
+pub(crate) const FRAME_OBJECTS_SLOT: i32 = DOCUMENT_OWNER_SLOT + 1;
+pub(crate) const FRAME_MESSAGE_SLOT: i32 = FRAME_OBJECTS_SLOT + 1;
+
+pub(crate) fn initialize_document_realm_slots(
+    context: v8::Local<v8::Context>,
+    undefined: v8::Local<v8::Value>,
+) {
+    // GetEmbedderData is not a bounds check: V8 requires every slot read to
+    // have been set first, even when Rust exposes an Option return value.
+    for slot in DOCUMENT_MEMBERS_SLOT..=FRAME_MESSAGE_SLOT {
+        context.set_embedder_data(slot, undefined);
+    }
+}
 
 #[op2(nofast)]
 fn op_register_document_realm(
     scope: &mut v8::PinScope,
     members: v8::Local<v8::Object>,
     frame_id: u32,
+    deliver_message: v8::Local<v8::Value>,
+    frame_objects: v8::Local<v8::Value>,
 ) {
     if let Some(context) = members.get_creation_context(scope) {
         context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         context.set_embedder_data(DOCUMENT_OWNER_SLOT, id.into());
+        // Capture privileged entry points only once. Re-running page init must
+        // never replace native delivery with an author-installed wrapper.
+        if deliver_message.is_function()
+            && context.get_embedder_data(scope, FRAME_MESSAGE_SLOT).is_none_or(|value| !value.is_function())
+        {
+            context.set_embedder_data(FRAME_MESSAGE_SLOT, deliver_message);
+        }
+        if frame_objects.is_object()
+            && context.get_embedder_data(scope, FRAME_OBJECTS_SLOT).is_none_or(|value| !value.is_object())
+        {
+            context.set_embedder_data(FRAME_OBJECTS_SLOT, frame_objects);
+        }
         if context != scope.get_current_context() {
             // Frame contexts own no Rust typed slots. Discard the empty annex
             // created by these setters while the isolate is alive (#1161).
@@ -5919,20 +6200,27 @@ fn op_initial_frame(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
-        let parent_state = frame_state(state, parent_frame_id);
+        let Ok(parent_state) = fetch_realm_state(scope, state) else { return 0 };
+        if parent_state.borrow().frame_id != parent_frame_id { return 0; }
+        let opaque_sandbox = parent_state.borrow().dom.as_ref()
+            .and_then(|dom| dom.with_node(NodeId::new(owner_node), |node| node.get_attribute("sandbox")
+                .map(|tokens| !tokens.split_whitespace().any(|token| token == "allow-same-origin"))))
+            .flatten().unwrap_or(false);
+        if opaque_sandbox { return 0; }
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
             || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
         {
             return 0;
         }
-        let Some(frame_id) = page.borrow().frame_id_counter.checked_add(1) else { return 0 };
-        page.borrow_mut().frame_id_counter = frame_id;
+        let Some(frame_id) = allocate_frame_id() else { return 0 };
         let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
         let main_context = scope.get_current_context();
         let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
             .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
         else { return 0 };
+        let undefined = v8::undefined(scope);
+        initialize_document_realm_slots(context, undefined.into());
         // Same borrowed deno_core slots as fetched frame realms. Child contexts
         // must not own or free these pointers.
         unsafe {
@@ -6137,7 +6425,7 @@ fn op_subtle_hmac(
     #[buffer] key: &[u8],
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     macro_rules! run {
         ($d:ty) => {{
             let mut mac = Hmac::<$d>::new_from_slice(key).map_err(crypto_err)?;
@@ -6176,7 +6464,7 @@ fn op_subtle_aes_gcm(
     if iv.len() != 12 {
         return Err(crypto_err("AES-GCM requires a 96-bit (12-byte) IV"));
     }
-    let nonce = Nonce::from_slice(iv);
+    let nonce: &Nonce<aes_gcm::aead::consts::U12> = iv.try_into().map_err(crypto_err)?;
     macro_rules! run {
         ($ty:ty) => {{
             let cipher = <$ty>::new_from_slice(key).map_err(crypto_err)?;
@@ -6212,7 +6500,7 @@ fn op_subtle_aes_cbc(
     #[buffer] data: &[u8],
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     use cbc::cipher::block_padding::Pkcs7;
-    use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+    use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
     use cbc::{Decryptor, Encryptor};
 
     if iv.len() != 16 {
@@ -6223,11 +6511,11 @@ fn op_subtle_aes_cbc(
             if encrypt {
                 Encryptor::<$cipher>::new_from_slices(key, iv)
                     .map_err(crypto_err)?
-                    .encrypt_padded_vec_mut::<Pkcs7>(data)
+                    .encrypt_padded_vec::<Pkcs7>(data)
             } else {
                 Decryptor::<$cipher>::new_from_slices(key, iv)
                     .map_err(crypto_err)?
-                    .decrypt_padded_vec_mut::<Pkcs7>(data)
+                    .decrypt_padded_vec::<Pkcs7>(data)
                     .map_err(|_| crypto_err("AES-CBC decryption failed: invalid padding"))?
             }
         }};
@@ -6409,7 +6697,7 @@ fn random_bytes(len: u32) -> Result<Vec<u8>, deno_error::JsErrorBox> {
         )));
     }
     let mut buf = vec![0u8; len as usize];
-    getrandom::getrandom(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
+    getrandom::fill(&mut buf).map_err(|e| crypto_err(format!("getrandom failed: {e}")))?;
     Ok(buf)
 }
 
@@ -6805,7 +7093,7 @@ fn op_canvas_register_surface(
         .and_then(|dom| dom.get_node(node))
         .is_some_and(|node| {
             node.as_element()
-                .is_some_and(|name| name.local.as_ref() == "canvas")
+                .is_some_and(|name| &*name.local == "canvas")
         });
     if !is_canvas {
         return false;
@@ -6859,7 +7147,7 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 }
 
 pub fn build_extension() -> Extension {
-    let mut ops = vec![
+    let ops = vec![
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
@@ -6884,6 +7172,7 @@ pub fn build_extension() -> Extension {
         op_navigate(),
         op_session_history(),
         op_history_traverse(),
+        op_frame_document_begin(),
         op_frame_document_ready(),
         op_initial_frame(),
         op_document_realm_member(),
@@ -6915,7 +7204,8 @@ pub fn build_extension() -> Extension {
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
-    {
+    let ops = {
+        let mut ops = ops;
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
@@ -6938,7 +7228,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_scroll_to());
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
-    }
+        ops
+    };
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -7560,7 +7851,7 @@ fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
         dom.get_node(node_id).is_some_and(|node| {
             node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "img")
+                .is_some_and(|element| &*element.local == "img")
         })
     });
     if !is_image {
@@ -7661,7 +7952,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         };
         let is_image = dom.get_node(node_id).is_some_and(|node| {
             node.as_element()
-                .is_some_and(|element| element.local.as_ref() == "img")
+                .is_some_and(|element| &*element.local == "img")
         });
         if !is_image {
             return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();

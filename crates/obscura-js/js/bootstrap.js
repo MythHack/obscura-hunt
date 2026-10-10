@@ -27,8 +27,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_await_rejected', '__obscura_click_target',
     '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
     '__obscura_viewport_w', '__obscura_viewport_h',
-    '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
-    '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
+    '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameElements',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
@@ -162,6 +161,8 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 // makes `iframe.contentDocument.title` read the frame's document rather than
 // the caller's. Set by __obscura_init; 0 is the page.
 let _realmFrameId = 0;
+let _realmParentFrameId = 0;
+let _realmRegistered = false;
 
 const _dom = (cmd, a1, a2) => {
   let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
@@ -2293,25 +2294,30 @@ function __prepareInsertedScript(script) {
 }
 
 function __prepareInsertedSubtree(root) {
-  // HTML's script preparation algorithm leaves a disconnected script
-  // unstarted.  When an ancestor is later connected, insertion steps visit
-  // every script in that subtree in tree order.
+  // Disconnected scripts and iframes wait for insertion into a live document.
+  // Visit both in tree order when an ancestor becomes connected.
   if (!root || !root.isConnected) return;
-  const scripts = [];
+  const elements = [];
   const seen = new Set();
-  if (root.nodeType === 1 && root.tagName === 'SCRIPT') {
-    scripts.push(root);
+  if (root.nodeType === 1 && (root.tagName === 'SCRIPT' || root.tagName === 'IFRAME')) {
+    elements.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script, iframe") || [];
   for (const nid of ids) {
-    const script = _wrapEl(+nid);
-    if (script && !seen.has(script._nid)) {
-      scripts.push(script);
-      seen.add(script._nid);
+    const element = _wrapEl(+nid);
+    if (element && !seen.has(element._nid)) {
+      elements.push(element);
+      seen.add(element._nid);
     }
   }
-  for (const script of scripts) __prepareInsertedScript(script);
+  for (const element of elements) {
+    if (element.tagName === 'SCRIPT') __prepareInsertedScript(element);
+    else {
+      const src = element.getAttribute('src');
+      if (src && src !== 'about:blank') element._loadIframeSrc(src);
+    }
+  }
 }
 
 function _seedDetachedTreeState(node) {
@@ -4668,64 +4674,59 @@ class Element extends Node {
     _resetIframeElement(this);
   }
   _loadIframeSrc(url) {
+    if (!this.isConnected) return;
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
-    // Both the src setter and the parser sweep in __obscura_init reach here, so
-    // a frame the page assigned before init must not be fetched a second time.
+    // The parser sweep and the src setter must share the same real request.
     if (this._iframeLoadingUrl === fullUrl) return;
     this._resetIframeFrame();
     this._iframeLoadingUrl = fullUrl;
     const el = this;
+    let frameId;
+    try {
+      frameId = __obscuraCore.ops.op_frame_document_begin(el._nid, fullUrl);
+      el._frameId = frameId;
+      globalThis.__obscura_frameElements[frameId] = el;
+      _bindIframeWindowFrame(el._iframeWin, frameId);
+      _frameWindows[frameId] = el._iframeWin;
+    } catch (_) {
+      el.dispatchEvent(new Event('error'));
+      return;
+    }
     let pageOrigin = '';
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', 'Document'
+      'no-cors', 'same-origin', {destination: 'Document', frame_id: frameId}
     ).then(raw => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
+      // Numeric identity also distinguishes replaced owners with the same URL.
+      if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
-      if (!response.blocked && response.status > 0 && response.status < 400) {
-        const html = response.body || '';
-        const loadedUrl = response.url || fullUrl;
-        el._iframeLoadedUrl = loadedUrl;
-        // Hand the document to the host, which gives this frame a realm of its
-        // own and runs the scripts that came with it (issue #600). The shim
-        // document below stays: it is what the parent reads through
-        // contentDocument.
-        const box = el.getBoundingClientRect();
-        if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
-        el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
-        if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
-        el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
-        // Bind the window to the realm the host just queued. This is what makes
-        // posting into the frame reach the frame's own listeners, and makes a
-        // message coming back out arrive with this window as its `source`.
-        if (el._frameId) {
-          el._iframeWin._frameId = el._frameId;
-          globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
-          globalThis.__obscura_frameElements[el._frameId] = el;
-        }
-      } else {
-        el._iframeLoadedUrl = fullUrl;
-        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+      if (response.blocked || response.status <= 0 || response.status >= 400) {
+        throw new Error('Iframe document request failed');
       }
-
-      // Dispatch through the element so the onload property/attribute and any
-      // addEventListener('load', ...) listeners all run. Calling el.onload()
-      // directly bypasses listeners registered via addEventListener.
+      const html = response.body || '';
+      const loadedUrl = response.url || fullUrl;
+      if (!_iframeEmbeddingAllowed(response, loadedUrl)) {
+        throw new Error('Iframe embedding denied or unsupported by response policy');
+      }
+      __obscuraCore.ops.op_frame_document_ready(
+        loadedUrl, html, el.clientWidth || 300, el.clientHeight || 150,
+        el._nid, frameId);
+      const document = new _IframeDocument(html, loadedUrl, el);
+      el._iframeWin = new _IframeWindow(document, loadedUrl);
+      _bindIframeWindowFrame(el._iframeWin, frameId);
+      _frameWindows[frameId] = el._iframeWin;
+      // The shim is only a guarded parent facade; the host builds the real V8
+      // document under the identity already used for the Document request.
       el.dispatchEvent(new Event('load'));
     }).catch(() => {
-      if (el._iframeLoadingUrl !== fullUrl) return;
-      el._iframeLoadedUrl = fullUrl;
-      el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-
-      el.dispatchEvent(new Event('load'));
+      if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
+      globalThis.__obscura_forgetFrame(frameId);
+      el._frameId = 0;
+      el.dispatchEvent(new Event('error'));
     });
   }
   get contentDocument() {
@@ -4733,22 +4734,13 @@ class Element extends Node {
     if (_ensureInitialFrameRealm(this) === false) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
-    if (this._iframeDoc) {
-      const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
-      if (this.src === '' || this.src === 'about:blank' || this._iframeLoadedUrl === 'about:blank') {
-        return this._iframeDoc;
-      }
-      const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this._iframeLoadedUrl);
-      if (pageOrigin !== '' && pageOrigin === iframeOrigin) {
-        return this._iframeDoc;
-      }
-      return null; // Cross-origin: blocked
+    if (!this._iframeWin) {
+      if (!this.isConnected) return null;
+      const doc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+      this._iframeWin = new _IframeWindow(doc, 'about:blank');
     }
-    if (!this._iframeDoc) {
-      this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
-    }
-    return this._iframeDoc;
+    const state = _iframeWindowState.get(this._iframeWin);
+    return _iframeWindowSameOrigin(state) ? state.document : null;
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
@@ -10600,15 +10592,14 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   }
   get thresholds() { return this._thresholds.slice(); }
 };
+function _viewportRenderingUpdate() {
+  _scheduleIntersectionRenderCheckpoint();
+  _scheduleResizeRenderCheckpoint();
+}
 (function() {
-  const renderingUpdate = () => {
-    _scheduleIntersectionRenderCheckpoint();
-    _scheduleResizeRenderCheckpoint();
-  };
   // Scrolling calls the IO-only hook. Actual viewport resizing remains a full
   // rendering update and schedules both observer families.
   globalThis.__obscura_recompute_intersections = _scheduleIntersectionRenderCheckpoint;
-  globalThis.addEventListener("resize", renderingUpdate);
   const wireUp = () => {
     if (!globalThis.document) return;
     // DOM writes synchronously mark ResizeObserver dirty through `_dom`; this
@@ -10675,6 +10666,8 @@ globalThis.DOMException = (function () {
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
 globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+const _messageEvents = new WeakSet();
+const _trustedMessageEvents = new WeakSet();
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -10737,7 +10730,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
 };
 globalThis.Event = class Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return _trustedEvents.has(this); }
+  get isTrusted() { return _messageEvents.has(this) ? _trustedMessageEvents.has(this) : _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
   composedPath() {
@@ -10900,6 +10893,7 @@ globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event {
   constructor(t,o={}) {
     super(t,o);
+    _messageEvents.add(this);
     this.data = Object.prototype.hasOwnProperty.call(o, "data") ? o.data : null;
     this.origin = o.origin == null ? "" : String(o.origin);
     this.lastEventId = o.lastEventId == null ? "" : String(o.lastEventId);
@@ -10907,6 +10901,9 @@ globalThis.MessageEvent = class extends Event {
     this.ports = Array.isArray(o.ports) ? o.ports.slice() : [];
   }
 };
+const _NativeMessageEvent = globalThis.MessageEvent;
+const _parseFrameMessage = JSON.parse;
+const _defineFrameMessageProperties = Object.defineProperties;
 globalThis.ProgressEvent = class ProgressEvent extends Event {
   constructor(type, init) {
     super(type, init || {});
@@ -14106,9 +14103,126 @@ function _iframeRealmGlobal(target, name) {
   return value;
 }
 
+function _iframeEmbeddingAllowed(response, url) {
+  const headers = Object.entries(response.headers || {});
+  const values = name => headers.filter(([key]) => key.toLowerCase() === name)
+    .map(([, value]) => String(value));
+  const policies = values('content-security-policy');
+  const xfo = values('x-frame-options');
+  if (!policies.length && !xfo.length) return true;
+  const ancestors = _domParse('frame_ancestor_origins');
+  if (!Array.isArray(ancestors) || !ancestors.length) return false;
+  const documentOrigin = _urlParseOp(url)?.origin;
+  let hasAncestors = false;
+  for (const policy of policies.flatMap(value => value.split(','))) {
+    const directive = policy.split(';').map(value => value.trim().split(/\s+/))
+      .find(parts => parts[0].toLowerCase() === 'frame-ancestors');
+    if (!directive) continue;
+    hasAncestors = true;
+    const sources = directive.slice(1);
+    if (!ancestors.every(origin => sources.some(source => {
+      if (origin === 'null') return false;
+      if (source === '*') return true;
+      if (source.toLowerCase() === "'self'") return origin === documentOrigin;
+      const parsed = _urlParseOp(source);
+      // Unsupported source patterns fail closed, not as a successful embedding.
+      return parsed && parsed.origin !== 'null' && parsed.pathname === '/'
+        && !parsed.search && !parsed.hash && origin === parsed.origin;
+    }))) return false;
+  }
+  // An enforced frame-ancestors directive supersedes X-Frame-Options.
+  if (hasAncestors) return true;
+  return xfo.flatMap(value => value.split(',')).every(value =>
+    value.trim().toUpperCase() === 'SAMEORIGIN'
+    && ancestors.every(origin => origin !== 'null' && origin === documentOrigin));
+}
+
+const _iframeWindowState = new WeakMap();
+const _iframeCrossOriginKeys = [
+  'window', 'self', 'location', 'close', 'closed', 'focus', 'blur', 'frames',
+  'length', 'top', 'opener', 'parent', 'postMessage',
+];
+const _iframeCrossOriginKeySet = new Set(_iframeCrossOriginKeys);
+
+function _iframeSandboxIsOpaque(element) {
+  const sandbox = _domParse('get_attribute', element._nid, 'sandbox');
+  return sandbox !== null && !String(sandbox).split(/\s+/).includes('allow-same-origin');
+}
+
+function _iframeWindowIsLive(state) {
+  return !!state && state.element._iframeWin === state.proxy
+    && (state.element._frameId || 0) === state.frameId
+    && _dom('is_connected', state.ownerNode) === 'true'
+    && state.ownerGeneration === _browserPostedTaskGeneration()
+    && (!state.frameId || _dom('frame_owner_matches', state.frameId, state.ownerNode) === 'true');
+}
+
+function _iframeWindowSameOrigin(state) {
+  if (!_iframeWindowIsLive(state) || state.opaque) return false;
+  if (_frameObjects[state.frameId]) {
+    return _dom('frame_same_origin', state.frameId, state.ownerNode) === 'true';
+  }
+  // The URL parser and native creator origin also cover inherited blank/srcdoc
+  // documents. Serialized opaque origins are not mutually same-origin.
+  return state.inherited ? state.origin === _realmOrigin()
+    : state.origin !== 'null' && state.origin === _realmOrigin();
+}
+
+function _iframeAccessDenied() {
+  throw new DOMException('Blocked access to a cross-origin frame.', 'SecurityError');
+}
+
+function _iframeCrossOriginSpecialKey(key) {
+  return key === 'then' || key === Symbol.toStringTag
+    || key === Symbol.hasInstance || key === Symbol.isConcatSpreadable;
+}
+
+function _iframeNavigate(state, value) {
+  if (_iframeWindowIsLive(state)) state.element.src = String(value);
+}
+
+function _iframeCrossOriginValue(target, key, state) {
+  if (_iframeCrossOriginSpecialKey(key)) return undefined;
+  if (!_iframeCrossOriginKeySet.has(key)) return _iframeAccessDenied();
+  if (key === 'window' || key === 'self' || key === 'frames') return state.proxy;
+  if (key === 'postMessage') return state.postMessage;
+  if (key === 'location') return state.crossOriginLocation;
+  if (key === 'closed') return target.closed || !_iframeWindowIsLive(state);
+  if (key === 'opener') return null;
+  if (key === 'close' || key === 'focus' || key === 'blur') return state.operations[key];
+  return Reflect.get(target, key, target);
+}
+
+function _bindIframeWindowFrame(win, frameId) {
+  const state = _iframeWindowState.get(win);
+  if (state) {
+    state.frameId = frameId >>> 0;
+    state.opaque = __obscuraCore.ops.op_dom(
+      'frame_is_sandboxed_opaque', String(state.frameId), '', _realmFrameId) !== 'false';
+  }
+}
+
 const _iframeWindowProxyHandler = {
   get(target, key, receiver) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) return _iframeCrossOriginValue(target, key, state);
+    if (key === 'document') return _frameObjectsFor(state.element)?.document || state.document;
+    if (key === 'localStorage' || key === 'sessionStorage') return globalThis[key];
+    if (key === 'postMessage') return state.postMessage;
+    if (key === 'window' || key === 'self' || key === 'frames') return receiver;
     if (key === 'globalThis') return receiver;
+    const real = _frameObjectsFor(state.element)?.window;
+    if (real) {
+      if (key === 'eval') {
+        return state.nativeEval ||= _markNative(function (source) {
+          if (!_iframeWindowSameOrigin(state)) return _iframeAccessDenied();
+          const value = Reflect.apply(real.eval, real, [source]);
+          return value === real ? state.proxy : value;
+        });
+      }
+      const value = Reflect.get(real, key);
+      return value === real ? receiver : value;
+    }
     if (Reflect.has(target, key)) return Reflect.get(target, key, receiver);
     if (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key)) {
       return _iframeRealmGlobal(target, key);
@@ -14116,20 +14230,51 @@ const _iframeWindowProxyHandler = {
     return undefined;
   },
   has(target, key) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) {
+      if (_iframeCrossOriginKeySet.has(key) || _iframeCrossOriginSpecialKey(key)) return true;
+      return _iframeAccessDenied();
+    }
+    const real = _frameObjectsFor(state.element)?.window;
+    if (real) return Reflect.has(real, key);
+    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage') return true;
     return key === 'globalThis'
       || Reflect.has(target, key)
       || (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key));
   },
   ownKeys(target) {
+    if (!_iframeWindowSameOrigin(_iframeWindowState.get(target))) {
+      return _iframeCrossOriginKeys.concat('then', Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable);
+    }
+    const real = _frameObjectsFor(_iframeWindowState.get(target).element)?.window;
+    if (real) return Reflect.ownKeys(real);
     const keys = Reflect.ownKeys(target);
     const seen = new Set(keys);
     for (const name of _iframeRealmGlobalNames) {
-      if (!seen.has(name)) keys.push(name);
+      if (!seen.has(name)) { keys.push(name); seen.add(name); }
     }
     if (!seen.has('globalThis')) keys.push('globalThis');
+    for (const name of ['document', 'localStorage', 'sessionStorage']) {
+      if (!seen.has(name)) keys.push(name);
+    }
     return keys;
   },
   getOwnPropertyDescriptor(target, key) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) {
+      return { value: _iframeCrossOriginValue(target, key, state), writable: false,
+        enumerable: true, configurable: true };
+    }
+    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage' || key === 'postMessage'
+        || key === 'window' || key === 'self' || key === 'frames' || key === 'globalThis') {
+      return { value: this.get(target, key, state.proxy), writable: false,
+        enumerable: true, configurable: true };
+    }
+    const real = _frameObjectsFor(state.element)?.window;
+    if (real) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(real, key);
+      return descriptor ? { ...descriptor, configurable: true } : undefined;
+    }
     const own = Reflect.getOwnPropertyDescriptor(target, key);
     if (own) return own;
     if (key === 'globalThis') {
@@ -14145,26 +14290,52 @@ const _iframeWindowProxyHandler = {
     }
     return undefined;
   },
+  set(target, key, value) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) {
+      if (key === 'location') { _iframeNavigate(state, value); return true; }
+      return _iframeAccessDenied();
+    }
+    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage') return false;
+    return Reflect.set(_frameObjectsFor(state.element)?.window || target, key, value);
+  },
+  defineProperty(target, key, descriptor) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) return _iframeAccessDenied();
+    // A JS proxy cannot hide frozen target properties after navigation. Like a
+    // WindowProxy, keep its target extensible instead of allowing that escape.
+    if (descriptor.configurable !== true) return false;
+    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage') return false;
+    return Reflect.defineProperty(_frameObjectsFor(state.element)?.window || target, key, descriptor);
+  },
+  deleteProperty(target, key) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) return _iframeAccessDenied();
+    return Reflect.deleteProperty(_frameObjectsFor(state.element)?.window || target, key);
+  },
+  getPrototypeOf(target) {
+    const state = _iframeWindowState.get(target);
+    return _iframeWindowSameOrigin(state)
+      ? Reflect.getPrototypeOf(_frameObjectsFor(state.element)?.window || target) : null;
+  },
+  setPrototypeOf(target, prototype) {
+    const state = _iframeWindowState.get(target);
+    if (!_iframeWindowSameOrigin(state)) return _iframeAccessDenied();
+    return Reflect.setPrototypeOf(_frameObjectsFor(state.element)?.window || target, prototype);
+  },
+  preventExtensions() { return false; },
 };
 
-// Cross-realm messaging.
-//
-// A realm cannot reach another realm's context on its own, so postMessage is
-// handed to the host, which delivers it into the target realm. These are
-// declared rather than assigned by the host so the snapshot-time hide list
-// picks them up; a global added later would stay enumerable on `window`.
+// Cross-realm messaging. Native delivery and raw frame objects stay in this
+// closure; op_register_document_realm captures them before author scripts run.
 globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
 globalThis.__obscura_parentFrameId = 0;
-globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+const _frameWindows = Object.create(null);
 // frame id -> the iframe element that owns it. The host uses this composed-tree
 // registry to retain frames inside closed shadow roots without keeping removed
 // elements alive after their browsing context is released.
 globalThis.__obscura_frameElements = Object.create(null);
-// frame id -> that frame's real window and document, filled by the host.
-// Declared here rather than created by the host at runtime: the hide list is
-// computed from this global at snapshot time, so a property the host adds later
-// would stay enumerable on `window` and be visible to any script that walks it.
-globalThis.__obscura_frameObjects = Object.create(null);
+const _frameObjects = Object.create(null);
 // The frames of this realm whose element is still in the document.
 //
 // Liveness is asked of the element, not of a document query: an iframe inside
@@ -14186,31 +14357,44 @@ globalThis.__obscura_liveFrameIds = function () {
 globalThis.__obscura_forgetFrame = function (frameId) {
   _dom('retire_frame', frameId);
   delete globalThis.__obscura_frameElements[frameId];
-  delete globalThis.__obscura_frameObjects[frameId];
-  delete globalThis.__obscura_frameWindows[frameId];
+  delete _frameObjects[frameId];
+  delete _frameWindows[frameId];
 };
 
 function _realmOrigin() {
   return _domParse('document_origin') || 'null';
 }
 
-// Whether a postMessage restricted to `targetOrigin` may be delivered to a
-// realm whose current origin is `receiverOrigin`, given the sender's origin.
-// Mirrors the browser check done at delivery time: '*' (or an unspecified '')
-// allows any origin; '/' requires the receiver to be same-origin as the sender;
-// anything else must equal the receiver's own origin.
-function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
-  if (!targetOrigin || targetOrigin === '*') return true;
-  let expected;
-  if (targetOrigin === '/') {
-    expected = senderOrigin;
-  } else {
-    try { expected = new URL(targetOrigin).origin; } catch (_) { expected = targetOrigin; }
+function _normalizePostMessageTargetOrigin(value) {
+  // The dictionary overload includes null; a null targetOrigin MEMBER still
+  // undergoes DOMString conversion and is not the dictionary's default.
+  if (value === null || typeof value === 'object' || typeof value === 'function') {
+    value = value == null ? undefined : value.targetOrigin;
   }
-  return receiverOrigin === expected;
+  if (value === undefined) return '/';
+  if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  const targetOrigin = String(value);
+  if (targetOrigin === '*' || targetOrigin === '/') return targetOrigin;
+  if (!_urlParseOp(targetOrigin)) {
+    throw new DOMException('Invalid target origin in postMessage.', 'SyntaxError');
+  }
+  return targetOrigin;
+}
+
+// Check the receiver's current native origin at delivery, not at enqueue time.
+function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin, sourceFrameId) {
+  if (targetOrigin === '*') return true;
+  if (targetOrigin === undefined || targetOrigin === '/') {
+    if (receiverOrigin !== senderOrigin) return false;
+    // Equal "null" strings do not make distinct opaque principals equal.
+    return receiverOrigin !== 'null' || sourceFrameId === _realmFrameId;
+  }
+  const expected = _urlParseOp(targetOrigin)?.origin;
+  return !!expected && expected !== 'null' && receiverOrigin === expected;
 }
 
 function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+  const to = _normalizePostMessageTargetOrigin(targetOrigin);
   let json;
   // Structured clone cannot cross realms here. JSON carries what postMessage is
   // actually used for; anything else throws the same DataCloneError a browser
@@ -14221,22 +14405,14 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
   if (json === undefined) json = '{"v":null}';
-  // An unspecified targetOrigin stays permissive (empty string); the receiver
-  // enforces a specified one against its own origin in __obscura_deliverMessage.
-  const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
   if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
   // Top-level self-posts also work in a standalone runtime without a Page to
   // drain cross-realm messages. Serialize only once, before scheduling.
   const origin = _realmOrigin();
-  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
   const clone = JSON.parse(json).v;
   setTimeout(() => {
-    try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
-    } catch (error) {
-      console.error('message listener failed:', error && error.message || error);
-    }
+    if (!_targetOriginAllows(to, _realmOrigin(), origin, _realmFrameId)) return;
+    _dispatchRealmMessage(clone, origin, globalThis);
   }, 0);
 }
 
@@ -14249,17 +14425,15 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
 // public interface is visible to anything that walks it, and real Chrome has no
 // such member.
 function _frameObjectsFor(element) {
-  const frameId = element._frameId;
-  if (!frameId) return null;
-  const entry = globalThis.__obscura_frameObjects[frameId];
-  return entry || null;
+  const state = _iframeWindowState.get(element._iframeWin);
+  if (!state || state.element !== element || !_iframeWindowSameOrigin(state)) return null;
+  return _frameObjects[state.frameId] || null;
 }
 
 function _ensureInitialFrameRealm(element) {
   if (element._frameId || !element.isConnected) return;
   // An opaque sandbox must never receive the creator's security token.
-  if (element.hasAttribute('sandbox') &&
-      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
+  if (_iframeSandboxIsOpaque(element) || _iframeWindowState.get(element._iframeWin)?.opaque) return;
   const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
     const core = child.__obscura_core_handoff;
     for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
@@ -14280,14 +14454,15 @@ function _ensureInitialFrameRealm(element) {
     });
     child.innerWidth = 300;
     child.innerHeight = 150;
-    globalThis.__obscura_frameObjects[id] = {
-      window: child, document: child.document, initial: true,
-    };
+    _frameObjects[id] = { window: child, document: child.document };
   }, element._nid);
   if (frameId) {
     element._frameId = frameId;
-    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
-    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    const doc = new _IframeDocument(
+      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
+    element._iframeWin = new _IframeWindow(doc, 'about:blank');
+    _bindIframeWindowFrame(element._iframeWin, frameId);
+    _frameWindows[frameId] = element._iframeWin;
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
@@ -14297,70 +14472,48 @@ function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
   element._frameId = 0;
   element._iframeLoadingUrl = null;
-  element._iframeLoadedUrl = 'about:blank';
-  element._iframeDoc = new _IframeDocument(
+  const doc = new _IframeDocument(
     '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
-  element._iframeWin = new _IframeWindow(element._iframeDoc, 'about:blank');
+  element._iframeWin = new _IframeWindow(doc, 'about:blank');
 }
 
-// The window object this realm uses to stand for frame `frameId`, built once
-// and reused so `event.source === iframe.contentWindow` holds.
-//
-// Once the host has published the frame's real global, that is the object,
-// wrapped only to keep `postMessage` meaning "send *into* the frame from
-// here". Calling the frame's own postMessage would make the frame both sender
-// and receiver, losing the sender's origin and source.
+// Reuse the guarded facade after publishing the real realm. A retained facade
+// must recheck current native origin and ownership on every access.
 function _frameWindowFor(frameId) {
-  if (!frameId) return null;
-  const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
-  const existing = globalThis.__obscura_frameWindows[frameId];
-  if (!real) return existing || null;
-  if (globalThis.__obscura_frameObjects[frameId].initial) return real;
-  if (existing && existing.__obscura_wrapsRealm) return existing;
-
-  const post = _markNative(function (data, targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data, targetOrigin);
-  });
-  const win = new Proxy(real, {
-    get(target, prop) {
-      if (prop === 'postMessage') return post;
-      if (prop === '__obscura_wrapsRealm') return true;
-      // Not `receiver`: an accessor on a real global must run with the global
-      // itself as `this`, not with this proxy.
-      return Reflect.get(target, prop);
-    },
-    has(target, prop) {
-      return prop === '__obscura_wrapsRealm' || Reflect.has(target, prop);
-    },
-  });
-  globalThis.__obscura_frameWindows[frameId] = win;
-  return win;
+  return _frameWindows[frameId] || null;
 }
 
-// The host calls this inside the target realm.
-globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, targetOrigin) {
+// Captured in native context embedder data, never installed on the page global.
+function _deliverRealmMessage(dataJson, origin, sourceFrameId, targetOrigin) {
   // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
   // origin, the same check a real browser does at delivery time. A mismatch
   // drops the message silently.
-  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
+  if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin, sourceFrameId)) return;
   let data = null;
-  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  try { data = _parseFrameMessage(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
-  const source = (globalThis.__obscura_frameId !== 0
-                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+  const source = (_realmFrameId !== 0 && sourceFrameId === _realmParentFrameId)
     ? globalThis.parent
     : _frameWindowFor(sourceFrameId);
+  _dispatchRealmMessage(data, origin, source);
+}
+
+function _dispatchRealmMessage(data, origin, source) {
   try {
-    // Trusted, because the user agent delivers this event: the sender called
-    // postMessage, it did not dispatch this. Real embedders check the flag and
-    // drop anything untrusted, so an untrusted event is not merely suspicious,
-    // it is silently discarded and the widget waits forever.
-    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-      new MessageEvent('message', { data, origin, source })));
+    const event = new _NativeMessageEvent('message', { data, origin, source });
+    // Do not route trusted delivery through page-replaceable constructors,
+    // dispatchEvent or __obscura_markTrusted hooks.
+    _trustedMessageEvents.add(event);
+    _defineFrameMessageProperties(event, {
+      origin: { value: origin, writable: false, configurable: false },
+      source: { value: source, writable: false, configurable: false },
+      isTrusted: { value: true, writable: false, configurable: false },
+    });
+    _eventTargetDispatch(globalThis, event);
   } catch (error) {
     console.error('message listener failed:', error && error.message || error);
   }
-};
+}
 
 // A window in another browsing context, as seen from this one.
 //
@@ -14420,8 +14573,14 @@ function _installFramingRelationships() {
 
 class _IframeWindow {
   constructor(doc, url) {
-    this.document = doc;
-    this._url = url;
+    const element = doc._iframeEl;
+    const state = {
+      document: doc, element, ownerNode: element._nid,
+      ownerGeneration: _browserPostedTaskGeneration(),
+      frameId: element._frameId || 0, opaque: _iframeSandboxIsOpaque(element),
+      inherited: false, origin: 'null', proxy: null,
+    };
+    _iframeWindowState.set(this, state);
     this.top = globalThis;
     this.parent = globalThis;
     this.frameElement = null;
@@ -14435,40 +14594,55 @@ class _IframeWindow {
     this.outerWidth = 300;
     this.outerHeight = 150;
     this.devicePixelRatio = globalThis.devicePixelRatio;
-    this.localStorage = globalThis.localStorage;
-    this.sessionStorage = globalThis.sessionStorage;
     this.performance = globalThis.performance;
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
     this.chrome = globalThis.chrome;
 
-    try {
-      const u = new URL(url);
+    const u = _urlParseOp(url);
+    if (u) {
+      state.inherited = u.protocol === 'about:' && (u.pathname === 'blank' || u.pathname === 'srcdoc');
+      state.origin = state.inherited ? _realmOrigin() : u.origin;
       this.location = {
         href: url, origin: u.origin, protocol: u.protocol,
         host: u.host, hostname: u.hostname, port: u.port,
         pathname: u.pathname, search: u.search, hash: u.hash,
         toString() { return url; }, assign(){}, reload(){}, replace(){},
       };
-    } catch(e) {
+    } else {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
     }
 
     const proxy = new Proxy(this, _iframeWindowProxyHandler);
+    state.proxy = proxy;
+    _iframeWindowState.set(proxy, state);
+    state.postMessage = _markNative(function postMessage(data, targetOrigin, _transfer) {
+      if (_iframeWindowIsLive(state) && state.frameId) {
+        _sendRealmMessage(state.frameId, data, targetOrigin);
+      } else {
+        _normalizePostMessageTargetOrigin(targetOrigin);
+      }
+    });
+    state.operations = Object.create(null);
+    for (const name of ['close', 'focus', 'blur']) {
+      state.operations[name] = _markNative(this[name].bind(this));
+    }
+    const crossOriginLocation = Object.create(null);
+    Object.defineProperties(crossOriginLocation, {
+      href: { get: _iframeAccessDenied, set: value => _iframeNavigate(state, value),
+        enumerable: true, configurable: true },
+      replace: { value: _markNative(function replace(value) { _iframeNavigate(state, value); }),
+        enumerable: true, configurable: true },
+    });
+    state.crossOriginLocation = crossOriginLocation;
+    // Do not leave the fetched shim DOM on a public iframe expando either.
+    if (element._iframeDoc === doc) delete element._iframeDoc;
     this.self = proxy;
     this.window = proxy;
     this.frames = proxy;
     return proxy;
   }
 
-  postMessage(data, targetOrigin, _transfer) {
-    // Into the frame's own realm, through the host. This used to dispatch the
-    // event on the *parent's* window, so a page could never actually talk to
-    // the document inside its iframe. A frame that has not loaded yet has no
-    // browsing context to receive anything.
-    if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data, targetOrigin);
-  }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
   clearTimeout(id) { globalThis.clearTimeout(id); }
@@ -17219,12 +17393,19 @@ const _documentMembers = Object.freeze(Object.fromEntries([
 ]));
 
 globalThis.__obscura_init = function() {
-  // The host sets __obscura_frameId on a frame realm before calling this.
-  _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  // Capture realm identity once, before author code can replace public hints.
+  if (!_realmRegistered) {
+    _realmFrameId = globalThis.__obscura_frameId >>> 0;
+    _realmParentFrameId = globalThis.__obscura_parentFrameId >>> 0;
+    _realmRegistered = true;
+    // Bind window listeners to the restored realm, not the snapshot's global
+    // proxy: the listener WeakMap must not carry a snapshot-era window key.
+    _eventTargetAdd(globalThis, 'resize', _viewportRenderingUpdate);
+  }
   const caretMembers = _installCaretGeometry();
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
-    _realmFrameId);
+    _realmFrameId, _deliverRealmMessage, _frameObjects);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);

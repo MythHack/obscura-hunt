@@ -129,6 +129,14 @@ pub async fn handle(
                 });
                 ctx.refresh_runtime_event_collection(&page_id);
                 ctx.ensure_default_context(&page_id);
+                let created = ctx.ensure_child_default_contexts(&page_id);
+                for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
+                    if Some(&runtime_session) != session_id.as_ref() {
+                        for context in &created {
+                            ctx.pending_events.push(execution_context_created_event(context, Some(runtime_session.clone())));
+                        }
+                    }
+                }
                 if newly_enabled {
                     let events = ctx.contexts_for_page(&page_id)
                         .map(|context| execution_context_created_event(
@@ -160,7 +168,7 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            validate_context(params, "contextId", ctx, session_id, "evaluate")?;
+            let frame_id = validate_context(params, "contextId", ctx, session_id, "evaluate")?.unwrap_or(0);
 
             let await_promise = params
                 .get("awaitPromise")
@@ -181,7 +189,8 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.evaluate_for_cdp_with_timeout(
+                page.evaluate_for_cdp_in_frame(
+                    frame_id,
                     expression,
                     return_by_value,
                     await_promise,
@@ -222,12 +231,14 @@ pub async fn handle(
                 .map(|a| a.to_vec())
                 .unwrap_or_default();
 
-            // #51: validate executionContextId the same way Runtime.evaluate
-            // does. CDP names this field `executionContextId` on
-            // callFunctionOn (not `contextId`); a request may omit it when
-            // `objectId` is supplied — in that case context validation is a
-            // no-op and the default context is used.
-            validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+            let requested_frame = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+            let object_frame = object_id.map(|id| {
+                ctx.get_session_page(session_id).ok_or_else(|| "No page".to_string())?.object_frame_id(id)
+            }).transpose()?;
+            if requested_frame.zip(object_frame).is_some_and(|(requested, object)| requested != object) {
+                return Err("Object belongs to a different execution context".to_string());
+            }
+            let frame_id = requested_frame.or(object_frame).unwrap_or(0);
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -243,7 +254,8 @@ pub async fn handle(
                 .ok_or("No page")?;
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                page.call_function_on_for_cdp_with_timeout(
+                page.call_function_on_for_cdp_in_frame(
+                    frame_id,
                     function_declaration,
                     object_id,
                     &arguments,
@@ -290,6 +302,7 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page")?;
+                let frame_id = page.object_frame_id(oid)?;
                 // The child ids minted below are `<parent>::<key>` and the key
                 // is a property name off a page object, so the page decides
                 // what ends up inside this literal. A JSON literal covers the
@@ -327,7 +340,7 @@ pub async fn handle(
                     }})()",
                     oid = oid_literal,
                 );
-                let result = page.evaluate(&code);
+                let result = page.evaluate_in_native_frame(frame_id, &code)?;
                 if let serde_json::Value::Array(props) = result {
                     let descriptors: Vec<Value> = props
                         .iter()
@@ -481,13 +494,13 @@ pub async fn handle(
 /// context Obscura has not advertised for the attached page. An absent identity
 /// uses the page's default context. Direct embedders retain the compatibility
 /// path for ids reserved through `next_isolated_context`.
-fn validate_context(
+pub(crate) fn validate_context(
     params: &Value,
     field: &str,
     ctx: &crate::dispatch::CdpContext,
     session_id: &Option<String>,
     method: &str,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     let id = params.get(field).and_then(|value| value.as_i64());
     let unique_id = params.get("uniqueContextId").and_then(|value| value.as_str());
     if id.is_some() && unique_id.is_some() {
@@ -496,24 +509,26 @@ fn validate_context(
         ));
     }
     if id.is_none() && unique_id.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let record = id.and_then(|id| ctx.context_by_id(id))
         .or_else(|| unique_id.and_then(|id| ctx.context_by_unique_id(id)));
     if let Some(record) = record {
         let owner = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
         if owner == Some(&record.page_id) {
-            // This registry currently validates ownership/routing only. A
-            // named isolated context still executes in the owning page's
-            // current V8 runtime/global; it is not a separate V8 realm yet.
-            return Ok(());
+            let page = ctx.get_page(&record.page_id).ok_or("No page")?;
+            if record.frame_id == page.frame_id { return Ok(Some(0)); }
+            if !record.is_default {
+                return Err("Child isolated execution worlds are not supported".to_string());
+            }
+            return super::page::native_frame_id(page, &record.frame_id).map(Some);
         }
     } else if session_id.is_none() && unique_id.is_none()
         && id.is_some_and(|id| ctx.valid_context_ids.contains(&id))
     {
         // Direct embedders can still reserve an id through the existing public
         // next_isolated_context API. Attached sessions require page ownership.
-        return Ok(());
+        return Ok(Some(0));
     }
     let identity = id.map(|id| id.to_string())
         .or_else(|| unique_id.map(str::to_string))
@@ -524,7 +539,7 @@ fn validate_context(
             identity
         ));
     }
-    Ok(())
+    Err("Cannot route execution context without its owning page".to_string())
 }
 
 /// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.

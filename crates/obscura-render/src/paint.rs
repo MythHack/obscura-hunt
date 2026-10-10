@@ -29,6 +29,9 @@ use crate::dom::{
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Match the page transport's image response budget, including uncached reads.
+/// Set this explicitly rather than inheriting ureq's 10 MiB convenience limit.
+const MAX_RESOURCE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 /// CSS `content:url(...)` is only discoverable after cascade. Remember a
 /// bounded set of successful selections so repeated prepares can seed their
 /// intrinsic geometry before that cascade instead of always laying out twice.
@@ -478,7 +481,7 @@ impl RenderResourceCache {
         let node = tree.get_node(id)?;
         if node
             .as_element()
-            .is_none_or(|element| element.local.as_ref() != "video")
+            .is_none_or(|element| &*element.local != "video")
         {
             return None;
         }
@@ -711,7 +714,7 @@ impl RenderResourceCache {
         for (nid, value) in remembered {
             let is_live_image = tree.get_node(nid).is_some_and(|node| {
                 node.as_element()
-                    .is_some_and(|element| element.local.as_ref() == "img")
+                    .is_some_and(|element| &*element.local == "img")
             });
             if !is_live_image {
                 self.forget_content_image_intrinsic(nid);
@@ -2163,7 +2166,7 @@ impl PreparedRender {
     fn image_intrinsics_affect_geometry(&self, tree: &DomTree, id: obscura_dom::tree::NodeId) -> bool {
         if !tree.get_node(id).is_some_and(|node| {
             node.as_element()
-                .is_some_and(|name| name.local.as_ref() == "img")
+                .is_some_and(|name| &*name.local == "img")
         }) {
             return true;
         }
@@ -3559,7 +3562,7 @@ fn native_raster_scale_supported(tree: &DomTree, laid: &crate::DomLayout) -> boo
         tree.get_node(id).is_some_and(|node| {
             node.as_element().is_some_and(|name| {
                 matches!(
-                    name.local.as_ref(),
+                    &*name.local,
                     "img" | "picture" | "svg" | "canvas" | "video"
                 )
             })
@@ -4847,7 +4850,7 @@ fn paint_laid_dom_scrolled(
             }
         }
 
-        if box_on_surface && name.local.as_ref() == "canvas" {
+        if box_on_surface && &*name.local == "canvas" {
             if let Some(surface) = canvas_surfaces.surface(nid) {
                 // A canvas bitmap is replaced content: CSS sizing and
                 // object-fit operate on the content box, never the padding or
@@ -4884,7 +4887,7 @@ fn paint_laid_dom_scrolled(
         }
         paint_css_outline(&mut pixmap, &rect, style, element_clip_mask, raster_scale);
 
-        if box_on_surface && matches!(name.local.as_ref(), "img" | "video") {
+        if box_on_surface && matches!(&*name.local, "img" | "video") {
             if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
                 // ancestor overflow clip: the raster must not paint past it (a
@@ -4912,7 +4915,7 @@ fn paint_laid_dom_scrolled(
                 // grey placeholder. box_rect/visible_rect are already
                 // clip-intersected, so none of this paints outside an
                 // overflow:hidden clip.
-                if !painted && name.local.as_ref() == "img" {
+                if !painted && &*name.local == "img" {
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
                             draw_text(
@@ -4956,7 +4959,7 @@ fn paint_laid_dom_scrolled(
         // painted individually (they are added to `svg_subtree_skip`). The svg
         // is drawn at its full border-box size (undistorted) and clipped to the
         // overflow-visible region.
-        if name.local.as_ref() == "svg" {
+        if &*name.local == "svg" {
             if box_on_surface {
                 let mut markup = serialize_svg_styled(
                     tree,
@@ -5042,7 +5045,7 @@ fn paint_laid_dom_scrolled(
         // List-item marker (bullet or number), drawn in the indent to the left
         // of the item's content box. `list_style` is inherited and resolved,
         // so `None` (e.g. a nav `<ul style="list-style:none">`) suppresses it.
-        if name.local.as_ref() == "li" {
+        if &*name.local == "li" {
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
@@ -5110,7 +5113,7 @@ fn paint_laid_dom_scrolled(
         // A closed native `<select>` paints only its selected option. Options
         // themselves are popup content (`display:none` in the layout tree),
         // so the label and disclosure arrow belong to the atomic control.
-        if name.local.as_ref() == "select" {
+        if &*name.local == "select" {
             if let Some(label) = selected_option_label(tree, nid) {
                 let fsize = style.font_size.unwrap_or(13.333_333);
                 let line_height = crate::inline::used_line_height(style);
@@ -5157,7 +5160,7 @@ fn paint_laid_dom_scrolled(
         }
 
         let input_type =
-            (name.local.as_ref() == "input").then(|| node.get_attribute("type").unwrap_or("text"));
+            (&*name.local == "input").then(|| node.get_attribute("type").unwrap_or("text"));
         let checkable = input_type.is_some_and(|kind| {
             kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
         });
@@ -5264,7 +5267,7 @@ fn paint_laid_dom_scrolled(
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if !checkable && (name.local.as_ref() == "input" || name.local.as_ref() == "textarea") {
+        if !checkable && (&*name.local == "input" || &*name.local == "textarea") {
             let live_value = tree
                 .form_control_state(nid)
                 .and_then(|control| control.value);
@@ -5272,7 +5275,7 @@ fn paint_laid_dom_scrolled(
                 .as_deref()
                 .or_else(|| node.get_attribute("value"));
             let has_value = value.is_some_and(|v| !v.is_empty())
-                || (name.local.as_ref() == "textarea" && !tree.text_content(nid).is_empty());
+                || (&*name.local == "textarea" && !tree.text_content(nid).is_empty());
             // A text `<input>`'s value is not a DOM text node either, so it
             // needs painting from its live state, falling back to the attribute.
             // Without this the
@@ -5280,7 +5283,7 @@ fn paint_laid_dom_scrolled(
             // from script, or by typing — while its `value` reads back
             // correctly, so only a screenshot or PDF shows anything wrong.
             // `<textarea>` is unaffected: its value *is* a text node.
-            if has_value && name.local.as_ref() == "input" {
+            if has_value && &*name.local == "input" {
                 if let Some(value) = value {
                     if !value.is_empty() {
                         let fsize = style.font_size.unwrap_or(16.0);
@@ -6845,7 +6848,7 @@ fn selected_option_label(tree: &DomTree, select: obscura_dom::tree::NodeId) -> O
         };
         if option
             .as_element()
-            .map_or(true, |name| name.local.as_ref() != "option")
+            .map_or(true, |name| &*name.local != "option")
         {
             continue;
         }
@@ -7541,19 +7544,6 @@ fn fetch_bytes_with_kind(
     cache.get_or_load(&resolved, is_font)
 }
 
-fn fetch_profiled_image_bytes(
-    src: &str,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-    profile: ImageRequestProfile,
-) -> Option<Arc<[u8]>> {
-    if src.starts_with("data:") {
-        return fetch_bytes(src, base_url, cache);
-    }
-    let resolved = resolve_resource_url(src, base_url)?;
-    cache.get_or_load_image(&resolved, profile)
-}
-
 fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     if src.starts_with("data:") {
         return Some(src.to_string());
@@ -7608,7 +7598,7 @@ fn collect_web_fonts(
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         // Inspect tags without copying unrelated script/text payloads.
         if !tree.with_node(nid, |node| {
-            node.as_element().is_some_and(|element| element.local.as_ref() == "style")
+            node.as_element().is_some_and(|element| &*element.local == "style")
         }).unwrap_or(false) {
             continue;
         }
@@ -7663,7 +7653,7 @@ fn collect_web_fonts(
     let mut preloads = Vec::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let preload = tree.with_node(nid, |node| {
-            if node.as_element()?.local.as_ref() != "link" {
+            if &*node.as_element()?.local != "link" {
                 return None;
             }
             let rel = node.get_attribute("rel").unwrap_or("");
@@ -7984,12 +7974,15 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
     for attempt in 0..3 {
         // Advertise only formats that this build can decode. Content-negotiating
         // CDNs otherwise commonly choose AVIF and leave the image blank.
-        let res = image_agent().get(url).set("Accept", IMAGE_ACCEPT).call();
+        let res = image_agent().get(url).header("Accept", IMAGE_ACCEPT).call();
         match res {
-            Ok(resp) => {
-                let mut buf = Vec::new();
-                use std::io::Read;
-                return resp.into_reader().read_to_end(&mut buf).ok().map(|_| buf);
+            Ok(mut resp) => {
+                return resp
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_RESOURCE_RESPONSE_BYTES)
+                    .read_to_vec()
+                    .ok();
             }
             // 429 (rate limit) and 5xx are transient: a short backoff clears a
             // brief blip. A sustained limit (Wikimedia 429s a 60-image burst
@@ -7998,7 +7991,7 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
             // minutes, so fast-fail to the grey placeholder instead. Real
             // fidelity for that case needs an HTTP/2 image client (multiplexing
             // like Chrome), not blocking retries.
-            Err(ureq::Error::Status(code, _))
+            Err(ureq::Error::StatusCode(code))
                 if matches!(code, 429 | 500 | 502 | 503 | 504) && attempt < 2 =>
             {
                 std::thread::sleep(backoff);
@@ -8007,10 +8000,13 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
             // A resolution failure is not transient at this timescale, and it
             // is also how the SSRF guard below refuses a host: never sleep
             // through the backoff for a request that will not be made.
-            Err(ureq::Error::Transport(err)) if err.kind() == ureq::ErrorKind::Dns => {
+            Err(ureq::Error::HostNotFound) | Err(ureq::Error::StatusCode(_)) => {
                 return None;
             }
-            Err(ureq::Error::Transport(_)) if attempt < 2 => {
+            Err(ureq::Error::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return None;
+            }
+            Err(_) if attempt < 2 => {
                 std::thread::sleep(backoff);
                 backoff *= 2;
             }
@@ -8029,16 +8025,24 @@ fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
 fn image_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(10))
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            // ureq 3 enables environment proxies by default. Keep this
+            // standalone loader direct so every target is resolved and checked;
+            // cookie/proxy-aware page requests remain owned by obscura-net.
+            .proxy(None)
             // Present the same normal browser identity the engine uses for the
             // document. A bot-identifying UA got image requests filtered by CDNs
             // that gate on User-Agent (Akamai/Cloudflare image endpoints on
             // cnbc, techcrunch, arstechnica), so the images Chrome loads came
             // back blank; a real browser UA loads the same bytes Chrome does.
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            .resolver(SsrfGuardResolver)
-            .build()
+            .build();
+        ureq::Agent::with_parts(
+            config,
+            ureq::unversioned::transport::DefaultConnector::default(),
+            SsrfGuardResolver,
+        )
     })
 }
 
@@ -8051,24 +8055,40 @@ fn image_agent() -> &'static ureq::Agent {
 /// every redirect hop, since ureq resolves each connection through here.
 /// `OBSCURA_ALLOW_PRIVATE_NETWORK` lifts the restriction, as it does for the
 /// transports; the renderer has no per-context flag to consult.
+#[derive(Debug)]
 struct SsrfGuardResolver;
 
-impl ureq::Resolver for SsrfGuardResolver {
-    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-        use std::net::ToSocketAddrs;
-        let addrs: Vec<std::net::SocketAddr> = netloc.to_socket_addrs()?.collect();
+impl ureq::unversioned::resolver::Resolver for SsrfGuardResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        // Delegate DNS and its deadline to ureq; never redo the lookup after
+        // checking addresses, which would reopen the DNS-rebinding window.
+        let addrs = ureq::unversioned::resolver::Resolver::resolve(
+            &ureq::unversioned::resolver::DefaultResolver::default(),
+            uri,
+            config,
+            timeout,
+        )
+            .map_err(|error| match error {
+                ureq::Error::Io(_) => ureq::Error::HostNotFound,
+                error => error,
+            })?;
         if !obscura_ssrf::env_allows_private_network() {
             if let Some(bad) = addrs
                 .iter()
                 .find(|addr| obscura_ssrf::is_forbidden_ip(addr.ip()))
             {
-                return Err(std::io::Error::new(
+                return Err(ureq::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
-                        "SSRF blocked: '{netloc}' resolves to forbidden address {}",
+                        "SSRF blocked: '{uri}' resolves to forbidden address {}",
                         bad.ip()
                     ),
-                ));
+                )));
             }
         }
         Ok(addrs)
@@ -9738,7 +9758,7 @@ fn collect_image_intrinsics(
     let mut selected = HashMap::new();
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         let source = tree.with_node(nid, |node| {
-            match node.as_element()?.local.as_ref() {
+            match &*node.as_element()?.local {
                 "img" => Some(Source::Image),
                 "video" => node.get_attribute("poster").map(str::trim)
                     .filter(|poster| !poster.is_empty())
@@ -9796,7 +9816,7 @@ fn collect_content_image_intrinsics(
     let mut active = HashSet::new();
     for (&nid, style) in styles {
         if !tree.with_node(nid, |node| {
-            node.as_element().is_some_and(|name| name.local.as_ref() == "img")
+            node.as_element().is_some_and(|name| &*name.local == "img")
         }).unwrap_or(false) {
             continue;
         }
@@ -9912,7 +9932,7 @@ fn picture_source_url(
     let parent = img.parent?;
     let is_picture = tree
         .get_node(parent)
-        .and_then(|p| p.as_element().map(|e| e.local.as_ref() == "picture"))
+        .and_then(|p| p.as_element().map(|e| &*e.local == "picture"))
         .unwrap_or(false);
     if !is_picture {
         return None;
@@ -9927,7 +9947,7 @@ fn picture_source_url(
         };
         if child
             .as_element()
-            .map(|e| e.local.as_ref() != "source")
+            .map(|e| &*e.local != "source")
             .unwrap_or(true)
         {
             continue;
@@ -10925,7 +10945,7 @@ fn has_inline_svg_text(tree: &DomTree) -> bool {
         .any(|nid| {
             tree.with_node(nid, |node| {
                 node.as_element().is_some_and(|name| {
-                    matches!(name.local.as_ref(), "text" | "tspan" | "textPath")
+                    matches!(&*name.local, "text" | "tspan" | "textPath")
                 })
             }).unwrap_or(false)
         })
@@ -11145,7 +11165,7 @@ fn serialize_svg_node(
             // Emit the local name only, dropping any prefix (`xlink:href` ->
             // `href`): resvg reads both, and a bare local avoids needing an
             // `xmlns:xlink` declaration in the standalone document.
-            let aname = attr.name.local.as_ref();
+            let aname = &*attr.name.local;
             // HTML frameworks commonly stamp hydration attributes such as
             // `q:id` onto inline SVG. In an HTML document that name is fine,
             // but our standalone XML serialization has no matching `xmlns:q`,
@@ -11504,7 +11524,7 @@ fn inject_external_sprites(
         let Some(el) = node.as_element() else {
             continue;
         };
-        if el.local.as_ref() != "use" {
+        if &*el.local != "use" {
             continue;
         }
         // `get_attribute` matches by local name, so a single "href" lookup

@@ -20,15 +20,22 @@ async fn serve() -> String {
                 let mut buf = [0u8; 2048];
                 let read = socket.read(&mut buf).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                let body = if request.starts_with("GET /child.html ") {
+                let body = if request.starts_with("GET /denied-host.html ") {
+                    "<html><body><iframe src=\"/denied.html\"></iframe></body></html>"
+                } else if request.starts_with("GET /denied.html ") {
+                    "<html><body><script>window.secret = 'must-not-run';</script></body></html>"
+                } else if request.starts_with("GET /child.html ") {
                     "<html><body><iframe src=\"/grandchild.html\"></iframe></body></html>"
                 } else if request.starts_with("GET /grandchild.html ") {
                     "<html><body><p>deep</p></body></html>"
                 } else {
                     "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
                 };
+                let policy = if request.starts_with("GET /denied.html ") {
+                    "Content-Security-Policy: frame-ancestors 'none'\r\nContent-Security-Policy: img-src 'self'\r\n"
+                } else { "" };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{policy}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(resp.as_bytes()).await;
@@ -185,7 +192,7 @@ async fn get_frame_tree_reports_nested_child_frames() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn isolated_worlds_are_owned_by_their_exact_frame() {
+async fn child_default_contexts_are_owned_by_their_exact_frame() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let url = serve().await;
     let mut ctx = CdpContext::new();
@@ -218,16 +225,34 @@ async fn isolated_worlds_are_owned_by_their_exact_frame() {
         &mut ctx, 5, "Page.createIsolatedWorld",
         json!({"frameId": main_id.clone(), "worldName": "utility"}), &session,
     ).await["executionContextId"].as_i64().unwrap();
-    let child_world = cdp(
-        &mut ctx, 6, "Page.createIsolatedWorld",
-        json!({"frameId": child_id.clone(), "worldName": "utility"}), &session,
-    ).await["executionContextId"].as_i64().unwrap();
-    let grandchild_world = cdp(
-        &mut ctx, 7, "Page.createIsolatedWorld",
-        json!({"frameId": grandchild_id.clone(), "worldName": "utility"}), &session,
-    ).await["executionContextId"].as_i64().unwrap();
+    let default_for = |frame_id: &str| ctx.pending_events.iter().find(|event| {
+        event.method == "Runtime.executionContextCreated"
+            && event.session_id.as_deref() == Some(session.as_str())
+            && event.params["context"]["auxData"]["frameId"] == frame_id
+            && event.params["context"]["auxData"]["isDefault"] == true
+    }).unwrap().params["context"]["id"].as_i64().unwrap();
+    let child_world = default_for(&child_id);
+    let grandchild_world = default_for(&grandchild_id);
     assert_ne!(main_world, child_world);
     assert_ne!(child_world, grandchild_world);
+    let unsupported = dispatch(&CdpRequest {
+        id: 6, method: "Page.createIsolatedWorld".to_string(),
+        params: json!({"frameId": child_id, "worldName": "utility"}),
+        session_id: Some(session.clone()),
+    }, &mut ctx).await;
+    assert!(unsupported.error.unwrap().message.contains("not supported"));
+    cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "globalThis.marker = 'host'", "returnByValue": true,
+    }), &session).await;
+    let child_marker = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "globalThis.marker = 'child'; [marker, location.pathname]",
+        "contextId": child_world, "returnByValue": true,
+    }), &session).await;
+    assert_eq!(child_marker["result"]["value"], json!(["child", "/child.html"]));
+    let host_marker = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression": "marker", "returnByValue": true,
+    }), &session).await;
+    assert_eq!(host_marker["result"]["value"], "host");
 
     let unknown = dispatch(
         &CdpRequest {
@@ -320,4 +345,24 @@ async fn isolated_worlds_are_owned_by_their_exact_frame() {
     assert_eq!(recreated.len(), 1, "only the main-frame world should persist");
     assert_eq!(recreated[0].params["context"]["auxData"]["frameId"], main_id);
 
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn protected_response_does_not_create_an_executable_frame() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    let base = serve().await;
+    cdp(&mut ctx, 1, "Network.enable", json!({}), &session).await;
+    cdp(&mut ctx, 2, "Page.navigate",
+        json!({"url": format!("{base}denied-host.html"), "waitUntil": "load"}),
+        &session).await;
+    assert!(ctx.pending_events.iter().any(|event|
+        event.method == "Network.responseReceived"
+            && event.params["response"]["url"] == format!("{base}denied.html")
+            && event.params["response"]["status"] == 200),
+        "the protected response must actually reach the browser");
+    let tree = cdp(&mut ctx, 3, "Page.getFrameTree", json!({}), &session).await;
+    assert_eq!(tree["frameTree"]["childFrames"], json!([]),
+        "every enforced CSP field must prevent a live child frame");
 }

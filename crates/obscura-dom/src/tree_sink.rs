@@ -22,7 +22,7 @@ fn is_valid_shadow_host(tree: &DomTree, id: NodeId) -> bool {
     if name.ns != ns!(html) {
         return false;
     }
-    let local = name.local.as_ref();
+    let local = &*name.local;
     if matches!(
         local,
         "article"
@@ -305,7 +305,7 @@ impl TreeSink for DomTree {
         attrs: &[HtmlAttribute],
     ) -> bool {
         let mode = attrs.iter().find_map(|attr| {
-            if attr.name.local.as_ref() != "shadowrootmode" {
+            if &*attr.name.local != "shadowrootmode" {
                 return None;
             }
             match attr.value.as_ref() {

@@ -15,8 +15,21 @@ const DEFAULT_SCREENSHOT_QUALITY: i64 = 80;
 /// child's protocol id is derived from its page's. It stays stable for the
 /// life of the frame, which is what lets a client match an attach event to the
 /// frame it later sees in the tree.
-fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
+pub(crate) fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
     format!("{page_frame_id}-frame-{frame_id}")
+}
+
+pub(crate) fn native_frame_id(page: &obscura_browser::Page, id: &str) -> Result<u32, String> {
+    if id == page.frame_id { return Ok(0); }
+    page.frames.iter().find(|frame| child_frame_id(&page.frame_id, frame.frame_id()) == id
+        && page.live_frame_owner(frame.frame_id()).is_some())
+        .map(|frame| frame.frame_id())
+        .ok_or_else(|| format!("Cannot find context for live frame: {id}"))
+}
+
+fn network_frame_id(main: &str, frame_id: u32) -> std::borrow::Cow<'_, str> {
+    if frame_id == 0 { std::borrow::Cow::Borrowed(main) }
+    else { std::borrow::Cow::Owned(child_frame_id(main, frame_id)) }
 }
 
 fn is_localhost(url: &url::Url) -> bool {
@@ -83,13 +96,15 @@ fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm)
     } else {
         child_frame_id(page_frame_id, frame.parent_frame_id())
     };
-    frame_value(
+    let mut value = frame_value(
         &id,
         Some(&parent_id),
         &format!("{id}-loader"),
         frame.url(),
         "text/html",
-    )
+    );
+    value["securityOrigin"] = json!(frame.origin());
+    value
 }
 
 /// The page's child frames, flattened with each parent ahead of its children
@@ -99,7 +114,8 @@ pub fn child_frame_values(page: &obscura_browser::Page) -> Vec<Value> {
         for frame in page
             .frames
             .iter()
-            .filter(|frame| frame.parent_frame_id() == parent_frame_id)
+            .filter(|frame| frame.parent_frame_id() == parent_frame_id
+                && page.live_frame_owner(frame.frame_id()).is_some())
         {
             out.push(child_frame_value(&page.frame_id, frame));
             walk(page, frame.frame_id(), out);
@@ -117,7 +133,8 @@ fn frame_tree(page: &obscura_browser::Page, loader_id: &str) -> Value {
     fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
         page.frames
             .iter()
-            .filter(|frame| frame.parent_frame_id() == parent_frame_id)
+            .filter(|frame| frame.parent_frame_id() == parent_frame_id
+                && page.live_frame_owner(frame.frame_id()).is_some())
             .map(|frame| {
                 json!({
                     "frame": child_frame_value(&page.frame_id, frame),
@@ -891,7 +908,7 @@ pub fn emit_navigation_events(
         network_events
             .iter()
             .map(|ev| {
-                if !nav_seen && ev.resource_type == "Document" && ev.url == page_url {
+                if !nav_seen && ev.frame_id == 0 && ev.resource_type == "Document" && ev.url == page_url {
                     nav_seen = true;
                     loader_id.to_string()
                 } else {
@@ -902,7 +919,7 @@ pub fn emit_navigation_events(
     };
     let nav_idx: Option<usize> = network_events
         .iter()
-        .position(|ev| ev.resource_type == "Document" && ev.url == page_url);
+        .position(|ev| ev.frame_id == 0 && ev.resource_type == "Document" && ev.url == page_url);
 
     // The main resource's body is stored under its internal request id, but the
     // client sees it as `loader_id` (the requestId we report above). Alias it so
@@ -989,6 +1006,7 @@ pub fn emit_navigation_events(
                 continue;
             }
             let rid = &nav_request_ids[i];
+            let frame_id = network_frame_id(frame_id, net_event.frame_id);
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
                 params: json!({
@@ -1009,6 +1027,9 @@ pub fn emit_navigation_events(
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
+        let frame_id = network_frame_id(frame_id, net_event.frame_id);
+        let loader_id = if net_event.frame_id == 0 { std::borrow::Cow::Borrowed(loader_id) }
+            else { std::borrow::Cow::Owned(format!("{frame_id}-loader")) };
         if Some(i) != nav_idx && !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
@@ -1183,6 +1204,9 @@ pub(crate) fn emit_runtime_network_events(
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
     for network_event in network_events {
         let request_id = &network_event.request_id;
+        let frame_id = network_frame_id(frame_id, network_event.frame_id);
+        let loader_id = if network_event.frame_id == 0 { std::borrow::Cow::Borrowed(loader_id.as_str()) }
+            else { std::borrow::Cow::Owned(format!("{frame_id}-loader")) };
         if !network_event.intercepted {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
@@ -1467,10 +1491,11 @@ pub async fn handle(
                         .to_string();
                 let (origin, persist) = if frame_id == page.frame_id {
                     (page.url_string(), true)
-                } else if let Some(frame) = page.frames.iter().find(|frame| {
+                } else if page.frames.iter().any(|frame| {
                     child_frame_id(&page.frame_id, frame.frame_id()) == frame_id
+                        && page.live_frame_owner(frame.frame_id()).is_some()
                 }) {
-                    (frame.url().to_string(), false)
+                    return Err("Child isolated execution worlds are not supported".to_string());
                 } else {
                     return Err(format!("No frame with given id found: {frame_id}"));
                 };
@@ -1962,6 +1987,7 @@ mod tests {
             ("script-1", "Script", "https://example.test/app.js", 404)]
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
                 request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                frame_id: 0,
                 resource_type: kind.into(), status, headers: Default::default(),
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
@@ -2303,6 +2329,7 @@ mod tests {
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
             request_id: "fetch-7".into(),
+            frame_id: 0,
             intercepted: false,
             url: "https://example.test/data.json".into(),
             method: "GET".into(),
@@ -2399,6 +2426,7 @@ mod tests {
         let page_url = "https://example.test/";
         let event = obscura_browser::NetworkEvent {
             request_id: "document-internal".into(),
+            frame_id: 0,
             intercepted: false,
             url: page_url.into(),
             method: "GET".into(),

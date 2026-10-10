@@ -4,3 +4,10 @@ RUST_TEST_THREADS = "1"
 [alias]
 # Local runtime iteration only. Benchmark with the normal non-incremental build.
 test-js = "nextest run --release --features render -p obscura-js --lib --config profile.release.package.obscura-js.incremental=true"
+[build]
+rustc-wrapper="sccache"
+
+# The prebuilt Windows V8 archive links libcmt; use the same CRT in Rust
+# executables and native-build snapshot generators instead of mixing runtimes.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

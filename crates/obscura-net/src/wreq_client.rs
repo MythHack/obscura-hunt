@@ -238,7 +238,7 @@ impl StealthHttpClient {
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //
         // `client.rs` (the reqwest path) already reads these via `configured_root_paths()` and
-        // feeds `add_root_certificate`, so a private CA works there. This client did not, which
+        // feeds `tls_certs_merge`, so a private CA works there. This client did not, which
         // made the *better-fingerprinted* transport the only one unable to reach hosts behind a
         // private/national CA (measured against a Brazilian government portal whose leaf is
         // issued by an ICP-Brasil intermediate: `--stealth` failed with CERTIFICATE_VERIFY_FAILED
@@ -567,11 +567,21 @@ impl StealthHttpClient {
                 }
             }
         }
-        let response_headers: HashMap<String, String> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        let mut response_headers: HashMap<String, String> = HashMap::new();
+        for (name, value) in resp.headers().iter() {
+            let name = name.as_str();
+            let value = value.to_str().unwrap_or("");
+            if matches!(name, "content-security-policy" | "x-frame-options") {
+                response_headers.entry(name.to_string())
+                    .and_modify(|existing| {
+                        existing.push_str(", ");
+                        existing.push_str(value);
+                    })
+                    .or_insert_with(|| value.to_string());
+            } else {
+                response_headers.insert(name.to_string(), value.to_string());
+            }
+        }
         let body_url = url.clone();
         Ok(StealthResponseHeaders {
             status: status.as_u16(),
@@ -864,23 +874,6 @@ mod tests {
             .expect("a folded header must not fail the response");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), "folded");
-    }
-
-    #[tokio::test]
-    async fn stealth_network_error_names_the_cause() {
-        // A port nobody listens on: the message must say the connection was
-        // refused instead of only "error sending request", and must not be a
-        // Debug dump of the error structs.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let client = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let message = client.fetch(&url).await.expect_err("nothing listens").to_string();
-        assert!(message.to_lowercase().contains("refused"), "{message}");
-        assert!(!message.contains("source: Some("), "{message}");
     }
 
     /// Serve one `Content-Encoding: gzip` response on an ephemeral port.

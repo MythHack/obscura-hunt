@@ -596,8 +596,7 @@ fn parse_container_names(value: &str) -> Option<Vec<String>> {
         return Some(Vec::new());
     }
     let mut names = Vec::new();
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     while !parser.is_exhausted() {
         let ident = parser.expect_ident_cloned().ok()?;
         let lower = ident.to_ascii_lowercase();
@@ -729,8 +728,7 @@ pub(crate) fn recompute_overflow(style: &mut LayoutStyle) {
 }
 
 fn parse_font_variation_settings(value: &str) -> Option<Vec<crate::FontVariationSetting>> {
-    let mut input = cssparser::ParserInput::new(value.trim());
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value.trim());
     if parser.is_exhausted() {
         return None;
     }
@@ -768,7 +766,7 @@ fn parse_font_variation_settings(value: &str) -> Option<Vec<crate::FontVariation
     )
 }
 
-fn parse_font_variation_number(parser: &mut cssparser::Parser<'_, '_>) -> Option<f32> {
+fn parse_font_variation_number(parser: &mut cssparser::Parser<'_>) -> Option<f32> {
     if let Ok(value) = parser.try_parse(|input| input.expect_number()) {
         return value.is_finite().then_some(value);
     }
@@ -790,12 +788,12 @@ fn parse_font_variation_number(parser: &mut cssparser::Parser<'_, '_>) -> Option
     resolve_contextual_length(expression, 0.0, 0.0, 0.0, 0.0, 0.0).filter(|value| value.is_finite())
 }
 
-fn unitless_math_tokens<'i, 't>(
-    parser: &mut cssparser::Parser<'i, 't>,
+fn unitless_math_tokens(
+    parser: &mut cssparser::Parser<'_>,
     depth: u8,
-) -> Result<(), cssparser::ParseError<'i, ()>> {
+) -> Result<(), cssparser::ParseError<()>> {
     if depth >= 64 {
-        return Err(parser.new_custom_error(()));
+        return Err(cssparser::ParseError::custom(()));
     }
     while !parser.is_exhausted() {
         let token = parser.next_including_whitespace_and_comments()?.clone();
@@ -819,7 +817,7 @@ fn unitless_math_tokens<'i, 't>(
             cssparser::Token::ParenthesisBlock => {
                 parser.parse_nested_block(|input| unitless_math_tokens(input, depth + 1))?;
             }
-            _ => return Err(parser.new_custom_error(())),
+            _ => return Err(cssparser::ParseError::custom(())),
         }
     }
     Ok(())
@@ -4730,8 +4728,7 @@ enum GridLineKind {
 /// the entire declaration must be ignored rather than partially resetting
 /// earlier winning longhands.
 fn parse_grid_line_kind(value: &str) -> Option<GridLineKind> {
-    let mut input = cssparser::ParserInput::new(value.trim());
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value.trim());
 
     // auto
     {
@@ -4804,7 +4801,7 @@ fn parse_grid_line_kind(value: &str) -> Option<GridLineKind> {
     None
 }
 
-fn consume_grid_integer(parser: &mut cssparser::Parser<'_, '_>, positive_only: bool) -> bool {
+fn consume_grid_integer(parser: &mut cssparser::Parser<'_>, positive_only: bool) -> bool {
     let state = parser.state();
     let valid = parser.expect_integer().is_ok_and(|integer| {
         if positive_only {
@@ -4819,7 +4816,7 @@ fn consume_grid_integer(parser: &mut cssparser::Parser<'_, '_>, positive_only: b
     valid
 }
 
-fn consume_grid_custom_ident(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+fn consume_grid_custom_ident(parser: &mut cssparser::Parser<'_>) -> bool {
     let state = parser.state();
     let valid = parser.expect_ident_cloned().is_ok_and(|ident| {
         !matches!(
@@ -4833,7 +4830,7 @@ fn consume_grid_custom_ident(parser: &mut cssparser::Parser<'_, '_>) -> bool {
     valid
 }
 
-fn consume_grid_integer_math(parser: &mut cssparser::Parser<'_, '_>) -> bool {
+fn consume_grid_integer_math(parser: &mut cssparser::Parser<'_>) -> bool {
     let state = parser.state();
     let is_math = parser.expect_function().is_ok_and(|name| {
         matches!(
@@ -4848,7 +4845,7 @@ fn consume_grid_integer_math(parser: &mut cssparser::Parser<'_, '_>) -> bool {
     let valid = parser
         .parse_nested_block::<_, _, ()>(|nested| {
             if nested.is_exhausted() {
-                return Err(nested.new_custom_error(()));
+                return Err(cssparser::ParseError::custom(()));
             }
             while nested.next_including_whitespace().is_ok() {}
             Ok(())
@@ -7129,8 +7126,7 @@ fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
 }
 
 fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
-    let mut input = cssparser::ParserInput::new(value);
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(value);
     let length = match parser.next().ok()? {
         cssparser::Token::Number { value, .. } if *value == 0.0 => crate::Dimension::Px(0.0),
         cssparser::Token::Dimension { value, unit, .. } if value.is_finite() => {

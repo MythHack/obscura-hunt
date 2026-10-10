@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   build:
     strategy:
@@ -52,6 +56,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+
       - name: Install stealth build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -70,14 +77,16 @@ jobs:
           echo "CXXFLAGS=-isystem $SDK_PATH/usr/include/c++/v1" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$XCODE_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
 
-      - name: Configure libclang (Windows)
+      - name: Configure native TLS tools (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          choco install nasm --yes --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build no-render release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
+        run: cargo build --locked --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features
 
       - name: Stage no-render release binary
         shell: bash
@@ -91,7 +100,7 @@ jobs:
           fi
 
       - name: Build no-render stealth release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
+        run: cargo build --locked --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --no-default-features --features stealth
 
       - name: Stage no-render stealth release binary
         shell: bash
@@ -105,7 +114,7 @@ jobs:
           fi
 
       - name: Build render-enabled release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render
+        run: cargo build --locked --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render
 
       - name: Stage default release binary
         shell: bash
@@ -119,7 +128,7 @@ jobs:
           fi
 
       - name: Build render-enabled stealth release binary
-        run: cargo build --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
+        run: cargo build --locked --profile release-dist --target ${{ matrix.target }} -p obscura-cli --bins --features render,stealth
 
       - name: Stage stealth release binary
         shell: bash
@@ -212,7 +221,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Hash release archives
+        working-directory: dist
+        run: sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          draft: true
           files: dist/*

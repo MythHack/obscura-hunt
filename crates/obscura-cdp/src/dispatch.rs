@@ -62,7 +62,7 @@ pub struct CdpContext {
     pub nav_events_emitted: std::collections::HashSet<String>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
-    pub announced_frames: HashMap<String, Vec<String>>,
+    pub announced_frames: std::rc::Rc<std::cell::RefCell<HashMap<String, Vec<String>>>>,
     pub pending_events: Vec<CdpEvent>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -176,7 +176,7 @@ impl CdpContext {
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
             nav_events_emitted: std::collections::HashSet::new(),
-            announced_frames: HashMap::new(),
+            announced_frames: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -339,7 +339,7 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
-        self.announced_frames.remove(id);
+        self.announced_frames.borrow_mut().remove(id);
         #[cfg(feature = "render")]
         {
             for session_id in &removed_sessions {
@@ -393,13 +393,29 @@ impl CdpContext {
     }
 
     pub(crate) fn ensure_default_context(&mut self, page_id: &str) -> Option<ExecutionContextRecord> {
-        if let Some(context) = self.contexts_for_page(page_id).into_iter().find(|context| context.is_default) {
+        let frame_id = self.get_page(page_id)?.frame_id.clone();
+        if let Some(context) = self.contexts_for_page(page_id).find(|context| context.is_default && context.frame_id == frame_id) {
             return Some(context.clone());
         }
         let page = self.get_page(page_id)?;
         let frame_id = page.frame_id.clone();
         let origin = page.url_string();
         Some(self.allocate_context(page_id, &frame_id, &origin, "", true))
+    }
+
+    pub(crate) fn ensure_child_default_contexts(&mut self, page_id: &str) -> Vec<ExecutionContextRecord> {
+        let Some(page) = self.get_page(page_id) else { return Vec::new() };
+        let children = page.frames.iter()
+            .filter(|frame| page.live_frame_owner(frame.frame_id()).is_some())
+            .map(|frame| (domains::page::child_frame_id(&page.frame_id, frame.frame_id()), frame.origin().to_string()))
+            .collect::<Vec<_>>();
+        let mut created = Vec::new();
+        for (frame_id, origin) in children {
+            if !self.contexts_for_page(page_id).any(|context| context.is_default && context.frame_id == frame_id) {
+                created.push(self.allocate_context(page_id, &frame_id, &origin, "", true));
+            }
+        }
+        created
     }
 
     /// The single hook for an installed replacement Document.
@@ -474,8 +490,9 @@ impl CdpContext {
     }
 
     pub(crate) fn default_context_id(&self, page_id: &str) -> Option<i64> {
+        let frame_id = &self.get_page(page_id)?.frame_id;
         self.contexts_for_page(page_id)
-            .find(|context| context.is_default).map(|context| context.id)
+            .find(|context| context.is_default && &context.frame_id == frame_id).map(|context| context.id)
     }
 
     fn remove_frame_contexts(
@@ -1063,41 +1080,37 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             continue;
         };
         let live = crate::domains::page::child_frame_values(page);
-        let known = ctx.announced_frames.get(&page.id);
-        let live_ids: Vec<String> = live
-            .iter()
-            .map(|frame| frame["id"].as_str().unwrap_or_default().to_string())
-            .collect();
+        let announcement_state = ctx.announced_frames.borrow();
+        let known = announcement_state.get(&page.id);
+        let mut owners = page.network_frame_registry()
+            .map(|registry| registry.borrow().live_frame_owners()).unwrap_or_default();
+        owners.sort_unstable_by_key(|(id, _, _)| *id);
+        let live_ids = owners.iter().map(|(id, _, _)|
+            domains::page::child_frame_id(&page.frame_id, *id)).collect::<Vec<_>>();
 
+        // Reservations are real browsing contexts with a native owner, even
+        // while their Document request has not constructed a V8 realm yet.
+        for (id, parent, _) in owners {
+            let id = domains::page::child_frame_id(&page.frame_id, id);
+            if known.is_some_and(|ids| ids.contains(&id)) { continue; }
+            let parent_id = if parent == 0 { page.frame_id.clone() }
+                else { domains::page::child_frame_id(&page.frame_id, parent) };
+            for session_id in session_ids {
+                events.push(CdpEvent::with_session("Page.frameAttached", json!({
+                    "frameId": id, "parentFrameId": parent_id,
+                }), session_id.clone()));
+            }
+        }
         for frame in &live {
             let id = frame["id"].as_str().unwrap_or_default();
-            if known.is_some_and(|ids| ids.iter().any(|seen| seen == id)) {
+            if ctx.contexts_for_page(&page.id).any(|context| context.is_default && context.frame_id == id) {
                 continue;
             }
             for session_id in session_ids {
-                // Attach before navigate: a client builds its frame from the
-                // attach event and treats a navigation of a frame it has never
-                // seen as a protocol error.
-                events.push(CdpEvent {
-                    method: "Page.frameAttached".into(),
-                    params: json!({
-                        "frameId": id,
-                        "parentFrameId": frame["parentId"].as_str().unwrap_or_default(),
-                    }),
-                    session_id: Some(session_id.clone()),
-                });
-                events.push(CdpEvent {
-                    method: "Page.frameNavigated".into(),
-                    params: json!({ "frame": frame, "type": "Navigation" }),
-                    session_id: Some(session_id.clone()),
-                });
-                // The frame's document scripts have already run by the time it
-                // is in this list, so it is not still loading.
-                events.push(CdpEvent {
-                    method: "Page.frameStoppedLoading".into(),
-                    params: json!({ "frameId": id }),
-                    session_id: Some(session_id.clone()),
-                });
+                events.push(CdpEvent::with_session("Page.frameNavigated",
+                    json!({"frame": frame, "type": "Navigation"}), session_id.clone()));
+                events.push(CdpEvent::with_session("Page.frameStoppedLoading",
+                    json!({"frameId": id}), session_id.clone()));
             }
         }
 
@@ -1133,7 +1146,16 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
             });
         }
     }
-    ctx.announced_frames.extend(announced);
+    for page_id in page_to_sessions.keys() {
+        let created = ctx.ensure_child_default_contexts(page_id);
+        let sessions = ctx.runtime_sessions_for_page(page_id);
+        for context in created {
+            for session in &sessions {
+                events.push(domains::runtime::execution_context_created_event(&context, Some(session.clone())));
+            }
+        }
+    }
+    ctx.announced_frames.borrow_mut().extend(announced);
     ctx.pending_events.extend(events);
 }
 

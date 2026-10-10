@@ -165,7 +165,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
                     (10, name.to_string(), String::new(), vec![], String::new())
                 }
                 NodeData::Element { name, attrs, .. } => {
-                    let tag = name.local.as_ref().to_string();
+                    let tag = name.local.to_string();
                     let flat = attrs
                         .iter()
                         .map(|a| (a.name.local.to_string(), a.value.clone()))

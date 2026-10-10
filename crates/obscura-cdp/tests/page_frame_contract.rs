@@ -237,21 +237,29 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         .params["frame"];
     assert_frame_contract(child_event_frame);
 
-    cdp(
+    // Input uses native hit testing, not an author-overridden elementFromPoint.
+    let route_rect = cdp(
         &mut ctx,
         7,
         "Runtime.evaluate",
         json!({
-            "expression": "document.elementFromPoint = () => document.getElementById('route')"
+            "expression": "JSON.stringify(document.getElementById('route').getBoundingClientRect().toJSON())",
+            "returnByValue": true
         }),
         Some(&session_id),
     )
     .await;
+    let route_rect: Value =
+        serde_json::from_str(route_rect["result"]["value"].as_str().unwrap()).unwrap();
+    assert!(route_rect["width"].as_f64().unwrap() > 0.0);
+    assert!(route_rect["height"].as_f64().unwrap() > 0.0);
+    let x = route_rect["x"].as_f64().unwrap() + route_rect["width"].as_f64().unwrap() / 2.0;
+    let y = route_rect["y"].as_f64().unwrap() + route_rect["height"].as_f64().unwrap() / 2.0;
     cdp(
         &mut ctx,
         8,
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 0, "y": 0, "button": "left"}),
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left"}),
         Some(&session_id),
     )
     .await;
@@ -260,7 +268,7 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         &mut ctx,
         9,
         "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 0, "y": 0, "button": "left"}),
+        json!({"type": "mouseReleased", "x": x, "y": y, "button": "left"}),
         Some(&session_id),
     )
     .await;

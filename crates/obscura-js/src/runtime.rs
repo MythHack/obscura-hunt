@@ -244,11 +244,22 @@ pub struct CdpObjectState {
     evaluation_recipes: HashMap<String, String>,
 }
 
+/// Restores the command realm even when an awaited CDP command is cancelled.
+struct CdpRealmScope {
+    current: Rc<std::cell::Cell<u32>>,
+    previous: u32,
+}
+
+impl Drop for CdpRealmScope {
+    fn drop(&mut self) { self.current.set(self.previous); }
+}
+
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
+    cdp_frame_id: Rc<std::cell::Cell<u32>>,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
     /// intentionally separate from page fetch/XHR activity so analytics does
@@ -608,14 +619,21 @@ impl ObscuraJsRuntime {
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
             });
+            {
+                let context = runtime.main_context();
+                v8::scope!(let scope, runtime.v8_isolate());
+                let context = v8::Local::new(scope, context);
+                let undefined = v8::undefined(scope);
+                crate::ops::initialize_document_realm_slots(context, undefined.into());
+            }
 
             {
                 let op_state = runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
                 op_state.put(state_clone);
-                // Empty until a frame realm exists, which is what keeps the
-                // lookup free for pages that have no frames.
-                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+                let mut realms = crate::ops::RealmStates::default();
+                realms.set_main_context(runtime.main_context());
+                op_state.put(Rc::new(RefCell::new(realms)));
             }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
@@ -641,6 +659,7 @@ impl ObscuraJsRuntime {
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
             object_counter: 0,
+            cdp_frame_id: Rc::new(std::cell::Cell::new(0)),
             import_map,
             module_load_activity,
             isolate_handle,
@@ -700,6 +719,8 @@ impl ObscuraJsRuntime {
                     deno_core::v8::ContextOptions::default(),
                 )
             })?;
+            let undefined = deno_core::v8::undefined(scope);
+            crate::ops::initialize_document_realm_slots(context, undefined.into());
             deno_core::v8::Global::new(scope, context)
         };
         Some(context)
@@ -973,6 +994,123 @@ impl ObscuraJsRuntime {
         self.realm_states().borrow_mut().forget_frame(frame_id);
     }
 
+    pub fn live_frame_owner(&self, frame_id: u32) -> Option<(u32, NodeId)> {
+        self.realm_states().borrow().live_frame_owner(frame_id)
+    }
+
+    pub fn network_frame_registry(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
+        self.realm_states()
+    }
+
+    fn enter_cdp_frame(&self, frame_id: u32) -> Result<CdpRealmScope, String> {
+        if frame_id != 0 && self.realm_states().borrow().context(frame_id).is_none() {
+            return Err("Cannot find live child frame context".to_string());
+        }
+        let previous = self.cdp_frame_id.replace(frame_id);
+        Ok(CdpRealmScope { current: self.cdp_frame_id.clone(), previous })
+    }
+
+    fn cdp_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
+        let frame_id = self.cdp_frame_id.get();
+        if frame_id == 0 { return Ok(self.runtime().main_context()); }
+        self.realm_states().borrow().context(frame_id)
+            .ok_or_else(|| "Cannot find live child frame context".to_string())
+    }
+
+    /// Resolves handles in this runtime only, never in another page or realm.
+    pub fn object_frame_id(&self, object_id: &str) -> Result<u32, String> {
+        let root = object_id.split("::").next().unwrap_or(object_id);
+        if !self.object_store.contains_key(object_id)
+            && !self.object_store.contains_key(root)
+            && !self.evaluation_recipes.contains_key(object_id)
+        {
+            return Err("Cannot find object with specified id".to_string());
+        }
+        let frame_id = root.strip_prefix("frame-").or_else(|| root.strip_prefix("console-"))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(id, _)| id.parse::<u32>().ok()).unwrap_or(0);
+        if frame_id != 0 && self.live_frame_owner(frame_id).is_none() {
+            return Err("Cannot find live child frame context".to_string());
+        }
+        Ok(frame_id)
+    }
+
+    pub fn evaluate_in_cdp_frame(&mut self, frame_id: u32, expression: &str)
+        -> Result<serde_json::Value, String>
+    {
+        let _realm = self.enter_cdp_frame(frame_id)?;
+        self.evaluate(expression)
+    }
+
+    pub async fn evaluate_for_cdp_in_frame(
+        &mut self, frame_id: u32, expression: &str, return_by_value: bool,
+        await_promise: bool, timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
+        let _realm = self.enter_cdp_frame(frame_id)?;
+        self.evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, timeout_ms).await
+    }
+
+    pub async fn call_function_on_for_cdp_in_frame(
+        &mut self, frame_id: u32, declaration: &str, object_id: Option<&str>,
+        arguments: &[serde_json::Value], return_by_value: bool, await_promise: bool,
+        timeout_ms: u64,
+    ) -> Result<RemoteObjectInfo, String> {
+        let _realm = self.enter_cdp_frame(frame_id)?;
+        for id in object_id.into_iter().chain(arguments.iter().filter_map(|arg| arg["objectId"].as_str())) {
+            if self.object_frame_id(id)? != frame_id {
+                return Err("Object belongs to a different execution context".to_string());
+            }
+        }
+        let this = self.resolve_this(object_id);
+        let (setup, args) = self.build_args(arguments);
+        let source = format!("(function() {{ {setup} return ({declaration}).call({this}, {args}); }})()");
+        self.evaluate_for_cdp_with_timeout(&source, return_by_value, await_promise, timeout_ms).await
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_hit_test(&mut self, frame_id: u32, x: f64, y: f64) -> Result<Option<NodeId>, String> {
+        let shared = if frame_id == 0 { self.state.clone() } else {
+            let realms = self.realm_states();
+            let realms = realms.borrow();
+            realms.context(frame_id).ok_or("Cannot find live child frame context")?;
+            realms.by_frame_id(frame_id).ok_or("Cannot find child document")?
+        };
+        let mut state = shared.borrow_mut();
+        begin_animation_task(&mut state);
+        ensure_resolved_scroll(&mut state).ok_or("Native hit test layout unavailable")?;
+        let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
+        let prepared = state.prepared_render.as_ref().ok_or("Native layout unavailable")?;
+        let dom = state.dom.as_ref().ok_or("Native document unavailable")?;
+        Ok(prepared.hit_test(dom, scroll, x as f32, y as f32))
+    }
+
+    /// Uses the native content box and resolved ancestor/root scroll, not
+    /// author-overridable geometry or parent-visible child document objects.
+    #[cfg(feature = "render")]
+    pub fn direct_child_point(&mut self, frame_id: u32, x: f64, y: f64)
+        -> Result<Option<(f64, f64)>, String>
+    {
+        let (parent, owner) = self.live_frame_owner(frame_id).ok_or("No live frame owner")?;
+        if parent != 0 { return Err("Nested frame input is not supported".to_string()); }
+        let mut state = self.state.borrow_mut();
+        begin_animation_task(&mut state);
+        ensure_resolved_scroll(&mut state).ok_or("Native owner layout unavailable")?;
+        let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
+        let prepared = state.prepared_render.as_ref().ok_or("Native owner layout unavailable")?;
+        let layout = prepared.layout();
+        if layout.transforms.get(&owner).is_some_and(|transform| !transform.is_translation()) {
+            return Err("Transformed child frame input is not supported".to_string());
+        }
+        let rect = prepared.viewport_rect_with_scroll(owner, scroll).ok_or("Frame owner has no box")?;
+        let style = layout.styles.get(&owner).ok_or("Frame owner has no style")?;
+        let left = f64::from(rect.x + style.border.left + style.padding.left);
+        let top = f64::from(rect.y + style.border.top + style.padding.top);
+        let width = f64::from(rect.width - style.border.left - style.border.right - style.padding.left - style.padding.right);
+        let height = f64::from(rect.height - style.border.top - style.border.bottom - style.padding.top - style.padding.bottom);
+        let local = (x - left, y - top);
+        Ok((local.0 >= 0.0 && local.1 >= 0.0 && local.0 < width && local.1 < height).then_some(local))
+    }
+
     /// The origin of the document this runtime is running, or `"null"` for a
     /// scheme that has no tuple origin.
     pub(crate) fn page_origin(&self) -> String {
@@ -1007,15 +1145,9 @@ impl ObscuraJsRuntime {
         realm.set_security_token(token);
     }
 
-    /// Publishes a frame realm's own `window` and `document` objects into the
-    /// page realm, under `__obscura_frameObjects[frameId]`.
-    ///
-    /// This is what the single isolate buys. Objects cannot cross isolates, so
-    /// a parent could only ever be handed a copy or a shim; within one isolate
-    /// it can hold the frame's real globals, which is what a browser gives it
-    /// for a same-origin frame. `contentWindow.someGlobal` is then a plain
-    /// property read of the frame's own object, and `contentDocument` is the
-    /// document the frame's scripts actually mutated.
+    /// Publishes real frame objects into the bootstrap's native-captured private
+    /// registry. Author-visible access goes through the live, origin-checked
+    /// iframe facade, never a page-readable table of raw handles.
     pub(crate) fn publish_realm_objects(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
@@ -1047,21 +1179,9 @@ impl ObscuraJsRuntime {
 
         let main_context = v8::Local::new(scope, main);
         let scope = &mut v8::ContextScope::new(scope, main_context);
-        let global = main_context.global(scope);
-        let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
-            return false;
-        };
-        let registry = match global
-            .get(scope, registry_key.into())
-            .and_then(|value| value.to_object(scope))
-        {
-            Some(registry) if !registry.is_null_or_undefined() => registry,
-            _ => {
-                let fresh = v8::Object::new(scope);
-                global.set(scope, registry_key.into(), fresh.into());
-                fresh
-            }
-        };
+        let Some(registry) = main_context.get_embedder_data(scope, crate::ops::FRAME_OBJECTS_SLOT)
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        else { return false; };
 
         let entry = v8::Object::new(scope);
         let window = v8::Local::new(scope, frame_window);
@@ -1078,6 +1198,46 @@ impl ObscuraJsRuntime {
         registry
             .set(scope, index.into(), entry.into())
             .unwrap_or(false)
+    }
+
+    /// Delivers authenticated queued metadata through the callback captured at
+    /// realm initialization, without resolving any author-visible global hook.
+    pub fn deliver_frame_message(
+        &mut self,
+        target_frame_id: u32,
+        data_json: &str,
+        origin: &str,
+        source_frame_id: u32,
+        target_origin: &str,
+    ) -> Result<(), String> {
+        let context = if target_frame_id == 0 {
+            self.runtime().main_context()
+        } else {
+            self.realm_states().borrow().context(target_frame_id)
+                .ok_or("Cannot find live child frame context")?
+        };
+        self.begin_javascript_task();
+        let result = (|| {
+            let mut entered = self.runtime();
+            v8::scope!(let scope, entered.v8_isolate());
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(let scope, scope);
+            let callback = context.get_embedder_data(scope, crate::ops::FRAME_MESSAGE_SLOT)
+                .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                .ok_or("Realm message delivery is unavailable")?;
+            let data = v8::String::new(scope, data_json).ok_or("Message data too large")?;
+            let origin = v8::String::new(scope, origin).ok_or("Message origin too large")?;
+            let source = v8::Integer::new_from_unsigned(scope, source_frame_id);
+            let target = v8::String::new(scope, target_origin).ok_or("Message target origin too large")?;
+            let receiver = v8::undefined(scope);
+            if callback.call(scope, receiver.into(), &[data.into(), origin.into(), source.into(), target.into()]).is_none() {
+                return Err(exception_text(scope));
+            }
+            scope.perform_microtask_checkpoint();
+            Ok(())
+        })();
+        self.finish_heap_checked(result)
     }
 
     /// The table ops consult to find the calling realm's document.
@@ -1145,10 +1305,19 @@ impl ObscuraJsRuntime {
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
-        let result = self
-            .runtime()
-            .execute_script(name, source)
-            .map_err(|error| error.to_string());
+        let result = if self.cdp_frame_id.get() == 0 {
+            self.runtime().execute_script(name, source).map_err(|error| error.to_string())
+        } else {
+            let context = self.cdp_context()?;
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let code = v8::String::new(scope, &source).ok_or("source too large")?;
+            match v8::Script::compile(scope, code, None).and_then(|script| script.run(scope)) {
+                Some(value) => Ok(v8::Global::new(scope, value)),
+                None => Err(exception_text(scope)),
+            }
+        };
         self.finish_heap_checked(result)
     }
 
@@ -1317,19 +1486,9 @@ impl ObscuraJsRuntime {
                 let Some(object_id) = arg.get("objectId").and_then(|value| value.as_str()) else {
                     continue;
                 };
-                let frame_id = object_id
-                    .strip_prefix("console-")
-                    .and_then(|rest| rest.split_once('-'))
-                    .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
-                    .unwrap_or(0);
-                let object_id_lit = js_string_literal(object_id);
-                let retrieval = if frame_id == 0 {
-                    format!("globalThis.__obscura_objects[{object_id_lit}]")
-                } else {
-                    format!(
-                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}]"
-                    )
-                };
+                // The host resolves console handles in their own native realm,
+                // not through a page-readable registry of child globals.
+                let retrieval = format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id));
                 self.object_store.insert(object_id.to_string(), retrieval);
             }
         }
@@ -1881,7 +2040,7 @@ impl ObscuraJsRuntime {
             let Some(element) = node.as_element() else {
                 continue;
             };
-            let candidate = match element.local.as_ref() {
+            let candidate = match &*element.local {
                 "img" => state
                     .render_resources
                     .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
@@ -2836,22 +2995,15 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
+        let frame_id = object_id.strip_prefix("frame-").or_else(|| object_id.strip_prefix("console-"))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok()).unwrap_or(0);
         self.evaluation_recipes.remove(object_id);
         if self.object_store.remove(object_id).is_some() {
-            let frame_id = object_id
-                .strip_prefix("console-")
-                .and_then(|rest| rest.split_once('-'))
-                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
-                .unwrap_or(0);
-            let object_id_lit = js_string_literal(object_id);
-            let code = if frame_id == 0 {
-                format!("delete globalThis.__obscura_objects[{object_id_lit}];")
-            } else {
-                format!(
-                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects[{object_id_lit}];"
-                )
-            };
-            let _ = self.execute_runtime_script("<release>", code);
+            if let Ok(_realm) = self.enter_cdp_frame(frame_id) {
+                let _ = self.execute_runtime_script("<release>", format!(
+                    "delete globalThis.__obscura_objects[{}];", js_string_literal(object_id)));
+            }
         }
     }
 
@@ -2859,20 +3011,19 @@ impl ObscuraJsRuntime {
         let mut frame_ids: Vec<u32> = self
             .object_store
             .keys()
-            .filter_map(|object_id| object_id.strip_prefix("console-"))
+            .filter_map(|object_id| object_id.strip_prefix("frame-").or_else(|| object_id.strip_prefix("console-")))
             .filter_map(|rest| rest.split_once('-'))
             .filter_map(|(frame_id, _)| frame_id.parse().ok())
             .filter(|frame_id| *frame_id != 0)
             .collect();
         frame_ids.sort_unstable();
         frame_ids.dedup();
-        let mut code = "globalThis.__obscura_objects = {};".to_string();
+        frame_ids.push(0);
         for frame_id in frame_ids {
-            code.push_str(&format!(
-                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
-            ));
+            if let Ok(_realm) = self.enter_cdp_frame(frame_id) {
+                let _ = self.execute_runtime_script("<releaseGroup>", "globalThis.__obscura_objects = {};".to_string());
+            }
         }
-        let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
         self.evaluation_recipes.clear();
     }
@@ -4047,7 +4198,12 @@ impl ObscuraJsRuntime {
     }
     fn make_oid(&self, _counter: u64) -> String {
         let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
+        let frame_id = self.cdp_frame_id.get();
+        if frame_id == 0 {
+            format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
+        } else {
+            format!("frame-{frame_id}-{{\"injectedScriptId\":1,\"id\":{id}}}")
+        }
     }
 
     fn wrap_expression(expression: &str) -> String {
@@ -4129,6 +4285,9 @@ impl ObscuraJsRuntime {
         if let Some(retrieval) = self.object_store.get(object_id) {
             return Some(retrieval.clone());
         }
+        if object_id.contains("::") && self.object_frame_id(object_id).ok() == Some(self.cdp_frame_id.get()) {
+            return Some(format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)));
+        }
         let expression = self.evaluation_recipes.get(object_id)?.clone();
         let object_id_literal = js_string_literal(object_id);
         let code =
@@ -4203,8 +4362,8 @@ impl ObscuraJsRuntime {
         &mut self,
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
+        let context = self.cdp_context()?;
         let mut entered = self.runtime();
-        let context = entered.main_context();
         v8::scope_with_context!(scope, entered.v8_isolate(), context);
         let local = deno_core::v8::Local::new(scope, result);
 
@@ -4285,8 +4444,8 @@ impl ObscuraJsRuntime {
     ) -> Result<RemoteObjectInfo, String> {
         // JSON cannot preserve undefined, bigint, or exceptional numbers.
         let primitive = {
+            let context = self.cdp_context()?;
             let mut entered = self.runtime();
-            let context = entered.main_context();
             v8::scope_with_context!(scope, entered.v8_isolate(), context);
             let value = deno_core::v8::Local::new(scope, &result);
             if value.is_undefined() {
@@ -5038,8 +5197,10 @@ mod tests {
                     retainedFrames.push(child);
                     frame.remove();
                 }
-                return retainedFrames.map(child => child.document.body.textContent);
-            })()"#).unwrap(), serde_json::json!(["retained", "retained", "retained", "retained"]));
+                return retainedFrames.map(child => {
+                    try { child.document; return 'allowed'; } catch (error) { return error.name; }
+                });
+            })()"#).unwrap(), serde_json::json!(["SecurityError", "SecurityError", "SecurityError", "SecurityError"]));
             drop(rt);
         }
     }
@@ -5054,7 +5215,15 @@ mod tests {
             v8::scope_with_context!(scope, entered.v8_isolate(), context);
             scope.get_current_context().set_slot(Rc::new(String::from("main context state")));
         }
-        rt.evaluate("__obscura_test_ops.op_register_document_realm({}, 123)").unwrap();
+        rt.execute_script("attempt-replace-native-delivery", r#"
+            globalThis.delivered = [];
+            addEventListener('message', event => delivered.push([event.data, event.origin, event.isTrusted]));
+            __obscura_test_ops.op_register_document_realm({}, 123,
+                () => delivered.push('forged'), {});
+        "#).unwrap();
+        rt.deliver_frame_message(0, r#"{"v":"native"}"#, "https://sender.example", 1, "*").unwrap();
+        assert_eq!(rt.evaluate("delivered").unwrap(),
+            serde_json::json!([["native", "https://sender.example", true]]));
         let mut entered = rt.runtime();
         let context = entered.main_context();
         v8::scope_with_context!(scope, entered.v8_isolate(), context);

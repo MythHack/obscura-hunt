@@ -154,7 +154,7 @@ fn relational_key_may_match(
         }
         Some(RelationalSelectorKey::LocalName(expected)) => dom_node
             .as_element()
-            .is_some_and(|element| element.local.as_ref().eq_ignore_ascii_case(expected)),
+            .is_some_and(|element| str::eq_ignore_ascii_case(&element.local, expected)),
     }
 }
 
@@ -187,10 +187,10 @@ impl RelationalInvalidation {
             RelationalSelectorKey::Attribute(expected) => dom_node.attrs().is_some_and(|attrs| {
                 attrs
                     .iter()
-                    .any(|attribute| attribute.name.local.as_ref().eq_ignore_ascii_case(expected))
+                    .any(|attribute| str::eq_ignore_ascii_case(&attribute.name.local, expected))
             }),
             RelationalSelectorKey::LocalName(expected) => {
-                element.local.as_ref().eq_ignore_ascii_case(expected)
+                str::eq_ignore_ascii_case(&element.local, expected)
             }
         })
     }
@@ -1738,7 +1738,7 @@ impl PseudoRuleMap {
         };
         node.as_element().is_some_and(|element| {
             self.bucket_matches_container_query_rule(
-                self.by_local.get(element.local.as_ref()),
+                self.by_local.get(&*element.local),
                 tree,
                 matcher,
                 nid,
@@ -1770,7 +1770,7 @@ impl PseudoRuleMap {
                 || node.attrs().is_some_and(|attributes| {
                     attributes.iter().any(|attribute| {
                         self.bucket_matches_container_query_rule(
-                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            self.by_attribute.get(&*attribute.name.local),
                             tree,
                             matcher,
                             nid,
@@ -2589,7 +2589,7 @@ impl Stylesheet {
         };
         let normal_match = node.as_element().is_some_and(|element| {
             self.bucket_matches_container_query_rule(
-                self.by_local.get(element.local.as_ref()),
+                self.by_local.get(&*element.local),
                 tree,
                 matcher,
                 nid,
@@ -2621,7 +2621,7 @@ impl Stylesheet {
                 || node.attrs().is_some_and(|attributes| {
                     attributes.iter().any(|attribute| {
                         self.bucket_matches_container_query_rule(
-                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            self.by_attribute.get(&*attribute.name.local),
                             tree,
                             matcher,
                             nid,
@@ -2636,7 +2636,7 @@ impl Stylesheet {
                 )
         });
         let supports_placeholder = node.as_element().is_some_and(|element| {
-            matches!(element.local.as_ref(), "input" | "textarea")
+            matches!(&*element.local, "input" | "textarea")
         });
         normal_match
             || self
@@ -3085,7 +3085,7 @@ impl Stylesheet {
             if let Some(node) = tree.borrow_node(nid) {
                 if let Some(element) = node.as_element() {
                     consider(
-                        rules.by_local.get(element.local.as_ref()),
+                        rules.by_local.get(&*element.local),
                         &mut normal_matched,
                         &mut important_matched,
                     );
@@ -3110,7 +3110,7 @@ impl Stylesheet {
                     if let Some(attributes) = node.attrs() {
                         for attribute in attributes {
                             consider(
-                                rules.by_attribute.get(attribute.name.local.as_ref()),
+                                rules.by_attribute.get(&*attribute.name.local),
                                 &mut normal_matched,
                                 &mut important_matched,
                             );
@@ -3248,7 +3248,7 @@ impl Stylesheet {
             .borrow_node(nid)
             .is_some_and(|node| {
                 node.as_element().is_some_and(|element| {
-                    matches!(element.local.as_ref(), "input" | "textarea")
+                    matches!(&*element.local, "input" | "textarea")
                 })
             });
         (
@@ -3717,7 +3717,7 @@ impl Stylesheet {
                 if let Some(attributes) = node.attrs() {
                     for attribute in attributes {
                         consider(
-                            self.by_attribute.get(attribute.name.local.as_ref()),
+                            self.by_attribute.get(&*attribute.name.local),
                             &mut normal_matched,
                             &mut important_matched,
                         );
@@ -6356,8 +6356,7 @@ fn parse_container_query(input: &str) -> Option<ContainerQuery> {
 }
 
 fn parse_container_query_name(input: &str) -> Option<String> {
-    let mut input = cssparser::ParserInput::new(input.trim());
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(input.trim());
     let ident = parser.expect_ident_cloned().ok()?;
     if !parser.is_exhausted() {
         return None;
@@ -6441,8 +6440,7 @@ fn parse_container_query_in_parens(input: &str, depth: usize) -> Option<Containe
 }
 
 fn is_general_enclosed_container_query(input: &str) -> bool {
-    let mut input = cssparser::ParserInput::new(input.trim());
-    let mut parser = cssparser::Parser::new(&mut input);
+    let mut parser = cssparser::Parser::new(input.trim());
     matches!(
         parser.next(),
         Ok(cssparser::Token::Ident(_)) | Ok(cssparser::Token::Function(_))

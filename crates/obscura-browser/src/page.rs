@@ -176,6 +176,8 @@ fn navigation_referrer(source: &Url, target: &Url) -> String {
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
+    /// Initiating native realm; zero is the main document.
+    pub frame_id: u32,
     /// The live interception channel already emitted the request start.
     pub intercepted: bool,
     pub url: String,
@@ -307,6 +309,7 @@ pub struct Page {
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
+    mouse_gesture_frame: Option<u32>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
@@ -1125,6 +1128,7 @@ impl Page {
             response_bodies: std::collections::HashMap::new(),
             response_body_order: std::collections::VecDeque::new(),
             network_event_counter: 0,
+            mouse_gesture_frame: None,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
@@ -1206,6 +1210,12 @@ impl Page {
             else {
                 return false;
             };
+            if self.js.as_ref().and_then(|js| js.live_frame_owner(frame.frame_id))
+                .is_none_or(|(parent_id, _)| parent_id != frame.parent_frame_id)
+            {
+                self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                return true;
+            }
             // A realm is a live v8::Context plus a DOM tree, and the page realm
             // holds its window and document, so nothing here can be collected
             // while the document lives. Frames are released when the document
@@ -1364,17 +1374,12 @@ impl Page {
         }
 
         for message in pending {
-            let escaped_data = serde_json::to_string(&message.data_json).unwrap_or_default();
-            let escaped_origin = serde_json::to_string(&message.origin).unwrap_or_default();
-            let escaped_target_origin =
-                serde_json::to_string(&message.target_origin).unwrap_or_default();
             if message.target_frame_id == 0 {
                 let Some(js) = self.js.as_mut() else { continue };
-                let script = format!(
-                    "globalThis.__obscura_deliverMessage({escaped_data}, {escaped_origin}, {}, {escaped_target_origin});",
-                    message.source_frame_id,
-                );
-                if let Err(error) = js.execute_script("<frame-message>", &script) {
+                if let Err(error) = js.deliver_frame_message(
+                    0, &message.data_json, &message.origin,
+                    message.source_frame_id, &message.target_origin,
+                ) {
                     tracing::debug!("message to the page failed: {error}");
                 }
                 continue;
@@ -1414,17 +1419,13 @@ impl Page {
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
                globalThis.__obscura_frameElements[{frame_id}]._frameId = 0;\
-               if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
-                 globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
              }}\
-             delete globalThis.__obscura_frameObjects[{frame_id}];\
-             delete globalThis.__obscura_frameWindows[{frame_id}];\
-             delete globalThis.__obscura_frameElements[{frame_id}];"
+             globalThis.__obscura_forgetFrame({frame_id});"
         );
         self.execute_frame_owner_script(parent_frame_id, &script);
         if parent_frame_id != 0 {
             let page_script = format!(
-                "delete globalThis.__obscura_frameObjects[{frame_id}];"
+                "globalThis.__obscura_forgetFrame({frame_id});"
             );
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
@@ -1615,6 +1616,101 @@ impl Page {
         realm.evaluate(js, expression)
     }
 
+
+    pub fn live_frame_owner(&self, frame_id: u32) -> Option<(u32, obscura_dom::NodeId)> {
+        self.frames.iter().find(|frame| frame.frame_id() == frame_id)?;
+        self.js.as_ref()?.live_frame_owner(frame_id)
+    }
+
+    pub fn network_frame_registry(&self)
+        -> Option<std::rc::Rc<std::cell::RefCell<obscura_js::ops::RealmStates>>>
+    {
+        self.js.as_ref().map(|js| js.network_frame_registry())
+    }
+
+    pub fn mouse_event_frame(&mut self, event_type: &str, x: f64, y: f64)
+        -> Result<(u32, f64, f64, Option<u32>), String>
+    {
+        if self.mouse_gesture_frame.is_some_and(|id| id != 0 && self.live_frame_owner(id).is_none()) {
+            self.mouse_gesture_frame = None;
+            return Err("Mouse gesture frame owner is stale".to_string());
+        }
+        #[cfg(feature = "render")]
+        let hit = {
+            let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+            let node = js.native_hit_test(0, x, y)?;
+            let child = js.network_frame_registry().borrow().live_frame_owners().into_iter()
+                .find_map(|(id, parent, owner)| (parent == 0 && Some(owner) == node).then_some(id));
+            if let Some(frame_id) = child {
+                if !self.frames.iter().any(|frame| frame.frame_id() == frame_id) {
+                    return Err("Child frame context is not ready for input".to_string());
+                }
+                if let Some((local_x, local_y)) = js.direct_child_point(frame_id, x, y)? {
+                    let child_node = js.native_hit_test(frame_id, local_x, local_y)?
+                        .ok_or("Child frame has no native hit target")?;
+                    (frame_id, local_x, local_y, Some(child_node.index() as u32))
+                } else { (0, x, y, node.map(|id| id.index() as u32)) }
+            } else { (0, x, y, node.map(|id| id.index() as u32)) }
+        };
+        #[cfg(not(feature = "render"))]
+        let hit = {
+            if !self.frames.is_empty() {
+                return Err("Native child frame input requires rendering support".to_string());
+            }
+            (0, x, y, None)
+        };
+        if let Some(pressed_frame) = self.mouse_gesture_frame {
+            if pressed_frame != hit.0
+                || (pressed_frame != 0 && self.live_frame_owner(pressed_frame).is_none())
+            {
+                self.mouse_gesture_frame = None;
+                let _ = self.evaluate_in_native_frame(pressed_frame, "globalThis.__obscura_mouse_down = null");
+                return Err("Mouse gesture frame owner changed or is obscured".to_string());
+            }
+        }
+        if event_type == "mousePressed" { self.mouse_gesture_frame = Some(hit.0); }
+        if event_type == "mouseReleased" { self.mouse_gesture_frame = None; }
+        Ok(hit)
+    }
+
+    pub fn object_frame_id(&self, object_id: &str) -> Result<u32, String> {
+        self.js.as_ref().ok_or("JavaScript runtime unavailable")?.object_frame_id(object_id)
+    }
+
+    pub fn evaluate_in_native_frame(&mut self, frame_id: u32, expression: &str)
+        -> Result<serde_json::Value, String>
+    {
+        if frame_id != 0 && self.live_frame_owner(frame_id).is_none() {
+            return Err("Cannot find live child frame context".to_string());
+        }
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
+            .evaluate_in_cdp_frame(frame_id, expression)
+    }
+
+    pub async fn evaluate_for_cdp_in_frame(
+        &mut self, frame_id: u32, expression: &str, return_by_value: bool,
+        await_promise: bool, timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if frame_id == 0 {
+            return self.evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, timeout_ms).await;
+        }
+        self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
+            .evaluate_for_cdp_in_frame(frame_id, expression, return_by_value, await_promise, timeout_ms).await
+    }
+
+    pub async fn call_function_on_for_cdp_in_frame(
+        &mut self, frame_id: u32, declaration: &str, object_id: Option<&str>,
+        arguments: &[serde_json::Value], return_by_value: bool, await_promise: bool,
+        timeout_ms: u64,
+    ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
+        if frame_id != 0 {
+            self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
+        }
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
+            .call_function_on_for_cdp_in_frame(frame_id, declaration, object_id, arguments,
+                return_by_value, await_promise, timeout_ms).await
+    }
     /// Update the page's CSS viewport. Calling this before navigation makes
     /// responsive scripts observe it from their first instruction; calling it
     /// on a live page mirrors CDP's device-metrics override surfaces.
@@ -2266,7 +2362,7 @@ impl Page {
                         let Some(name) = node.as_element() else {
                             continue;
                         };
-                        if name.local.as_ref() == "base" && !found_base {
+                        if &*name.local == "base" && !found_base {
                             if let Some(href) = node.get_attribute("href") {
                                 found_base = true;
                                 if let Some(resolved) =
@@ -2275,7 +2371,7 @@ impl Page {
                                     active_base = Some(resolved);
                                 }
                             }
-                        } else if name.local.as_ref() == "script" {
+                        } else if &*name.local == "script" {
                             bases_at_script.insert(
                                 nid.raw(),
                                 active_base
@@ -3817,7 +3913,7 @@ impl Page {
                     };
                     if node
                         .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "style")
+                        .is_some_and(|element| &*element.local == "style")
                     {
                         sources.push(dom.text_content(id));
                     }
@@ -3826,7 +3922,7 @@ impl Page {
                     }
                     if node
                         .as_element()
-                        .is_some_and(|element| element.local.as_ref() == "use")
+                        .is_some_and(|element| &*element.local == "use")
                     {
                         if let Some(href) = node
                             .get_attribute("href")
@@ -4268,6 +4364,7 @@ impl Page {
         for ev in events {
             self.network_events.push(NetworkEvent {
                 request_id: ev.request_id,
+                frame_id: ev.frame_id,
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
@@ -4571,6 +4668,7 @@ impl Page {
             .as_secs_f64();
         self.network_events.push(NetworkEvent {
             request_id: request_id.clone(),
+            frame_id: 0,
             intercepted: false,
             url: url.to_string(),
             method: method.to_string(),
@@ -6983,9 +7081,9 @@ mod tests {
             .js
             .as_mut()
             .unwrap()
-            .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
+            .evaluate("f.contentWindow.__ran === 'YES' && typeof __obscura_frameObjects === 'undefined'")
             .unwrap();
-        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+        assert_eq!(published, serde_json::json!(true), "the page cannot reach the frame");
     }
 
     /// The sweep still does its job: an iframe removed from the document has
@@ -7012,14 +7110,14 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                "Object.keys(globalThis.__obscura_frameObjects).length\
-                 + Object.keys(globalThis.__obscura_frameWindows).length\
-                 + Object.keys(globalThis.__obscura_frameElements).length",
+                "typeof __obscura_frameObjects === 'undefined'\
+                 && typeof __obscura_frameWindows === 'undefined'\
+                 && globalThis.__obscura_liveFrameIds().length === 0",
             )
             .unwrap();
         assert_eq!(
-            left.as_f64(),
-            Some(0.0),
+            left,
+            serde_json::json!(true),
             "a reference to the discarded frame survived, so its context cannot be collected"
         );
     }
@@ -10048,7 +10146,7 @@ mod tests {
                             .unwrap_or_default();
                         if dom.get_node(nid).is_some_and(|node| {
                             node.as_element()
-                                .is_some_and(|element| element.local.as_ref() == "style")
+                                .is_some_and(|element| &*element.local == "style")
                         }) {
                             sources.push(dom.text_content(nid));
                         }

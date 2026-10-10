@@ -9,6 +9,7 @@ use crate::dispatch::CdpContext;
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
 /// requests silently default to node 0 and click the wrong element.
 fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
+    reject_child_node_handle(page, params)?;
     if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64()) {
         return Ok(nid);
     }
@@ -29,6 +30,15 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
         return Ok(nid as u64);
     }
     Err("nodeId, backendNodeId, or objectId required".to_string())
+}
+
+fn reject_child_node_handle(page: &Page, params: &Value) -> Result<(), String> {
+    if let Some(id) = params.get("objectId").and_then(Value::as_str) {
+        if page.object_frame_id(id)? != 0 {
+            return Err("Child DOM node handles require frame-scoped backend node IDs, which are not supported".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Standard base64 (with padding). Used to ferry file bytes to the JS layer for
@@ -94,6 +104,16 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "getFrameOwner" => {
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let id = params.get("frameId").and_then(Value::as_str).ok_or("frameId required")?;
+            let frame_id = super::page::native_frame_id(page, id)?;
+            let (parent, owner) = page.live_frame_owner(frame_id).ok_or("No live owner for frame")?;
+            if parent != 0 {
+                return Err("Nested frame owner backend node IDs are not supported".to_string());
+            }
+            Ok(json!({"nodeId": owner.index(), "backendNodeId": owner.index()}))
+        }
         "enable" => Ok(json!({})),
         "getDocument" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
@@ -133,6 +153,7 @@ pub async fn handle(
         }
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            reject_child_node_handle(page, params)?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
 
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
@@ -162,7 +183,12 @@ pub async fn handle(
             Ok(json!({ "node": node }))
         }
         "resolveNode" => {
+            let frame_id = super::runtime::validate_context(params, "executionContextId", ctx, session_id, "resolveNode")?.unwrap_or(0);
+            if frame_id != 0 {
+                return Err("Child DOM backend node IDs are not supported".to_string());
+            }
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            reject_child_node_handle(page, params)?;
             let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
             {
@@ -418,8 +444,8 @@ fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
         }
         NodeData::Element { name, attrs, .. } => {
             result["nodeType"] = json!(1);
-            result["nodeName"] = json!(name.local.as_ref().to_ascii_uppercase());
-            result["localName"] = json!(name.local.as_ref());
+            result["nodeName"] = json!(str::to_ascii_uppercase(&name.local));
+            result["localName"] = json!(&*name.local);
             result["nodeValue"] = json!("");
             let cdp_attrs: Vec<String> = attrs.iter()
                 .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();

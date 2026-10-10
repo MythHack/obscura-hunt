@@ -157,12 +157,20 @@ pub async fn handle(
             let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
+            let (frame_id, x, y, target_node) = if matches!(event_type,
+                "mouseMoved" | "mousePressed" | "mouseReleased" | "mouseWheel")
+            {
+                ctx.get_session_page_mut(session_id).ok_or("No page")?
+                    .mouse_event_frame(event_type, x, y)?
+            } else { (0, x, y, None) };
+            let target_expression = target_node.map(|id| format!("globalThis._wrap({id})"))
+                .unwrap_or_else(|| format!("(document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body"));
 
             if event_type == "mouseMoved" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
+                            var target = {target_expression};\
                             if (!target) return;\
                             var old = globalThis.__obscura_hover_target || null;\
                             globalThis.__obscura_hover_target = target;\
@@ -184,13 +192,13 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_in_native_frame(frame_id, &code)?;
                 }
             } else if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = {target_expression};\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
@@ -236,13 +244,13 @@ pub async fn handle(
                         shift_key = shift_key,
                         pointer_pressure = if buttons == 0 { 0.0 } else { 0.5 },
                     );
-                    page.evaluate(&code);
+                    page.evaluate_in_native_frame(frame_id, &code)?;
                 }
             } else if event_type == "mouseReleased" {
                 let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = {target_expression};\
                             if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
@@ -334,10 +342,10 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_in_native_frame(frame_id, &code)?;
                     // Document navigation runs after the input acknowledgement.
                     // Same-document routing still needs a frame notification.
-                    if !page.has_pending_navigation() && page.sync_virtual_url() {
+                    if frame_id == 0 && !page.has_pending_navigation() && page.sync_virtual_url() {
                         Some((page.frame_id.clone(), page.url_string()))
                     } else {
                         None
@@ -354,7 +362,7 @@ pub async fn handle(
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body || document.documentElement;\
+                            var target = {target_expression};\
                             if (!target) return;\
                             var wheel = globalThis.__obscura_markTrusted(new WheelEvent('wheel', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},deltaX:{delta_x},deltaY:{delta_y},deltaMode:0,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             if (!target.dispatchEvent(wheel)) return;\
@@ -395,7 +403,7 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    page.evaluate(&code);
+                    page.evaluate_in_native_frame(frame_id, &code)?;
                 }
             }
 
