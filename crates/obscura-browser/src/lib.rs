@@ -16,7 +16,7 @@ pub use obscura_js::{
     validate_capture_region, AnimationSample, AnimationSampleMode, AnimationSampleTime,
     CaptureError, CaptureRegion,
 };
-pub use page::{NetworkEvent, Page, PageError};
+pub use page::{url_matches_cdp_pattern, NetworkEvent, Page, PageError};
 pub use window::{WindowEvent, WindowId, WindowInfo};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};

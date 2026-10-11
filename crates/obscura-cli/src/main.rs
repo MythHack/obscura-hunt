@@ -193,6 +193,10 @@ enum Command {
     },
 
     Mcp {
+        /// Recursively load additional font files before the first render.
+        #[arg(long = "font-dir", value_name = "DIR")]
+        font_dirs: Vec<std::path::PathBuf>,
+
         #[arg(long)]
         http: bool,
 
@@ -587,12 +591,14 @@ async fn run_cli() -> anyhow::Result<()> {
             .await?;
         }
         Some(Command::Mcp {
+            font_dirs,
             http,
             host,
             port,
             proxy,
             user_agent,
         }) => {
+            configure_font_directories(&font_dirs)?;
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
                 obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
@@ -2496,6 +2502,21 @@ mod tests {
                 ]
             ),
             _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn parsed_mcp_accepts_repeated_font_directories() {
+        let args = Args::try_parse_from([
+            "obscura", "mcp", "--font-dir", "/fonts/cjk", "--font-dir", "/fonts/brand",
+        ])
+        .expect("clap should accept MCP font directories");
+        match args.command {
+            Some(Command::Mcp { font_dirs, .. }) => assert_eq!(
+                font_dirs,
+                [std::path::PathBuf::from("/fonts/cjk"), std::path::PathBuf::from("/fonts/brand")]
+            ),
+            _ => panic!("expected Mcp command"),
         }
     }
 

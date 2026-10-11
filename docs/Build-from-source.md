@@ -12,8 +12,9 @@ and linking. For the scoped incremental runtime workflow, see
 ## Build
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
-cd obscura
+git clone https://github.com/MythHack/obscura-hunt.git
+cd obscura-hunt
+export RUSTC_WRAPPER=sccache
 cargo build --release -p obscura-cli --bins --features render
 ```
 
@@ -31,6 +32,25 @@ cargo build --release -p obscura-cli --bins --features render,stealth
 This is the complete rendering build with the stealth wreq/BoringSSL transport,
 TLS fingerprint randomization, browser-identity protections, and tracker
 blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
+
+### Fork dependency patches
+
+This fork selects its local dependency patches through the workspace
+`[patch.crates-io]`; Cargo builds them automatically, in place of the original
+packages. They are not additional browser processes or separately built modules.
+
+`vendor/deno_core-0.412.0` supplies the native `BrowserRealm` interface used by
+related windows. Each document has its own module registry inside the shared V8
+isolate, and navigating or closing one document retires only its module work.
+The original dependency keeps `JsRealm` and `ModuleMap` private, so this integration
+cannot be implemented through its public interface alone. Keep the patch until
+an upstream interface can replace it without losing those browser semantics.
+
+Use the scoped `-p obscura-cli --bins` commands above to build `obscura` and
+`obscura-worker`. An unscoped workspace build also builds auxiliary programs such
+as `paint_file`, the upstream HTML-to-PNG rendering harness; HuntForge does not
+require that executable.
+
 
 ## Without rendering
 

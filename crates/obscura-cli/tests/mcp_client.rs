@@ -7,6 +7,39 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 const OBSCURA: &str = env!("CARGO_BIN_EXE_obscura");
+
+#[test]
+fn mcp_font_directory_is_validated_before_either_transport_starts() {
+    let missing = std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
+    assert!(!missing.exists());
+    for http in [false, true] {
+        let mut command = Command::new(OBSCURA);
+        command.args(["mcp", "--font-dir"]).arg(&missing).stdin(Stdio::null());
+        if http {
+            command.args(["--http", "--port", "0"]);
+        }
+        let output = command.output().expect("start MCP with invalid font directory");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
+    }
+}
+
+#[test]
+fn mcp_font_directory_respects_render_feature() {
+    let output = Command::new(OBSCURA)
+        .args(["mcp", "--font-dir"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("start MCP with existing font directory");
+    if cfg!(feature = "render") {
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    } else {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--font-dir requires a render-enabled build"));
+    }
+}
+
 const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
 <body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
 <a href="/more">More information...</a></body></html>"#;
@@ -377,6 +410,24 @@ fn test_wait_drives_timer_and_queued_navigation() {
         serde_json::json!({"expression": "document.title"}),
     );
     assert_eq!(content_text(&title), QUEUED_NAVIGATION_TITLE);
+}
+
+#[test]
+fn test_wait_for_function_drives_scheduled_page_tasks() {
+    let mut c = McpClient::spawn();
+    c.tool("browser_navigate", serde_json::json!({"url": TIMER_TEST_INITIAL_PAGE}));
+    c.tool("browser_evaluate", serde_json::json!({
+        "expression": "(setTimeout(() => { window.ready = 'timer completed'; }, 20), false)"
+    }));
+
+    let waited = c.tool("browser_wait_for_function", serde_json::json!({
+        "function": "window.ready === 'timer completed'",
+        "timeout": 1000,
+        "pollIntervalMs": 10
+    }));
+    assert!(waited["result"]["isError"].is_null(), "wait failed: {waited}");
+    let value = c.tool("browser_evaluate", serde_json::json!({"expression": "window.ready"}));
+    assert_eq!(content_text(&value), "timer completed");
 }
 
 #[test]
