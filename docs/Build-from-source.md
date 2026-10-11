@@ -33,6 +33,24 @@ This is the complete rendering build with the stealth wreq/BoringSSL transport,
 TLS fingerprint randomization, browser-identity protections, and tracker
 blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
+### Windows (PowerShell)
+
+Install the Visual Studio C++ Build Tools, CMake, and LLVM. The stealth transport
+uses bindgen, which must load `libclang.dll`; having `clang.exe` on `PATH` alone
+does not guarantee that the DLL can be found. Set `LIBCLANG_PATH` to the directory
+containing the DLL, not to the DLL file. For an LLVM installation at `E:\LLVM`:
+
+```powershell
+$env:RUSTC_WRAPPER = "sccache"
+$env:LIBCLANG_PATH = "E:\LLVM\bin" # Replace with your actual LLVM bin directory.
+cargo build --release --locked -p obscura-cli --bins --features render,stealth
+```
+
+These variables apply to the current terminal. If BoringSSL produced `crypto.lib`
+and `ssl.lib` but bindgen reports `Unable to find libclang`, fix this DLL path and
+rerun the build. Do not run `cargo clean`: the completed native libraries remain
+reusable.
+
 ### Fork dependency patches
 
 This fork selects its local dependency patches through the workspace
@@ -70,10 +88,8 @@ development libraries. On Ubuntu/Debian:
 sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
 ```
 
-On macOS, install the Xcode Command Line Tools and CMake. On Windows, install
-the Visual Studio C++ Build Tools, CMake, and LLVM/Clang. Ensure the directory
-containing `libclang` is available through `LIBCLANG_PATH` if bindgen cannot
-locate it automatically.
+On macOS, install the Xcode Command Line Tools and CMake. For the Windows toolchain
+and DLL search path, see [Windows (PowerShell)](#windows-powershell).
 
 On macOS 26 with the standalone Command Line Tools, Apple Clang may not find
 libc++ while compiling BoringSSL. Use the active SDK for that build:
