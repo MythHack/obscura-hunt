@@ -51,6 +51,20 @@ and `ssl.lib` but bindgen reports `Unable to find libclang`, fix this DLL path a
 rerun the build. Do not run `cargo clean`: the completed native libraries remain
 reusable.
 
+To avoid setting the variable in every terminal, add a machine-local default to
+`$CARGO_HOME/config.toml` (normally `~/.cargo/config.toml`), merging with an existing
+`[env]` table if present:
+
+```toml
+[env]
+LIBCLANG_PATH = { value = "E:/LLVM/bin", force = false }
+```
+
+Use your actual LLVM directory. Explicit shell values still take precedence.
+Do not commit an absolute machine path to the project's `.cargo/config.toml`:
+Cargo applies `[env]` on every platform, and an explicit `LIBCLANG_PATH` disables
+clang-sys's normal library search outside that directory.
+
 ### Fork dependency patches
 
 This fork selects its local dependency patches through the workspace
