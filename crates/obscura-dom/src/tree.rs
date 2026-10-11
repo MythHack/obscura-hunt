@@ -764,6 +764,36 @@ impl DomTree {
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
     }
 
+    /// Whether `ancestor` is an inclusive ancestor of `node` through ordinary
+    /// parent links only (a shadow root ends the walk), as MutationObserver
+    /// subtree matching requires. Bounded like the other ancestor walks.
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = Some(node);
+        for _ in 0..=inner.nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor {
+                return true;
+            }
+            current = inner
+                .nodes
+                .get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    /// Whether `ancestor` is a host-including inclusive ancestor of `node`, the
+    /// DOM pre-insertion check that stops a node from being inserted into its
+    /// own subtree. Uses the same bounded walk as the reparenting guards.
+    pub fn is_host_including_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        if ancestor == node {
+            return true;
+        }
+        let inner = self.inner.borrow();
+        Self::would_create_host_including_cycle(&inner, node, ancestor)
+    }
     /// DOM insertion rejects a node when it is a host-including inclusive
     /// ancestor of the destination parent. Ordinary parent links are not enough
     /// for this check because a ShadowRoot's parent is intentionally null.

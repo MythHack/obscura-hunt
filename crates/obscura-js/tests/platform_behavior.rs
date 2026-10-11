@@ -562,3 +562,246 @@ fn geometry_math_uses_receiver_coordinates_and_preserves_all_exposed_operations(
         [false,true,true],["SyntaxError",7],"TypeError","TypeError","TypeError","InvalidStateError",
         "TypeError","TypeError","TypeError",true,[24,40,9],{"x":7,"y":10,"z":0,"w":1}]));
 }
+
+
+
+
+
+#[test]
+fn detached_documents_adopt_real_nodes_without_losing_identity_or_mutating_the_live_page() {
+    let mut rt = page("<body><div id='live'>untouched</div></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const first = document.implementation.createHTMLDocument('Editor');
+        const second = document.implementation.createHTMLDocument();
+        const node = first.createElement('p'); node.append(first.createTextNode('draft'));
+        first.body.appendChild(node);
+        const text = node.firstChild, adopted = second.adoptNode(node);
+        const detached = node.parentNode === null;
+        second.body.appendChild(node);
+        const imported = document.importNode(node,true);
+        const parsed = new DOMParser().parseFromString('<p id="parsed">content</p>','text/html');
+        const range = first.createRange();
+        const xml = first.implementation.createDocument('urn:notes','n:root',first.implementation.createDocumentType('n:root','public','system'));
+        const cdata = xml.createCDATASection('data'), pi = xml.createProcessingInstruction('target','value');
+        xml.documentElement.append(cdata,pi);
+        return [first instanceof Document,first.defaultView,first.title,first.doctype.name,
+            adopted === node,detached,node.ownerDocument === second,text.ownerDocument === second,
+            first.body.childNodes.length,second.body.textContent,imported !== node,
+            imported.ownerDocument === document,imported.textContent,document.getElementById('live').textContent,
+            parsed instanceof Document,parsed.getElementById('parsed').ownerDocument === parsed,
+            range.startContainer === first,range.collapsed,first.location,first.hasFocus(),first.getSelection(),
+            xml instanceof XMLDocument,xml.documentElement.namespaceURI,xml.doctype.publicId,xml.doctype.systemId,
+            cdata.cloneNode().ownerDocument===xml,pi.cloneNode().ownerDocument===xml];
+    })()"#).unwrap(),json!([true,null,"Editor","html",true,true,true,true,0,"draft",true,true,"draft","untouched",true,true,true,true,
+        null,false,null,true,"urn:notes","public","system",true,true]));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn mutation_observers_keep_original_values_filters_and_removed_subtrees_until_delivery() {
+    let mut rt = page("<div id='root'><span id='child' data-x='old'>abc</span></div>");
+    rt.evaluate(r#"globalThis.deliveries = []; globalThis.callbackThis = false;
+        globalThis.root = document.getElementById('root'); globalThis.child = document.getElementById('child');
+        globalThis.observer = new MutationObserver(function(records, self) {
+            callbackThis = this === self;
+            deliveries.push(records.map(r => [r.type,r.target.id || r.target.nodeName,r.attributeName,r.attributeNamespace,
+                r.oldValue,r instanceof MutationRecord,r.addedNodes instanceof NodeList,r.removedNodes instanceof NodeList]));
+        });
+        observer.observe(root,{subtree:true,childList:true,attributeOldValue:true,attributeFilter:['data-x'],characterDataOldValue:true});
+        child.setAttribute('data-x','new'); child.setAttribute('ignored','x');
+        child.setAttributeNS('urn:other','p:data-x','namespaced');
+        child.firstChild.nodeValue = 'def';
+        root.removeChild(child); child.setAttribute('data-x','detached');
+    "#).unwrap();
+    rt.run_event_loop().await.unwrap();
+    assert_eq!(rt.evaluate("[callbackThis,deliveries]").unwrap(),json!([true,[[
+        ["attributes","child","data-x",null,"old",true,true,true],
+        ["characterData","#text",null,null,"abc",true,true,true],
+        ["childList","root",null,null,null,true,true,true],
+        ["attributes","child","data-x",null,"new",true,true,true]
+    ]]]));
+    rt.evaluate("child.setAttribute('data-x','after'); observer.disconnect(); root.appendChild(child);").unwrap();
+    rt.run_event_loop().await.unwrap();
+    assert_eq!(rt.evaluate("deliveries.length").unwrap(),json!(1));
+    assert_eq!(rt.evaluate(r#"(() => {
+        const fails = f => { try { f(); return ''; } catch(e) { return e.name; } };
+        const o = new MutationObserver(()=>{}); o.observe(root,{attributes:true,attributeOldValue:true});
+        o.observe(root,{childList:true}); root.setAttribute('data-x','not-recorded');
+        root.replaceChildren('x','y');
+        const r = o.takeRecords();
+        return [fails(()=>new MutationObserver(null)),fails(()=>o.observe(root,{})),
+            fails(()=>o.observe(root,{attributes:false,attributeOldValue:true})),
+            fails(()=>new MutationRecord()),r.length,Array.from(r[0].addedNodes,n=>n.data),
+            r[0].removedNodes[0]===child,r[0].oldValue];
+    })()"#).unwrap(),json!(["TypeError","TypeError","TypeError","TypeError",1,["x","y"],true,null]));
+}
+#[test]
+fn dom_preinsert_validity_and_fragment_moves_report_real_tree_changes() {
+    let mut rt = page("<body><div id='old'><i id='move'></i></div><div id='new'><b id='tail'></b></div></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const old = document.getElementById('old'), dest = document.getElementById('new');
+        const move = document.getElementById('move'), tail = document.getElementById('tail');
+        const records = new MutationObserver(() => {}); records.observe(document.body,{childList:true,subtree:true});
+        const fragment = document.createDocumentFragment(); fragment.append(move,document.createTextNode('x'));
+        const fragRecords = new MutationObserver(() => {}); fragRecords.observe(fragment,{childList:true});
+        dest.insertBefore(fragment,tail);
+        const summarize = r => [r.target.id || r.target.nodeName,Array.from(r.addedNodes,n=>n.id || n.data),
+            Array.from(r.removedNodes,n=>n.id || n.data),r.previousSibling && r.previousSibling.id,r.nextSibling && r.nextSibling.id];
+        const result = records.takeRecords().map(summarize), emptied = fragRecords.takeRecords().map(summarize);
+        const fails = f => { try { f(); return ''; } catch(e) { return e.name; } };
+        const errors = [fails(()=>move.appendChild(document.body)),fails(()=>dest.appendChild({_nid:move._nid})),
+            fails(()=>document.appendChild(document.createTextNode('bad'))),fails(()=>document.appendChild(document.createElement('html'))),
+            fails(()=>dest.insertBefore(move,old)),fails(()=>dest.replaceChild(document,tail))];
+        return [dest.textContent,Array.from(dest.childNodes,n=>n.id || n.data),fragment.childNodes.length,result,emptied,errors,
+            move.compareDocumentPosition(tail),tail.compareDocumentPosition(move),move.ownerDocument === document];
+    })()"#).unwrap(), json!(["x",["move","x","tail"],0,
+        [["old",[],["move"],null,null],["new",["move","x"],[],null,"tail"]],
+        [["#document-fragment",[],["move","x"],null,null]],
+        ["HierarchyRequestError","TypeError","HierarchyRequestError","HierarchyRequestError","NotFoundError","HierarchyRequestError"],4,2,true]));
+}
+#[test]
+fn click_reentrancy_does_not_flip_cancelled_controls_or_skip_legend_rules() {
+    let mut rt = page("<fieldset disabled><legend><input id='free' type='checkbox'></legend><legend><input id='blocked' type='checkbox'></legend><div><legend><button id='wrapped'>No</button></legend></div></fieldset><input id='cancel' type='checkbox'>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const free = document.getElementById('free'), blocked = document.getElementById('blocked');
+        const cancel = document.getElementById('cancel'), wrapped = document.getElementById('wrapped');
+        let calls = 0, changes = 0, blockedCalls = 0;
+        free.addEventListener('click', () => { if (++calls < 4) free.click(); });
+        free.addEventListener('change', () => changes++);
+        blocked.addEventListener('click', () => blockedCalls++);
+        wrapped.addEventListener('click', () => blockedCalls++);
+        free._clickInProgress = true; free.click(); blocked.click(); wrapped.click();
+        cancel.indeterminate = true;
+        cancel.addEventListener('click', e => { cancel.click(); e.preventDefault(); });
+        cancel.click();
+        free.click();
+        const inert = document.createElement('div'); inert.setAttribute('disabled','');
+        let inertCalls = 0; inert.addEventListener('click', () => inertCalls++); inert.click();
+        return [calls,changes,free.checked,blocked.checked,blockedCalls,
+            cancel.checked,cancel.indeterminate,inertCalls];
+    })()"#).unwrap(), json!([2,2,false,false,0,false,true,1]));
+}
+#[test]
+fn html_interfaces_do_not_misroute_style_loader_or_framework_value_trackers() {
+    let mut rt = page("<head></head><body><div id='target'></div></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const head = document.head, div = document.getElementById('target');
+        const input = document.createElement('input'), textarea = document.createElement('textarea');
+        const foreign = document.createElementNS('urn:foreign', 'div');
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        const styleTarget = head instanceof HTMLIFrameElement ? head.contentDocument.head : head;
+        const style = document.createElement('style'); style.textContent = '.ready { color: green }';
+        styleTarget.appendChild(style);
+        Object.defineProperty(div, 'tagName', {value:'IFRAME'});
+        let constructorError = ''; try { new HTMLDivElement(); } catch(e) { constructorError = e.name; }
+        HTMLDivElement.prototype.brand = 'div'; HTMLIFrameElement.prototype.brand = 'iframe';
+        return [style.parentNode === head, div instanceof HTMLDivElement,
+            div instanceof HTMLIFrameElement, foreign instanceof HTMLDivElement,
+            svg instanceof HTMLElement, input instanceof HTMLInputElement,
+            input instanceof HTMLTextAreaElement, textarea instanceof HTMLTextAreaElement,
+            !!Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set,
+            !!Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'checked').set,
+            Object.getPrototypeOf(document.createElement('div')) === HTMLDivElement.prototype,
+            HTMLDivElement.prototype !== HTMLIFrameElement.prototype,constructorError,div.brand,
+            document.createElement('iframe').brand,Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set instanceof Function];
+    })()"#).unwrap(), json!([true,true,false,false,false,true,false,true,true,true,true,true,"TypeError","div","iframe",true]));
+}
+
+#[test]
+fn ranges_clone_extract_delete_insert_and_surround_actual_dom_content() {
+    let mut rt = page("<body><div id='edit'><b>ab</b><i>cd</i><u>ef</u></div></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const host = document.getElementById('edit'), middle = host.children[1];
+        const first = host.firstChild.firstChild, last = host.lastChild.firstChild;
+        const observer = new MutationObserver(()=>{}); observer.observe(host,{subtree:true,childList:true,characterDataOldValue:true});
+        const range = document.createRange(); range.setStart(first,1); range.setEnd(last,1);
+        const clone = range.cloneContents();
+        const cloneHTML = Array.from(clone.childNodes,n=>n.outerHTML).join('');
+        const before = host.innerHTML, extracted = range.extractContents();
+        const extractHTML = Array.from(extracted.childNodes,n=>n.outerHTML).join('');
+        const collapsed = [range.collapsed,range.startContainer===host,range.startOffset];
+        const mutations = observer.takeRecords().map(r=>[r.type,r.oldValue]);
+        const insert = document.createElement('strong'); insert.textContent='X'; range.insertNode(insert);
+        const selected = [range.startContainer===host,range.startOffset,range.endContainer===host,range.endOffset];
+        range.surroundContents(document.createElement('mark'));
+        const wrapped = host.innerHTML; range.deleteContents();
+        const textRange = document.createRange(); textRange.setStart(first,0); textRange.setEnd(first,1);
+        const textCopy = textRange.extractContents();
+        return [cloneHTML,before,extractHTML,extracted.childNodes[1]===middle,collapsed,mutations,
+            selected,wrapped,host.innerHTML,textCopy.textContent,textRange.collapsed,textRange.startOffset,
+            clone.ownerDocument===document,extracted.ownerDocument===document];
+    })()"#).unwrap(),json!(["<b>b</b><i>cd</i><u>e</u>","<b>ab</b><i>cd</i><u>ef</u>",
+        "<b>b</b><i>cd</i><u>e</u>",true,[true,true,1],
+        [["characterData","ab"],["childList",null],["characterData","ef"]],
+        [true,1,true,2],"<b>a</b><mark><strong>X</strong></mark><u>f</u>","<b></b><u>f</u>","a",true,0,true,true]));
+}
+
+#[test]
+fn ranges_split_text_and_reject_invalid_mutation_without_losing_content() {
+    let mut rt = page("<!doctype html><body><div id='edit'>abcd<span>ef</span></div></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const host = document.getElementById('edit'), text = host.firstChild;
+        const fails = f => { try { f(); return ''; } catch(e) { return e.name; } };
+        const range = document.createRange(); range.setStart(text,2); range.collapse(true);
+        const fragment = document.createDocumentFragment(); const em = document.createElement('em'); em.textContent='X';
+        fragment.append(em,document.createTextNode('Y')); range.insertNode(fragment);
+        const inserted = [host.innerHTML,fragment.childNodes.length,range.startContainer===text,range.startOffset,
+            range.endContainer===host,range.endOffset,range.toString()];
+        range.setStart(text,1); range.setEnd(host.lastChild.firstChild,1);
+        const invalid = fails(()=>range.surroundContents(document.createElement('mark')));
+        const intact = host.innerHTML; range.deleteContents();
+        const docRange = document.createRange(); docRange.selectNode(document.doctype);
+        const doctypeError = fails(()=>docRange.cloneContents());
+        const orphan = document.createTextNode('alone'); range.selectNodeContents(orphan);
+        return [inserted,invalid,intact,host.innerHTML,range.collapsed,doctypeError,
+            fails(()=>range.insertNode(document.createElement('b'))),orphan.data];
+    })()"#).unwrap(),json!([["ab<em>X</em>Ycd<span>ef</span>",0,true,2,true,3,"XY"],
+        "InvalidStateError","ab<em>X</em>Ycd<span>ef</span>","a<span>f</span>",false,
+        "HierarchyRequestError","HierarchyRequestError","alone"]));
+}
+
+#[test]
+fn native_frame_documents_keep_owner_and_reject_cross_arena_adoption_before_removal() {
+    let mut rt = page("<body><iframe id='frame'></iframe><div id='parent'>parent</div></body>");
+    rt.set_url("https://example.test/parent");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const win = document.getElementById('frame').contentWindow, childDoc = win.document;
+        const node = Document.prototype.createElement.call(childDoc,'p'); node.textContent='child'; childDoc.body.appendChild(node);
+        const ownerGet = Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
+        const other = Object.getOwnPropertyDescriptor(Document.prototype,'implementation').get.call(childDoc).createHTMLDocument('child detached');
+        const sameArena = Document.prototype.adoptNode.call(other,node) === node;
+        other.body.appendChild(node);
+        const fails = f => { try { f(); return ''; } catch(e) { return e.name; } };
+        const errors = [fails(()=>document.adoptNode(node)),fails(()=>document.body.appendChild(node)),
+            fails(()=>document.importNode(node,true)),fails(()=>childDoc.adoptNode(document.getElementById('parent')))];
+        const position = document.body.compareDocumentPosition(childDoc.body), reverse = childDoc.body.compareDocumentPosition(document.body);
+        const range = document.createRange(); range.selectNodeContents(document.body);
+        return [sameArena,node.ownerDocument===other,ownerGet.call(node)===other,node.parentNode===other.body,
+            errors,document.getElementById('parent').parentNode===document.body,other.body.textContent,
+            childDoc.body.ownerDocument===childDoc,document.body.ownerDocument===document,
+            [position & 1,position & 6,reverse & 1,reverse & 6],fails(()=>range.comparePoint(childDoc.body,0))];
+    })()"#).unwrap(),json!([true,true,true,true,["NotSupportedError","NotSupportedError","NotSupportedError","NotSupportedError"],
+        true,"child",true,true,[1,4,1,2],"WrongDocumentError"]));
+}
+
+#[test]
+fn fragment_replacement_and_postconnection_steps_keep_real_mutation_order() {
+    let mut rt = page("<!doctype html><body></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const doc = document.implementation.createHTMLDocument(), fragment = doc.createDocumentFragment();
+        fragment.append(doc.createElement('b'),doc.createTextNode('old'));
+        const removed = fragment.firstChild;
+        const observer = new MutationObserver(()=>{}); observer.observe(fragment,{childList:true,subtree:true,attributes:true});
+        fragment.innerHTML='<i>new</i>'; removed.setAttribute('data-state','removed');
+        const records = observer.takeRecords();
+        const connection = document.createDocumentFragment(), script = document.createElement('script'), frame = document.createElement('iframe');
+        frame.id='later-frame';
+        script.textContent="globalThis.beforeFrame = document.getElementById('later-frame').contentWindow === null;";
+        connection.append(script,frame); document.body.appendChild(connection);
+        const type = document.implementation.createDocumentType('html','','');
+        document.doctype.replaceWith(type); type.before(document.createComment('before')); type.after(document.createComment('after'));
+        return [records.map(r=>[r.type,r.addedNodes.length,r.removedNodes.length]),records[0].removedNodes[0]===removed,
+            removed.ownerDocument===doc,fragment.firstChild.ownerDocument===doc,beforeFrame,
+            frame.contentWindow.document.body.ownerDocument===frame.contentDocument,
+            document.firstChild.nodeName,document.childNodes[2].nodeName,
+            fragment.firstChild.webkitMatchesSelector('i')];
+    })()"#).unwrap(),json!([[["childList",1,2],["attributes",0,0]],true,true,true,true,true,"#comment","#comment",true]));
+}

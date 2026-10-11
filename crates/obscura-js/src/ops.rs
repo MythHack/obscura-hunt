@@ -2749,6 +2749,34 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
             result.push(']');
             result
         }
+        "is_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
+        // "previous,next" sibling ids of arg1, -1 for none: one crossing for
+        // the pair a mutation record captures.
+        "sibling_nids" => {
+            let Ok(nid) = arg1.parse::<u32>() else {
+                return "-1,-1".into();
+            };
+            let (prev, next) = dom
+                .with_node(NodeId::new(nid), |node| (node.prev_sibling, node.next_sibling))
+                .unwrap_or((None, None));
+            let id = |value: Option<NodeId>| value.map_or(-1, |id| id.index() as i64);
+            format!("{},{}", id(prev), id(next))
+        }
+        // arg1 is a host-including inclusive ancestor of arg2. Walks up from
+        // arg2 instead of enumerating arg1's descendants.
+        "is_host_including_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_host_including_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
         "next_in_subtree" => {
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
             let current = NodeId::new(arg2.parse::<u32>().unwrap_or(0));
@@ -3152,6 +3180,13 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
                 .map(|id| id.index().to_string())
                 .unwrap_or("-1".into())
         }
+        "parse_document_html" => {
+            let parsed = obscura_dom::parse_html(&arg1);
+            let document = dom.new_node(NodeData::Document);
+            dom.import_children_from(document, &parsed, parsed.document());
+            mark_script_subtree_started(&gs, document);
+            document.index().to_string()
+        }
         "create_document_fragment" => dom.new_node(NodeData::Document).index().to_string(),
         "clone_node" => {
             let nid = match arg1.parse::<u32>() {
@@ -3224,16 +3259,12 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
             .to_string()
         }
         "create_doctype" => {
-            // arg1 = name, arg2 = public_id. system_id stored only in the
-            // JS wrapper since neither current WPT test reads it back from
-            // the underlying tree.
+            let (public_id, system_id) = arg2.split_once('\0').unwrap_or((&arg2, ""));
             dom.new_node(NodeData::Doctype {
-                name: arg1.clone(),
-                public_id: arg2.clone(),
-                system_id: String::new(),
-            })
-            .index()
-            .to_string()
+                name: arg1,
+                public_id: public_id.to_owned(),
+                system_id: system_id.to_owned(),
+            }).index().to_string()
         }
         "pi_target" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -3267,6 +3298,13 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
                 .flatten()
                 .unwrap_or_default();
             serde_json::to_string(&val).unwrap_or("\"\"".into())
+        }
+        "doctype_system_id" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.with_node(NodeId::new(nid), |node| match &node.data {
+                NodeData::Doctype { system_id, .. } => serde_json::to_string(system_id).unwrap_or_else(|_| "null".into()),
+                _ => "null".into(),
+            }).unwrap_or_else(|| "null".into())
         }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
