@@ -1,2 +1,6 @@
 target/
 .DS_Store
+/dist/
+/obscura-*.tar.gz
+/obscura-*.zip
+/smoke.png

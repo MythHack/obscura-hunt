@@ -141,10 +141,15 @@ provide screenshots, screencasts, or PDF output.
 
 ### Downloads
 
-Published builds will appear on the
-[fork Releases page](https://github.com/MythHack/obscura-hunt/releases).
-For now, build from source. Upstream packages and Docker images do not include
-this fork's changes.
+Download **v0.1.2** from the
+[fork Releases page](https://github.com/MythHack/obscura-hunt/releases/tag/v0.1.2).
+Native packages cover Linux x64/ARM64, macOS x64/ARM64, and Windows x64.
+Choose the default rendering build, `-stealth` (rendering + stealth),
+`-no-render`, or `-no-render-stealth`; each archive contains the matching
+`obscura`/`obscura-worker` pair, `LICENSE`, and `build-info.json`.
+Verify the archive against `SHA256SUMS.txt`, then run `obscura --build-info`
+to inspect the actual source commit and compiled features. Upstream packages
+and Docker images do not include this fork's changes.
 
 ## Use it
 

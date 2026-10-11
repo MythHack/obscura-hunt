@@ -126,8 +126,13 @@ Cargo 自动使用本分支随仓库提供的依赖补丁，构建时请保留�
 
 ### 下载发布包
 
-发布包可用后，会放在 [本分支 Releases 页面](https://github.com/MythHack/obscura-hunt/releases)。
-目前请从源码构建；上游发布包和 Docker 镜像不包含本分支的改动。
+在 [v0.1.2 Release 页面](https://github.com/MythHack/obscura-hunt/releases/tag/v0.1.2)下载发布包。
+原生构建覆盖 Linux x64/ARM64、macOS x64/ARM64 和 Windows x64。
+默认包启用渲染，`-stealth` 启用渲染与 stealth；另提供 `-no-render` 和
+`-no-render-stealth`。每个包包含同一构建的 `obscura`/`obscura-worker`、
+`LICENSE` 和 `build-info.json`。先用 `SHA256SUMS.txt` 核对压缩包，
+再运行 `obscura --build-info` 查看实际源码提交与编译 features。
+上游发布包和 Docker 镜像不包含本分支的改动。
 
 ## 使用方法
 

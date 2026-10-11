@@ -60,6 +60,12 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Verify clean tagged source
+        shell: bash
+        run: |
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git describe --tags --exact-match HEAD)" = "$OBSCURA_VERSION"
+
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
@@ -159,7 +165,26 @@ jobs:
           for VARIANT in default stealth no-render no-render-stealth; do
             BIN=dist/$VARIANT/obscura
             [ -f "$BIN.exe" ] && BIN="$BIN.exe"
-            "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1"
+            "$BIN" --build-info > "dist/$VARIANT/build-info.json"
+            python - "$VARIANT" "$(git rev-parse HEAD)" "$OBSCURA_VERSION" "${{ matrix.target }}" <<'PY'
+          import json, sys
+          variant, commit, tag, target = sys.argv[1:]
+          with open(f"dist/{variant}/build-info.json", encoding="utf-8") as source:
+              info = json.load(source)
+          assert info["name"] == "obscura", info
+          assert info["version"] == tag.removeprefix("v"), info
+          assert info["target"] == target, info
+          assert info["source"] == {
+              "repository": "https://github.com/MythHack/obscura-hunt",
+              "commit": commit, "dirty": False,
+          }, info
+          assert info["features"] == {
+              "render": not variant.startswith("no-render"),
+              "stealth": variant.endswith("stealth"),
+          }, info
+          PY
+            "$BIN" fetch "data:text/html,<title>ok</title>" --eval "1+1" | python -c 'import json,sys; assert json.load(sys.stdin) == 2'
+            cp LICENSE "dist/$VARIANT/LICENSE"
           done
           for VARIANT in default stealth; do
             BIN=dist/$VARIANT/obscura
@@ -181,22 +206,22 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker
-          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker
-          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker
+          tar czf ${{ matrix.name }}.tar.gz -C dist/default obscura obscura-worker LICENSE build-info.json
+          tar czf ${{ matrix.name }}-stealth.tar.gz -C dist/stealth obscura obscura-worker LICENSE build-info.json
+          tar czf ${{ matrix.name }}-no-render.tar.gz -C dist/no-render obscura obscura-worker LICENSE build-info.json
+          tar czf ${{ matrix.name }}-no-render-stealth.tar.gz -C dist/no-render-stealth obscura obscura-worker LICENSE build-info.json
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd dist/default
-          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}.zip obscura.exe obscura-worker.exe LICENSE build-info.json
           cd ../stealth
-          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-stealth.zip obscura.exe obscura-worker.exe LICENSE build-info.json
           cd ../no-render
-          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-no-render.zip obscura.exe obscura-worker.exe LICENSE build-info.json
           cd ../no-render-stealth
-          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe
+          7z a ../../${{ matrix.name }}-no-render-stealth.zip obscura.exe obscura-worker.exe LICENSE build-info.json
 
       - name: Upload packaged binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

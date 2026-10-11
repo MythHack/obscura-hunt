@@ -14,6 +14,7 @@ Top-level flags apply to every subcommand.
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
 -h, --help                   Help
 -V, --version                Version
+    --build-info             Print JSON source revision, dirty state, target and features
 ```
 
 ## `obscura fetch <URL>`
