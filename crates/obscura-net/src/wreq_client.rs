@@ -189,6 +189,8 @@ pub struct StealthHttpClient {
     allow_private_network: bool,
     pub block_trackers: bool,
     pub cookie_jar: Arc<CookieJar>,
+    pub user_agent: RwLock<String>,
+    pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -284,8 +286,21 @@ impl StealthHttpClient {
                 std::env::var("OBSCURA_BLOCK_TRACKERS").ok().as_deref(),
             ),
             cookie_jar,
+            user_agent: RwLock::new(STEALTH_USER_AGENT.to_string()),
+            accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    pub fn for_page(&self) -> Self {
+        Self {
+            client: self.client.clone(), allow_private_network: self.allow_private_network,
+            block_trackers: self.block_trackers, cookie_jar: self.cookie_jar.clone(),
+            user_agent: RwLock::new(self.user_agent.try_read().expect("identity is being updated").clone()),
+            accept_language: RwLock::new(self.accept_language.try_read().expect("identity is being updated").clone()),
+            extra_headers: RwLock::new(self.extra_headers.try_read().expect("headers are being updated").clone()),
+            in_flight: self.in_flight.clone(),
         }
     }
 
@@ -314,7 +329,7 @@ impl StealthHttpClient {
     async fn fetch_with_profile(
         &self,
         url: &Url,
-        request: ResourceRequest,
+        mut request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
@@ -339,6 +354,7 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut strip_credential_headers = false;
 
         // Follow up to 20 redirects (Fetch spec + the reqwest path): 0..=20 makes
         // 21 requests, so the 20th hop is followed and only the 21st fails.
@@ -346,6 +362,8 @@ impl StealthHttpClient {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
 
+            req = req.header("user-agent", self.user_agent.read().await.as_str())
+                .header("accept-language", self.accept_language.read().await.as_str());
             req = req
                 .header("accept", request.accept())
                 .header("sec-fetch-site", request_fetch_site(&request, &current_url))
@@ -356,9 +374,9 @@ impl StealthHttpClient {
                     .header("upgrade-insecure-requests", "1")
                     .header("sec-fetch-user", "?1");
             }
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                req = req.header("referer", referer);
-            }
+            let referer = request_referrer(&request, &current_url);
+            request.referrer = referer.as_deref().and_then(|value| Url::parse(value).ok());
+            if let Some(referer) = referer { req = req.header("referer", referer); }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
@@ -378,6 +396,8 @@ impl StealthHttpClient {
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("referer") || ((strip_credential_headers || !request.sends_credentials_to(&current_url))
+                    && crate::client::is_credential_header(k)) { continue; }
                 if k.eq_ignore_ascii_case("origin") {
                     continue;
                 }
@@ -444,6 +464,9 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    strip_credential_headers |= current_url.origin() != next_url.origin();
+                    if let Some(policy) = response_headers.get("referrer-policy")
+                        .and_then(|value| crate::client::parse_referrer_policy(value)) { request.referrer_policy = policy.to_string(); }
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
@@ -537,15 +560,18 @@ impl StealthHttpClient {
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
+        if !headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+            req = req.header("user-agent", self.user_agent.read().await.as_str());
+        }
+        if !headers.keys().any(|name| name.eq_ignore_ascii_case("accept-language")) {
+            req = req.header("accept-language", self.accept_language.read().await.as_str());
+        }
 
         if let Some(context) = cookie_context {
             let cookie_header = self.cookie_jar.get_cookie_header_in_context(url, context);
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
-        }
-        for (k, v) in self.extra_headers.read().await.iter() {
-            req = req.header(k.as_str(), v.as_str());
         }
         for (k, v) in headers.iter() {
             req = req.header(k.as_str(), v.as_str());
@@ -596,6 +622,10 @@ impl StealthHttpClient {
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
     }
+
+    pub async fn set_user_agent(&self, user_agent: &str) { *self.user_agent.write().await = user_agent.to_string(); }
+
+    pub async fn set_accept_language(&self, language: &str) { *self.accept_language.write().await = language.to_string(); }
 
     pub fn active_requests(&self) -> u32 {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
@@ -831,6 +861,8 @@ mod tests {
             allow_private_network: true,
             block_trackers: true,
             cookie_jar: Arc::new(CookieJar::new()),
+            user_agent: tokio::sync::RwLock::new(super::STEALTH_USER_AGENT.to_string()),
+            accept_language: tokio::sync::RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };

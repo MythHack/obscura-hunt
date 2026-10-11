@@ -92,6 +92,8 @@ pub struct JsNetworkEvent {
     pub request_id: String,
     /// Native initiating browsing context. Zero is the main realm.
     pub frame_id: u32,
+    /// Exact document generation captured at native request initiation.
+    pub frame_generation: u64,
     /// The interception consumer already received the request start.
     pub intercepted: bool,
     pub url: String,
@@ -175,6 +177,7 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    pub(crate) referrer_policy: String,
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
@@ -410,12 +413,20 @@ pub struct PendingFrameMessage {
     pub data_json: String,
 }
 
+#[cfg(feature = "render")]
+impl Drop for ObscuraState {
+    fn drop(&mut self) {
+        for task in self.render_resource_tasks.drain(..) { task.abort(); }
+    }
+}
+
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.cookie_jar = parent.cookie_jar.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
         self.encoding = parent.encoding.clone();
+        self.referrer_policy = document_referrer_policy(parent);
         self.blocked_urls = parent.blocked_urls.clone();
         self.intercept_enabled = parent.intercept_enabled;
         self.intercept_url_patterns = parent.intercept_url_patterns.clone();
@@ -425,9 +436,30 @@ impl ObscuraState {
             self.stealth_client = parent.stealth_client.clone();
         }
         #[cfg(feature = "render")]
+        {
+            self.render_resource_limiter = parent.render_resource_limiter.clone();
+            self.render_resource_notify = parent.render_resource_notify.clone();
+        }
+        #[cfg(feature = "render")]
         if has_page_transport(parent) {
             self.render_resources.set_sync_loading_enabled(false);
         }
+    }
+
+    #[cfg(feature = "render")]
+    pub(crate) fn abandon_render_resources(&mut self) {
+        if self.render_resource_tasks.is_empty() && self.render_resource_in_flight.is_empty()
+            && self.render_resource_backlog.is_empty() && self.render_resource_events.is_empty()
+            && self.render_resource_rx.is_empty() && !self.render_resources.has_sync_misses() { return; }
+        for task in self.render_resource_tasks.drain(..) { task.abort(); }
+        self.render_resource_in_flight.clear();
+        self.render_resource_backlog.clear();
+        self.render_resource_events.clear();
+        drop(self.render_resources.take_sync_misses(usize::MAX));
+        // Abort is not a join. A fresh channel fences already finishing loads.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.render_resource_tx = tx;
+        self.render_resource_rx = rx;
     }
 
     pub fn new() -> Self {
@@ -442,6 +474,7 @@ impl ObscuraState {
             content_type: String::new(),
             title: String::new(),
             referrer: String::new(),
+            referrer_policy: String::new(),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
@@ -682,13 +715,32 @@ fn record_js_network_completion(
     body: &str,
     base64_encoded: bool,
 ) {
-    let mut gs = state.borrow_mut();
+    record_network_completion(&mut state.borrow_mut(), event, |_| StoredNetworkResponseBody {
+        body: body.to_string(), base64_encoded,
+    });
+}
+
+pub(crate) fn record_network_response(
+    state: &RefCell<ObscuraState>, event: JsNetworkEvent, body: &[u8],
+) {
+    record_network_completion(&mut state.borrow_mut(), event, |headers| {
+        match obscura_net::encoding::decode_devtools_response_body(
+            body, headers.get("content-type").map(String::as_str),
+        ) {
+            Some(body) => StoredNetworkResponseBody { body, base64_encoded: false },
+            None => StoredNetworkResponseBody { body: BASE64.encode(body), base64_encoded: true },
+        }
+    });
+}
+
+fn record_network_completion(
+    gs: &mut ObscuraState, event: JsNetworkEvent,
+    body: impl FnOnce(&HashMap<String, String>) -> StoredNetworkResponseBody,
+) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
-            body: body.to_string(), base64_encoded,
-        });
+        gs.network_response_bodies.insert(event.request_id.clone(), body(&event.response_headers));
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -696,10 +748,10 @@ fn record_js_network_completion(
             }
         }
     }
-    push_js_network_event(&mut gs, event);
+    push_js_network_event(gs, event);
 }
 
-fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
+pub(crate) fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
     gs.js_network_events.push(event);
     const MAX_JS_NETWORK_EVENTS: usize = 4096;
     if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
@@ -929,6 +981,7 @@ struct FrameTimers {
     sandboxed_opaque: bool,
     document_url: Option<String>,
     document_load_started: bool,
+    referrer_policy: Option<String>,
     cancel: Rc<CancelHandle>,
 }
 
@@ -1025,6 +1078,43 @@ impl RealmStates {
             .map(|entry| entry.context.clone()).collect()
     }
 
+    pub(crate) fn page_contexts(&self, root: u32) -> Vec<v8::Global<v8::Context>> {
+        self.entries.iter().filter(|entry| {
+            if !self.entry_active(entry) { return false; }
+            let mut frame = entry.frame_id;
+            for _ in 0..=max_live_frames() {
+                if frame == root { return true; }
+                let Some(parent) = self.frame_parent(frame) else { return false; };
+                frame = parent;
+            }
+            false
+        }).map(|entry| entry.context.clone()).collect()
+    }
+
+    pub(crate) fn frame_referrer_policy(&self, frame_id: u32) -> Option<String> {
+        self.frame_timers.get(&frame_id)?.referrer_policy.clone()
+    }
+
+    /// Native document ownership, not execution worlds. Popups and retired
+    /// owner chains are not subdocuments of this page.
+    #[cfg(feature = "render")]
+    pub(crate) fn render_document_states<'a>(&'a self, root: &'a SharedState)
+        -> impl Iterator<Item = &'a SharedState> + 'a
+    {
+        let root_id = root.borrow().frame_id;
+        self.documents.iter().filter_map(move |(id, state)| {
+            if self.frame_timers_active(*id) != Some(true) { return None; }
+            if *id == root_id { return Rc::ptr_eq(state, root).then_some(state); }
+            let mut current = *id;
+            for _ in 0..self.documents.len() {
+                let (parent, _) = self.live_frame_owner(current)?;
+                if parent == root_id { return Some(state); }
+                current = parent;
+            }
+            None
+        })
+    }
+
     pub(crate) fn retire_modules(&mut self, scope: &mut v8::PinScope) {
         for realm in self.retired_modules.drain(..) { realm.retire(scope); }
         for entry in &self.entries {
@@ -1057,6 +1147,7 @@ impl RealmStates {
     ) {
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
             owner: None, parent_document: None, sandboxed_opaque: false, document_url: None,
+            referrer_policy: None,
             document_load_started: false, cancel: CancelHandle::new_rc(),
         });
         let generation = state.borrow().document_generation;
@@ -1088,6 +1179,7 @@ impl RealmStates {
             owner: Some((Rc::downgrade(parent), node, generation)),
             parent_document: Some((Rc::downgrade(parent), generation)),
             sandboxed_opaque, document_url: None, document_load_started: false,
+            referrer_policy: None,
             cancel: CancelHandle::new_rc(),
         });
     }
@@ -1157,7 +1249,13 @@ impl RealmStates {
 
     pub(crate) fn cancel_inactive_frame_timers(&self) {
         for (id, timers) in &self.frame_timers {
-            if self.frame_timers_active(*id) == Some(false) { timers.cancel.cancel(); }
+            if self.frame_timers_active(*id) == Some(false) {
+                timers.cancel.cancel();
+                #[cfg(feature = "render")]
+                if let Some(state) = self.documents.get(id) {
+                    if let Ok(mut state) = state.try_borrow_mut() { state.abandon_render_resources(); }
+                }
+            }
         }
     }
 
@@ -1693,6 +1791,8 @@ pub struct RenderResourceResponse {
 #[cfg(feature = "render")]
 #[derive(Debug)]
 pub struct RenderResourceEvent {
+    pub frame_id: u32,
+    pub frame_generation: u64,
     pub is_font: bool,
     pub response: RenderResourceResponse,
 }
@@ -2625,6 +2725,29 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
             .flatten()
             .map(|id| id.index().to_string())
             .unwrap_or("-1".into())
+        }
+        // Modal input follows native slot/host ownership, never wrapper expandos.
+        "flat_tree_parent" => {
+            let node = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            dom.assigned_slot(node)
+                .or_else(|| dom.shadow_root_info(node).map(|root| root.host))
+                .or_else(|| dom.with_node(node, |node| node.parent).flatten())
+                .map(|id| id.index().to_string())
+                .unwrap_or("null".into())
+        }
+        "flat_tree_children" => {
+            let node = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let children = dom.slot_rendered_children(node)
+                .or_else(|| dom.shadow_children(node))
+                .unwrap_or_else(|| dom.children(node));
+            use std::fmt::Write as _;
+            let mut result = String::from("[");
+            for (index, child) in children.iter().enumerate() {
+                if index != 0 { result.push(','); }
+                let _ = write!(result, "{}", child.raw());
+            }
+            result.push(']');
+            result
         }
         "next_in_subtree" => {
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
@@ -3883,10 +4006,33 @@ fn op_fetch_url(
         let registry = state.borrow().borrow::<Rc<RefCell<RealmStates>>>().clone();
         let world_cancel = registry.borrow().context_cancel(&context)
             .ok_or_else(|| deno_error::JsErrorBox::type_error("Fetch execution world is retired"))?;
-        let (destination, cancel_rid, document_frame) = match options {
-            FetchOptions::Destination(destination) => (destination, None, None),
-            FetchOptions::Cancelable { cancel_rid, destination } => (destination, Some(cancel_rid), None),
-            FetchOptions::FrameDocument { frame_id, destination } => (destination, None, Some(frame_id)),
+        let (destination, cancel_rid, document_frame, referrer, referrer_policy) = match options {
+            FetchOptions::Destination(destination) => (destination, None, None, None, String::new()),
+            FetchOptions::Request { cancel_rid, destination, referrer, referrer_policy } =>
+                (destination, cancel_rid, None, referrer, referrer_policy),
+            FetchOptions::FrameDocument { frame_id, destination } =>
+                (destination, None, Some(frame_id), None, String::new()),
+        };
+        let (referrer_source, referrer_policy) = {
+            let owner = owner.borrow();
+            let source = match referrer.as_deref() {
+                None | Some("about:client") => document_referrer_source(&owner),
+                Some("") => None,
+                Some(value) => {
+                    let source = document_base_url(&owner).and_then(|base| url::Url::parse(&base).ok())
+                        .and_then(|base| base.join(value).ok())
+                        .ok_or_else(|| deno_error::JsErrorBox::type_error("Invalid request referrer"))?;
+                    if source.origin().ascii_serialization() != origin {
+                        return Err(deno_error::JsErrorBox::type_error("Request referrer must be same-origin"));
+                    }
+                    Some(source)
+                }
+            };
+            let policy = if referrer_policy.is_empty() { document_referrer_policy(&owner) }
+                else if obscura_net::client::parse_referrer_policy(&referrer_policy) == Some(referrer_policy.as_str()) {
+                    referrer_policy
+                } else { return Err(deno_error::JsErrorBox::type_error("Invalid request referrer policy")); };
+            (source, policy)
         };
         let (calling_frame, generation) = {
             let owner = owner.borrow();
@@ -3916,16 +4062,16 @@ fn op_fetch_url(
         let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
             .map(|resource| resource.0.clone())
             .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
-        Ok((page, initiator, parent_frame_id, destination, cancel, origin))
+        Ok((page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy))
     })();
     async move {
-        let (page, initiator, parent_frame_id, destination, cancel, origin) = captured?;
+        let (page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy) = captured?;
         initiator.ensure_live()?;
         let request_cancel = cancel.clone();
         let world_cancel = initiator.world_cancel.clone();
         let future = async move {
             fetch_url_inner(state, page, initiator, url, method, headers_json, body,
-                origin, mode, credentials, destination, parent_frame_id, request_cancel)
+                origin, mode, credentials, destination, parent_frame_id, request_cancel, referrer_source, referrer_policy)
                 .or_cancel(world_cancel).await
                 .map_err(|_| deno_error::JsErrorBox::type_error("Fetch execution world was disposed"))?
         };
@@ -3941,8 +4087,12 @@ fn op_fetch_url(
 #[serde(untagged)]
 enum FetchOptions {
     Destination(String),
-    Cancelable { cancel_rid: u32, destination: String },
     FrameDocument { frame_id: u32, destination: String },
+    Request {
+        #[serde(default)] cancel_rid: Option<u32>, destination: String,
+        #[serde(default)] referrer: Option<String>,
+        #[serde(default)] referrer_policy: String,
+    },
 }
 
 struct FetchInitiator {
@@ -3982,13 +4132,36 @@ pub(crate) fn fetch_realm_state(scope: &mut v8::PinScope, state: &OpState)
     crate::window::caller_window(scope, state).map(|(_, _, document)| document)
 }
 
+pub(crate) fn document_referrer_source(state: &ObscuraState) -> Option<url::Url> {
+    let source = url::Url::parse(&state.url).ok()?;
+    if matches!(source.scheme(), "http" | "https") { Some(source) }
+    else { state.about_base_url.as_deref().and_then(|base| url::Url::parse(base).ok()) }
+}
+
+pub(crate) fn document_referrer_policy(state: &ObscuraState) -> String {
+    let mut policy = state.referrer_policy.clone();
+    if let Some(dom) = &state.dom {
+        for node in dom.query_selector_all("meta").unwrap_or_default() {
+            if let Some(value) = dom.with_node(node, |node| {
+                if !node.get_attribute("name").is_some_and(|name| name.eq_ignore_ascii_case("referrer")) { return None; }
+                node.get_attribute("content").map(|value| value.trim().to_ascii_lowercase())
+            }).flatten() {
+                if obscura_net::client::parse_referrer_policy(&value) == Some(value.as_str()) { policy = value; }
+            }
+        }
+    }
+    policy
+}
+
 async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, page: SharedState, initiator: FetchInitiator,
     url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
     destination: String, parent_frame_id: Option<u32>, cancel: Option<Rc<CancelHandle>>,
+    mut referrer_source: Option<url::Url>, mut referrer_policy: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let frame_id = initiator.frame_id;
+    let frame_generation = if frame_id == initiator.owner.borrow().frame_id { initiator.generation } else { 0 };
     let (resource_type, resource_type_name) = match destination.as_str() {
         "Script" => (ResourceType::Script, "Script"),
         "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
@@ -4080,7 +4253,7 @@ async fn fetch_url_inner(
     let mut network_guard = FetchNetworkGuard {
         state: Rc::downgrade(&page),
         event: Some(JsNetworkEvent {
-            request_id: request_id.clone(), frame_id, intercepted: false,
+            request_id: request_id.clone(), frame_id, frame_generation, intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
@@ -4127,12 +4300,18 @@ async fn fetch_url_inner(
                     body_base64: bb,
                 }) => {
                     network_guard.event = None;
+                    if resource_type == ResourceType::Document {
+                        initiator.registry.borrow_mut().frame_timers.get_mut(&frame_id).map(|frame| {
+                            frame.referrer_policy = Some(h.iter().find(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+                                .and_then(|(_, value)| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
+                        });
+                    }
                     // Keep fulfilled responses visible to CDP just like transport
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
                     record_js_network_completion(&page, JsNetworkEvent {
-                        request_id: request_id.clone(), frame_id, intercepted: true,
+                        request_id: request_id.clone(), frame_id, frame_generation, intercepted: true,
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         resource_type: resource_type_name.to_string(),
@@ -4348,6 +4527,32 @@ async fn fetch_url_inner(
         }
     }
 
+    // Page defaults are injected after CORS preflight, like DevTools headers.
+    // Request headers override them case-insensitively without mutating the page.
+    let mut request_headers = HashMap::new();
+    if let Some(client) = &http_client {
+        request_headers.insert("user-agent".to_string(), client.user_agent.read().await.clone());
+        request_headers.insert("accept-language".to_string(), client.accept_language.read().await.clone());
+        #[cfg(feature = "stealth")]
+        {
+            let stealth = page.borrow().stealth_client.clone();
+            if let Some(stealth) = stealth {
+                request_headers.insert("user-agent".to_string(), stealth.user_agent.read().await.clone());
+                request_headers.insert("accept-language".to_string(), stealth.accept_language.read().await.clone());
+            }
+        }
+        for (name, value) in client.extra_headers.read().await.iter() {
+            request_headers.insert(name.to_ascii_lowercase(), value.clone());
+        }
+    }
+    if !request_headers.contains_key("user-agent") {
+        request_headers.insert("user-agent".to_string(),
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string());
+    }
+    for (name, value) in custom_headers { request_headers.insert(name.to_ascii_lowercase(), value); }
+    request_headers.remove("referer");
+    request_headers.remove("origin");
+
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
     // redirect hop without losing the Chrome TLS/client-hint transport.
@@ -4363,7 +4568,7 @@ async fn fetch_url_inner(
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
-                custom_headers.clone(),
+                request_headers,
                 body.clone(),
                 page_origin.clone(),
                 mode.clone(),
@@ -4374,6 +4579,7 @@ async fn fetch_url_inner(
                 cancel,
                 network_guard,
                 resource_type,
+                referrer_source, referrer_policy,
             )
             .await;
         }
@@ -4388,7 +4594,7 @@ async fn fetch_url_inner(
     let mut current_body = body;
     // A mutable copy applied per hop: credential headers are dropped when a
     // redirect crosses origin, and body headers when the method downgrades.
-    let mut current_headers = custom_headers.clone();
+    let mut current_headers = request_headers;
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
@@ -4427,20 +4633,13 @@ async fn fetch_url_inner(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
-        if !current_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("user-agent"))
-        {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
-        }
+        let target = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+        let referer = obscura_net::client::referrer_for_policy(referrer_source.as_ref(), &target, &referrer_policy);
+        referrer_source = referer.as_deref().and_then(|value| url::Url::parse(value).ok());
+        if let Some(referer) = referer { req = req.header("Referer", referer); }
 
         for (k, v) in &current_headers {
+            if !credentials_allowed && matches!(k.as_str(), "authorization" | "proxy-authorization" | "cookie") { continue; }
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -4557,6 +4756,8 @@ async fn fetch_url_inner(
         // drop the body headers once the body is gone (#967).
         let crosses_origin = base.origin() != next_url.origin();
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
+        if let Some(policy) = resp.headers().get("referrer-policy").and_then(|value| value.to_str().ok())
+            .and_then(obscura_net::client::parse_referrer_policy) { referrer_policy = policy.to_string(); }
 
         redirected_from.push(base);
         current_url = next_url.to_string();
@@ -4581,6 +4782,12 @@ async fn fetch_url_inner(
         } else {
             resp_headers.insert(name.to_string(), value);
         }
+    }
+    if resource_type == ResourceType::Document {
+        initiator.registry.borrow_mut().frame_timers.get_mut(&frame_id).map(|frame| {
+            frame.referrer_policy = Some(resp_headers.get("referrer-policy")
+                .and_then(|value| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
+        });
     }
 
     let final_is_cross_origin = request_origin(&current_url)
@@ -4656,15 +4863,15 @@ async fn fetch_url_inner(
             }
         }
         if let Some(state) = body_state.upgrade() {
-            record_js_network_completion(&state, JsNetworkEvent {
-                request_id, frame_id, intercepted: was_intercepted,
+            record_network_response(&state, JsNetworkEvent {
+                request_id, frame_id, frame_generation, intercepted: was_intercepted,
                 error_text: None,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 resource_type: resource_type_name.to_string(),
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
-            }, &String::from_utf8_lossy(&resp_bytes), false);
+            }, &resp_bytes);
         }
         network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
@@ -4717,13 +4924,14 @@ async fn stealth_fetch_all(
     cancel: Option<Rc<CancelHandle>>,
     network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
+    mut referrer_source: Option<url::Url>, mut referrer_policy: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
     // Applied per hop; credential headers are dropped on a cross-origin
     // redirect and body headers on a GET downgrade (#967).
-    let mut current_headers = custom_headers.clone();
+    let mut current_headers = custom_headers;
     let mut redirects_followed: usize = 0;
     let mut redirected_from = Vec::new();
     let mut crossed_origin = request_origin(&current_url)
@@ -4750,9 +4958,14 @@ async fn stealth_fetch_all(
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &current_headers {
+            if !credentials.allows(&page_origin, &current_url)
+                && matches!(k.as_str(), "authorization" | "proxy-authorization" | "cookie") { continue; }
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
+        let referer = obscura_net::client::referrer_for_policy(referrer_source.as_ref(), &parsed_current, &referrer_policy);
+        referrer_source = referer.as_deref().and_then(|value| url::Url::parse(value).ok());
+        if let Some(referer) = referer { req_headers.insert("referer".to_string(), referer); }
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
         let cookie_context = credentials_allowed.then(|| {
             if cookie_initiator
@@ -4839,12 +5052,20 @@ async fn stealth_fetch_all(
         // Do not forward credentials to a different origin (#967).
         let crosses_origin = parsed_current.origin() != next_url.origin();
         sanitize_redirect_headers(&mut current_headers, crosses_origin, downgraded_to_get);
+        if let Some(policy) = r.headers.get("referrer-policy")
+            .and_then(|value| obscura_net::client::parse_referrer_policy(value)) { referrer_policy = policy.to_string(); }
         redirected_from.push(parsed_current);
         current_url = next_url.to_string();
     };
 
     let status = response.status;
     let resp_headers = response.headers;
+    if resource_type == ResourceType::Document {
+        initiator.registry.borrow_mut().frame_timers.get_mut(&initiator.frame_id).map(|frame| {
+            frame.referrer_policy = Some(resp_headers.get("referrer-policy")
+                .and_then(|value| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
+        });
+    }
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -4925,7 +5146,7 @@ async fn stealth_fetch_all(
             event.body_size = resp_bytes.len();
             event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
-            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+            record_network_response(&state, event, &resp_bytes);
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
@@ -6649,7 +6870,10 @@ fn op_initial_frame(
             (document_base_url(&child).unwrap_or_else(|| child.url.clone()), child.import_map.clone())
         };
         let proxy = windows.borrow().windows.get(&window_id).and_then(|window| window.loader.proxy_url.clone());
-        let loader = Rc::new(crate::module_loader::ObscuraModuleLoader::with_page_state(&base, proxy, &child, imports));
+        let root = windows.borrow().windows.get(&window_id).ok_or_else(||
+            deno_error::JsErrorBox::generic("Frame page owner is unavailable"))?.state.clone();
+        let loader = Rc::new(crate::module_loader::ObscuraModuleLoader::with_page_state(&base, proxy, &child, imports)
+            .with_network_state(&root));
         let modules = deno_core::BrowserRealm::attach(scope, context, loader);
         let handle = v8::Global::new(scope, context);
         registry.borrow_mut().register(handle.clone(), frame_id, child);
@@ -7843,6 +8067,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
+        ops.push(op_layout_hit_test_stack());
         ops.push(op_layout_caret());
         ops.push(op_layout_caret_rect());
         ops.push(op_resize_observer_measurements());
@@ -8902,6 +9127,28 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
     prepared
         .hit_test(dom, scroll, x as f32, y as f32)
         .map_or(-1, |id| id.index() as i32)
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_hit_test_stack(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let prepared = gs.prepared_render.as_ref()?;
+        let dom = gs.dom.as_ref()?;
+        let mut ids = String::new();
+        use std::fmt::Write as _;
+        for id in prepared.hit_test_stack(dom, scroll, x as f32, y as f32) {
+            if !ids.is_empty() { ids.push(','); }
+            let _ = write!(ids, "{}", id.index());
+        }
+        Some(ids)
+    })).ok().flatten().unwrap_or_default()
 }
 
 #[cfg(feature = "render")]

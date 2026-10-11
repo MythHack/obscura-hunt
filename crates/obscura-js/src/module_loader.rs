@@ -15,7 +15,7 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::ObscuraState;
+use crate::ops::{ObscuraState, JsNetworkEvent, record_network_response, push_js_network_event, document_referrer_policy};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -80,6 +80,9 @@ pub struct ObscuraModuleLoader {
     /// identity, redirect/security policy, interception, and callbacks as the
     /// entry module. Directly-constructed standalone loaders remain supported.
     page_state: Option<Weak<RefCell<ObscuraState>>>,
+    /// The page receipt queue survives child-world teardown. The requesting
+    /// document remains separate so frame and generation provenance is exact.
+    network_state: Option<Weak<RefCell<ObscuraState>>>,
     /// Directly-constructed loaders still use Obscura's network policy and
     /// connection pool; they simply have an isolated cookie jar.
     standalone_client: Option<Arc<obscura_net::ObscuraHttpClient>>,
@@ -115,6 +118,7 @@ impl ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
             page_state: None,
+            network_state: None,
             standalone_client: Some(standalone_client),
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
@@ -132,11 +136,17 @@ impl ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
             page_state: Some(Rc::downgrade(page_state)),
+            network_state: Some(Rc::downgrade(page_state)),
             standalone_client: None,
             import_map,
             activity: Arc::new(ModuleLoadActivity::default()),
             loaded_specifiers: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn with_network_state(mut self, state: &Rc<RefCell<ObscuraState>>) -> Self {
+        self.network_state = Some(Rc::downgrade(state));
+        self
     }
 
     pub(crate) fn activity(&self) -> Arc<ModuleLoadActivity> {
@@ -215,6 +225,13 @@ impl ModuleLoader for ObscuraModuleLoader {
         // decrement the count through Drop as well as success and failure.
         let is_dyn_import = options.is_dynamic_import;
         let activity_guard = is_dyn_import.then(|| activity.begin());
+        let page_state = self.page_state.clone();
+        let network_state = self.network_state.clone();
+        static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let request_id = format!("module-{}", NEXT_MODULE_REQUEST_ID.fetch_add(
+            1, std::sync::atomic::Ordering::Relaxed,
+        ));
         let page_network = match self.page_state.as_ref() {
             Some(weak) => (|| {
                 let state = weak
@@ -237,7 +254,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let stealth = state.stealth_client.clone();
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
+                Ok((client, stealth, state.callbacks.clone(), state.frame_id, state.document_generation,
+                    document_referrer_policy(&state), state.inherited_origin.as_deref() == Some("null")))
             })(),
             None => self
                 .standalone_client
@@ -247,7 +265,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
+                    (client, stealth, None, 0, 0, String::new(), false)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -264,11 +282,14 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks)) => {
+                Ok((client, stealth, callbacks, frame_id, generation, referrer_policy, opaque_origin)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
-                    let request =
-                        obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    let mut request = obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    request.referrer_policy = referrer_policy;
+                    // URL resolution and the native document principal are distinct:
+                    // an opaque sandbox must not gain its URL origin's credentials.
+                    if opaque_origin { request.initiator = Some(ModuleSpecifier::parse("about:blank").unwrap()); }
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
                         Some(stealth) => stealth
@@ -287,8 +308,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 )
                                 .await
                         }
-                    }
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    };
                     #[cfg(not(feature = "stealth"))]
                     let resp = {
                         let _ = &stealth;
@@ -299,8 +319,42 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 callbacks.as_deref(),
                             )
                             .await
-                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
                     };
+                    if let Some(owner) = page_state.as_ref().and_then(Weak::upgrade) {
+                        let owner = owner.try_borrow().map_err(|_| io_err(
+                            "Module document owner is already borrowed".to_string()))?;
+                        if owner.frame_id != frame_id || owner.document_generation != generation {
+                            return Err(io_err("Module document owner was replaced".to_string()));
+                        }
+                    } else if page_state.is_some() {
+                        return Err(io_err("Module document owner was dropped".to_string()));
+                    }
+                    let resp = resp.map_err(|error| {
+                        let message = format!("Failed to fetch module {}: {}", url, error);
+                        if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
+                            push_js_network_event(&mut state.borrow_mut(), JsNetworkEvent {
+                                request_id: request_id.clone(), frame_id, frame_generation: generation, intercepted: false,
+                                url: url.clone(), method: "GET".to_string(), resource_type: "Script".to_string(),
+                                status: 0, response_headers: Default::default(), body_size: 0,
+                                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs_f64(), error_text: Some(message.clone()),
+                            });
+                        }
+                        io_err(message)
+                    })?;
+                    if resp.status != 0 {
+                        if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
+                            record_network_response(&state, JsNetworkEvent {
+                                request_id, frame_id, frame_generation: generation, intercepted: false,
+                                url: resp.url.to_string(), method: "GET".to_string(),
+                                resource_type: "Script".to_string(), status: resp.status,
+                                response_headers: resp.headers.clone(), body_size: resp.body.len(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+                                error_text: None,
+                            }, &resp.body);
+                        }
+                    }
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
                             "Module {} returned HTTP {}",

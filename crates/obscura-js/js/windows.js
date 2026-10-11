@@ -214,6 +214,7 @@ function _initializeNativeWindow(child, windowId, realmId) {
   delete child.Deno;
   for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                      '__obscura_ua_platform_version', '__obscura_stealth',
+                     '__obscura_language', '__obscura_languages',
                      '__obscura_geo_lat', '__obscura_geo_lon']) {
     if (globalThis[name] !== undefined) child[name] = globalThis[name];
   }

@@ -1023,7 +1023,6 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Network.setRequestInterception"
             | "Network.setBlockedURLs"
             | "Network.setExtraHTTPHeaders"
-            | "Network.setUserAgentOverride"
             | "Network.getCookies"
             | "Network.getAllCookies"
             | "Network.setCookie"

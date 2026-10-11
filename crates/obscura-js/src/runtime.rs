@@ -471,9 +471,7 @@ impl Drop for EnteredRuntime<'_> {
 impl Drop for ObscuraJsRuntime {
     fn drop(&mut self) {
         #[cfg(feature = "render")]
-        if Rc::strong_count(&self.state) == 1 {
-            for task in self.state.borrow_mut().render_resource_tasks.drain(..) { task.abort(); }
-        }
+        if Rc::strong_count(&self.js_runtime) == 1 { self.abandon_render_resources(); }
         if Rc::strong_count(&self.js_runtime) == 1 {
             unsafe { self.js_runtime.borrow_mut().v8_isolate().enter(); }
         }
@@ -1055,17 +1053,19 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 9] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
             "__obscura_ua_platform_version",
+            "__obscura_language",
+            "__obscura_languages",
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
         ];
 
-        let main = self.runtime().main_context();
+        let main = self.root_context.clone();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         v8::scope!(let scope, isolate);
@@ -1104,10 +1104,8 @@ impl ObscuraJsRuntime {
     /// client, callbacks and the stealth transport. A frame shares these with
     /// its page, exactly as it shares them in a browser.
     pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
-        // A frame realm shares the page transport, so its renderer cache must
-        // not open synchronous requests either. Frame geometry currently
-        // resolves against the main document's renderer state, so frame-scoped
-        // background loading is not wired up here.
+        // Native child documents keep independent renderer caches and result
+        // channels, but share the page transport, capacity and wake-up.
         frame.inherit_resources(&self.state.borrow());
     }
 
@@ -1123,7 +1121,8 @@ impl ObscuraJsRuntime {
         };
         let proxy = self.windows.borrow().windows.get(&self.window_id)
             .and_then(|window| window.loader.proxy_url.clone());
-        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, state, imports));
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, state, imports)
+            .with_network_state(&self.state));
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         v8::scope_with_context!(scope, entered.v8_isolate(), main);
@@ -1208,7 +1207,8 @@ impl ObscuraJsRuntime {
             (crate::ops::document_base_url(&state).unwrap_or_else(|| state.url.clone()), state.import_map.clone()) };
         let proxy = self.windows.borrow().windows.get(&self.window_id)
             .ok_or("Window is closed")?.loader.proxy_url.clone();
-        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, &state, imports));
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, &state, imports)
+            .with_network_state(&self.state));
         let modules = {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
@@ -1903,18 +1903,7 @@ impl ObscuraJsRuntime {
             let render_resources = crate::ops::fresh_render_resources(&gs);
             gs.render_resources = render_resources;
             gs.render_image_in_flight.clear();
-            for task in gs.render_resource_tasks.drain(..) {
-                task.abort();
-            }
-            gs.render_resource_in_flight.clear();
-            gs.render_resource_backlog.clear();
-            gs.render_resource_events.clear();
-            // A fresh channel: a load of the old document that is still
-            // finishing (abort is not a join) delivers into a dropped
-            // receiver, never into this document's results.
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            gs.render_resource_tx = tx;
-            gs.render_resource_rx = rx;
+            gs.abandon_render_resources();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
             gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
@@ -1967,6 +1956,10 @@ impl ObscuraJsRuntime {
     /// referrer semantics.
     pub fn set_referrer(&self, referrer: &str) {
         self.state.borrow_mut().referrer = referrer.to_string();
+    }
+
+    pub fn set_referrer_policy(&self, policy: &str) {
+        self.state.borrow_mut().referrer_policy = policy.to_string();
     }
 
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
@@ -2051,6 +2044,21 @@ impl ObscuraJsRuntime {
             .cloned()
     }
 
+    pub fn take_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
+        let mut state = self.state.borrow_mut();
+        state.network_response_body_order.retain(|id| id != request_id);
+        state.network_response_bodies.remove(request_id)
+    }
+
+    pub fn window_http_client(&self, id: crate::window::WindowId) -> Option<std::sync::Arc<obscura_net::ObscuraHttpClient>> {
+        self.windows.borrow().windows.get(&id)?.state.borrow().http_client.clone()
+    }
+
+    #[cfg(feature = "stealth")]
+    pub fn window_stealth_client(&self, id: crate::window::WindowId) -> Option<std::sync::Arc<obscura_net::StealthHttpClient>> {
+        self.windows.borrow().windows.get(&id)?.state.borrow().stealth_client.clone()
+    }
+
     pub fn clear_network_response_bodies(&self) {
         let mut state = self.state.borrow_mut();
         state.network_response_bodies.clear();
@@ -2092,21 +2100,50 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().intercept_block_patterns = patterns;
     }
 
+    fn set_identity_globals(&mut self, values: &[(&str, serde_json::Value)]) {
+        let mut contexts = self.realm_states().borrow().page_contexts(self.state.borrow().frame_id);
+        if !contexts.iter().any(|context| context == &self.root_context) {
+            contexts.push(self.root_context.clone());
+        }
+        let mut entered = self.runtime();
+        v8::scope!(let scope, entered.v8_isolate());
+        for context in contexts {
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let global = context.global(scope);
+            for (name, value) in values {
+                let Some(key) = v8::String::new(scope, name) else { continue; };
+                if let Ok(value) = deno_core::serde_v8::to_v8(scope, value) {
+                    global.set(scope, key.into(), value);
+                }
+            }
+        }
+    }
+
     pub fn set_user_agent(&mut self, ua: &str) {
-        let _ = self.execute_runtime_script(
-            "<set-ua>",
-            format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
-        );
+        self.set_identity_globals(&[("__obscura_ua", serde_json::json!(ua))]);
+    }
+
+    /// Navigator identity is per-page and per-world; ICU's process locale stays pinned.
+    pub fn set_language(&mut self, accept_language: &str) {
+        let languages: Vec<&str> = accept_language.split(',')
+            .filter_map(|entry| entry.split(';').next()).map(str::trim)
+            .filter(|tag| !tag.is_empty() && *tag != "*").collect();
+        if let Some(primary) = languages.first() {
+            self.set_identity_globals(&[
+                ("__obscura_language", serde_json::json!(primary)),
+                ("__obscura_languages", serde_json::json!(languages)),
+            ]);
+        }
     }
 
     pub fn set_locale(&mut self, locale: &str) {
-        let _ = self.execute_runtime_script(
-            "<set-locale>",
-            format!(
-                "globalThis.__obscura_language = {};",
-                js_string_literal(locale)
-            ),
-        );
+        let base = locale.split('-').next().unwrap_or(locale);
+        let languages = if base == locale { vec![locale] } else { vec![locale, base] };
+        self.set_identity_globals(&[
+            ("__obscura_language", serde_json::json!(locale)),
+            ("__obscura_languages", serde_json::json!(languages)),
+        ]);
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
@@ -2620,11 +2657,16 @@ impl ObscuraJsRuntime {
 
     #[cfg(feature = "render")]
     fn seed_shared_render_resource(&mut self, url: String, bytes: Option<std::sync::Arc<[u8]>>) {
-        let mut state = self.state.borrow_mut();
+        Self::seed_shared_render_resource_in_state(&mut self.state.borrow_mut(), url, bytes);
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_resource_in_state(state: &mut ObscuraState, url: String,
+        bytes: Option<std::sync::Arc<[u8]>>) {
         match bytes {
             Some(bytes) => {
                 state.render_resources.seed_shared(url, bytes);
-                crate::ops::invalidate_render_resource_geometry(&mut state);
+                crate::ops::invalidate_render_resource_geometry(state);
             }
             None => state.render_resources.seed_missing(url),
         }
@@ -2647,7 +2689,12 @@ impl ObscuraJsRuntime {
         profile: crate::ops::ImageRequestProfile,
         bytes: Option<std::sync::Arc<[u8]>>,
     ) {
-        let mut state = self.state.borrow_mut();
+        Self::seed_shared_render_image_resource_in_state(&mut self.state.borrow_mut(), url, profile, bytes);
+    }
+
+    #[cfg(feature = "render")]
+    fn seed_shared_render_image_resource_in_state(state: &mut ObscuraState, url: String,
+        profile: crate::ops::ImageRequestProfile, bytes: Option<std::sync::Arc<[u8]>>) {
         match bytes {
             Some(bytes) if obscura_render::image_intrinsic_dimensions(&bytes).is_some() => {
                 let needs_geometry = match (&state.prepared_render, &state.dom) {
@@ -2661,7 +2708,7 @@ impl ObscuraJsRuntime {
                     .seed_image_shared(url, profile, bytes);
                 state.activity_generation = state.activity_generation.wrapping_add(1);
                 if needs_geometry {
-                    crate::ops::invalidate_render_resource_geometry(&mut state);
+                    crate::ops::invalidate_render_resource_geometry(state);
                 }
             }
             _ => state.render_resources.seed_image_missing(url, profile),
@@ -2693,29 +2740,40 @@ impl ObscuraJsRuntime {
     pub fn take_render_resource_requests(
         &self,
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
-        let mut state = self.state.borrow_mut();
-        if !state.render_resources.has_sync_misses() {
-            return Vec::new();
-        }
-        let misses = state.render_resources.take_sync_misses();
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        let pending: usize = registry.render_document_states(&self.state)
+            .map(|state| state.borrow().render_resource_in_flight.len()).sum();
+        let blocked = self.state.borrow().blocked_urls.clone();
+        Self::take_document_render_resource_requests(&mut self.state.borrow_mut(),
+            &blocked, MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending))
+    }
+
+    #[cfg(feature = "render")]
+    fn take_document_render_resource_requests(state: &mut ObscuraState,
+        blocked_urls: &[String], available: usize)
+        -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>
+    {
+        if available == 0 || !state.render_resources.has_sync_misses() { return Vec::new(); }
+        let misses = state.render_resources.take_sync_misses(available);
         let mut requests = Vec::new();
         for (url, profile, is_font) in misses {
+            let known = match profile {
+                Some(profile) => state.render_resources.has_live_image_outcome(&url, profile),
+                None => state.render_resources.has_live_outcome(&url),
+            };
+            if known { continue; }
             // Fetch interception patterns pause requests; they are not a URL
             // blocklist. Static renderer resources currently pass through,
             // while Network.setBlockedURLs remains authoritative here.
-            let blocked = state
-                .blocked_urls
-                .iter()
-                .any(|pattern| crate::ops::glob_match(pattern, &url));
-            let allowed = page_render_resource_url_allowed(&state.url, &url);
+            let blocked = blocked_urls.iter().any(|pattern| crate::ops::glob_match(pattern, &url));
+            let allowed = page_render_resource_url_allowed(
+                state.about_base_url.as_deref().unwrap_or(&state.url), &url);
             if blocked || !allowed {
                 match profile {
                     Some(profile) => state.render_resources.seed_image_missing(url, profile),
                     None => state.render_resources.seed_missing(url),
                 }
-                continue;
-            }
-            if state.render_resource_in_flight.len() >= MAX_PENDING_RENDER_RESOURCES {
                 continue;
             }
             if state
@@ -2735,9 +2793,12 @@ impl ObscuraJsRuntime {
         &self,
         candidates: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        let pending: usize = registry.render_document_states(&self.state)
+            .map(|state| state.borrow().render_resource_in_flight.len()).sum();
+        let available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending);
         let mut state = self.state.borrow_mut();
-        let available =
-            MAX_PENDING_RENDER_RESOURCES.saturating_sub(state.render_resource_in_flight.len());
         candidates
             .into_iter()
             .filter(|(url, profile, is_font)| {
@@ -2757,19 +2818,12 @@ impl ObscuraJsRuntime {
     /// dropped channel.
     #[cfg(feature = "render")]
     pub fn abandon_render_resources(&self) {
-        let mut state = self.state.borrow_mut();
-        for task in state.render_resource_tasks.drain(..) {
-            task.abort();
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        registry.cancel_inactive_frame_timers();
+        for state in registry.render_document_states(&self.state) {
+            state.borrow_mut().abandon_render_resources();
         }
-        state.render_resource_in_flight.clear();
-        state.render_resource_backlog.clear();
-        state.render_resource_events.clear();
-        // A fresh channel fences results that are still on their way (abort
-        // is not a join) even when this runtime survives, as after a failed
-        // navigation.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        state.render_resource_tx = tx;
-        state.render_resource_rx = rx;
     }
 
     /// Whether a page transport (plain or stealth client) is installed.
@@ -2799,10 +2853,14 @@ impl ObscuraJsRuntime {
         &self,
         requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
     ) -> usize {
-        if requests.is_empty() {
-            return 0;
-        }
-        let mut state = self.state.borrow_mut();
+        Self::start_document_render_resource_loads(&self.state, requests)
+    }
+
+    #[cfg(feature = "render")]
+    fn start_document_render_resource_loads(document: &crate::ops::SharedState,
+        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>) -> usize {
+        if requests.is_empty() { return 0; }
+        let mut state = document.borrow_mut();
         if tokio::runtime::Handle::try_current().is_err() {
             state.render_resource_backlog.extend(requests);
             return 0;
@@ -2812,7 +2870,7 @@ impl ObscuraJsRuntime {
         let http_client = state.http_client.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
-        let initiator = url::Url::parse(&state.url).ok();
+        let initiator = url::Url::parse(state.inherited_origin.as_deref().unwrap_or(&state.url)).ok();
         if !crate::ops::has_page_transport(&state) || initiator.is_none() {
             // No transport or no document URL: nothing can be loaded; forget
             // the in-flight marks so a later scan may retry.
@@ -2968,26 +3026,45 @@ impl ObscuraJsRuntime {
     /// the number of loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn service_render_resources(&mut self) -> usize {
-        {
-            let state = self.state.borrow();
-            if state.render_resource_rx.is_empty()
-                && state.render_resource_backlog.is_empty()
-                && !state.render_resources.has_sync_misses()
-            {
-                return 0;
-            }
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        registry.cancel_inactive_frame_timers();
+        if !registry.render_document_states(&self.state).any(|state| {
+            let state = state.borrow();
+            !state.render_resource_rx.is_empty() || !state.render_resource_backlog.is_empty()
+                || state.render_resources.has_sync_misses()
+        }) { return 0; }
+        let mut loaded = 0;
+        for state in registry.render_document_states(&self.state) {
+            loaded += Self::apply_document_render_resource_results(&mut state.borrow_mut());
         }
-        let loaded = self.apply_render_resource_results();
-        let mut requests = std::mem::take(&mut self.state.borrow_mut().render_resource_backlog);
-        requests.extend(self.take_render_resource_requests());
-        self.start_render_resource_loads(requests);
+        let pending: usize = registry.render_document_states(&self.state)
+            .map(|state| state.borrow().render_resource_in_flight.len()).sum();
+        let mut available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending);
+        // Page policy is live even when a child inherited an earlier snapshot.
+        let blocked = self.state.borrow().blocked_urls.clone();
+        for state in registry.render_document_states(&self.state) {
+            let mut document = state.borrow_mut();
+            let mut requests = std::mem::take(&mut document.render_resource_backlog);
+            let discovered = Self::take_document_render_resource_requests(&mut document, &blocked, available);
+            available -= discovered.len();
+            requests.extend(discovered);
+            drop(document);
+            Self::start_document_render_resource_loads(state, requests);
+        }
         loaded
     }
 
     /// Whether page-transport loads are still running for this document.
     #[cfg(feature = "render")]
     pub fn has_pending_render_resources(&self) -> bool {
-        !self.state.borrow().render_resource_in_flight.is_empty()
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        let pending = registry.render_document_states(&self.state).any(|state| {
+            let state = state.borrow();
+            !state.render_resource_in_flight.is_empty() || state.render_resources.has_sync_misses()
+        });
+        pending
     }
 
     /// Apply every finished page-transport load without waiting. Called at
@@ -2997,28 +3074,23 @@ impl ObscuraJsRuntime {
     /// number of loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn apply_render_resource_results(&mut self) -> usize {
-        let loads = {
-            let mut state = self.state.borrow_mut();
-            let mut loads = Vec::new();
-            while let Ok(load) = state.render_resource_rx.try_recv() {
-                loads.push(load);
-            }
-            loads
-        };
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        registry.cancel_inactive_frame_timers();
+        let loaded = registry.render_document_states(&self.state)
+            .map(|state| Self::apply_document_render_resource_results(&mut state.borrow_mut())).sum();
+        loaded
+    }
+
+    #[cfg(feature = "render")]
+    fn apply_document_render_resource_results(state: &mut ObscuraState) -> usize {
         let mut loaded = 0;
-        for load in loads {
-            let generation = self.state.borrow().document_generation;
-            if load.generation != generation {
-                // A previous document's response: no seed, no event, and it
-                // must not clear a same-URL request of the current document.
+        while let Ok(load) = state.render_resource_rx.try_recv() {
+            if load.generation != state.document_generation {
                 tracing::debug!(url = %load.url, "discarded render resource load of a retired document");
                 continue;
             }
-            self.state.borrow_mut().render_resource_in_flight.remove(&(
-                load.url.clone(),
-                load.profile,
-                load.is_font,
-            ));
+            state.render_resource_in_flight.remove(&(load.url.clone(), load.profile, load.is_font));
             let is_font = load.is_font;
             let bytes = match &load.response {
                 Some(response) if (200..300).contains(&response.status) => {
@@ -3029,14 +3101,13 @@ impl ObscuraJsRuntime {
             };
             tracing::debug!(url = %load.url, loaded = bytes.is_some(), "applied render resource load");
             match load.profile {
-                Some(profile) => self.seed_shared_render_image_resource(load.url, profile, bytes),
-                None => self.seed_shared_render_resource(load.url, bytes),
+                Some(profile) => Self::seed_shared_render_image_resource_in_state(state, load.url, profile, bytes),
+                None => Self::seed_shared_render_resource_in_state(state, load.url, bytes),
             }
             if let Some(response) = load.response {
-                self.state
-                    .borrow_mut()
-                    .render_resource_events
-                    .push(crate::ops::RenderResourceEvent { is_font, response });
+                state.render_resource_events.push(crate::ops::RenderResourceEvent {
+                    frame_id: state.frame_id, frame_generation: load.generation, is_font, response,
+                });
             }
         }
         loaded
@@ -3046,7 +3117,18 @@ impl ObscuraJsRuntime {
     /// events yet.
     #[cfg(feature = "render")]
     pub fn take_render_resource_events(&self) -> Vec<crate::ops::RenderResourceEvent> {
-        std::mem::take(&mut self.state.borrow_mut().render_resource_events)
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        let root_id = self.state.borrow().frame_id;
+        let mut events = Vec::new();
+        for state in registry.render_document_states(&self.state) {
+            let mut state = state.borrow_mut();
+            for mut event in state.render_resource_events.drain(..) {
+                if event.frame_id == root_id { event.frame_id = 0; }
+                events.push(event);
+            }
+        }
+        events
     }
 
     #[cfg(feature = "render")]
@@ -4630,21 +4712,16 @@ impl ObscuraJsRuntime {
             state.pending_style_mutations.clear();
             let render_resources = crate::ops::fresh_render_resources(&state);
             state.render_resources = render_resources;
-            for task in state.render_resource_tasks.drain(..) {
-                task.abort();
-            }
-            state.render_resource_in_flight.clear();
-            state.render_resource_backlog.clear();
-            state.render_resource_events.clear();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            state.render_resource_tx = tx;
-            state.render_resource_rx = rx;
+            state.abandon_render_resources();
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
             state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
-        state.dom.take()
+        let dom = state.dom.take();
+        drop(state);
+        self.realm_states().borrow().cancel_inactive_frame_timers();
+        dom
     }
 
     /// Export document-owned script preparation state before the runtime realm
@@ -4723,7 +4800,11 @@ impl ObscuraJsRuntime {
     /// (fetch/XHR/dynamic resource). The Page moves these into its own
     /// network_events so the CDP layer emits Network events for them (#406).
     pub fn take_js_network_events(&self) -> Vec<crate::ops::JsNetworkEvent> {
-        std::mem::take(&mut self.state.borrow_mut().js_network_events)
+        let mut state = self.state.borrow_mut();
+        let root_frame = state.frame_id;
+        let mut events = std::mem::take(&mut state.js_network_events);
+        for event in &mut events { if event.frame_id == root_frame { event.frame_id = 0; } }
+        events
     }
 
     pub fn dom_ref(&self) -> Option<std::cell::Ref<'_, Option<DomTree>>> {
@@ -5494,6 +5575,47 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn native_child_resources_share_capacity_across_isolated_worlds_and_retire() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::new()));
+        rt.set_dom(parse_html("<iframe id=child></iframe>"));
+        rt.set_url("https://example.test/page");
+        rt.run_page_init();
+        let requests = (0..MAX_PENDING_RENDER_RESOURCES)
+            .map(|index| (format!("https://assets.test/{index}.svg"), None, false)).collect();
+        assert_eq!(rt.mark_render_resources_in_flight(requests).len(), MAX_PENDING_RENDER_RESOURCES);
+        rt.evaluate(r#"(() => {
+            const d = document.getElementById('child').contentDocument;
+            d.body.innerHTML = '<div id=icon style="content:url(https://assets.test/child.svg)"></div>';
+            return d.getElementById('icon').getBoundingClientRect().width;
+        })()"#).unwrap();
+        let registry = rt.realm_states();
+        let child_id = registry.borrow().live_frame_owners()[0].0;
+        rt.ensure_isolated_world(child_id, "first", false).unwrap();
+        rt.ensure_isolated_world(child_id, "second", false).unwrap();
+        let child = rt.document_state_for_frame(child_id).unwrap();
+        rt.service_render_resources();
+        assert!(child.borrow().render_resource_in_flight.is_empty());
+        assert!(child.borrow().render_resources.has_sync_misses(), "capacity defers, not drops, child work");
+        assert!(std::sync::Arc::ptr_eq(&rt.state.borrow().render_resource_limiter,
+            &child.borrow().render_resource_limiter));
+        rt.state.borrow_mut().render_resource_in_flight.remove(
+            &("https://assets.test/0.svg".into(), None, false));
+        rt.service_render_resources();
+        rt.service_render_resources();
+        assert_eq!(child.borrow().render_resource_in_flight.len(), 1,
+            "isolated worlds do not schedule the document twice");
+        assert!(rt.mark_render_resources_in_flight(vec![("https://assets.test/extra.svg".into(), None, false)]).is_empty());
+        let old_tx = child.borrow().render_resource_tx.clone();
+        rt.evaluate("document.getElementById('child').remove()").unwrap();
+        assert!(child.borrow().render_resource_in_flight.is_empty());
+        assert!(old_tx.is_closed(), "detachment retires the document result channel");
+        rt.abandon_render_resources();
+        assert!(!rt.has_pending_render_resources());
+    }
+
     /// A load that answers after the document was retired (abort is not a
     /// join) must neither seed the surviving runtime nor clear a same-URL
     /// request of the document that replaced it.
@@ -6081,10 +6203,38 @@ mod tests {
                 Document.prototype.elementFromPoint.call(d, 10, 10) === child,
                 foreign.elementFromPoint.call(document, 10, 10) === parent,
                 Document.prototype.elementFromPoint.call(d, 400, 10) === null,
-                foreign.elementFromPoint.call(document, 400, 10) === document.body,
+                foreign.elementFromPoint.call(document, 400, 10) === document.elementFromPoint(400, 10),
                 Document.prototype.elementsFromPoint.call(d, 10, 10)[0] === child,
                 foreign.elementsFromPoint.call(document, 10, 10)[0] === parent];
         })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn elements_from_point_returns_native_occlusion_stack_with_clip_zoom_and_depth() {
+        let mut rt = setup_runtime(r#"<style>
+            body{margin:0} #dialog{position:fixed;left:100px;top:100px;width:400px;height:200px;z-index:1000}
+            #close{position:absolute;left:350px;top:10px;width:32px;height:32px;z-index:1002}
+            #overlay{position:absolute;inset:0;z-index:1001}
+            #clip{position:absolute;left:0;top:0;width:20px;height:20px;overflow:hidden;z-index:2000}
+            #clipped{width:80px;height:80px;transform:translate(450px,110px)}
+            #scene{position:absolute;left:0;top:0;width:80px;height:80px;zoom:1.25;transform-style:preserve-3d}
+            #near,#far{position:absolute;inset:0} #near{transform:translateZ(20px)} #far{transform:translateZ(-20px)}
+        </style><div id=dialog><button id=close>x</button><div id=overlay></div></div>
+            <div id=clip><div id=clipped></div></div><div id=scene><div id=near></div><div id=far></div></div>"#);
+        assert_eq!(rt.evaluate(r#"document.elementsFromPoint(466,126).slice(0,3).map(e=>e.id)"#).unwrap(),
+            serde_json::json!(["close","overlay","dialog"]));
+        let close = rt.with_dom(|dom| dom.get_element_by_id("close").unwrap()).unwrap();
+        assert_eq!(rt.native_hit_test(0,466.0,126.0).unwrap(), Some(close));
+        let near = rt.with_dom(|dom| dom.get_element_by_id("near").unwrap()).unwrap();
+        assert_eq!(rt.native_hit_test(0,50.0,50.0).unwrap(), Some(near));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const stack=document.elementsFromPoint(50,50);
+            return [stack[0].id, stack.indexOf(document.getElementById('near')) < stack.indexOf(document.getElementById('far')),
+                document.elementFromPoint(50,50)===stack[0],
+                document.elementsFromPoint(-1,10).length,
+                document.elementsFromPoint(466,126).some(e=>e.id==='clipped')];
+        })()"#).unwrap(), serde_json::json!(["near",true,true,0,false]));
     }
 
     #[cfg(feature = "render")]
@@ -9748,6 +9898,77 @@ mod tests {
             document.body.removeAttribute('data-active');
             return [savedStyle.color, savedStyle.width, savedStyle.length > 20];
         })()"#).unwrap(), serde_json::json!(["rgb(0, 0, 255)", "80px", true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_cssom_reports_insets_longhands_and_live_model_values() {
+        let mut rt = setup_runtime(r#"<style>
+            body{margin:0} #spacer{height:40px}
+            #box{position:relative;top:5px;left:calc(4px + 3px);zoom:1.25;
+                width:80px;vertical-align:middle;text-transform:uppercase;
+                list-style-type:square;border-collapse:collapse;table-layout:fixed;
+                float:left;direction:rtl;font-style:italic;word-spacing:3px;
+                text-decoration-line:underline overline line-through;text-indent:6px;
+                flex-grow:2;flex-shrink:3;flex-basis:12px;order:-2;
+                align-self:center;justify-self:end;object-fit:cover;object-position:25% 7px;
+                background-image:linear-gradient(90deg, red, blue);
+                background-size:20px 30px;background-position:10px 25%;background-repeat:no-repeat;
+                box-shadow:1px 2px 3px 4px rgb(12,34,56);aspect-ratio:2;
+                animation-name:probe;animation-duration:2s;animation-delay:-250ms;
+                animation-iteration-count:3;animation-direction:alternate;
+                animation-fill-mode:both;animation-play-state:paused}
+        </style><div id=spacer></div><div id=box>text</div>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const c = getComputedStyle(document.getElementById('box'));
+            globalThis.savedModelStyle = c;
+            const plain = getComputedStyle(document.getElementById('spacer'));
+            return [plain.top,plain.left,c.top,c.left,c.zoom,c.width,
+                c.verticalAlign,c.textTransform,c.listStyleType,c.borderCollapse,c.tableLayout,
+                c.cssFloat,c.getPropertyValue('float'),c.direction,c.fontStyle,c.wordSpacing,
+                c.textDecorationLine,c.textIndent,c.flexGrow,c.flexShrink,c.flexBasis,c.order,
+                c.alignSelf,c.justifySelf,c.objectFit,c.objectPosition,c.backgroundSize,
+                c.backgroundPosition,c.backgroundRepeat,c.boxShadow,c.aspectRatio,
+                c.animationName,c.animationDuration,c.animationDelay,c.animationIterationCount,
+                c.animationDirection,c.animationFillMode,c.animationPlayState,
+                c.backgroundImage.startsWith('linear-gradient(')];
+        })()"#).unwrap(), serde_json::json!([
+            "auto","auto","5px","7px","1.25","80px",
+            "middle","uppercase","square","collapse","fixed","left","left","rtl","italic","3px",
+            "underline overline line-through","6px","2","3","12px","-2","center","end","cover","25% 7px",
+            "20px 30px","10px 25%","no-repeat","rgb(12, 34, 56) 1px 2px 3px 4px","2 / 1",
+            "probe","2s","-0.25s","3","alternate","both","paused",true
+        ]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.getElementById('box').style.top = '9px';
+            document.getElementById('box').style.textTransform = 'lowercase';
+            return [savedModelStyle.top,savedModelStyle.textTransform];
+        })()"#).unwrap(), serde_json::json!(["9px","lowercase"]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn computed_display_preserves_table_provenance_through_inherit_and_blockification() {
+        let mut rt = setup_runtime(r#"<style>
+            #inline{display:inline-table} #inherited{display:inherit}
+            #flex{display:flex} #item{display:inline-table}
+            #contents{display:contents} #pseudo::before{content:'x';display:inline-table}
+        </style><table id=t><thead id=head><tr id=row><th id=cell>x</th></tr></thead></table>
+            <ul><li id=li>x</li></ul><div id=inline><div id=inherited>x</div></div>
+            <div id=flex><div id=item>x</div></div><div id=contents>x</div><div id=pseudo></div>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const ids=['t','head','row','cell','li','inline','inherited','item','contents'];
+            const displays=ids.map(id=>getComputedStyle(document.getElementById(id)).display);
+            const table=getComputedStyle(document.getElementById('t'));
+            displays.push(table.flexDirection,table.alignItems,
+                getComputedStyle(document.getElementById('pseudo'),'::before').display);
+            document.getElementById('t').style.display='block';
+            displays.push(table.display);
+            return displays;
+        })()"#).unwrap(), serde_json::json!([
+            "table","table-header-group","table-row","table-cell","list-item",
+            "inline-table","inline-table","table","contents","row","normal","inline-table","block"
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -23201,14 +23422,8 @@ mod tests {
     #[test]
     fn test_elements_from_point_returns_array() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let len_in = rt
-            .evaluate("document.elementsFromPoint(10, 10).length")
-            .unwrap();
-        assert_eq!(len_in.as_f64().unwrap() as i64, 1);
-        let len_out = rt
-            .evaluate("document.elementsFromPoint(-1, -1).length")
-            .unwrap();
-        assert_eq!(len_out.as_f64().unwrap() as i64, 0);
+        assert_eq!(rt.evaluate("Array.isArray(document.elementsFromPoint(10,10))").unwrap(), serde_json::json!(true));
+        assert_eq!(rt.evaluate("document.elementsFromPoint(-1,-1).length").unwrap(), serde_json::json!(0));
     }
 
     #[test]

@@ -205,6 +205,8 @@ pub struct ResourceRequest {
     /// but a module dependency is referred by its importing module while its
     /// credentials mode is still relative to the owning document.
     pub referrer: Option<Url>,
+    /// Empty selects the browser default, strict-origin-when-cross-origin.
+    pub referrer_policy: String,
     pub mode: RequestMode,
     pub credentials: RequestCredentials,
     /// Hard limit for the decoded response body retained by this request.
@@ -218,6 +220,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Document,
             initiator: None,
             referrer: None,
+            referrer_policy: String::new(),
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
@@ -247,6 +250,7 @@ impl ResourceRequest {
             resource_type,
             initiator: Some(initiator.clone()),
             referrer: Some(initiator.clone()),
+            referrer_policy: String::new(),
             mode,
             credentials,
             max_response_bytes: match resource_type {
@@ -269,6 +273,7 @@ impl ResourceRequest {
             resource_type: ResourceType::Script,
             initiator: Some(initiator.clone()),
             referrer: Some(referrer.clone()),
+            referrer_policy: String::new(),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
             // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
@@ -474,25 +479,49 @@ pub(crate) fn same_site_context(
 }
 
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
-    let source = request
-        .referrer
-        .as_ref()
-        .or(request.initiator.as_ref())?;
-    if !matches!(source.scheme(), "http" | "https")
-        || !matches!(target.scheme(), "http" | "https")
-        || (source.scheme() == "https" && target.scheme() == "http")
-    {
+    referrer_for_policy(request.referrer.as_ref(), target, &request.referrer_policy)
+}
+
+/// Last recognized token wins, including comma-separated response policies.
+pub fn parse_referrer_policy(value: &str) -> Option<&str> {
+    value.split(',').map(str::trim).filter(|value| matches!(*value,
+        "no-referrer" | "no-referrer-when-downgrade" | "same-origin" | "origin"
+        | "strict-origin" | "origin-when-cross-origin" | "strict-origin-when-cross-origin"
+        | "unsafe-url")).last()
+}
+
+pub fn referrer_for_policy(source: Option<&Url>, target: &Url, policy: &str) -> Option<String> {
+    let source = source?;
+    if !matches!(source.scheme(), "http" | "https") || !matches!(target.scheme(), "http" | "https") {
         return None;
     }
-    if source.origin() == target.origin() {
-        let mut value = source.clone();
-        let _ = value.set_username("");
-        let _ = value.set_password(None);
-        value.set_fragment(None);
-        Some(value.to_string())
-    } else {
-        Some(format!("{}/", source.origin().ascii_serialization()))
-    }
+    let same_origin = source.origin() == target.origin();
+    let downgrade = source.scheme() == "https" && target.scheme() == "http";
+    let origin_only = match policy {
+        "no-referrer" => return None,
+        "same-origin" if !same_origin => return None,
+        "same-origin" | "unsafe-url" => false,
+        "origin" => true,
+        "origin-when-cross-origin" => !same_origin,
+        "strict-origin" if downgrade => return None,
+        "strict-origin" => true,
+        "no-referrer-when-downgrade" if downgrade => return None,
+        "no-referrer-when-downgrade" => false,
+        _ if downgrade => return None,
+        _ => !same_origin,
+    };
+    if origin_only { return Some(format!("{}/", source.origin().ascii_serialization())); }
+    let mut value = source.clone();
+    let _ = value.set_username("");
+    let _ = value.set_password(None);
+    value.set_fragment(None);
+    if value.as_str().len() > 4096 { Some(format!("{}/", source.origin().ascii_serialization())) }
+    else { Some(value.to_string()) }
+}
+
+pub(crate) fn is_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
 }
 
 pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
@@ -842,17 +871,17 @@ async fn read_reqwest_body_limited(
 }
 
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: Arc<tokio::sync::OnceCell<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
     pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
-    pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
+    pub interceptor: Arc<RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>>,
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
-    resource_loader: std::sync::Mutex<ResourceLoaderState>,
+    resource_loader: Arc<std::sync::Mutex<ResourceLoaderState>>,
     /// When true, `validate_url` lets localhost / RFC1918 / link-local addresses
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
@@ -870,6 +899,8 @@ struct ResourceCacheKey {
     credentials: RequestCredentials,
     initiator: Option<String>,
     referrer: Option<String>,
+    referrer_policy: String,
+    accept_language: String,
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
@@ -1055,7 +1086,7 @@ impl ObscuraHttpClient {
         allow_private_network: bool,
     ) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: Arc::new(tokio::sync::OnceCell::new()),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
@@ -1063,12 +1094,28 @@ impl ObscuraHttpClient {
             ),
             accept_language: RwLock::new("en-US,en;q=0.9".to_string()),
             extra_headers: RwLock::new(HashMap::new()),
-            interceptor: RwLock::new(None),
+            interceptor: Arc::new(RwLock::new(None)),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
-            resource_loader: std::sync::Mutex::new(ResourceLoaderState::default()),
+            resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
+        }
+    }
+
+    /// A new top-level page inherits a snapshot of identity and headers, while
+    /// sharing transport, cookies, cache and interception with its context.
+    /// Child frames keep the page client; popups take their own snapshot.
+    pub fn for_page(&self) -> Self {
+        Self {
+            client: self.client.clone(), proxy_url: self.proxy_url.clone(),
+            cookie_jar: self.cookie_jar.clone(),
+            user_agent: RwLock::new(self.user_agent.try_read().expect("identity is being updated").clone()),
+            accept_language: RwLock::new(self.accept_language.try_read().expect("identity is being updated").clone()),
+            extra_headers: RwLock::new(self.extra_headers.try_read().expect("headers are being updated").clone()),
+            interceptor: self.interceptor.clone(), timeout: self.timeout,
+            in_flight: self.in_flight.clone(), block_trackers: self.block_trackers,
+            resource_loader: self.resource_loader.clone(), allow_private_network: self.allow_private_network,
         }
     }
 
@@ -1228,6 +1275,8 @@ impl ObscuraHttpClient {
             credentials: request.credentials,
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
+            referrer_policy: request.referrer_policy.clone(),
+            accept_language: self.accept_language.read().await.clone(),
             user_agent: self.user_agent.read().await.clone(),
             extra_headers,
             max_response_bytes: request.max_response_bytes,
@@ -1384,7 +1433,7 @@ impl ObscuraHttpClient {
         url: &Url,
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
-        request: ResourceRequest,
+        mut request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1420,6 +1469,7 @@ impl ObscuraHttpClient {
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
+        let mut strip_credential_headers = false;
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
@@ -1495,10 +1545,10 @@ impl ObscuraHttpClient {
                 HeaderName::from_static("sec-fetch-dest"),
                 HeaderValue::from_static(request.destination()),
             );
-            if let Some(referer) = request_referrer(&request, &current_url) {
-                if let Ok(value) = HeaderValue::from_str(&referer) {
-                    headers.insert(reqwest::header::REFERER, value);
-                }
+            let referer = request_referrer(&request, &current_url);
+            request.referrer = referer.as_deref().and_then(|value| Url::parse(value).ok());
+            if let Some(referer) = referer {
+                if let Ok(value) = HeaderValue::from_str(&referer) { headers.insert(reqwest::header::REFERER, value); }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
             let accept_language = self.accept_language.read().await.clone();
@@ -1551,6 +1601,8 @@ impl ObscuraHttpClient {
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
+                if k.eq_ignore_ascii_case("referer") || ((strip_credential_headers || !request.sends_credentials_to(&current_url))
+                    && is_credential_header(k)) { continue; }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -1623,6 +1675,10 @@ impl ObscuraHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    strip_credential_headers |= current_url.origin() != next_url.origin();
+                    if let Some(policy) = response_headers.get("referrer-policy").and_then(|value| parse_referrer_policy(value)) {
+                        request.referrer_policy = policy.to_string();
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if status == reqwest::StatusCode::MOVED_PERMANENTLY
@@ -1743,6 +1799,8 @@ mod resource_cache_tests {
             credentials: RequestCredentials::Omit,
             initiator: None,
             referrer: None,
+            referrer_policy: String::new(),
+            accept_language: "en-US".into(),
             user_agent: "cache-test".into(),
             extra_headers: Vec::new(),
             max_response_bytes: 1024,
@@ -2087,6 +2145,30 @@ mod ssrf_tests {
             Some("https://app.example/")
         );
         assert_eq!(request_referrer(&request, &downgrade), None);
+    }
+
+    #[test]
+    fn explicit_referrer_policies_bound_cross_origin_and_downgrade_values() {
+        let source = Url::parse("https://user:secret@app.example/path?q=1#frag").unwrap();
+        let same = Url::parse("https://app.example/echo").unwrap();
+        let cross = Url::parse("https://cdn.example/echo").unwrap();
+        let down = Url::parse("http://cdn.example/echo").unwrap();
+        for (policy, same_value, cross_value, down_value) in [
+            ("no-referrer", None, None, None),
+            ("same-origin", Some("https://app.example/path?q=1"), None, None),
+            ("origin", Some("https://app.example/"), Some("https://app.example/"), Some("https://app.example/")),
+            ("strict-origin", Some("https://app.example/"), Some("https://app.example/"), None),
+            ("origin-when-cross-origin", Some("https://app.example/path?q=1"), Some("https://app.example/"), Some("https://app.example/")),
+            ("strict-origin-when-cross-origin", Some("https://app.example/path?q=1"), Some("https://app.example/"), None),
+            ("no-referrer-when-downgrade", Some("https://app.example/path?q=1"), Some("https://app.example/path?q=1"), None),
+            ("unsafe-url", Some("https://app.example/path?q=1"), Some("https://app.example/path?q=1"), Some("https://app.example/path?q=1")),
+        ] {
+            assert_eq!(super::referrer_for_policy(Some(&source), &same, policy).as_deref(), same_value, "{policy}");
+            assert_eq!(super::referrer_for_policy(Some(&source), &cross, policy).as_deref(), cross_value, "{policy}");
+            assert_eq!(super::referrer_for_policy(Some(&source), &down, policy).as_deref(), down_value, "{policy}");
+        }
+        assert_eq!(super::parse_referrer_policy("unsafe-url, unknown, no-referrer"), Some("no-referrer"));
+        assert_eq!(super::parse_referrer_policy("unknown"), None);
     }
 
     async fn http_fixture(

@@ -24,6 +24,34 @@ fn cookie_jar_for<'a>(ctx: &'a CdpContext, session_id: &Option<String>) -> &'a A
         .unwrap_or(&ctx.default_context.cookie_jar)
 }
 
+pub(super) async fn apply_user_agent_override(
+    params: &Value, ctx: &mut CdpContext, session_id: &Option<String>,
+) -> Result<(), String> {
+    let requested_user_agent = params.get("userAgent").and_then(Value::as_str)
+        .ok_or("setUserAgentOverride requires userAgent")?;
+    let language = params.get("acceptLanguage").and_then(Value::as_str)
+        .map(|value| if value.is_empty() { "en-US,en;q=0.9" } else { value });
+    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+    let user_agent = if requested_user_agent.is_empty() { page.context.user_agent.clone() }
+        else { requested_user_agent.to_string() };
+    #[cfg(feature = "stealth")]
+    let user_agent = if requested_user_agent.is_empty() && page.stealth_client.is_some() {
+        obscura_net::STEALTH_USER_AGENT.to_string()
+    } else { user_agent };
+    page.http_client.set_user_agent(&user_agent).await;
+    if let Some(language) = language { page.http_client.set_accept_language(language).await; }
+    #[cfg(feature = "stealth")]
+    if let Some(client) = &page.stealth_client {
+        client.set_user_agent(&user_agent).await;
+        if let Some(language) = language { client.set_accept_language(language).await; }
+    }
+    if let Some(js) = &mut page.js {
+        js.set_user_agent(&user_agent);
+        if let Some(language) = language { js.set_language(language); }
+    }
+    Ok(())
+}
+
 pub async fn handle(
     method: &str,
     params: &Value,
@@ -50,16 +78,13 @@ pub async fn handle(
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                         .collect();
-                    page.http_client.set_extra_headers(header_map).await;
+                    page.set_extra_headers(header_map).await;
                 }
             }
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let ua = params.get("userAgent").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(page) = ctx.get_session_page(session_id) {
-                page.http_client.set_user_agent(ua).await;
-            }
+            apply_user_agent_override(params, ctx, session_id).await?;
             Ok(json!({}))
         }
         "getCookies" | "getAllCookies" => {

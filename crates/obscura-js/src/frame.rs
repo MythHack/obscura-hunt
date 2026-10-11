@@ -108,6 +108,7 @@ impl FrameRealm {
         state.frame_id = frame_id;
         if opaque { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
+        state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
 
         let state = Rc::new(std::cell::RefCell::new(state));
         let modules = parent.attach_document_module_realm(&context, &state);

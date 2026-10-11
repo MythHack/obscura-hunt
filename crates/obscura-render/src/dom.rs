@@ -5288,6 +5288,7 @@ fn layout_dom_once(
         #[derive(Clone)]
         struct Inherited {
             display: crate::Display,
+            computed_display: Option<&'static str>,
             direction: taffy::Direction,
             display_contents: bool,
             is_inline_block: bool,
@@ -5354,6 +5355,7 @@ fn layout_dom_once(
                     // CSS Display's initial outer/inner value is inline flow.
                     // The root is blockified after computed values settle.
                     display: crate::Display::Inline,
+                    computed_display: None,
                     direction: taffy::Direction::Ltr,
                     display_contents: false,
                     is_inline_block: false,
@@ -5496,6 +5498,7 @@ fn layout_dom_once(
                         vh,
                     );
                     inh.display = style.display;
+                    inh.computed_display = style.computed_display;
                     inh.direction = style.direction.unwrap_or(inh.direction);
                     inh.display_contents = style.display_contents;
                     inh.is_inline_block = style.is_inline_block;
@@ -5678,6 +5681,7 @@ fn layout_dom_once(
                 }
                 if style.display_inherit {
                     style.display = inh.display;
+                    style.computed_display = inh.computed_display;
                     style.display_contents = inh.display_contents;
                     style.is_inline_block = inh.is_inline_block;
                     style.flow_root = inh.flow_root;
@@ -5693,6 +5697,7 @@ fn layout_dom_once(
                     style.display_inherit = false;
                 }
                 inh.display = style.display;
+                inh.computed_display = style.computed_display;
                 match style.direction {
                     Some(direction) => inh.direction = direction,
                     None => style.direction = Some(inh.direction),

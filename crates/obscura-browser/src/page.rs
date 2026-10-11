@@ -187,6 +187,8 @@ pub struct NetworkEvent {
     pub request_id: String,
     /// Initiating native realm; zero is the main document.
     pub frame_id: u32,
+    /// Document generation captured with the native initiating frame.
+    pub frame_generation: u64,
     /// The live interception channel already emitted the request start.
     pub intercepted: bool,
     pub url: String,
@@ -272,6 +274,7 @@ pub struct Page {
     /// separate from `url`: direct automation navigations have no referrer,
     /// while a navigation requested by page script uses the previous document.
     pub referrer: String,
+    referrer_policy: String,
     /// CSS viewport used by responsive page JavaScript and CDP screenshots.
     /// The physical `screen` fingerprint remains independent.
     pub viewport: (f32, f32),
@@ -1142,8 +1145,9 @@ impl Page {
         window_group: Option<std::rc::Rc<std::cell::RefCell<PageWindowGroup>>>,
         source: Option<&Self>,
     ) -> Self {
-        let http_client = source.map(|page| page.http_client.clone())
-            .unwrap_or_else(|| context.http_client.clone());
+        let http_client = source.and_then(|page| page.js.as_ref())
+            .and_then(|js| js.window_http_client(native_window_id))
+            .unwrap_or_else(|| Arc::new(context.http_client.for_page()));
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
         // (via target._targetInfo.targetId), so any divergence here makes
@@ -1152,7 +1156,7 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if let Some(source) = source {
-            source.stealth_client.clone()
+            source.js.as_ref().and_then(|js| js.window_stealth_client(native_window_id))
         } else if context.stealth {
             // The wreq client backing StealthHttpClient does not speak SOCKS5.
             // Callers must validate the proxy scheme up front and fail loudly
@@ -1160,11 +1164,12 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
-                context.cookie_jar.clone(),
-                context.proxy_url.as_deref(),
-                context.allow_private_network,
-            )))
+            let mut client = StealthHttpClient::with_proxy(
+                context.cookie_jar.clone(), context.proxy_url.as_deref(), context.allow_private_network,
+            );
+            *client.extra_headers.get_mut() = http_client.extra_headers.try_read().expect("headers are being updated").clone();
+            *client.accept_language.get_mut() = http_client.accept_language.try_read().expect("identity is being updated").clone();
+            Some(Arc::new(client))
         } else {
             None
         };
@@ -1188,6 +1193,7 @@ impl Page {
             context,
             title: String::new(),
             referrer: String::new(),
+            referrer_policy: String::new(),
             viewport: (1280.0, 720.0),
             screen_size_override: None,
             screen_metrics_emulated: false,
@@ -1285,6 +1291,13 @@ impl Page {
         self.history_index = settings.history_index;
         self.document_history_start = settings.document_history_start;
         self.network_event_counter = settings.network_event_counter;
+    }
+
+    /// Extra headers belong to one top-level page and its child documents.
+    pub async fn set_extra_headers(&self, headers: std::collections::HashMap<String, String>) {
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client { client.set_extra_headers(headers.clone()).await; }
+        self.http_client.set_extra_headers(headers).await;
     }
 
     /// Generation of the document installed in this Page, after native job adoption.
@@ -1414,6 +1427,7 @@ impl Page {
             self.url = page.url.take();
             self.title = std::mem::take(&mut page.title);
             self.referrer = std::mem::take(&mut page.referrer);
+            self.referrer_policy = std::mem::take(&mut page.referrer_policy);
             self.encoding = std::mem::take(&mut page.encoding);
             self.lifecycle = page.lifecycle;
             self.document_timeline_origin = page.document_timeline_origin;
@@ -2454,13 +2468,14 @@ impl Page {
         rt.set_content_type(&self.content_type);
         rt.set_title(&self.title);
         rt.set_referrer(&self.referrer);
+        rt.set_referrer_policy(&self.referrer_policy);
         let (session_history, session_index) = self.predicted_session_history();
         rt.set_session_history(session_history, session_index, session_index);
 
         #[cfg(feature = "stealth")]
-        if self.stealth_client.is_some() {
+        if let Some(client) = &self.stealth_client {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            if let Ok(ua) = client.user_agent.try_read() { rt.set_user_agent(&ua); }
             rt.set_platform(
                 obscura_net::STEALTH_NAVIGATOR_PLATFORM,
                 obscura_net::STEALTH_UA_PLATFORM,
@@ -2486,6 +2501,13 @@ impl Page {
                 &self.context.ua_platform,
                 &self.context.ua_platform_version,
             );
+        }
+        if let Ok(accept_language) = self.http_client.accept_language.try_read() {
+            rt.set_language(&accept_language);
+        }
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client {
+            if let Ok(language) = client.accept_language.try_read() { rt.set_language(&language); }
         }
         if let Some(locale) = &self.locale_override {
             rt.set_locale(locale);
@@ -3510,14 +3532,6 @@ impl Page {
                             tracing::warn!("ES module evaluation error: {}", error);
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
-                            self.record_network_event(
-                                &url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -3598,14 +3612,6 @@ impl Page {
                         tracing::warn!("ES module evaluation error: {}", error);
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
-                        self.record_network_event(
-                            &url,
-                            "GET",
-                            "Script",
-                            200,
-                            &std::collections::HashMap::new(),
-                            0,
-                        );
                     }
                 }
             }
@@ -3662,6 +3668,7 @@ impl Page {
             budget_ms = script_deadline_ms,
             "script execution phase complete",
         );
+        self.sync_js_network_events();
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -4145,10 +4152,7 @@ impl Page {
         }
         self.navigation_timing.record("responseEnd");
 
-        // Store binary main resources (images, PDFs, octet-stream) base64 so
-        // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
-        // corrupts them (issue #340). Text-like types stay as text.
-        let main_is_binary = !is_text_like_content_type(response.content_type());
+        // Retention checks precede charset decoding and binary encoding.
         self.record_network_event_with_body(
             response.url.as_str(),
             "GET",
@@ -4156,7 +4160,7 @@ impl Page {
             response.status,
             &response.headers,
             &response.body,
-            main_is_binary,
+            false,
         );
 
         if !response.redirected_from.is_empty() {
@@ -4182,6 +4186,8 @@ impl Page {
             None => (parse_html(&body_text), base_content_type(response.content_type()).unwrap_or_default()),
         };
         self.content_type = document_content_type;
+        self.referrer_policy = response.header("referrer-policy")
+            .and_then(obscura_net::client::parse_referrer_policy).unwrap_or("").to_string();
 
         self.title = dom
             .query_selector("title")
@@ -4619,6 +4625,12 @@ impl Page {
                 event.response.body.as_ref(),
                 true,
             );
+            // This is exactly the receipt just inserted above, not a URL match
+            // that could attach a child response to another document's request.
+            if let Some(receipt) = self.network_events.last_mut() {
+                receipt.frame_id = event.frame_id;
+                receipt.frame_generation = event.frame_generation;
+            }
         }
     }
 
@@ -4967,9 +4979,15 @@ impl Page {
             None => return,
         };
         for ev in events {
+            if let Some(body) = self.js.as_ref().and_then(|js| js.take_network_response_body(&ev.request_id)) {
+                self.store_response_body_with(ev.request_id.clone(), ev.body_size, || StoredResponseBody {
+                    body: body.body, base64_encoded: body.base64_encoded,
+                });
+            }
             self.network_events.push(NetworkEvent {
                 request_id: ev.request_id,
                 frame_id: ev.frame_id,
+                frame_generation: ev.frame_generation,
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
@@ -5220,24 +5238,6 @@ impl Page {
         }
     }
 
-    fn record_network_event(
-        &mut self,
-        url: &str,
-        method: &str,
-        resource_type: &str,
-        status: u16,
-        response_headers: &std::collections::HashMap<String, String>,
-        body_size: usize,
-    ) {
-        self.record_network_event_inner(
-            url,
-            method,
-            resource_type,
-            status,
-            response_headers,
-            body_size,
-        );
-    }
 
     fn record_network_event_with_body(
         &mut self,
@@ -5257,7 +5257,16 @@ impl Page {
             response_headers,
             body.len(),
         );
-        self.store_response_body(request_id, body, base64_encoded);
+        self.store_response_body_with(request_id, body.len(), || {
+            if !base64_encoded {
+                if let Some(text) = obscura_net::encoding::decode_devtools_response_body(
+                    body, response_headers.get("content-type").map(String::as_str),
+                ) {
+                    return StoredResponseBody { body: text, base64_encoded: false };
+                }
+            }
+            StoredResponseBody { body: BASE64.encode(body), base64_encoded: true }
+        });
     }
 
     fn record_network_event_inner(
@@ -5278,6 +5287,7 @@ impl Page {
         self.network_events.push(NetworkEvent {
             request_id: request_id.clone(),
             frame_id: 0,
+            frame_generation: self.window_document_generation,
             intercepted: false,
             url: url.to_string(),
             method: method.to_string(),
@@ -5292,24 +5302,16 @@ impl Page {
         request_id
     }
 
-    fn store_response_body(&mut self, request_id: String, body: &[u8], base64_encoded: bool) {
+    fn store_response_body_with(
+        &mut self, request_id: String, body_size: usize,
+        body: impl FnOnce() -> StoredResponseBody,
+    ) {
         let max_entries = response_body_entry_limit();
         let max_bytes = response_body_byte_limit();
-        if max_entries == 0 || max_bytes == 0 || body.len() > max_bytes {
+        if max_entries == 0 || max_bytes == 0 || body_size > max_bytes {
             return;
         }
-        let body = if base64_encoded {
-            BASE64.encode(body)
-        } else {
-            String::from_utf8_lossy(body).to_string()
-        };
-        self.response_bodies.insert(
-            request_id.clone(),
-            StoredResponseBody {
-                body,
-                base64_encoded,
-            },
-        );
+        self.response_bodies.insert(request_id.clone(), body());
         self.response_body_order.push_back(request_id);
         while self.response_body_order.len() > max_entries {
             if let Some(oldest) = self.response_body_order.pop_front() {
@@ -5406,6 +5408,7 @@ impl Page {
         if self.js.is_none() {
             return;
         }
+        self.sync_js_network_events();
         // Suspension rebuilds the renderer cache on resume (`take_dom`), so
         // results for the suspended realm would have nowhere to go.
         self.retire_render_resources();
@@ -9749,6 +9752,106 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn native_child_late_linked_css_font_and_image_update_layout_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let observed = observed.clone();
+                let mut released = released.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let size = socket.read(&mut buffer).await.unwrap_or(0);
+                        if size == 0 || request.len() > 16_384 { return; }
+                        request.extend_from_slice(&buffer[..size]);
+                    }
+                    let path = String::from_utf8_lossy(&request).split_whitespace()
+                        .nth(1).unwrap().to_string();
+                    let _ = observed.send(path.clone());
+                    let (mime, body): (&str, &[u8]) = match path.as_str() {
+                        "/child.css" => ("text/css", br#"@font-face{font-family:LateFixture;src:url(/late-font)}
+                            #box{width:73px} #text{font:20px LateFixture,serif;display:inline-block}
+                            #icon{content:url(/late.svg);display:inline-block}"#),
+                        "/late-font" => ("font/ttf", include_bytes!("../../obscura-render/assets/liberation-mono.ttf")),
+                        _ => ("image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"/>"#),
+                    };
+                    if path != "/child.css" && released.wait_for(|ready| *ready).await.is_err() { return; }
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let mut page = page_with_transport_and_body("child-late", &format!("{origin}/page"), "<iframe id=child></iframe>");
+        assert_eq!(page.evaluate(r#"(() => {
+            const d = document.getElementById('child').contentDocument;
+            d.body.innerHTML = '<style>#box{width:10px}</style><div id=box></div><span id=text>iiiiiiiiii</span><span id=icon></span>';
+            const before = d.getElementById('box').getBoundingClientRect().width;
+            const link = d.createElement('link'); link.rel='stylesheet'; link.href='/child.css';
+            link.onload=()=>{globalThis.childSheetReady=true}; d.head.appendChild(link);
+            return before;
+        })()"#), serde_json::json!(10));
+        assert!(page.js.as_mut().unwrap().resolve_promises_until(|js|
+            js.evaluate("globalThis.childSheetReady === true").unwrap() == serde_json::json!(true), 2_000).await);
+        let before_font = page.evaluate("document.getElementById('child').contentDocument.getElementById('text').getBoundingClientRect().width").as_f64().unwrap();
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources(), "only the child has late renderer resources");
+        release.send(true).unwrap();
+        page.prepare_screenshot_resources(2_000).await;
+        assert!(!page.has_pending_render_resources());
+        let geometry = page.evaluate(r#"(() => {
+            const d = document.getElementById('child').contentDocument;
+            return [d.getElementById('box').getBoundingClientRect().width,
+                d.getElementById('icon').getBoundingClientRect().width,
+                d.getElementById('icon').getBoundingClientRect().height,
+                d.getElementById('text').getBoundingClientRect().width];
+        })()"#);
+        assert_eq!(geometry[0], serde_json::json!(73));
+        assert_eq!(geometry[1], serde_json::json!(20));
+        assert_eq!(geometry[2], serde_json::json!(10));
+        assert!((geometry[3].as_f64().unwrap() - before_font).abs() > 1.0,
+            "the linked font bytes must reshape child text, not only produce a receipt");
+        for (path, kind) in [("/late.svg", "Image"), ("/late-font", "Font")] {
+            let receipts: Vec<_> = page.network_events.iter().filter(|event| event.url == format!("{origin}{path}")).collect();
+            assert_eq!(receipts.len(), 1, "one native response per child resource");
+            assert_eq!(receipts[0].resource_type, kind);
+            assert_ne!(receipts[0].frame_id, 0);
+            assert_eq!(receipts[0].frame_generation,
+                page.js.as_ref().unwrap().cdp_document_generation(receipts[0].frame_id).unwrap());
+            assert!(page.get_response_body(&receipts[0].request_id).is_some());
+        }
+        let mut served = Vec::new();
+        while let Ok(path) = requests.try_recv() { served.push(path); }
+        for path in ["/child.css", "/late-font", "/late.svg"] {
+            assert_eq!(served.iter().filter(|request| request.as_str() == path).count(), 1,
+                "resource must use the existing page transport exactly once: {path}");
+        }
+        release.send(false).unwrap();
+        page.evaluate(r#"(() => {
+            const d=document.getElementById('child').contentDocument;
+            d.getElementById('icon').style.content='url(/retire.svg)';
+            return d.getElementById('icon').getBoundingClientRect().width;
+        })()"#);
+        page.queue_pending_render_resources();
+        assert!(page.has_pending_render_resources());
+        page.evaluate("document.getElementById('child').remove()");
+        page.queue_pending_render_resources();
+        assert!(!page.has_pending_render_resources(), "detaching the native owner aborts child work");
+        release.send(true).unwrap();
+        tokio::task::yield_now().await;
+        page.drain_render_resource_results();
+        assert!(!page.network_events.iter().any(|event| event.url == format!("{origin}/retire.svg")),
+            "retired child bytes must not become a main-document receipt");
+        server.abort();
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn renderer_misses_cover_script_fonts_and_shadow_root_styles() {
         let (address, _peak, _open, seen_rx) = spawn_counting_svg_server(0, 6);
         let page_url = format!("http://{address}/page");
@@ -10115,28 +10218,27 @@ mod tests {
     async fn render_resource_loads_share_one_page_wide_concurrency_limit() {
         let (address, peak, _open, _seen_rx) = spawn_counting_svg_server(300, 8);
         let page_url = format!("http://{address}/page");
-        let mut page = page_with_transport_and_body("limit", &page_url, "");
-        // Three groups added one after the other, each queued by its own
-        // paint miss while the previous group's loads are still running: all
-        // of them share one limiter. Every group must actually start loads.
+        let mut page = page_with_transport_and_body("limit", &page_url, "<iframe id=first></iframe><iframe id=second></iframe>");
+        // A main document and two native children, each queued while previous
+        // loads are still running, must share the same page transport limiter.
         for group in 0..3 {
             let markup: String = (0..14)
                 .map(|index| {
                     format!(
-                        r#"<div style="width:10px;height:10px;background-image:url(http://{address}/bg{group}-{index}.svg)"></div>"#
+                        r#"<div style="width:10px;height:10px;content:url(http://{address}/bg{group}-{index}.svg)"></div>"#
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            page.js
-                .as_mut()
-                .unwrap()
-                .evaluate(&format!(
-                    "document.body.insertAdjacentHTML('beforeend', {});",
-                    serde_json::to_string(&markup).unwrap()
-                ))
-                .unwrap();
-            page.screenshot(page.viewport);
+            let target = match group {
+                0 => "document",
+                1 => "document.getElementById('first').contentDocument",
+                _ => "document.getElementById('second').contentDocument",
+            };
+            page.js.as_mut().unwrap().evaluate(&format!(
+                "(() => {{ const d={target}; d.body.insertAdjacentHTML('beforeend', {}); return d.body.getBoundingClientRect().width; }})()",
+                serde_json::to_string(&markup).unwrap()
+            )).unwrap();
             page.queue_pending_render_resources();
             assert!(
                 page.has_pending_render_resources(),
@@ -11065,28 +11167,6 @@ impl From<ObscuraNetError> for PageError {
     }
 }
 
-/// Whether a Content-Type is text-like and can be stored/returned as a UTF-8
-/// string. Everything else (images, PDF, fonts, octet-stream) is binary and must
-/// be base64-encoded so Network.getResponseBody returns intact bytes.
-fn is_text_like_content_type(content_type: Option<&str>) -> bool {
-    let ct = match content_type {
-        Some(c) => c.split(';').next().unwrap_or(c).trim().to_ascii_lowercase(),
-        // No Content-Type: assume text (matches the HTML-parse default).
-        None => return true,
-    };
-    if ct.is_empty() {
-        return true;
-    }
-    ct.starts_with("text/")
-        || ct == "application/json"
-        || ct == "application/xml"
-        || ct == "application/xhtml+xml"
-        || ct == "application/javascript"
-        || ct == "application/ecmascript"
-        || ct == "image/svg+xml"
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
-}
 
 /// Lowercased MIME type of a Content-Type header, without parameters.
 fn base_content_type(content_type: Option<&str>) -> Option<String> {

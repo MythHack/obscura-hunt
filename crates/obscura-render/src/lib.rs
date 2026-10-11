@@ -1308,6 +1308,11 @@ pub struct LayoutStyle {
     /// layout such as table cells, rather than the computed CSS display.
     /// Descendants are not CSS flex items in these containers.
     pub internal_flex_container: bool,
+    /// Computed box type when native layout uses a block/flex stand-in.
+    pub(crate) computed_display: Option<&'static str>,
+    /// Authored flex longhands must not be confused with table-wrapper defaults.
+    pub(crate) flex_direction_authored: bool,
+    pub(crate) align_items_authored: bool,
     /// The computed inner display is `table`.
     ///
     /// Taffy has no table display mode, so authored table boxes are represented
@@ -2023,6 +2028,12 @@ pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
 /// Thus inline-flex becomes flex and inline-grid becomes grid, while
 /// inline-block/plain inline become block.
 pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
+    style.computed_display = match style.computed_display {
+        Some("inline-table") => Some("table"),
+        Some("table-cell" | "table-row" | "table-row-group" | "table-header-group"
+            | "table-footer-group" | "table-column" | "table-column-group" | "table-caption") => None,
+        other => other,
+    };
     if !is_inline_level_box(style) {
         return;
     }

@@ -43,6 +43,19 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         "tr" => Display::Flex,
         _ => Display::Block,
     };
+    style.computed_display = match tag {
+        "table" => Some("table"),
+        "thead" => Some("table-header-group"),
+        "tbody" => Some("table-row-group"),
+        "tfoot" => Some("table-footer-group"),
+        "tr" => Some("table-row"),
+        "td" | "th" => Some("table-cell"),
+        "col" => Some("table-column"),
+        "colgroup" => Some("table-column-group"),
+        "caption" => Some("table-caption"),
+        "li" => Some("list-item"),
+        _ => None,
+    };
     if tag == "slot" {
         // HTML's UA sheet makes a slot transparent to box generation; its
         // assigned nodes or fallback children participate at the slot's
@@ -864,6 +877,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 // the UA table/control approximation merely because its
                 // internal enum happens to equal the newly specified value.
                 style.internal_flex_container = false;
+                style.computed_display = None;
                 style.is_table_box = false;
                 style.is_table_cell_box = false;
                 style.is_inline_block = false;
@@ -902,12 +916,14 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.display = crate::Display::Block;
                     style.flow_root = true;
                     style.is_table_box = true;
+                    style.computed_display = Some("table");
                 }
                 "inline-table" => {
                     style.display = crate::Display::Inline;
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                    style.computed_display = Some("inline-table");
                 }
                 "table-cell" => {
                     // A table cell establishes an internal flow container. A
@@ -919,6 +935,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.flex_direction = Some(taffy::FlexDirection::Column);
                     style.align_items = Some(taffy::AlignItems::FLEX_START);
                     style.is_table_cell_box = true;
+                    style.computed_display = Some("table-cell");
                 }
                 "-webkit-box" => {
                     // The unclamped legacy display is an old flexbox. When it
@@ -1331,6 +1348,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "align-items" => {
             if let Some(Some(value)) = self_alignment_value(value) {
                 style.align_items = Some(value);
+                style.align_items_authored = true;
             }
         }
         "justify-items" => {
@@ -1341,6 +1359,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "place-items" => {
             if let Some((Some(align), Some(justify))) = self_alignment_pair(value) {
                 style.align_items = Some(align);
+                style.align_items_authored = true;
                 style.justify_items = Some(justify);
             }
         }
@@ -1387,16 +1406,23 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 // `flex-flow: column` resets an earlier flex-wrap to nowrap,
                 // while `flex-flow: wrap` resets direction to row.
                 style.flex_direction = Some(direction);
+                style.flex_direction_authored = true;
                 style.flex_wrap = Some(wrap);
             }
         }
-        "flex-direction" => match value {
-            "row" => style.flex_direction = Some(taffy::FlexDirection::Row),
-            "row-reverse" => style.flex_direction = Some(taffy::FlexDirection::RowReverse),
-            "column" => style.flex_direction = Some(taffy::FlexDirection::Column),
-            "column-reverse" => style.flex_direction = Some(taffy::FlexDirection::ColumnReverse),
-            _ => {}
-        },
+        "flex-direction" => {
+            let direction = match value {
+                "row" => Some(taffy::FlexDirection::Row),
+                "row-reverse" => Some(taffy::FlexDirection::RowReverse),
+                "column" => Some(taffy::FlexDirection::Column),
+                "column-reverse" => Some(taffy::FlexDirection::ColumnReverse),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                style.flex_direction = Some(direction);
+                style.flex_direction_authored = true;
+            }
+        }
         "flex-wrap" => match value {
             "wrap" => style.flex_wrap = Some(taffy::FlexWrap::Wrap),
             "nowrap" => style.flex_wrap = Some(taffy::FlexWrap::NoWrap),

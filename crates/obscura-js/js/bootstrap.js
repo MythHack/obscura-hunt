@@ -21,6 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_language', '__obscura_languages',
     '__obscura_stealth', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
@@ -4010,7 +4011,7 @@ class Element extends Node {
     // :modal is a JS-observable dialog state (a dialog opened via showModal()),
     // not understood by the native selector engine; handle it like :popover-open.
     if (typeof s === "string" && s.indexOf(":modal") !== -1) {
-      if (this._dialogModal !== true) return false;
+      if (!_modalInput.isModal(this)) return false;
       const rest = s.replace(/:modal/g, "").trim();
       if (rest === "") return true;
       return this.matches(rest);
@@ -4221,19 +4222,7 @@ class Element extends Node {
       }
     }
   }
-  focus() {
-    if (!this.isConnected) return;
-    const previous = globalThis.__obscura_focused || null;
-    if (previous === this) return;
-    if (previous) {
-      _dispatchTrustedDomEvent(previous, _worldEventConstructors.FocusEvent, 'blur', { relatedTarget: this });
-      _dispatchTrustedDomEvent(previous, _worldEventConstructors.FocusEvent, 'focusout', { bubbles: true, composed: true, relatedTarget: this });
-    }
-    globalThis.__obscura_focused = this;
-    globalThis.__obscura_click_target = this;
-    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'focus', { relatedTarget: previous });
-    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'focusin', { bubbles: true, composed: true, relatedTarget: previous });
-  }
+  focus() { _modalInput.focus(this); }
   blur() {
     if (globalThis.__obscura_focused !== this) return;
     globalThis.__obscura_focused = null;
@@ -4332,9 +4321,9 @@ class Element extends Node {
     }
   }
   // HTMLDialogElement members (live on Element.prototype like popover/input;
-  // meaningful only when localName === 'dialog'). Modal top-layer/focus/render
-  // is layout (out of scope); the open state, returnValue, and beforetoggle/
-  // toggle/close/cancel events are JS-observable and implemented here.
+  // meaningful only when localName === 'dialog'). The private document-local
+  // stack owns focus and native input rules. Top-layer/backdrop painting is
+  // not implemented here; synthetic keyboard dispatch has no default action.
   get open() { return this.hasAttribute('open'); }
   set open(v) { if (v) { if (!this.hasAttribute('open')) this.setAttribute('open', ''); } else if (this.hasAttribute('open')) { this.removeAttribute('open'); this._dialogModal = false; } }
   get returnValue() { return this._returnValue != null ? this._returnValue : ''; }
@@ -4346,7 +4335,7 @@ class Element extends Node {
   get closedBy() { const v = (this.getAttribute('closedby') || '').toLowerCase(); return (v === 'any' || v === 'closerequest' || v === 'none') ? v : 'auto'; }
   set closedBy(v) { this.setAttribute('closedby', String(v)); }
   show() {
-    if (this.hasAttribute('open')) { if (this._dialogModal) throw new DOMException("The dialog is already open as a modal dialog.", "InvalidStateError"); return; }
+    if (this.hasAttribute('open')) { if (_modalInput.isModal(this)) throw new DOMException("The dialog is already open as a modal dialog.", "InvalidStateError"); return; }
     const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
     if (!this.dispatchEvent(before)) return;
     if (this.hasAttribute('open')) return;
@@ -4354,34 +4343,29 @@ class Element extends Node {
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   showModal() {
-    if (this.hasAttribute('open')) throw new DOMException("The dialog is already open.", "InvalidStateError");
+    if (this.hasAttribute('open')) {
+      if (_modalInput.isModal(this)) return;
+      throw new DOMException("The dialog is already open.", "InvalidStateError");
+    }
     if (!this.isConnected) throw new DOMException("The dialog is not connected to a document.", "InvalidStateError");
     const before = new ToggleEvent("beforetoggle", { cancelable: true, oldState: "closed", newState: "open" });
     if (!this.dispatchEvent(before)) return;
     if (this.hasAttribute('open')) return;
     this.setAttribute('open', ''); this._dialogModal = true;
+    _modalInput.open(this);
     const self = this; setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   _dialogClose(result, fireClose) {
     if (!this.hasAttribute('open')) return;
     this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-    this.removeAttribute('open'); this._dialogModal = false;
     if (result !== undefined) this._returnValue = String(result);
+    _modalInput.close(this);
     const self = this;
     setTimeout(() => { try { self.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     if (fireClose) setTimeout(() => { try { self.dispatchEvent(new Event('close', { bubbles: false, cancelable: false })); } catch (e) {} }, 0);
   }
   close(result) { this._dialogClose(result, true); }
-  requestClose(result) {
-    if (!this.hasAttribute('open')) return;
-    if (this._dialogCancelFiring) return; // no re-entrant cancel
-    this._dialogCancelFiring = true;
-    let canceled = false;
-    try { const ev = new Event('cancel', { bubbles: false, cancelable: true }); this.dispatchEvent(ev); canceled = ev.defaultPrevented; }
-    finally { this._dialogCancelFiring = false; }
-    if (canceled) return;
-    this._dialogClose(result, true);
-  }
+  requestClose(result) { _modalInput.requestClose(this, result); }
   attachInternals() {
     const reg = (typeof customElements !== 'undefined' && customElements._registry) ? customElements._registry : null;
     if (!reg || !reg.get(this.localName)) throw new DOMException("Failed to execute 'attachInternals' on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.", "NotSupportedError");
@@ -5643,6 +5627,7 @@ function _convertNodes(nodes) {
   reflectEnum("dir", "dir", ["ltr", "rtl", "auto"], "", "");
   reflectBool("autofocus", "autofocus");
   reflectBool("hidden", "hidden");
+  reflectBool("inert", "inert");
   // tabIndex default is element-dependent (0 for natively-focusable, else -1);
   // reflection.js does not assert it, but match the common case anyway.
   reflectLong("tabIndex", "tabindex", function () {
@@ -7932,6 +7917,8 @@ globalThis.navigator = {
   });
   defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
   defGetter('languages', function() {
+    const languages = globalThis.__obscura_languages;
+    if (Array.isArray(languages) && languages.length) return Object.freeze(languages.slice());
     const language = globalThis.__obscura_language || "en-US";
     const base = language.split('-')[0];
     return base !== language ? [language, base] : [language];
@@ -8199,6 +8186,22 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+function _requestReferrerPolicy(value) {
+  const policy = value === undefined ? '' : String(value);
+  if (!['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin',
+        'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'].includes(policy)) {
+    throw new TypeError('Invalid Request referrerPolicy: ' + policy);
+  }
+  return policy;
+}
+function _requestReferrer(value) {
+  if (value === undefined || value === 'about:client') return 'about:client';
+  if (String(value) === '') return '';
+  const resolved = new URL(String(value), _domParse('document_base_url') || _domParse('document_url'));
+  if (resolved.origin !== _domParse('document_origin')) throw new TypeError('Request referrer must be same-origin');
+  return resolved.href;
+}
+
 async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
@@ -8232,6 +8235,8 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   if (fetchCredentials !== "omit" && fetchCredentials !== "same-origin" && fetchCredentials !== "include") {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
+  const referrer = _requestReferrer(init.referrer !== undefined ? init.referrer : (request ? request.referrer : undefined));
+  const referrerPolicy = _requestReferrerPolicy(init.referrerPolicy !== undefined ? init.referrerPolicy : (request ? request.referrerPolicy : undefined));
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const initSignal = init.signal;
   const inputSignal = initSignal !== undefined ? initSignal : (request ? request.signal : null);
@@ -8253,7 +8258,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   let raw;
   try {
     raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
-      signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType, globalThis);
+      { cancel_rid: cancelRid, destination: resourceType, referrer, referrer_policy: referrerPolicy }, globalThis);
   } catch (error) {
     cleanup();
     throw signalState && signalState.aborted ? signalState.reason
@@ -8688,7 +8693,8 @@ if (typeof Request === 'undefined') {
         throw new TypeError("Failed to construct 'Request': '" + this.credentials + "' is not a valid RequestCredentials value");
       }
       this.redirect = init.redirect || 'follow';
-      this.referrer = init.referrer || '';
+      this.referrer = _requestReferrer(init.referrer);
+      this.referrerPolicy = _requestReferrerPolicy(init.referrerPolicy);
       const signal = init.signal;
       if (signal != null && !_abortSignalState(signal)) {
         throw new TypeError("Failed to construct 'Request': signal is not an AbortSignal");
@@ -8705,6 +8711,7 @@ if (typeof Request === 'undefined') {
         credentials: this.credentials,
         redirect: this.redirect,
         referrer: this.referrer,
+        referrerPolicy: this.referrerPolicy,
         signal: this.signal,
         cache: this.cache,
       });
@@ -9572,10 +9579,6 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
           return r.width != null ? `${r.width}px` : null;
         case 'height': case 'block-size':
           return r.height != null ? `${r.height}px` : null;
-        case 'left': return r.left != null ? `${r.left}px` : null;
-        case 'top': return r.top != null ? `${r.top}px` : null;
-        case 'right': return r.right != null ? `${r.right}px` : null;
-        case 'bottom': return r.bottom != null ? `${r.bottom}px` : null;
         case 'client-width': case 'offset-width':
           return r.width != null ? `${r.width}px` : null;
         case 'client-height': case 'offset-height':
@@ -9609,6 +9612,7 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
     'justify-content': 'normal', gap: 'normal',
     'grid-template-columns': 'none', 'grid-template-rows': 'none',
     'will-change': 'auto', 'backface-visibility': 'visible',
+    top: 'auto', right: 'auto', bottom: 'auto', left: 'auto',
   };
 
   const lookup = (rawProp) => {
@@ -9619,6 +9623,7 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
     if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
+    if (kebab === 'css-float') kebab = 'float';
     refreshRendered(kebab);
     if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
       return snapshot.rendered[kebab];
@@ -14907,6 +14912,7 @@ function _ensureInitialFrameRealm(element) {
       delete child.Deno;
       for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
                          '__obscura_ua_platform_version', '__obscura_stealth',
+                         '__obscura_language', '__obscura_languages',
                          '__obscura_geo_lat', '__obscura_geo_lon']) {
         if (globalThis[name] !== undefined) child[name] = globalThis[name];
       }
@@ -18008,14 +18014,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     if (x < 0 || y < 0 || x > w || y > h) return null;
     if (typeof __obscuraCore.ops.op_layout_hit_test === 'function') {
       var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y, _realmFrameId);
-      if (hitNid >= 0) {
-        var hit = _wrapEl(hitNid);
-        return hit === this.documentElement && this.body ? this.body : hit;
-      }
-      // The root canvas still belongs to the document when no descendant box
-      // is hit. Preserve the long-standing in-viewport fallback used by pages
-      // before renderer-backed hit testing was available.
-      return this.body || this.documentElement || null;
+      return hitNid >= 0 ? _wrapEl(hitNid) : null;
     }
     var all = this.querySelectorAll('*');
     var best = null;
@@ -18080,6 +18079,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     return best || this.body || this.documentElement || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
+    const method = _documentRealmMember(this, 'elementsFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) return [];
+    if (typeof __obscuraCore.ops.op_layout_hit_test_stack === 'function') {
+      const raw = __obscuraCore.ops.op_layout_hit_test_stack(x, y, _realmFrameId);
+      return raw ? raw.split(',').map(id => _wrapEl(Number(id))).filter(Boolean) : [];
+    }
     var el = this.elementFromPoint(x, y);
     return el ? [el] : [];
   };
@@ -18198,16 +18204,22 @@ function _installCaretGeometry() {
   };
 }
 
+// Shared only through the native document-member slot, never a page global.
+// Entries use native node ids so isolated worlds do not depend on expandos.
+let _modalState = { stack: [], canceling: new Set() };
+let _modalInput;
+
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'elementsFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
   ['activateElement', function() {
     return _nativeElementClick.call(this);
   }],
+  ['modalState', function() { return _modalState; }],
 ]));
 const _worldEventConstructors = Object.freeze({ Event, MouseEvent, PointerEvent, KeyboardEvent,
   FocusEvent, InputEvent, CustomEvent, SubmitEvent, WheelEvent });
@@ -18248,6 +18260,35 @@ const _worldNativeInput = (() => {
     }
     return false;
   };
+  const flatParentId = id => _domParse('flat_tree_parent',id);
+  const flatContains = (ancestor,id) => {
+    for (;id!==null;id=flatParentId(id)) if (id===ancestor) return true;
+    return false;
+  };
+  const activeModal = () => {
+    const stack=_modalState.stack;
+    for (let i=stack.length-1;i>=0;i--) {
+      const entry=stack[i];
+      if (_dom('is_connected',entry.nodeId)!=='true' || _domParse('get_attribute',entry.nodeId,'open')===null) {
+        stack.splice(i,1);
+        for (let j=i;j<stack.length;j++) {
+          const newer=stack[j];
+          if (newer.previousFocusId!==null && flatContains(entry.nodeId,newer.previousFocusId)) newer.previousFocusId=entry.previousFocusId;
+        }
+      }
+    }
+    return stack[stack.length-1] || null;
+  };
+  const allowed = element => {
+    if (!connected(element)) return false;
+    const modal=activeModal();
+    let inside=!modal;
+    for (let id=nid(element);id!==null;id=flatParentId(id)) {
+      if (_domParse('get_attribute',id,'inert')!==null) return false;
+      if (modal && id===modal.nodeId) { inside=true; break; }
+    }
+    return inside;
+  };
   const read = (element,name) => name==='selectionStart' ? (_ns_selectionStart.get(element) ?? null)
     : name==='selectionEnd' ? (_ns_selectionEnd.get(element) ?? null) : apply(descriptors[name].get,element,[]);
   const value = element => _domParse('get_form_state',nid(element))?.value
@@ -18262,26 +18303,122 @@ const _worldNativeInput = (() => {
   const focus = element => {
     const previousId=__obscuraCore.ops.op_world_focus(globalThis,null,false);
     const previous=previousId===0xFFFFFFFF ? null : _worldWrapNode(previousId);
-    if (previous===element || (element && !connected(element))) return;
+    if (previous===element || (element && (!allowed(element) || disabled(element)))) return;
     if (previous) {
       dispatch(previous,_worldEventConstructors.FocusEvent,'blur',{relatedTarget:element});
       dispatch(previous,_worldEventConstructors.FocusEvent,'focusout',{bubbles:true,composed:true,relatedTarget:element});
     }
+    if (element && (!allowed(element) || disabled(element))) return;
     __obscuraCore.ops.op_world_focus(globalThis,element,true);
+    if (element) globalThis.__obscura_click_target=element;
     if (element) {
       dispatch(element,_worldEventConstructors.FocusEvent,'focus',{relatedTarget:previous});
       dispatch(element,_worldEventConstructors.FocusEvent,'focusin',{bubbles:true,composed:true,relatedTarget:previous});
     }
   };
+  const focusable = dialog => {
+    const candidates=[],dialogId=nid(dialog);
+    const pending=(_domParse('flat_tree_children',dialogId) || []).reverse();
+    while (pending.length) {
+      const id=pending.pop(),element=_worldWrapNode(id);
+      const children=_domParse('flat_tree_children',id) || [];
+      for (let i=children.length-1;i>=0;i--) pending.push(children[i]);
+      if (!tag(element) || !allowed(element) || disabled(element) || (attr(element,'type') || '').toLowerCase()==='hidden') continue;
+      const specified=attr(element,'tabindex'),editable=attr(element,'contenteditable');
+      const natural=matches(element,'button,input,select,textarea,iframe,a[href],area[href],audio[controls],video[controls]') || (editable!==null && editable.toLowerCase()!=='false');
+      const parsed=specified===null ? NaN : Number.parseInt(specified,10);
+      const tabIndex=Number.isNaN(parsed) ? (natural ? 0 : -1) : parsed;
+      if (tabIndex<0) continue;
+      let visible=true;
+      for (let owner=id;owner!==null;owner=flatParentId(owner)) {
+        const node=_worldWrapNode(owner);
+        if (tag(node)) {
+          const style=computedStyle(node);
+          if (attr(node,'hidden')!==null || style.display==='none' || (owner===id && (style.visibility==='hidden' || style.visibility==='collapse'))) { visible=false; break; }
+        }
+        if (owner===dialogId) break;
+      }
+      if (visible) candidates.push({element,tabIndex});
+    }
+    candidates.sort((a,b)=>(a.tabIndex>0 ? a.tabIndex : Infinity)-(b.tabIndex>0 ? b.tabIndex : Infinity));
+    return candidates.map(candidate=>candidate.element);
+  };
+  const focusDialog = dialog => {
+    const candidates=focusable(dialog);
+    focus(attr(dialog,'autofocus')!==null ? dialog : candidates.find(element=>attr(element,'autofocus')!==null) || candidates[0] || dialog);
+  };
+  const openModal = dialog => {
+    activeModal();
+    const previous=__obscuraCore.ops.op_world_focus(globalThis,null,false);
+    _modalState.stack.push({nodeId:nid(dialog),previousFocusId:previous===0xFFFFFFFF ? null : previous});
+    focusDialog(dialog);
+  };
+  const closeModal = dialog => {
+    const stack=_modalState.stack,id=nid(dialog),index=stack.findIndex(entry=>entry.nodeId===id);
+    const entry=index<0 ? null : stack[index],wasTop=index===stack.length-1;
+    if (entry) {
+      stack.splice(index,1);
+      // Closing a lower dialog must neither steal focus nor leave a newer
+      // dialog restoring focus into a dialog that has already closed.
+      for (const newer of stack) {
+        if (newer.previousFocusId!==null && flatContains(id,newer.previousFocusId)) newer.previousFocusId=entry.previousFocusId;
+      }
+    }
+    // Remove stack ownership before attribute mutation can run author hooks.
+    apply(descriptors.removeAttribute.value,dialog,['open']);
+    dialog._dialogModal=false;
+    if (!entry) return;
+    const current=__obscuraCore.ops.op_world_focus(globalThis,null,false);
+    if (!wasTop || current===0xFFFFFFFF || !flatContains(id,current)) return;
+    const previous=entry.previousFocusId===null ? null : _worldWrapNode(entry.previousFocusId);
+    if (previous && allowed(previous) && !disabled(previous)) focus(previous);
+    else {
+      const modal=activeModal();
+      if (modal) focusDialog(_worldWrapNode(modal.nodeId));
+      else focus(null);
+    }
+  };
+  const requestClose = (dialog,result,trusted=false) => {
+    const id=nid(dialog),canceling=_modalState.canceling;
+    if (attr(dialog,'open')===null || canceling.has(id)) return;
+    const modal=_modalState.stack.find(entry=>entry.nodeId===id);
+    canceling.add(id);
+    let accepted;
+    try {
+      accepted=trusted ? dispatch(dialog,_worldEventConstructors.Event,'cancel',{cancelable:true})
+        : _domEventDispatch(dialog,new _worldEventConstructors.Event('cancel',{cancelable:true}));
+    } finally { canceling.delete(id); }
+    if (accepted && (!modal || _modalState.stack.includes(modal))) apply(descriptors._dialogClose.value,dialog,[result,true]);
+  };
+  const keyDefault = (key,shift) => {
+    const modal=activeModal();
+    if (!modal) return false;
+    const dialog=_worldWrapNode(modal.nodeId);
+    if (key==='Escape') {
+      if ((attr(dialog,'closedby') || '').toLowerCase()!=='none') requestClose(dialog,undefined,true);
+      return true;
+    }
+    if (key!=='Tab') return false;
+    const candidates=focusable(dialog);
+    if (!candidates.length) focus(dialog);
+    else {
+      const current=candidates.indexOf(active());
+      const next=current<0 ? (shift ? candidates.length-1 : 0) : (current+(shift ? -1 : 1)+candidates.length)%candidates.length;
+      focus(candidates[next]);
+    }
+    return true;
+  };
+  _modalInput=Object.freeze({ focus, allowed, requestClose, open:openModal, close:closeModal,
+    isModal:element=>{ activeModal(); return _modalState.stack.some(entry=>entry.nodeId===nid(element)); } });
   const submit = (form,submitter) => {
     if (form && dispatch(form,_worldEventConstructors.SubmitEvent,'submit',{bubbles:true,cancelable:true,submitter:submitter || null})) apply(navigateSubmit,form,[submitter]);
   };
   const insert = (text,imeCommit,inputType='insertText') => {
     const target=active();
-    if (!matches(target,'input,textarea') || disabled(target) || (!imeCommit && attr(target,'readonly')!==null)) return;
+    if (!allowed(target) || !matches(target,'input,textarea') || disabled(target) || (!imeCommit && attr(target,'readonly')!==null)) return;
     const commitStart=imeCommit ? (read(target,'selectionStart') ?? value(target).length) : null;
     if (!dispatch(target,_worldEventConstructors.InputEvent,'beforeinput',{bubbles:true,composed:true,cancelable:true,data:text,inputType})) return;
-    if (attr(target,'readonly')!==null || disabled(target) || !connected(target)) return;
+    if (!allowed(target) || attr(target,'readonly')!==null || disabled(target)) return;
     const old=value(target),start=read(target,'selectionStart'),end=read(target,'selectionEnd');
     if (start===null) setValue(target,old+text);
     else {
@@ -18295,7 +18432,7 @@ const _worldNativeInput = (() => {
   };
   const erase = backward => {
     const target=active();
-    if (!matches(target,'input,textarea') || disabled(target) || attr(target,'readonly')!==null) return;
+    if (!allowed(target) || !matches(target,'input,textarea') || disabled(target) || attr(target,'readonly')!==null) return;
     const old=value(target),start=read(target,'selectionStart'),end=read(target,'selectionEnd');
     let lower=start===null ? old.length : Math.max(0,Math.min(start,old.length));
     let upper=end===null ? lower : Math.max(0,Math.min(end,old.length));
@@ -18309,12 +18446,13 @@ const _worldNativeInput = (() => {
     }
     const inputType=backward ? 'deleteContentBackward' : 'deleteContentForward';
     if (!dispatch(target,_worldEventConstructors.InputEvent,'beforeinput',{bubbles:true,composed:true,cancelable:true,data:null,inputType})) return;
+    if (!allowed(target) || disabled(target) || attr(target,'readonly')!==null) return;
     setValue(target,old.slice(0,lower)+old.slice(upper));
     if (start!==null) { _ns_selectionStart.set(target,lower); _ns_selectionEnd.set(target,lower); }
     dispatch(target,_worldEventConstructors.InputEvent,'input',{bubbles:true,composed:true,data:null,inputType});
   };
   const activate = (target,init,count) => {
-    if (disabled(target)) return;
+    if (!allowed(target) || disabled(target)) return;
     const type=(attr(target,'type') || '').toLowerCase();
     const checkable=tag(target)==='INPUT' && (type==='checkbox' || type==='radio');
     const oldChecked=checkable && _inputChecked(target),oldIndeterminate=checkable && _inputIndeterminate(target);
@@ -18369,8 +18507,10 @@ const _worldNativeInput = (() => {
     if (kind==='fill') {
       const target=_worldWrapNode(payload.nodeId);
       if (!matches(target,'input,textarea') || !connected(target)) return 'error:not an editable field';
+      if (!allowed(target)) return 'error:element is inert';
       if (disabled(target) || attr(target,'readonly')!==null) return 'error:field is not editable';
       focus(target);
+      if (!allowed(target)) return 'error:element is inert';
       if (payload.append) {
         const end=value(target).length;
         _ns_selectionStart.set(target,end); _ns_selectionEnd.set(target,end);
@@ -18387,6 +18527,7 @@ const _worldNativeInput = (() => {
     if (kind==='setChecked') {
       const target=_worldWrapNode(payload.nodeId);
       if (!matches(target,'input[type=checkbox],input[type=radio]') || !connected(target)) return 'error:not a checkable field';
+      if (!allowed(target)) return 'error:element is inert';
       if (disabled(target)) return 'error:field is disabled';
       focus(target);
       if (_inputChecked(target)!==payload.checked) activate(target,{bubbles:true,cancelable:true,composed:true,view:globalThis},1);
@@ -18395,6 +18536,7 @@ const _worldNativeInput = (() => {
     if (kind==='selectOption') {
       const target=_worldWrapNode(payload.nodeId);
       if (tag(target)!=='SELECT' || !connected(target)) return 'error:not a select field';
+      if (!allowed(target)) return 'error:element is inert';
       if (disabled(target)) return 'error:field is disabled';
       const options=read(target,'options');
       let index=-1;
@@ -18404,6 +18546,7 @@ const _worldNativeInput = (() => {
       }
       if (index<0) return 'error:no matching option';
       focus(target);
+      if (!allowed(target)) return 'error:element is inert';
       apply(descriptors.selectedIndex.set,target,[index]);
       dispatch(target,_worldEventConstructors.Event,'input',{bubbles:true});
       dispatch(target,_worldEventConstructors.Event,'change',{bubbles:true});
@@ -18411,6 +18554,7 @@ const _worldNativeInput = (() => {
     }
     if (kind==='setFiles') {
       const target=_worldWrapNode(payload.nodeId);
+      if (!allowed(target) || disabled(target)) return false;
       const files=payload.files.map(spec=> {
         const binary=decodeBase64(spec.b64),bytes=new Uint8Array(binary.length);
         for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
@@ -18426,14 +18570,18 @@ const _worldNativeInput = (() => {
     const init={bubbles:true,cancelable:true,composed:true,view:globalThis,altKey:!!(modifiers&1),ctrlKey:!!(modifiers&2),metaKey:!!(modifiers&4),shiftKey:!!(modifiers&8)};
     if (kind==='key') {
       const target=active(),type=payload.type,key=payload.key || '',text=payload.text || '';
+      if (!allowed(target)) return false;
       const keyInit={...init,key,code:payload.code || '',keyCode:payload.windowsVirtualKeyCode || 0,which:payload.windowsVirtualKeyCode || 0};
       if (type==='keyUp') dispatch(target,_worldEventConstructors.KeyboardEvent,'keyup',{...keyInit,cancelable:false});
       else if (type==='char') { if (text) insert(text,false); }
       else if (type==='keyDown' || type==='rawKeyDown') {
         if (!dispatch(target,_worldEventConstructors.KeyboardEvent,'keydown',keyInit)) return false;
+        if (keyDefault(key,init.shiftKey)) return true;
+        if (!allowed(active())) return false;
         if (text && text!=='\r' && text!=='\n') insert(text,false);
         if (key==='Enter') {
           if (!dispatch(active(),_worldEventConstructors.KeyboardEvent,'keypress',{...keyInit,charCode:keyInit.keyCode})) return false;
+          if (!allowed(active())) return false;
           if (tag(active())==='TEXTAREA') insert('\n',false,'insertLineBreak');
           else submit(closest(active(),'form'),null);
         } else if (key==='Backspace') erase(true);
@@ -18443,7 +18591,7 @@ const _worldNativeInput = (() => {
     }
     if (kind!=='mouse') throw new TypeError('Unknown native input kind');
     const target=payload.nodeId==null ? body() : _worldWrapNode(payload.nodeId);
-    if (!target) { mouseDown=null; return false; }
+    if (!allowed(target)) { mouseDown=null; return false; }
     const count=payload.clickCount ?? 1;
     Object.assign(init,{clientX:payload.x,clientY:payload.y,button:payload.buttonCode || 0,buttons:payload.buttons || 0,detail:count});
     const pointer={...init,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:init.buttons ? 0.5 : 0};
@@ -18463,12 +18611,14 @@ const _worldNativeInput = (() => {
         mouseOver=target;
       }
     }
+    if (!allowed(target)) { mouseDown=null; return false; }
     if (payload.type==='mouseMoved') {
       dispatch(target,_worldEventConstructors.PointerEvent,'pointermove',pointer);
       dispatch(target,_worldEventConstructors.MouseEvent,'mousemove',{...init,detail:0});
     } else if (payload.type==='mousePressed') {
       mouseDown={target,button:init.button};
       dispatch(target,_worldEventConstructors.PointerEvent,'pointerdown',pointer);
+      if (!allowed(target)) { mouseDown=null; return false; }
       if (dispatch(target,_worldEventConstructors.MouseEvent,'mousedown',init)) {
         const focusTarget=closest(target,_INTERACTIVE) || closest(target,'[tabindex]');
         focus(focusTarget && !disabled(focusTarget) ? focusTarget : null);
@@ -18476,6 +18626,7 @@ const _worldNativeInput = (() => {
     } else if (payload.type==='mouseReleased') {
       const down=mouseDown; mouseDown=null;
       dispatch(target,_worldEventConstructors.PointerEvent,'pointerup',{...pointer,buttons:0,pressure:0});
+      if (!allowed(target)) return false;
       dispatch(target,_worldEventConstructors.MouseEvent,'mouseup',{...init,buttons:0});
       if (down && down.button===init.button && init.button===0 && connected(down.target)) {
         let clickTarget=down.target;
@@ -18485,6 +18636,7 @@ const _worldNativeInput = (() => {
     } else if (payload.type==='mouseWheel') {
       const dx=payload.deltaX || 0,dy=payload.deltaY || 0;
       if (!dispatch(target,_worldEventConstructors.WheelEvent,'wheel',{...init,deltaX:dx,deltaY:dy,deltaMode:0})) return false;
+      if (!allowed(target)) return false;
       const root=_worldWrapNode(+_dom('query_selector','html')) || body();
       let scrollTarget=root;
       for (let element=target;element && element!==root && element!==body();element=parent(element)) {
@@ -18506,7 +18658,10 @@ function _installWorldFocus() {
       const nid = __obscuraCore.ops.op_world_focus(globalThis, null, false);
       return nid === 0xFFFFFFFF ? null : _wrapEl(nid);
     },
-    set(element) { __obscuraCore.ops.op_world_focus(globalThis, element ?? null, true); },
+    set(element) {
+      if (element && !_modalInput.allowed(element)) return;
+      __obscuraCore.ops.op_world_focus(globalThis, element ?? null, true);
+    },
     enumerable: false, configurable: false,
   });
 }
@@ -18527,6 +18682,14 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
     _realmFrameId, _deliverRealmMessage, _frameObjects);
+  if (_realmIsolated) {
+    // Resolve the canonical realm through the existing authenticated window
+    // target. The sentinel requests a borrowed native member even though both
+    // worlds have the same frame id; no public document/prototype is consulted.
+    const owner=_windowTarget(_nativeWindowId,_realmFrameId);
+    const state=__obscuraCore.ops.op_document_realm_member(owner,'modalState',0xFFFFFFFF);
+    _modalState=Reflect.apply(state,undefined,[]);
+  }
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);

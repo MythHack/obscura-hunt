@@ -742,6 +742,10 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
         {
             let parent = source_state.borrow();
             child.inherit_resources(&parent);
+            // Popups inherit a profile snapshot; iframes share their page client.
+            child.http_client = parent.http_client.as_ref().map(|client| std::sync::Arc::new(client.for_page()));
+            #[cfg(feature = "stealth")]
+            { child.stealth_client = parent.stealth_client.as_ref().map(|client| std::sync::Arc::new(client.for_page())); }
             child.intercept_tx = parent.intercept_tx.clone();
             child.intercept_page_id = format!("window-{id}");
             child.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -752,8 +756,11 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
             child.set_viewport(parent.viewport.0 as f64, parent.viewport.1 as f64);
         }
         let child = Rc::new(RefCell::new(child));
-        let loader = Rc::new(ObscuraModuleLoader::with_page_state("about:blank", proxy_url,
-            &child, child.borrow().import_map.clone()));
+        let (base, imports) = {
+            let child = child.borrow();
+            (crate::ops::document_base_url(&child).unwrap_or_else(|| child.url.clone()), child.import_map.clone())
+        };
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy_url, &child, imports));
         let module_realm = deno_core::BrowserRealm::attach(scope, context, loader.clone());
         let parent_context = v8::Local::new(scope, &callbacks.context);
         context.set_security_token(parent_context.get_security_token(scope));

@@ -36,7 +36,12 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
     // with OutputFull when it runs out. Legacy encodings can expand one byte into
     // three UTF-8 bytes, so grow the buffer and continue until the input is
     // consumed instead of truncating (or, in fatal mode, rejecting valid input).
-    let mut out = String::with_capacity(bytes.len() + 1);
+    let capacity = if fatal {
+        dec.max_utf8_buffer_length_without_replacement(bytes.len())?
+    } else {
+        dec.max_utf8_buffer_length(bytes.len())?
+    };
+    let mut out = String::with_capacity(capacity);
     let mut src = bytes;
     if fatal {
         loop {
@@ -66,6 +71,39 @@ pub fn decode_with_label(label: &str, bytes: &[u8], fatal: bool, ignore_bom: boo
             }
         }
     }
+}
+
+/// DevTools returns text only for a supported MIME decoder and lossless input.
+/// Callers check their retention limits before decoding or base64 encoding.
+pub fn decode_devtools_response_body(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    if body.is_empty() { return Some(String::new()); }
+    let content_type = content_type.filter(|value| !value.trim().is_empty()).unwrap_or("text/plain");
+    let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    let html = mime == "text/html";
+    let utf8 = matches!(mime.as_str(),
+        "application/javascript" | "application/ecmascript" | "application/x-ecmascript"
+        | "application/x-javascript" | "text/ecmascript" | "text/javascript"
+        | "text/javascript1.0" | "text/javascript1.1" | "text/javascript1.2"
+        | "text/javascript1.3" | "text/javascript1.4" | "text/javascript1.5"
+        | "text/jscript" | "text/livescript" | "text/x-ecmascript" | "text/x-javascript"
+        | "application/json" | "text/json" | "application/xml" | "text/xml")
+        || mime.ends_with("+json")
+        || (mime.starts_with("application/") && mime.ends_with("+xml"));
+    if !html && !utf8 && !(mime.starts_with("text/") && mime != "text/xsl") {
+        return None;
+    }
+    let charset = content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") { return None; }
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!value.is_empty()).then_some(value)
+    });
+    let encoding = charset.unwrap_or_else(|| {
+        if html { detect_encoding(body, Some(content_type)).0.name() }
+        else if utf8 { "utf-8" }
+        else { "windows-1252" }
+    });
+    decode_with_label(encoding, body, true, false)
 }
 
 /// Decode an HTTP response body. `content_type_header` is the raw header

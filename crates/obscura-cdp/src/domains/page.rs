@@ -1975,6 +1975,7 @@ mod tests {
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
                 request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
                 frame_id: 0,
+                frame_generation: 0,
                 resource_type: kind.into(), status, headers: Default::default(),
                 response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
                 error_text: None,
@@ -2313,6 +2314,7 @@ mod tests {
         let event = obscura_browser::NetworkEvent {
             request_id: "fetch-7".into(),
             frame_id: 0,
+            frame_generation: 0,
             intercepted: false,
             url: "https://example.test/data.json".into(),
             method: "GET".into(),
@@ -2411,6 +2413,7 @@ mod tests {
         .map(|(index, (url, kind))| obscura_browser::NetworkEvent {
             request_id: format!("finished-{index}"),
             frame_id: 0,
+            frame_generation: 0,
             intercepted: false,
             url: url.into(),
             method: "GET".into(),
@@ -2473,6 +2476,7 @@ mod tests {
         let event = obscura_browser::NetworkEvent {
             request_id: "document-internal".into(),
             frame_id: 0,
+            frame_generation: 0,
             intercepted: false,
             url: page_url.into(),
             method: "GET".into(),

@@ -252,9 +252,17 @@ impl RenderResourceCache {
     /// loads them through its asynchronous transport; nothing is
     /// reconstructed from the DOM, so script-registered fonts, shadow roots
     /// and every other renderer-only source are covered.
-    pub fn take_sync_misses(&mut self) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
-        self.sync_miss_keys.clear();
-        std::mem::take(&mut self.sync_misses)
+    pub fn take_sync_misses(&mut self, limit: usize) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
+        if limit >= self.sync_misses.len() {
+            self.sync_miss_keys.clear();
+            return std::mem::take(&mut self.sync_misses);
+        }
+        let misses: Vec<_> = self.sync_misses.drain(..limit).collect();
+        for (url, profile, _) in &misses {
+            let key = profile.map_or_else(|| url.clone(), |profile| image_resource_key(url, profile));
+            self.sync_miss_keys.remove(&key);
+        }
+        misses
     }
 
     /// Whether any cache-only miss is waiting to be taken.
@@ -1565,16 +1573,52 @@ impl PreparedRender {
         x: f32,
         y: f32,
     ) -> Option<obscura_dom::tree::NodeId> {
-        if !x.is_finite()
-            || !y.is_finite()
-            || x < 0.0
-            || y < 0.0
-            || x > self.viewport.0
-            || y > self.viewport.1
-        {
-            return None;
+        let mut best: Option<HitCandidate> = None;
+        self.visit_hit_candidates(tree, scroll, x, y, |candidate| {
+            if best.as_ref().is_none_or(|best| self.hit_ranks_above(tree, scroll, x, y, &candidate, best)) {
+                best = Some(candidate);
+            }
+        });
+        best.map(|candidate| candidate.id)
+    }
+
+    /// Front-to-back hits use repeated single-pass selection, not a sort:
+    /// ancestry and preserve-3d relations are not a total ordering.
+    pub fn hit_test_stack(&self, tree: &DomTree, scroll: &ResolvedScrollState,
+        x: f32, y: f32) -> Vec<obscura_dom::tree::NodeId> {
+        let mut candidates = Vec::new();
+        self.visit_hit_candidates(tree, scroll, x, y, |candidate| candidates.push(candidate));
+        let mut stack = Vec::with_capacity(candidates.len());
+        while !candidates.is_empty() {
+            let mut best = 0;
+            for index in 1..candidates.len() {
+                if self.hit_ranks_above(tree, scroll, x, y, &candidates[index], &candidates[best]) {
+                    best = index;
+                }
+            }
+            // Preserve traversal order for the next pass's non-total ties.
+            stack.push(candidates.remove(best).id);
         }
-        let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
+        stack
+    }
+
+    fn hit_ranks_above(&self, tree: &DomTree, scroll: &ResolvedScrollState, x: f32, y: f32,
+        candidate: &HitCandidate, best: &HitCandidate) -> bool {
+        let visual_depth = compare_preserve_depth(tree, &self.layout, scroll, candidate.id, best.id, x, y);
+        if visual_depth != std::cmp::Ordering::Equal { return visual_depth.is_gt(); }
+        let stacking = compare_stacking_paths(&candidate.path, &best.path);
+        if stacking != std::cmp::Ordering::Equal { return stacking.is_gt(); }
+        if tree.ancestors(candidate.id).contains(&best.id) { return true; }
+        if tree.ancestors(best.id).contains(&candidate.id) { return false; }
+        candidate.positioned.cmp(&best.positioned)
+            .then_with(|| candidate.depth.cmp(&best.depth))
+            .then_with(|| candidate.order.cmp(&best.order)).is_gt()
+    }
+
+    fn visit_hit_candidates(&self, tree: &DomTree, scroll: &ResolvedScrollState,
+        x: f32, y: f32, mut visit: impl FnMut(HitCandidate)) {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0
+            || x > self.viewport.0 || y > self.viewport.1 { return; }
         for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
             .into_iter()
             .enumerate()
@@ -1596,35 +1640,14 @@ impl PreparedRender {
                 continue;
             }
             if self.viewport_to_local(tree,id,scroll,x,y).is_none() { continue; }
-            let path = stacking_path(tree, &self.layout, id);
-            let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
-            let depth = tree.ancestors(id).len();
-            let replace = best
-                .as_ref()
-                .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
-                    let visual_depth = compare_preserve_depth(tree, &self.layout, scroll, id, *best_id, x, y);
-                    if visual_depth != std::cmp::Ordering::Equal { return visual_depth.is_gt(); }
-                    let stacking = compare_stacking_paths(&path, best_path);
-                    if stacking != std::cmp::Ordering::Equal {
-                        return stacking.is_gt();
-                    }
-                    if tree.ancestors(id).contains(best_id) {
-                        return true;
-                    }
-                    if tree.ancestors(*best_id).contains(&id) {
-                        return false;
-                    }
-                    positioned
-                        .cmp(best_positioned)
-                        .then_with(|| depth.cmp(best_depth))
-                        .then_with(|| order.cmp(best_order))
-                        .is_gt()
-                });
-            if replace {
-                best = Some((path, positioned, depth, order, id));
-            }
+            visit(HitCandidate {
+                path: stacking_path(tree, &self.layout, id),
+                positioned: style.position.is_some() || style.position_fixed || style.position_sticky,
+                depth: tree.ancestors(id).len(),
+                order,
+                id,
+            });
         }
-        best.map(|(_, _, _, _, id)| id)
     }
 
     /// Shaped-text caret in the viewport. Hit testing selects the painted
@@ -1701,6 +1724,37 @@ impl PreparedRender {
         let unzoom = |length| unzoom_dimension(length, zoom);
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
+        // Insets describe the cascaded positioning model, never viewport coordinates.
+        for (index, name) in ["top", "right", "bottom", "left"].into_iter().enumerate() {
+            out.insert(name, if style.position.is_none() {
+                "auto".to_string()
+            } else {
+                dimension_css(unzoom(style.inset[index].unwrap_or(crate::Dimension::Auto)), "auto")
+            });
+        }
+        out.insert("vertical-align", match style.vertical_align {
+            Some(crate::VerticalAlign::Top) => "top",
+            Some(crate::VerticalAlign::Middle) => "middle",
+            Some(crate::VerticalAlign::Bottom) => "bottom",
+            None => "baseline",
+        }.to_string());
+        out.insert("text-transform", match style.text_transform {
+            Some(crate::TextTransform::Uppercase) => "uppercase",
+            Some(crate::TextTransform::Lowercase) => "lowercase",
+            Some(crate::TextTransform::Capitalize) => "capitalize",
+            _ => "none",
+        }.to_string());
+        out.insert("list-style-type", match style.list_style {
+            Some(crate::ListStyle::Disc) | None => "disc",
+            Some(crate::ListStyle::Circle) => "circle",
+            Some(crate::ListStyle::Square) => "square",
+            Some(crate::ListStyle::Decimal) => "decimal",
+            Some(crate::ListStyle::None) => "none",
+        }.to_string());
+        out.insert("border-collapse", if style.border_collapse == Some(true) {
+            "collapse"
+        } else { "separate" }.to_string());
+        out.insert("table-layout", if style.table_layout_fixed { "fixed" } else { "auto" }.to_string());
         out.insert("font-size", css_px(style.font_size.unwrap_or(16.0) / zoom));
         out.insert(
             "font-weight",
@@ -1914,7 +1968,9 @@ impl PreparedRender {
 
         out.insert(
             "flex-direction",
-            match style.flex_direction.unwrap_or(taffy::FlexDirection::Row) {
+            match style.flex_direction
+                .filter(|_| style.flex_direction_authored || !style.internal_flex_container)
+                .unwrap_or(taffy::FlexDirection::Row) {
                 taffy::FlexDirection::Row => "row",
                 taffy::FlexDirection::RowReverse => "row-reverse",
                 taffy::FlexDirection::Column => "column",
@@ -1935,6 +1991,7 @@ impl PreparedRender {
             "align-items",
             style
                 .align_items
+                .filter(|_| style.align_items_authored || !style.internal_flex_container)
                 .map_or_else(|| "normal".to_string(), align_items_css),
         );
         out.insert(
@@ -2007,6 +2064,89 @@ impl PreparedRender {
                 |(x, y)| format!("{} {}", css_number(x), css_number(y)),
             ),
         );
+        out.insert("direction", if style.direction == Some(taffy::Direction::Rtl) { "rtl" } else { "ltr" }.to_string());
+        out.insert("font-style", if style.font_style_italic.unwrap_or(false) { "italic" } else { "normal" }.to_string());
+        out.insert("word-spacing", css_px(style.word_spacing.unwrap_or(0.0) / zoom));
+        let mut decoration = String::new();
+        for (enabled, line) in [(style.underline, "underline"), (style.overline, "overline"),
+            (style.line_through, "line-through")] {
+            if enabled.unwrap_or(false) {
+                if !decoration.is_empty() { decoration.push(' '); }
+                decoration.push_str(line);
+            }
+        }
+        if decoration.is_empty() { decoration.push_str("none"); }
+        out.insert("text-decoration", format!("{decoration} solid {}", css_color(current_color)));
+        out.insert("text-decoration-line", decoration);
+        out.insert("text-decoration-color", css_color(current_color));
+        out.insert("caret-color", css_color(current_color));
+        out.insert("text-indent", dimension_css(unzoom(style.text_indent.unwrap_or(crate::Dimension::Px(0.0))), "0px"));
+        out.insert("border-spacing", match style.border_spacing {
+            Some((x, y)) if x == y => css_px(x / zoom),
+            Some((x, y)) => format!("{} {}", css_px(x / zoom), css_px(y / zoom)),
+            None => "0px".to_string(),
+        });
+        out.insert("background-image", background_image_css(style));
+        out.insert("background-size", match (&style.background_size_expression, style.background_size_fit) {
+            (Some(expression), _) => expression.clone(),
+            (None, Some(crate::ObjectFit::Cover)) => "cover".to_string(),
+            (None, Some(crate::ObjectFit::Contain)) => "contain".to_string(),
+            _ => match style.background_size {
+                Some((x, y)) => format!("{} {}", css_px(x / zoom), css_px(y / zoom)),
+                None => "auto".to_string(),
+            },
+        });
+        out.insert("background-position", format!("{} {}",
+            position_axis_css(style.background_position.x, zoom),
+            position_axis_css(style.background_position.y, zoom)));
+        out.insert("background-repeat", match style.background_repeat.unwrap_or((true, true)) {
+            (true, true) => "repeat", (true, false) => "repeat-x",
+            (false, true) => "repeat-y", (false, false) => "no-repeat",
+        }.to_string());
+        out.insert("object-fit", match style.object_fit {
+            crate::ObjectFit::Fill => "fill", crate::ObjectFit::Contain => "contain",
+            crate::ObjectFit::Cover => "cover", crate::ObjectFit::ScaleDown => "scale-down",
+            crate::ObjectFit::None => "none",
+        }.to_string());
+        out.insert("object-position", format!("{} {}",
+            position_axis_css(style.object_position.x, zoom),
+            position_axis_css(style.object_position.y, zoom)));
+        out.insert("box-shadow", match style.box_shadow {
+            Some(shadow) => format!("{} {} {} {} {}{}", css_color(shadow.color),
+                css_px(shadow.offset_x / zoom), css_px(shadow.offset_y / zoom),
+                css_px(shadow.blur / zoom), css_px(shadow.spread / zoom),
+                if shadow.inset { " inset" } else { "" }),
+            None => "none".to_string(),
+        });
+        out.insert("aspect-ratio", match style.aspect_ratio {
+            Some(ratio) if !style.aspect_ratio_is_intrinsic => format!("{} / 1", css_number(ratio)),
+            _ => "auto".to_string(),
+        });
+        out.insert("align-self", style.align_self.map_or_else(|| "auto".to_string(), align_items_css));
+        out.insert("justify-self", style.justify_self.map_or_else(|| "auto".to_string(), align_items_css));
+        out.insert("flex-grow", css_number(style.flex_grow.unwrap_or(0.0)));
+        out.insert("flex-shrink", css_number(style.flex_shrink.unwrap_or(1.0)));
+        out.insert("flex-basis", dimension_css(unzoom(style.flex_basis), "auto"));
+        out.insert("order", style.order.to_string());
+        out.insert("grid-column", grid_placement_css(style.grid_column_raw.as_deref(), style.grid_column.as_ref()));
+        out.insert("grid-row", grid_placement_css(style.grid_row_raw.as_deref(), style.grid_row.as_ref()));
+        out.insert("animation-name", style.animation_name.clone().unwrap_or_else(|| "none".to_string()));
+        out.insert("animation-duration", format!("{}s", css_number(style.animation_timing.duration_ms / 1000.0)));
+        out.insert("animation-delay", format!("{}s", css_number(style.animation_timing.delay_ms / 1000.0)));
+        out.insert("animation-iteration-count", if style.animation_timing.iteration_count.is_infinite() {
+            "infinite".to_string()
+        } else { css_number(style.animation_timing.iteration_count) });
+        out.insert("animation-direction", match style.animation_timing.direction {
+            crate::AnimationDirection::Normal => "normal", crate::AnimationDirection::Reverse => "reverse",
+            crate::AnimationDirection::Alternate => "alternate", crate::AnimationDirection::AlternateReverse => "alternate-reverse",
+        }.to_string());
+        out.insert("animation-fill-mode", match style.animation_timing.fill_mode {
+            crate::AnimationFillMode::None => "none", crate::AnimationFillMode::Forwards => "forwards",
+            crate::AnimationFillMode::Backwards => "backwards", crate::AnimationFillMode::Both => "both",
+        }.to_string());
+        out.insert("animation-play-state", match style.animation_timing.play_state {
+            crate::AnimationPlayState::Running => "running", crate::AnimationPlayState::Paused => "paused",
+        }.to_string());
         Some(out)
     }
 
@@ -2341,6 +2481,10 @@ fn computed_display(style: &crate::LayoutStyle) -> &'static str {
         "-webkit-box"
     } else if style.webkit_box_display == Some(true) && !active_webkit_clamp {
         "-webkit-inline-box"
+    } else if let Some(display) = style.computed_display {
+        display
+    } else if style.flow_root && !style.is_inline_block {
+        "flow-root"
     } else if style.internal_flex_container {
         "block"
     } else {
@@ -2388,6 +2532,74 @@ fn dimension_css(value: crate::Dimension, auto: &str) -> String {
         crate::Dimension::Vmin(v) => format!("{}vmin", css_number(v)),
         crate::Dimension::Vmax(v) => format!("{}vmax", css_number(v)),
     }
+}
+
+fn position_axis_css(axis: crate::BackgroundPositionAxis, zoom: f32) -> String {
+    radius_value_css(crate::RadiusValue { length: axis.length / zoom, percentage: axis.percentage })
+}
+
+fn grid_placement_css(raw: Option<&str>, line: Option<&taffy::Line<taffy::GridPlacement>>) -> String {
+    if let Some(raw) = raw { return raw.to_string(); }
+    fn placement(value: &taffy::GridPlacement) -> String {
+        match value {
+            taffy::GridPlacement::Auto => "auto".to_string(),
+            taffy::GridPlacement::Line(line) => line.as_i16().to_string(),
+            taffy::GridPlacement::Span(span) => format!("span {span}"),
+            taffy::GridPlacement::NamedLine(name, index) => format!("{name} {index}"),
+            taffy::GridPlacement::NamedSpan(name, span) => format!("span {name} {span}"),
+        }
+    }
+    line.map_or_else(|| "auto".to_string(), |line| {
+        let start = placement(&line.start);
+        if line.end == taffy::GridPlacement::Auto { start } else { format!("{start} / {}", placement(&line.end)) }
+    })
+}
+
+fn background_image_css(style: &crate::LayoutStyle) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::new();
+    for (index, layer) in style.background_gradient_layers.iter().enumerate() {
+        if !value.is_empty() { value.push_str(", "); }
+        let (stops, positions, conic) = match layer {
+            crate::BackgroundGradientLayer::Linear { angle, stops, stop_positions, repeating } => {
+                let _ = write!(value, "{}linear-gradient({}deg", if *repeating { "repeating-" } else { "" }, css_number(*angle));
+                (stops, Some(stop_positions), false)
+            }
+            crate::BackgroundGradientLayer::Radial { center, stops } => {
+                let geometry = style.background_gradient_layer_radial_geometries.get(index)
+                    .copied().flatten().unwrap_or_default();
+                let shape = match geometry.shape { crate::RadialGradientShape::Circle => "circle", crate::RadialGradientShape::Ellipse => "ellipse" };
+                let size = match geometry.size {
+                    crate::RadialGradientSize::ClosestSide => "closest-side".to_string(),
+                    crate::RadialGradientSize::ClosestCorner => "closest-corner".to_string(),
+                    crate::RadialGradientSize::FarthestSide => "farthest-side".to_string(),
+                    crate::RadialGradientSize::FarthestCorner => "farthest-corner".to_string(),
+                    crate::RadialGradientSize::Explicit(x, y) => format!("{} {}", dimension_css(x, "auto"), dimension_css(y, "auto")),
+                };
+                let _ = write!(value, "radial-gradient({shape} {size} at {}% {}%", css_number(center.0 * 100.0), css_number(center.1 * 100.0));
+                (stops, None, false)
+            }
+            crate::BackgroundGradientLayer::Conic { angle, center, stops } => {
+                let _ = write!(value, "conic-gradient(from {}deg at {}% {}%", css_number(*angle), css_number(center.0 * 100.0), css_number(center.1 * 100.0));
+                (stops, None, true)
+            }
+        };
+        for (index, (color, position)) in stops.iter().enumerate() {
+            let _ = write!(value, ", {}", css_color(*color));
+            if let Some(raw) = positions.and_then(|positions| positions.get(index)).and_then(Option::as_deref) {
+                value.push(' '); value.push_str(raw);
+            } else if let Some(position) = position {
+                let _ = write!(value, " {}{}", css_number(*position * if conic { 360.0 } else { 100.0 }), if conic { "deg" } else { "%" });
+            }
+        }
+        value.push(')');
+    }
+    if let Some(url) = &style.background_image {
+        if !value.is_empty() { value.push_str(", "); }
+        let _ = write!(value, "url(\"{}\")", url.replace('\\', "\\\\").replace('"', "\\\""));
+    }
+    if value.is_empty() { value.push_str("none"); }
+    value
 }
 
 fn radius_value_css(value: crate::RadiusValue) -> String {
@@ -3096,7 +3308,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .collect::<HashMap<_, _>>();
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
+    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts, viewport, media_type);
     // Most framework pages use web fonts and many decorative SVG icons, but
     // only SVG text needs the page font faces. Avoid cloning/loading the page
     // font database for ordinary icons and HTML-only text.
@@ -3650,6 +3862,14 @@ fn stacking_z_index(
         return is_flex_or_grid.then_some(z);
     }
     None
+}
+
+struct HitCandidate {
+    path: Vec<i32>,
+    positioned: bool,
+    depth: usize,
+    order: usize,
+    id: obscura_dom::tree::NodeId,
 }
 
 fn stacking_path(tree: &DomTree, laid: &crate::DomLayout,
@@ -7990,6 +8210,8 @@ fn collect_web_fonts(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
 ) -> Vec<crate::inline::WebFont> {
     struct FontRule {
         sources: Vec<(String, String)>,
@@ -8003,15 +8225,8 @@ fn collect_web_fonts(
     let mut rules = Vec::new();
     let points = document_font_codepoints(tree);
 
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        // Inspect tags without copying unrelated script/text payloads.
-        if !tree.with_node(nid, |node| {
-            node.as_element().is_some_and(|element| &*element.local == "style")
-        }).unwrap_or(false) {
-            continue;
-        }
-        let css = tree.text_content(nid);
-        for face in font_face_blocks(&css) {
+    let mut collect_rules = |css: &str| {
+        for face in font_face_blocks(css) {
             if !font_face_covers_text(face, &points) {
                 continue;
             }
@@ -8030,7 +8245,30 @@ fn collect_web_fonts(
                 italic: font_face_italic(face),
             });
         }
+    };
+    let external = tree.external_stylesheets();
+    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
+        let Some(node) = tree.borrow_node(nid) else { continue };
+        let Some(element) = node.as_element() else { continue };
+        let inline = &*element.local == "style";
+        let linked = &*element.local == "link" && node.get_attribute("disabled").is_none()
+            && node.get_attribute("rel").is_some_and(|rel| rel.split_ascii_whitespace()
+                .any(|part| part.eq_ignore_ascii_case("stylesheet")));
+        if (!inline && !linked) || !node.get_attribute("media").is_none_or(|media|
+            media.trim().is_empty() || crate::css::media_query_applies_for_viewport_and_type(
+                media, viewport, media_type)) { continue; }
+        drop(node);
+        if let Some(sheet) = external.get(&nid) {
+            if let Some(cssom) = &sheet.cssom_rules {
+                if inline { for source in &sheet.sources { collect_rules(source); } }
+                for rule in cssom { collect_rules(rule); }
+                continue;
+            }
+            for source in &sheet.sources { collect_rules(source); }
+        }
+        if inline { collect_rules(&tree.text_content(nid)); }
     }
+    drop(collect_rules);
     for face in dynamic_fonts {
         let descriptor_block = format!(
             "src:{};font-weight:{};font-style:{};unicode-range:{}",
@@ -13318,7 +13556,7 @@ mod tests {
         cache.set_sync_loading_enabled(false);
         assert_eq!(cache.profiled_image_intrinsic("https://assets.test/unknown.svg", profile), None);
         assert_eq!(cache.cached_image_metadata("https://assets.test/unknown.svg", None), None);
-        let misses = cache.take_sync_misses();
+        let misses = cache.take_sync_misses(usize::MAX);
         assert_eq!(misses, vec![("https://assets.test/unknown.svg".into(), Some(profile), false)]);
     }
 
@@ -13331,7 +13569,7 @@ mod tests {
         for src in ["relative.svg", "file:///tmp/image.svg", "about:blank"] {
             assert_eq!(cache.profiled_image_intrinsic(src, profile), None);
         }
-        assert!(cache.take_sync_misses().is_empty());
+        assert!(cache.take_sync_misses(usize::MAX).is_empty());
         cache.seed_image("https://assets.test/image.svg".into(), profile,
             b"<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'/>".to_vec());
         assert_eq!(cache.profiled_image_intrinsic("//assets.test/image.svg", profile).unwrap().natural_size(), Some((20.0, 10.0)));
@@ -13755,7 +13993,7 @@ mod tests {
         );
         assert!(cache.has_sync_misses());
         assert_eq!(
-            cache.take_sync_misses(),
+            cache.take_sync_misses(usize::MAX),
             vec![
                 (font.to_string(), None, true),
                 (
@@ -13785,6 +14023,22 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_misses_wait_for_shared_page_capacity() {
+        let mut cache = RenderResourceCache::with_loader(|_url: &str| panic!("cache-only"));
+        cache.set_sync_loading_enabled(false);
+        let first = "https://example.test/first.ttf";
+        let second = "https://example.test/second.svg";
+        assert!(cache.get_or_load(first, true).is_none());
+        assert!(cache.get_or_load_image(second, ImageRequestProfile::CorsInclude).is_none());
+        assert!(cache.take_sync_misses(0).is_empty());
+        assert_eq!(cache.take_sync_misses(1), vec![(first.into(), None, true)]);
+        assert!(cache.get_or_load_image(second, ImageRequestProfile::CorsInclude).is_none());
+        assert_eq!(cache.take_sync_misses(1),
+            vec![(second.into(), Some(ImageRequestProfile::CorsInclude), false)]);
+        assert!(!cache.has_sync_misses());
+    }
+
+    #[test]
     fn cache_only_miss_queue_respects_the_cache_entry_limit() {
         let mut cache = RenderResourceCache::with_loader_and_limits(
             |_url: &str| None,
@@ -13803,7 +14057,7 @@ mod tests {
             .get_or_load("https://example.test/second.png", false)
                 .is_none()
         );
-        assert_eq!(cache.take_sync_misses().len(), 1);
+        assert_eq!(cache.take_sync_misses(usize::MAX).len(), 1);
 
         assert!(
             cache
@@ -13811,7 +14065,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            cache.take_sync_misses().len(),
+            cache.take_sync_misses(usize::MAX).len(),
             1,
             "a deferred miss is reported later"
         );

@@ -135,28 +135,7 @@ pub async fn handle(
             Ok(json!({}))
         }
         "setUserAgentOverride" => {
-            let user_agent = params
-                .get("userAgent")
-                .and_then(Value::as_str)
-                .ok_or("Emulation.setUserAgentOverride requires userAgent")?;
-            let accept_language = params.get("acceptLanguage").and_then(Value::as_str);
-            let http_client = ctx
-                .get_session_page(session_id)
-                .ok_or("No page for session")?
-                .http_client
-                .clone();
-            if !user_agent.is_empty() {
-                http_client.set_user_agent(user_agent).await;
-                if let Some(js) = ctx
-                    .get_session_page_mut(session_id)
-                    .and_then(|page| page.js.as_mut())
-                {
-                    js.set_user_agent(user_agent);
-                }
-            }
-            if let Some(accept_language) = accept_language {
-                http_client.set_accept_language(accept_language).await;
-            }
+            super::network::apply_user_agent_override(params, ctx, session_id).await?;
             Ok(json!({}))
         }
         "setLocaleOverride" => {
