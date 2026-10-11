@@ -327,6 +327,17 @@ platform font rasterization may differ from Chromium. The existing
 [Playwright](docs/Use-with-Playwright.md), and
 [MCP](docs/Use-the-MCP-server.md) guides cover their capture APIs and limits.
 
+CSS `zoom` accepts nonnegative numbers and percentages through the native
+cascade (`200%` computes to `2`), defaults to `1`, and is not inherited.
+Nested zoom factors multiply used box and text lengths before layout, so they
+affect sibling flow, paint, and hit testing. Computed CSS lengths and
+`offsetWidth`/`clientWidth` remain unzoomed; `getBoundingClientRect()` includes
+zoom. Zero retains its computed value but uses the compatibility factor `1`.
+CSS `perspective` defaults to `none`, resolves supported nonnegative contextual
+lengths to computed pixels, and establishes absolute/fixed containing blocks.
+The renderer still has no 3D perspective projection, so non-`none` perspective
+feature queries remain false rather than advertising a painted 3D effect.
+
 ### Start the CDP server
 
 ```bash

@@ -4826,3 +4826,157 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+
+#[cfg(feature = "paint")]
+#[test]
+fn perspective_computes_cascaded_lengths_and_establishes_containing_blocks() {
+    let tree = parse_html(r#"<style>
+        html { font-size:10px } body { margin:0 }
+        #camera { --depth:calc(2rem + 3em); font-size:20px; perspective:var(--depth) !important;
+            margin:30px; width:100px; height:80px }
+        #invalid { perspective:40px; perspective:-1px; perspective:20%; perspective:banana }
+        #inherit { perspective:inherit } #unset { perspective:unset }
+        </style><div id="default"></div><div id="camera" style="perspective:7px">
+        <div id="inherit"></div><div id="unset"></div>
+        <div id="badge" style="position:fixed;left:4px;top:6px;width:10px;height:10px"></div>
+        </div><div id="invalid"></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let prepared = obscura_render::prepare_dom(&tree, (400.0, 300.0), None, &mut resources).unwrap();
+    let computed = |name| prepared.computed_style(tree.get_element_by_id(name).unwrap()).unwrap();
+    assert_eq!(computed("default")["perspective"], "none");
+    assert_eq!(computed("camera")["perspective"], "80px");
+    assert_eq!(computed("inherit")["perspective"], "80px");
+    assert_eq!(computed("unset")["perspective"], "none");
+    assert_eq!(computed("invalid")["perspective"], "40px");
+    let layout = prepared.layout();
+    let camera = layout.rects[&tree.get_element_by_id("camera").unwrap()];
+    let badge = layout.rects[&tree.get_element_by_id("badge").unwrap()];
+    assert_eq!((badge.x - camera.x, badge.y - camera.y), (4.0, 6.0));
+    assert!(!obscura_render::style::supports_declaration("perspective", "80px"));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn zoom_changes_native_layout_nested_flow_paint_and_hit_testing() {
+    let tree = parse_html(r#"<!doctype html><style>
+        body { margin:0 } #zoomed { --factor:200%; zoom:var(--factor) !important; width:100px; background:red }
+        #nested { zoom:150%; width:20px; height:10px; background:lime }
+        #ordinary { width:20px; height:10px; background:blue }
+        #after { width:10px; height:10px; background:black }
+        #invalid { zoom:1.25; zoom:-2; zoom:2px; zoom:banana }
+        #inherit { zoom:inherit; width:10px; height:5px }
+        #unset { zoom:unset; width:10px; height:5px }
+        button { font:20px/24px monospace } #control-zoom { zoom:2 }
+        </style><div id="default"></div><div id="zoomed" style="zoom:3">
+        <div id="nested"></div><div id="ordinary"></div><div id="inherit"></div><div id="unset"></div>
+        </div><div id="after"></div><div id="invalid"></div>
+        <button id="control">AB</button><button id="control-zoom">AB</button>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (400.0, 300.0), None, &mut resources).unwrap();
+    let node = |name| tree.get_element_by_id(name).unwrap();
+    let rect = |name| prepared.document_rect(node(name)).unwrap();
+    let computed = |name| prepared.computed_style(node(name)).unwrap();
+    assert_eq!(computed("default")["zoom"], "1");
+    assert_eq!(computed("zoomed")["zoom"], "2");
+    assert_eq!(computed("zoomed")["width"], "100px");
+    assert_eq!(computed("ordinary")["zoom"], "1");
+    assert_eq!(computed("inherit")["zoom"], "2");
+    assert_eq!(computed("unset")["zoom"], "1");
+    assert_eq!(computed("invalid")["zoom"], "1.25");
+    assert_eq!((rect("zoomed").width, rect("zoomed").height), (200.0, 80.0));
+    assert_eq!((rect("nested").width, rect("nested").height), (60.0, 30.0));
+    assert_eq!((rect("ordinary").width, rect("ordinary").height, rect("ordinary").y), (40.0, 20.0, 30.0));
+    assert_eq!(rect("after").y, 80.0);
+    let normal_control = rect("control");
+    let zoom_control = rect("control-zoom");
+    assert!((zoom_control.width - normal_control.width * 2.0).abs() <= 1.0);
+    assert!((zoom_control.height - normal_control.height * 2.0).abs() <= 1.0);
+    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+    assert_eq!(prepared.hit_test(&tree, &scroll, 50.0, 20.0), Some(node("nested")));
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    let pixel = image.pixel(50, 20).unwrap();
+    assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 255, 0));
+    let pixel = image.pixel(150, 70).unwrap();
+    assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn zoom_scales_background_images_once_in_used_paint_coordinates() {
+    for (size, side) in [
+        ("10px 10px", 20),
+        ("auto", 20),
+        ("", 20),
+        ("50% 50%", 20),
+        ("calc(25% + 1em) auto", 30),
+        ("1rem 1rem", 20),
+        ("calc(5vw + 5vh) 10px", 20),
+        ("contain", 40),
+        ("cover", 40),
+    ] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            html {{ font-size:10px }} body {{ margin:0 }}
+            #image {{ zoom:2; width:20px; height:20px; font-size:10px; background-color:white;
+                background-image:url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%20viewBox='0%200%2010%2010'%3E%3Crect%20width='10'%20height='10'%20fill='red'/%3E%3C/svg%3E");
+                background-size:{size}; background-repeat:no-repeat }}
+            </style><div id="image"></div>"#));
+        let image = obscura_render::paint_dom(&tree, (100.0, 100.0), None).unwrap();
+        let inside = image.pixel(side - 1, side - 1).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0), "{size}");
+        let outside = image.pixel(side, side).unwrap();
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255), "{size}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn generated_pseudo_zoom_changes_box_paint_and_following_flow_without_compounding() {
+    use obscura_render::{
+        paint_prepared, prepare_dom_with_dynamic_fonts_and_stylesheet_cache,
+        prepare_dom_with_retained_attribute_styles, RenderResourceCache,
+    };
+
+    for (host_zoom, pseudo_zoom, side) in [
+        (1, "2", 20), (2, "inherit", 40), (2, "normal", 20), (2, "150%", 30),
+    ] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            body {{ margin:0 }} #host {{ zoom:{host_zoom}; width:50px; background:white }}
+            #host::before, #host::after {{ content:''; display:block; width:10px; height:10px; zoom:{pseudo_zoom} }}
+            #host::before {{ background:red }} #host::after {{ background:lime }}
+            #child {{ width:10px; height:5px; background:blue }}
+            #after {{ width:10px; height:5px }} #after.changed {{ width:11px }}
+            </style><div id="host"><div id="child"></div></div><div id="after" class=""></div>"#));
+        let host = tree.get_element_by_id("host").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        let after = tree.get_element_by_id("after").unwrap();
+        let child_height = 5 * host_zoom;
+        let mut resources = RenderResourceCache::with_loader(|_: &str| None);
+        let mut cache = obscura_render::css::StylesheetCache::default();
+        let mut prepared = prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (150.0, 120.0), None, &mut resources, &[], &mut cache,
+        ).unwrap();
+        for (before, next) in [("", "changed"), ("changed", "")] {
+            assert_eq!(prepared.document_rect(child).unwrap().y, side as f32, "{host_zoom} {pseudo_zoom}");
+            assert_eq!(prepared.document_rect(host).unwrap().height, (side * 2 + child_height) as f32);
+            assert_eq!(prepared.document_rect(after).unwrap().y, (side * 2 + child_height) as f32);
+            let image = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+            let pixel = image.pixel(side - 1, side - 1).unwrap();
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
+            let pixel = image.pixel(side, 1).unwrap();
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 255, 255));
+            let pixel = image.pixel(1, side + 1).unwrap();
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 0, 255));
+            let pixel = image.pixel(side - 1, side * 2 + child_height - 1).unwrap();
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 255, 0));
+            tree.with_node_mut(after, |node| node.set_attribute("class", next.into()));
+            prepared = prepare_dom_with_retained_attribute_styles(
+                &tree, (150.0, 120.0), None, &mut resources, &[], &mut cache, prepared,
+                &[obscura_render::dom::AttributeStyleMutation {
+                    node: after, name: "class".into(), old_value: Some(before.into()), new_value: Some(next.into()),
+                }],
+            ).unwrap();
+        }
+        assert_eq!(prepared.document_rect(child).unwrap().y, side as f32);
+        assert_eq!(prepared.document_rect(after).unwrap().y, (side * 2 + child_height) as f32);
+    }
+}

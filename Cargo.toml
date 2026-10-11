@@ -64,6 +64,8 @@ taffy = { path = "vendor/taffy" }
 # Carry the same canonical variable-font coordinates through shaping and
 # rasterization until the upstream API exposes them.
 cosmic-text = { path = "vendor/cosmic-text" }
+# Related browser windows share one isolate with independent module realms.
+deno_core = { path = "vendor/deno_core-0.412.0" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return

@@ -1,4 +1,9 @@
-`--storage-dir` persists cookies and localStorage to disk so they survive across runs.
+`--storage-dir` persists cookies to disk. Web Storage is currently in memory:
+`localStorage` is shared by same-origin pages in one browser context, while
+`sessionStorage` belongs to each top-level window. A related new window copies
+its opener's session namespace once; later changes are independent. Navigation
+preserves each window's origin-partitioned namespace. `noopener` starts empty,
+and opaque-origin documents cannot access Web Storage.
 
 ## CLI
 
@@ -7,7 +12,8 @@ obscura fetch https://example.com --storage-dir ./obscura-data
 obscura fetch https://example.com --storage-dir ./obscura-data
 ```
 
-The second invocation starts with the cookies and localStorage left by the first.
+The second invocation restores the cookies left by the first. It does not restore
+`localStorage` or `sessionStorage` from the previous process.
 
 ## Server
 
@@ -15,14 +21,15 @@ The second invocation starts with the cookies and localStorage left by the first
 obscura serve --storage-dir ./obscura-data
 ```
 
-All CDP sessions read and write to the same directory. Run separate `obscura serve` processes with different `--storage-dir` paths for isolated profiles.
+Pages in the default browser context share its cookie jar and live localStorage.
+Separate CDP browser contexts have isolated mutable state. Use different
+`--storage-dir` paths for separately persisted cookie profiles.
 
 ## Layout
 
 Inside `./obscura-data`:
 
 - `cookies.json`: cookie jar in a stable format with `same_site`, `expires`, `http_only`, `secure`.
-- `localStorage/<origin>.json`: one file per origin.
 
 The format is stable. Inspect with `jq`:
 
@@ -32,9 +39,9 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 
 ## When state is written
 
-- On clean process exit (Ctrl-C, SIGTERM).
-- After every navigation completes (CDP `Page.navigate`).
-- Manually via CDP `Network.setCookie` and `Network.deleteCookies`.
+- Cookies are saved through the browser context's persistence path, including
+  graceful shutdown. Forced process termination is not a persistence guarantee.
+- Neither Web Storage namespace is written to disk.
 
 ## Login once, scrape many
 
@@ -42,7 +49,9 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 obscura serve --storage-dir ./session-1
 ```
 
-Drive a login flow once via Puppeteer or Playwright. Stop the server. Subsequent runs against the same `--storage-dir` start logged in.
+Drive a cookie-based login flow once via Puppeteer or Playwright, then stop the
+server gracefully. Subsequent runs restore those cookies; logins that also need
+Web Storage must recreate that state.
 
 ## Multiple identities
 

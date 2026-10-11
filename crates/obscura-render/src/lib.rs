@@ -1618,6 +1618,21 @@ pub struct LayoutStyle {
     /// against the leftover space after `object-fit`; the CSS initial value
     /// is centered on both axes.
     pub object_position: ObjectPosition,
+    /// Non-inherited computed `zoom`, normalized from number/percentage.
+    /// `None` is the initial 1. Zero computes to zero but uses a factor of 1.
+    pub zoom: Option<f32>,
+    pub(crate) zoom_inherit: bool,
+    /// Product of nonzero used zoom factors through the rendered ancestry.
+    /// Lengths in a completed DOM layout are in this zoomed layout space;
+    /// CSSOM computed lengths and unscaled box metrics divide by this value.
+    pub(crate) effective_zoom: f32,
+    pub(crate) zoom_lengths_scaled: bool,
+    /// Non-inherited computed `perspective`; `None` is the initial `none`.
+    /// The top-down pass resolves contextual lengths before containing blocks
+    /// are built. Perspective projection is not yet painted by the 2D renderer.
+    pub perspective: Option<Dimension>,
+    pub(crate) perspective_expression: Option<String>,
+    pub(crate) perspective_inherit: bool,
     /// Ordered operations in the non-inherited `transform` property. Length
     /// percentages remain unresolved until the final border box is known.
     pub transform_ops: Vec<TransformOp>,
@@ -1762,6 +1777,89 @@ pub(crate) const CB_TRIGGER_ROTATE: u16 = 1 << 8;
 pub(crate) const CB_TRIGGER_SCALE: u16 = 1 << 9;
 
 impl LayoutStyle {
+    pub(crate) fn used_zoom(&self) -> f32 {
+        if self.zoom_lengths_scaled { self.effective_zoom } else { 1.0 }
+    }
+
+    /// Convert resolved computed lengths to/from the shared used layout/paint
+    /// coordinate space. Percentages and dimensionless ratios stay unchanged.
+    /// Retained restyle reverses this conversion before inheritance, so zoom
+    /// never compounds on a previous layout's already-scaled font or box.
+    pub(crate) fn scale_used_lengths(&mut self, factor: f32) {
+        // Generated boxes have their own zoom, including when the host's
+        // factor is one. Reverse each box's previous used scale independently
+        // before retained styles go through computed inheritance again.
+        for pseudo in [&mut self.before_pseudo, &mut self.after_pseudo, &mut self.placeholder_pseudo]
+            .into_iter().flatten() {
+            let pseudo_factor = if self.zoom_lengths_scaled {
+                if pseudo.zoom_inherit {
+                    pseudo.zoom = Some(self.zoom.unwrap_or(1.0));
+                    pseudo.zoom_inherit = false;
+                }
+                let local_zoom = pseudo.zoom.unwrap_or(1.0);
+                pseudo.effective_zoom = self.effective_zoom
+                    * if local_zoom == 0.0 { 1.0 } else { local_zoom };
+                pseudo.effective_zoom
+            } else if pseudo.zoom_lengths_scaled {
+                1.0 / pseudo.effective_zoom
+            } else {
+                1.0
+            };
+            pseudo.zoom_lengths_scaled = self.zoom_lengths_scaled;
+            pseudo.scale_used_lengths(pseudo_factor);
+        }
+        if factor == 1.0 { return; }
+        let dimension = |value: &mut Dimension| {
+            if let Dimension::Px(pixels) = value { *pixels *= factor; }
+        };
+        for value in [&mut self.width, &mut self.height, &mut self.min_width, &mut self.min_height,
+            &mut self.max_width, &mut self.max_height, &mut self.flex_basis] { dimension(value); }
+        for edges in [&mut self.margin, &mut self.padding, &mut self.border] {
+            edges.top *= factor; edges.right *= factor; edges.bottom *= factor; edges.left *= factor;
+        }
+        for value in self.inset.iter_mut().flatten() { dimension(value); }
+        for value in [&mut self.font_size, &mut self.letter_spacing, &mut self.word_spacing,
+            &mut self.row_gap, &mut self.column_gap, &mut self.ratio_only_available_width] {
+            if let Some(pixels) = value { *pixels *= factor; }
+        }
+        if let Some(LineHeight::Px(pixels)) = &mut self.line_height { *pixels *= factor; }
+        if let Some(value) = &mut self.text_indent { dimension(value); }
+        for size in [&mut self.intrinsic_size, &mut self.background_size, &mut self.mask_size,
+            &mut self.border_spacing] {
+            if let Some((x, y)) = size { *x *= factor; *y *= factor; }
+        }
+        if let Some(intrinsic) = &mut self.replaced_intrinsic {
+            if let Some(width) = &mut intrinsic.width { *width *= factor; }
+            if let Some(height) = &mut intrinsic.height { *height *= factor; }
+        }
+        self.border_model.specified_widths = self.border_model.specified_widths.map(|value| value * factor);
+        for radius in [&mut self.border_model.radii.top_left, &mut self.border_model.radii.top_right,
+            &mut self.border_model.radii.bottom_right, &mut self.border_model.radii.bottom_left] {
+            radius.x.length *= factor; radius.y.length *= factor;
+        }
+        self.outline.specified_width *= factor;
+        self.outline.offset *= factor;
+        if let Some(shadow) = &mut self.box_shadow {
+            shadow.offset_x *= factor; shadow.offset_y *= factor;
+            shadow.blur *= factor; shadow.spread *= factor;
+        }
+        self.background_position.x.length *= factor; self.background_position.y.length *= factor;
+        self.object_position.x.length *= factor; self.object_position.y.length *= factor;
+        if let Some(clip) = &mut self.clip_path {
+            for (x, y) in &mut clip.points { dimension(x); dimension(y); }
+        }
+        if let Some((x, y)) = &mut self.transform_origin { dimension(x); dimension(y); }
+        if let Some((x, y)) = &mut self.individual_translate { dimension(x); dimension(y); }
+        for operation in &mut self.transform_ops {
+            match operation {
+                TransformOp::Translate(x, y) => { dimension(&mut x.value); dimension(&mut y.value); }
+                TransformOp::Matrix(matrix) => { matrix.e *= factor; matrix.f *= factor; }
+                _ => {}
+            }
+        }
+        crate::style::scale_grid_lengths(self, factor);
+    }
+
     /// Whether CSS box sizes compute normally but do not apply to this box's
     /// used geometry. The display value here is post-blockification, so roots,
     /// flex/grid items, floats, and out-of-flow boxes retain applicable sizes.

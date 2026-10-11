@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -5,6 +6,7 @@ use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{max_live_frames, NavigationTiming};
 use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::window::{WindowEvent, WindowId, WindowInfo, WindowNavigation};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
     ResourceType, Response, ResponseCallback,
@@ -242,6 +244,13 @@ pub struct Page {
     pub id: String,
     pub frame_id: String,
     pub url: Option<Url>,
+    native_window_id: WindowId,
+    window_group: Option<std::rc::Rc<std::cell::RefCell<PageWindowGroup>>>,
+    window_navigation: Option<std::rc::Rc<WindowNavigation>>,
+    window_document_generation: u64,
+    window_closed: bool,
+    window_debugger_wait: std::cell::Cell<bool>,
+    popup_debugger_wait: std::cell::Cell<bool>,
     pub dom: Option<DomTree>,
     /// Live child frame realms, in creation order. Declared before `js` on
     /// purpose: a realm holds a V8 handle into that isolate, and fields drop in
@@ -344,6 +353,45 @@ pub struct Page {
     callbacks: Arc<CallbackRegistry>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+}
+
+#[derive(Default)]
+struct PageWindowGroup {
+    created: std::collections::VecDeque<WindowId>,
+    jobs: Vec<PageWindowJob>,
+    completed: std::collections::HashMap<WindowId, Page>,
+    settings: std::collections::HashMap<WindowId, PageWindowSettings>,
+}
+
+struct PageWindowJob {
+    navigation: std::rc::Rc<WindowNavigation>,
+    future: std::pin::Pin<Box<dyn Future<Output = (Page, Result<(), PageError>)>>>,
+}
+
+#[derive(Clone)]
+struct PageWindowSettings {
+    viewport: (f32, f32),
+    screen_size_override: Option<(f32, f32)>,
+    screen_metrics_emulated: bool,
+    locale_override: Option<String>,
+    device_metrics_baseline: Option<DeviceMetricsBaseline>,
+    reduced_motion: bool,
+    device_scale_factor: f32,
+    default_background_color_override: Option<[u8; 4]>,
+    navigation_timeout: Option<std::time::Duration>,
+    navigation_chain_limit: Option<usize>,
+    intercept_enabled: bool,
+    intercept_block_patterns: Vec<String>,
+    blocked_url_patterns: Vec<String>,
+    intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    preload_scripts: Vec<String>,
+    runtime_events_enabled: bool,
+    console_messages_enabled: bool,
+    callbacks: Arc<CallbackRegistry>,
+    history: Vec<String>,
+    history_index: usize,
+    document_history_start: usize,
+    network_event_counter: u32,
 }
 
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
@@ -1071,7 +1119,20 @@ fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImp
 
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
-        let http_client = context.http_client.clone();
+        Self::with_native_window(
+            id, context, obscura_js::window::allocate_window_id(),
+            Some(std::rc::Rc::new(std::cell::RefCell::new(PageWindowGroup::default()))),
+            None,
+        )
+    }
+
+    fn with_native_window(
+        id: String, context: Arc<BrowserContext>, native_window_id: WindowId,
+        window_group: Option<std::rc::Rc<std::cell::RefCell<PageWindowGroup>>>,
+        source: Option<&Self>,
+    ) -> Self {
+        let http_client = source.map(|page| page.http_client.clone())
+            .unwrap_or_else(|| context.http_client.clone());
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
         // (via target._targetInfo.targetId), so any divergence here makes
@@ -1079,7 +1140,9 @@ impl Page {
         // triggering a Target.closeTarget and "Frame has been detached".
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
-        let stealth_client = if context.stealth {
+        let stealth_client = if let Some(source) = source {
+            source.stealth_client.clone()
+        } else if context.stealth {
             // The wreq client backing StealthHttpClient does not speak SOCKS5.
             // Callers must validate the proxy scheme up front and fail loudly
             // (see obscura-cli) rather than silently rewriting socks5:// to
@@ -1098,6 +1161,13 @@ impl Page {
         Page {
             id,
             frame_id,
+            native_window_id,
+            window_group,
+            window_navigation: None,
+            window_document_generation: 0,
+            window_closed: false,
+            window_debugger_wait: std::cell::Cell::new(false),
+            popup_debugger_wait: std::cell::Cell::new(false),
             url: None,
             dom: None,
             frames: Vec::new(),
@@ -1146,11 +1216,376 @@ impl Page {
         }
     }
 
+    fn window_settings(&self) -> PageWindowSettings {
+        PageWindowSettings {
+            viewport: self.viewport,
+            screen_size_override: self.screen_size_override,
+            screen_metrics_emulated: self.screen_metrics_emulated,
+            locale_override: self.locale_override.clone(),
+            device_metrics_baseline: self.device_metrics_baseline,
+            reduced_motion: self.reduced_motion,
+            device_scale_factor: self.device_scale_factor,
+            default_background_color_override: self.default_background_color_override,
+            navigation_timeout: self.navigation_timeout,
+            navigation_chain_limit: self.navigation_chain_limit,
+            intercept_enabled: self.intercept_enabled,
+            intercept_block_patterns: self.intercept_block_patterns.clone(),
+            blocked_url_patterns: self.blocked_url_patterns.clone(),
+            intercept_tx: self.intercept_tx.clone(),
+            preload_scripts: self.preload_scripts.clone(),
+            runtime_events_enabled: self.runtime_events_enabled.get(),
+            console_messages_enabled: self.console_messages_enabled.get(),
+            callbacks: self.callbacks.clone(),
+            history: self.history.clone(),
+            history_index: self.history_index,
+            document_history_start: self.document_history_start,
+            network_event_counter: self.network_event_counter,
+        }
+    }
+
+    fn remember_window_settings(&self) {
+        let Some(group) = &self.window_group else { return };
+        if group.borrow().settings.contains_key(&self.native_window_id) {
+            group.borrow_mut().settings.insert(self.native_window_id, self.window_settings());
+        }
+    }
+
+    fn apply_window_settings(&mut self, settings: PageWindowSettings) {
+        self.viewport = settings.viewport;
+        self.screen_size_override = settings.screen_size_override;
+        self.screen_metrics_emulated = settings.screen_metrics_emulated;
+        self.locale_override = settings.locale_override;
+        self.device_metrics_baseline = settings.device_metrics_baseline;
+        self.reduced_motion = settings.reduced_motion;
+        self.device_scale_factor = settings.device_scale_factor;
+        self.default_background_color_override = settings.default_background_color_override;
+        self.navigation_timeout = settings.navigation_timeout;
+        self.navigation_chain_limit = settings.navigation_chain_limit;
+        self.intercept_enabled = settings.intercept_enabled;
+        self.intercept_block_patterns = settings.intercept_block_patterns;
+        self.blocked_url_patterns = settings.blocked_url_patterns;
+        self.intercept_tx = settings.intercept_tx;
+        self.preload_scripts = settings.preload_scripts;
+        self.runtime_events_enabled.set(settings.runtime_events_enabled);
+        self.console_messages_enabled.set(settings.console_messages_enabled);
+        self.callbacks = settings.callbacks;
+        self.history = settings.history;
+        self.history_index = settings.history_index;
+        self.document_history_start = settings.document_history_start;
+        self.network_event_counter = settings.network_event_counter;
+    }
+
+    /// Generation of the document installed in this Page, after native job adoption.
+    pub fn window_document_generation(&self) -> u64 { self.window_document_generation }
+
+    pub fn window_info(&self) -> WindowInfo {
+        self.js.as_ref().map(ObscuraJsRuntime::window_info).unwrap_or_else(|| WindowInfo {
+            id: self.native_window_id, target_id: self.id.clone(), frame_id: self.frame_id.clone(),
+            opener_id: None, opener_frame_id: None, name: String::new(),
+            url: self.url_string(), title: self.title.clone(), closed: self.window_closed,
+            can_access_opener: false, created_by_script: false,
+        })
+    }
+
+    pub fn window_target_id(&self, id: WindowId) -> Option<String> {
+        self.js.as_ref().and_then(|js| js.window_target_id(id))
+            .or_else(|| (id == self.native_window_id).then(|| self.id.clone()))
+    }
+
+    pub fn window_group_id(&self) -> WindowId {
+        self.js.as_ref().map(ObscuraJsRuntime::window_group_id).unwrap_or(self.native_window_id)
+    }
+
+    fn collect_native_windows(&mut self) {
+        let (Some(js), Some(group)) = (&self.js, &self.window_group) else { return };
+        let created = js.take_created_windows();
+        if created.is_empty() { return; }
+        let own_settings = self.window_settings();
+        let mut group = group.borrow_mut();
+        group.settings.insert(self.native_window_id, own_settings.clone());
+        for id in created {
+            let Ok(runtime) = js.for_window(id) else { continue };
+            let info = runtime.window_info();
+            let mut settings = info.opener_id.and_then(|opener| group.settings.get(&opener))
+                .cloned().unwrap_or_else(|| own_settings.clone());
+            settings.history.clear();
+            settings.history.push("about:blank".to_string());
+            settings.history_index = 0;
+            settings.callbacks = Arc::new(CallbackRegistry::new());
+            settings.document_history_start = 0;
+            settings.network_event_counter = 0;
+            group.settings.insert(id, settings);
+            group.created.push_back(id);
+        }
+    }
+
+    fn page_for_native_window(&self, id: WindowId) -> Result<Page, PageError> {
+        let runtime = self.js.as_ref().ok_or_else(|| PageError::NetworkError(
+            "JavaScript runtime unavailable".to_string()))?
+            .for_window(id).map_err(PageError::NetworkError)?;
+        let info = runtime.window_info();
+        let settings = if id == self.native_window_id {
+            self.window_settings()
+        } else {
+            self.window_group.as_ref().and_then(|group| group.borrow().settings.get(&id).cloned())
+                .unwrap_or_else(|| self.window_settings())
+        };
+        let mut page = Self::with_native_window(info.target_id, self.context.clone(), id, None, Some(self));
+        page.apply_window_settings(settings);
+        page.url = Url::parse(&info.url).ok();
+        page.title = info.title;
+        page.window_document_generation = runtime.window_document_generation();
+        page.lifecycle = LifecycleState::Loaded;
+        page.js = Some(runtime);
+        page.bind_native_window_settings();
+        Ok(page)
+    }
+
+    fn bind_native_window_settings(&self) {
+        let Some(js) = &self.js else { return };
+        js.set_local_storage(self.context.local_storage.clone());
+        js.set_cookie_jar(self.context.cookie_jar.clone());
+        js.set_http_client(self.http_client.clone());
+        js.set_callbacks(self.callbacks.clone());
+        js.set_intercept_page_id(&self.id);
+        js.set_intercept_enabled(self.intercept_enabled);
+        js.set_blocked_urls(self.blocked_url_patterns.clone());
+        js.set_runtime_events_enabled(self.runtime_events_enabled.get());
+        js.set_console_messages_enabled(self.console_messages_enabled.get());
+        if let Some(tx) = &self.intercept_tx { js.set_intercept_tx(tx.clone()); }
+        #[cfg(feature = "render")]
+        js.set_intercept_block_patterns(self.intercept_block_patterns.clone());
+        #[cfg(feature = "stealth")]
+        if let Some(client) = &self.stealth_client { js.set_stealth_client(client.clone()); }
+    }
+
+    /// Adopt the document window.open created synchronously, including any DOM
+    /// or globals already written through the returned WindowProxy.
+    pub fn take_popup_pages(&mut self) -> Vec<Page> {
+        self.sync_native_window_document();
+        self.collect_native_windows();
+        let Some(group) = self.window_group.clone() else { return Vec::new() };
+        let created = std::mem::take(&mut group.borrow_mut().created);
+        let mut pages = Vec::with_capacity(created.len());
+        for id in created {
+            let completed = group.borrow_mut().completed.remove(&id);
+            let page = match completed {
+                Some(page) => Ok(page),
+                None => self.page_for_native_window(id),
+            };
+            if let Ok(mut page) = page {
+                page.window_group = Some(group.clone());
+                pages.push(page);
+            }
+        }
+        pages
+    }
+
+    pub fn take_window_events(&self) -> Vec<WindowEvent> {
+        self.js.as_ref().map(ObscuraJsRuntime::take_window_events).unwrap_or_default()
+    }
+
+    fn sync_native_window_document(&mut self) {
+        let completed = self.window_group.as_ref()
+            .and_then(|group| group.borrow_mut().completed.remove(&self.native_window_id));
+        if let Some(mut page) = completed {
+            self.frames.clear();
+            self.js = page.js.take();
+            self.frames = std::mem::take(&mut page.frames);
+            self.dom = page.dom.take();
+            self.url = page.url.take();
+            self.title = std::mem::take(&mut page.title);
+            self.referrer = std::mem::take(&mut page.referrer);
+            self.encoding = std::mem::take(&mut page.encoding);
+            self.lifecycle = page.lifecycle;
+            self.document_timeline_origin = page.document_timeline_origin;
+            self.navigation_timing = page.navigation_timing.clone();
+            self.window_document_generation = page.window_document_generation;
+            self.history = std::mem::take(&mut page.history);
+            self.history_index = page.history_index;
+            self.document_history_start = page.document_history_start;
+            self.pending_frame_work = std::mem::take(&mut page.pending_frame_work);
+            self.network_events.extend(std::mem::take(&mut page.network_events));
+            self.response_bodies.extend(std::mem::take(&mut page.response_bodies));
+            self.response_body_order.extend(std::mem::take(&mut page.response_body_order));
+            self.network_event_counter = self.network_event_counter.max(page.network_event_counter);
+        }
+    }
+
+    fn queue_native_window_navigations(&mut self) -> Result<(), PageError> {
+        self.collect_native_windows();
+        let Some(group) = self.window_group.clone() else { return Ok(()) };
+        let navigations = self.js.as_ref().map(ObscuraJsRuntime::take_window_navigations)
+            .unwrap_or_default();
+        for navigation in navigations {
+            if !self.js.as_ref().is_some_and(|js| js.window_navigation_valid(&navigation)) { continue; }
+            let navigation = std::rc::Rc::new(navigation);
+            // One in-flight navigation per native root. A newer assignment or
+            // close cancels the old fetch before it can install a document.
+            group.borrow_mut().jobs.retain(|job| job.navigation.id != navigation.id);
+            let completed = group.borrow_mut().completed.remove(&navigation.id);
+            let mut page = match completed {
+                Some(page) => page,
+                None => self.page_for_native_window(navigation.id)?,
+            };
+            page.window_navigation = Some(navigation.clone());
+            let pending = navigation.clone();
+            let future = Box::pin(async move {
+                let referrer = if pending.noreferrer { String::new() } else {
+                    Url::parse(&pending.source_url).ok().and_then(|source| {
+                        Url::parse(&pending.url).ok().map(|target| navigation_referrer(&source, &target))
+                    }).unwrap_or_default()
+                };
+                let timeout = page.navigation_timeout();
+                let result = if cross_scheme_to_file(&pending.source_url, &pending.url) {
+                    Err(PageError::NetworkError("Cross-scheme file navigation is blocked".to_string()))
+                } else {
+                    match tokio::time::timeout(timeout, page.navigate_with_wait_post_inner(
+                        &pending.url, crate::lifecycle::WaitUntil::Load,
+                        &pending.method, &pending.body, &referrer,
+                    )).await {
+                        Ok(result) => result,
+                        Err(_) => Err(PageError::NetworkError(format!(
+                            "navigation exceeded {}ms deadline", duration_millis_u64(timeout)))),
+                    }
+                };
+                if result.is_ok() {
+                    page.push_history(page.url_string());
+                } else {
+                    page.lifecycle = LifecycleState::Failed;
+                }
+                page.window_navigation = None;
+                (page, result)
+            });
+            group.borrow_mut().jobs.push(PageWindowJob { navigation, future });
+        }
+        Ok(())
+    }
+
+    /// Progress the existing native group queue without retaining a shared
+    /// runtime or group RefMut over an await or a future's Pending return.
+    pub async fn drive_windows(&mut self, budget_ms: u64) -> Result<(), PageError> {
+        self.sync_native_window_document();
+        self.queue_native_window_navigations()?;
+        let Some(group) = self.window_group.clone() else { return Ok(()) };
+        let driving = futures::future::poll_fn(|cx| {
+            if let Err(error) = self.queue_native_window_navigations() {
+                return std::task::Poll::Ready(Err(error));
+            }
+            let mut jobs = std::mem::take(&mut group.borrow_mut().jobs);
+            let mut failure = None;
+            jobs.retain_mut(|job| {
+                if !self.js.as_ref().is_some_and(|js| js.window_navigation_valid(&job.navigation)) {
+                    return false;
+                }
+                match job.future.as_mut().poll(cx) {
+                    std::task::Poll::Pending => true,
+                    std::task::Poll::Ready((page, result)) => {
+                        let id = job.navigation.id;
+                        let settings = page.window_settings();
+                        let mut group = group.borrow_mut();
+                        group.settings.insert(id, settings);
+                        group.completed.insert(id, page);
+                        if let Err(error) = result { failure = Some(error); }
+                        false
+                    }
+                }
+            });
+            group.borrow_mut().jobs = jobs;
+            self.sync_native_window_document();
+            let turn = match self.js.as_mut() {
+                Some(js) => js.poll_windows(cx),
+                None => std::task::Poll::Ready(Ok(())),
+            };
+            self.collect_native_windows();
+            if let Some(error) = failure {
+                return std::task::Poll::Ready(Err(error));
+            }
+            match turn {
+                std::task::Poll::Ready(Err(error)) =>
+                    std::task::Poll::Ready(Err(PageError::NetworkError(error))),
+                std::task::Poll::Ready(Ok(())) if group.borrow().jobs.is_empty() =>
+                    std::task::Poll::Ready(Ok(())),
+                _ => std::task::Poll::Pending,
+            }
+        });
+        match tokio::time::timeout(std::time::Duration::from_millis(budget_ms.max(1)), driving).await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
+        }
+    }
+
+    pub fn has_window_work(&self) -> bool {
+        self.js.as_ref().is_some_and(ObscuraJsRuntime::has_window_work)
+            || self.window_group.as_ref().is_some_and(|group| {
+                let group = group.borrow();
+                !group.jobs.is_empty() || !group.created.is_empty()
+            })
+    }
+
+    pub fn close_window(&mut self) {
+        self.window_closed = true;
+        if let Some(group) = &self.window_group {
+            let mut group = group.borrow_mut();
+            group.jobs.retain(|job| job.navigation.id != self.native_window_id);
+            group.completed.remove(&self.native_window_id);
+            group.settings.remove(&self.native_window_id);
+        }
+        self.retire_render_resources();
+        self.pending_frame_work.clear();
+        self.frames.clear();
+        if let Some(js) = &mut self.js { js.close_window(); }
+    }
+
+    pub fn set_window_debugger_wait(&self, waiting: bool) {
+        self.window_debugger_wait.set(waiting);
+        if let Some(js) = &self.js { js.set_window_debugger_wait(waiting); }
+    }
+
+    pub fn set_popup_debugger_wait(&self, waiting: bool) {
+        self.popup_debugger_wait.set(waiting);
+        if let Some(js) = &self.js { js.set_popup_debugger_wait(waiting); }
+    }
+
+    fn take_evaluation_runtime(&mut self) -> Result<(ObscuraJsRuntime, u64), String> {
+        self.sync_native_window_document();
+        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+        let generation = self.window_document_generation;
+        // The evaluation owns the existing CDP object store. A disjoint native
+        // handle drives the group while the evaluation future is pending.
+        let driver = js.for_window(self.native_window_id)?;
+        Ok((std::mem::replace(js, driver), generation))
+    }
+
+    fn restore_evaluation_runtime(&mut self, js: ObscuraJsRuntime, generation: u64) {
+        if self.js.as_ref().is_some_and(|driver| driver.window_document_generation() == generation) {
+            self.js = Some(js);
+        }
+        self.sync_native_window_document();
+        self.collect_native_windows();
+    }
+
+    async fn await_with_window_work<T>(&mut self, future: impl Future<Output = T>) -> T {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut future => return result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                    if let Err(error) = self.drive_windows(5).await {
+                        tracing::debug!("Native window navigation failed: {}", error);
+                    }
+                }
+            }
+        }
+    }
+
     /// Set the end-to-end navigation deadline for this page. This page-scoped
     /// value takes precedence over `OBSCURA_NAV_TIMEOUT_MS`; callers that do
     /// not set it retain the existing environment-configurable 30s default.
     pub fn set_navigation_timeout(&mut self, timeout: std::time::Duration) {
         self.navigation_timeout = Some(timeout);
+        self.remember_window_settings();
     }
 
     /// Return the effective end-to-end navigation deadline for this page.
@@ -1164,6 +1599,7 @@ impl Page {
     /// nothing.
     pub fn set_navigation_chain_limit(&mut self, limit: usize) {
         self.navigation_chain_limit = Some(limit.max(1));
+        self.remember_window_settings();
     }
 
     pub fn navigation_chain_limit(&self) -> usize {
@@ -1695,8 +2131,12 @@ impl Page {
             return self.evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, timeout_ms).await;
         }
         self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
-        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
-            .evaluate_for_cdp_in_frame(frame_id, expression, return_by_value, await_promise, timeout_ms).await
+        let (mut js, generation) = self.take_evaluation_runtime()?;
+        let result = self.await_with_window_work(js.evaluate_for_cdp_in_frame(
+            frame_id, expression, return_by_value, await_promise, timeout_ms,
+        )).await;
+        self.restore_evaluation_runtime(js, generation);
+        result
     }
 
     pub async fn call_function_on_for_cdp_in_frame(
@@ -1707,9 +2147,12 @@ impl Page {
         if frame_id != 0 {
             self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
         }
-        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
-            .call_function_on_for_cdp_in_frame(frame_id, declaration, object_id, arguments,
-                return_by_value, await_promise, timeout_ms).await
+        let (mut js, generation) = self.take_evaluation_runtime()?;
+        let result = self.await_with_window_work(js.call_function_on_for_cdp_in_frame(
+            frame_id, declaration, object_id, arguments, return_by_value, await_promise, timeout_ms,
+        )).await;
+        self.restore_evaluation_runtime(js, generation);
+        result
     }
     /// Update the page's CSS viewport. Calling this before navigation makes
     /// responsive scripts observe it from their first instruction; calling it
@@ -1726,6 +2169,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_viewport(viewport.0 as f64, viewport.1 as f64);
         }
+        self.remember_window_settings();
     }
 
     /// Set or clear the CDP physical-screen override independently of layout.
@@ -1741,6 +2185,7 @@ impl Page {
                 self.screen_metrics_emulated,
             );
         }
+        self.remember_window_settings();
     }
 
     pub fn set_locale_override(&mut self, locale: Option<String>) {
@@ -1748,6 +2193,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_locale(self.locale_override.as_deref().unwrap_or("en-US"));
         }
+        self.remember_window_settings();
     }
 
     /// Apply CDP device metrics relative to the metrics that were active when
@@ -1796,6 +2242,7 @@ impl Page {
         if let Some(js) = &mut self.js {
             js.set_reduced_motion(reduce);
         }
+        self.remember_window_settings();
     }
 
     /// Set the screenshot surface density without changing CSS layout. CDP
@@ -1816,10 +2263,12 @@ impl Page {
                 &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
             );
         }
+        self.remember_window_settings();
     }
 
     pub fn set_default_background_color_override(&mut self, color: Option<[u8; 4]>) {
         self.default_background_color_override = color;
+        self.remember_window_settings();
     }
 
     #[cfg(feature = "render")]
@@ -1842,36 +2291,41 @@ impl Page {
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
     }
-    fn init_js(&mut self) {
+    fn init_js(&mut self) -> Result<(), PageError> {
+        if self.window_closed {
+            return Err(PageError::NetworkError("Native window is closed".to_string()));
+        }
         // init_js is also the new-document path.  Only resume_js explicitly
         // takes these IDs out before entering here and restores them after the
         // same DomTree is installed; a navigation must never inherit IDs from
         // a suspended prior document whose allocator may reuse them.
         self.suspended_started_script_ids.clear();
         self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
-        // Drop any existing runtime so the JS realm starts clean on
-        // every navigation. The old code reused the V8 isolate and
-        // only re-bound `globalThis.document`, leaving window.onload,
-        // custom window properties and event handlers from the prior
-        // page in place. That made it possible for a page to set
-        // attacker-controlled state, trigger a navigation, and then
-        // run code in the next document's context.
+        // Navigation replaces this root's document, not its native window or
+        // shared isolate. Related windows retain their globals and handles.
         self.pending_frame_work.clear();
-        if self.js.is_some() {
-            // Every frame realm holds a V8 handle into this isolate, so the
-            // frames of the outgoing document must go before the runtime does.
-            self.frames.clear();
-            let _ = self.js.take();
+        self.frames.clear();
+        let first_document = self.js.is_none();
+        let mut rt = if let Some(mut rt) = self.js.take() {
+            rt.set_url(&self.url_string());
+            if let Err(error) = rt.refresh_window_realm() {
+                rt.close_window();
+                self.js = Some(rt);
+                self.lifecycle = LifecycleState::Failed;
+                return Err(PageError::NetworkError(error));
+            }
+            rt
+        } else {
+            ObscuraJsRuntime::with_window_id(
+                &self.url_string(), self.context.proxy_url.clone(), self.native_window_id,
+            )
+        };
+        rt.set_window_target_id(&self.id);
+        rt.set_local_storage(self.context.local_storage.clone());
+        if first_document {
+            rt.set_window_debugger_wait(self.window_debugger_wait.get());
+            rt.set_popup_debugger_wait(self.popup_debugger_wait.get());
         }
-
-        // Thread the BrowserContext's proxy through to the ES-module loader
-        // and op_fetch_url so dynamic imports and JS fetch() honour the
-        // configured upstream proxy (#139). When proxy_url is None this is
-        // equivalent to with_base_url() (direct connection).
-        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
-            &self.url_string(),
-            self.context.proxy_url.clone(),
-        );
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
@@ -1956,8 +2410,11 @@ impl Page {
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
         );
+        self.window_document_generation = rt.window_document_generation();
+        rt.notify_window_navigated();
 
         self.js = Some(rt);
+        Ok(())
     }
 
     /// Resolve the document base URL per HTML spec:
@@ -3357,6 +3814,7 @@ impl Page {
                 self.history_index,
             );
         }
+        self.remember_window_settings();
     }
 
     /// The session history as it will be once the document being created
@@ -3519,8 +3977,8 @@ impl Page {
         }
 
         if url.scheme() == "about" {
-            self.navigate_blank();
-            self.init_js();
+            self.navigate_blank_document()?;
+            if self.js.is_none() { self.init_js()?; }
             // Preloads (Page.addScriptToEvaluateOnNewDocument, the
             // Runtime.addBinding shim) must run on about:blank too —
             // puppeteer's `browser.newPage()` lands on about:blank and
@@ -3567,6 +4025,11 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        if self.window_navigation.as_ref().is_some_and(|navigation| {
+            !self.js.as_ref().is_some_and(|js| js.window_navigation_valid(navigation))
+        }) {
+            return Err(PageError::NetworkError("Native window navigation was superseded".to_string()));
+        }
         self.navigation_timing.record("responseEnd");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
@@ -3605,7 +4068,7 @@ impl Page {
             .unwrap_or_default();
 
         self.dom = Some(dom);
-        self.init_js();
+        self.init_js()?;
         let author_stylesheets = self.fetch_stylesheets().await;
 
         // Install fetched CSS in native DOM state. Cross-origin bytes must not
@@ -3845,11 +4308,17 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        if let Err(error) = self.navigate_blank_document() {
+            tracing::error!("Cannot navigate native window to about:blank: {}", error);
+        }
+    }
+
+    fn navigate_blank_document(&mut self) -> Result<(), PageError> {
         self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
-        self.js = None;
+        // init_js replaces only this window's document when navigation commits.
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
             "<html><head></head><body></body></html>",
@@ -3857,6 +4326,8 @@ impl Page {
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
+        if self.js.is_some() { self.init_js()?; }
+        Ok(())
     }
 
     pub fn url_string(&self) -> String {
@@ -4454,11 +4925,18 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
-                .await
-            {
+        if self.js.is_some() {
+            let result = match self.take_evaluation_runtime() {
+                Ok((mut js, generation)) => {
+                    let result = self.await_with_window_work(js.evaluate_for_cdp(
+                        expression, return_by_value, await_promise,
+                    )).await;
+                    self.restore_evaluation_runtime(js, generation);
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -4501,14 +4979,13 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        if let Some(js) = &mut self.js {
-            js.evaluate_for_cdp_with_timeout(
-                expression,
-                return_by_value,
-                await_promise,
-                await_timeout_ms,
-            )
-            .await
+        if self.js.is_some() {
+            let (mut js, generation) = self.take_evaluation_runtime()?;
+            let result = self.await_with_window_work(js.evaluate_for_cdp_with_timeout(
+                expression, return_by_value, await_promise, await_timeout_ms,
+            )).await;
+            self.restore_evaluation_runtime(js, generation);
+            result
         } else {
             let value = self.evaluate(expression);
             Ok(obscura_js::runtime::RemoteObjectInfo {
@@ -4537,17 +5014,18 @@ impl Page {
         return_by_value: bool,
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
-        if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
-                    function_declaration,
-                    object_id,
-                    args,
-                    return_by_value,
-                    await_promise,
-                )
-                .await
-            {
+        if self.js.is_some() {
+            let result = match self.take_evaluation_runtime() {
+                Ok((mut js, generation)) => {
+                    let result = self.await_with_window_work(js.call_function_on_for_cdp(
+                        function_declaration, object_id, args, return_by_value, await_promise,
+                    )).await;
+                    self.restore_evaluation_runtime(js, generation);
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -4586,16 +5064,12 @@ impl Page {
         await_promise: bool,
         await_timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-        js.call_function_on_for_cdp_with_timeout(
-            function_declaration,
-            object_id,
-            args,
-            return_by_value,
-            await_promise,
-            await_timeout_ms,
-        )
-        .await
+        let (mut js, generation) = self.take_evaluation_runtime()?;
+        let result = self.await_with_window_work(js.call_function_on_for_cdp_with_timeout(
+            function_declaration, object_id, args, return_by_value, await_promise, await_timeout_ms,
+        )).await;
+        self.restore_evaluation_runtime(js, generation);
+        result
     }
 
     pub fn set_blocked_urls(&mut self, patterns: Vec<String>) {
@@ -4603,6 +5077,7 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_blocked_urls(patterns);
         }
+        self.remember_window_settings();
     }
 
     pub fn release_object(&mut self, object_id: &str) {
@@ -4783,6 +5258,11 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
+        // Native roots share an isolate and must survive automation tab switches.
+        // Dropping/reinitializing one destroys script state and remote handles.
+        if self.window_group.is_some() {
+            return;
+        }
         if self.js.is_none() {
             return;
         }
@@ -4822,7 +5302,10 @@ impl Page {
         }
         let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
         let cdp_object_state = std::mem::take(&mut self.suspended_cdp_object_state);
-        self.init_js();
+        if let Err(error) = self.init_js() {
+            tracing::error!("Cannot initialize native window document: {}", error);
+            return;
+        }
         if let Some(js) = &mut self.js {
             js.restore_started_script_ids(&started_script_ids);
             js.restore_cdp_object_state(cdp_object_state);
@@ -4885,6 +5368,7 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_runtime_events_enabled(enabled);
         }
+        self.remember_window_settings();
     }
 
     pub fn set_console_messages_enabled(&self, enabled: bool) {
@@ -4892,10 +5376,12 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_console_messages_enabled(enabled);
         }
+        self.remember_window_settings();
     }
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
         self.preload_scripts = scripts;
+        self.remember_window_settings();
     }
 
     /// Append a script that runs in the page before any of the page's own
@@ -4903,6 +5389,7 @@ impl Page {
     /// Takes effect on the next navigation (`goto` / `navigate*`).
     pub fn add_preload_script(&mut self, script: &str) {
         self.preload_scripts.push(script.to_string());
+        self.remember_window_settings();
     }
 
     /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
@@ -5039,6 +5526,7 @@ impl Page {
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
         }
+        self.remember_window_settings();
     }
 
     pub fn enable_intercept(&mut self, enabled: bool) {
@@ -5050,6 +5538,7 @@ impl Page {
             #[cfg(feature = "render")]
             js.set_intercept_block_patterns(self.intercept_block_patterns.clone());
         }
+        self.remember_window_settings();
     }
 }
 
@@ -5155,7 +5644,7 @@ mod tests {
         let mut page = super::Page::new("network-idle-regression".into(), context);
         page.url = Some(url::Url::parse("http://example.test/").unwrap());
         page.dom = Some(parse_html("<html><body></body></html>"));
-        page.init_js();
+        page.init_js().unwrap();
         page
     }
 
@@ -7141,7 +7630,7 @@ mod tests {
             </script>
             </body></html>"#,
         ));
-        page.init_js();
+        page.init_js().unwrap();
         page.execute_scripts().await;
 
         let before = page
@@ -7211,7 +7700,7 @@ mod tests {
         let mut page = super::Page::new("cdp-handle-suspend".to_string(), context);
         page.url = Some(url::Url::parse("http://example.com/").unwrap());
         page.dom = Some(parse_html("<html><body></body></html>"));
-        page.init_js();
+        page.init_js().unwrap();
 
         let object = page
             .evaluate_for_cdp_with_timeout("({ increment(value) { return value + 1; } })", false, false, 1_000)
@@ -7251,7 +7740,7 @@ mod tests {
         page.dom = Some(parse_html(
             "<html><head></head><body><script id=old></script></body></html>",
         ));
-        page.init_js();
+        page.init_js().unwrap();
         page.js
             .as_mut()
             .unwrap()
@@ -7265,7 +7754,7 @@ mod tests {
         page.dom = Some(parse_html(
             "<html><head></head><body data-fresh-runs=0><script id=fresh>document.body.setAttribute('data-fresh-runs', '1')</script></body></html>",
         ));
-        page.init_js();
+        page.init_js().unwrap();
         let result = page
             .js
             .as_mut()
@@ -7290,7 +7779,7 @@ mod tests {
         let mut page = super::Page::new("cdp-handle-navigation".to_string(), context);
         page.url = Some(url::Url::parse("http://example.com/old.html").unwrap());
         page.dom = Some(parse_html("<html><body></body></html>"));
-        page.init_js();
+        page.init_js().unwrap();
         let old_id = page
             .evaluate_for_cdp_with_timeout("({ marker: 1 })", false, false, 1_000)
             .await
@@ -7299,7 +7788,7 @@ mod tests {
             .unwrap();
 
         page.navigate_blank();
-        page.init_js();
+        page.init_js().unwrap();
         let new_id = page
             .evaluate_for_cdp_with_timeout("({ marker: 2 })", false, false, 1_000)
             .await
@@ -7335,7 +7824,7 @@ mod tests {
         let mut page = super::Page::new(name.to_string(), context);
         page.url = Some(url::Url::parse(&format!("{}/app/index.html", base)).unwrap());
         page.dom = Some(parse_html(html));
-        page.init_js();
+        page.init_js().unwrap();
         page
     }
 

@@ -3,7 +3,10 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/windows.js");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=native");
+    compile_incumbent_context();
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let snapshot_path = out_dir.join("OBSCURA_SNAPSHOT.bin");
@@ -13,7 +16,11 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    // Keep the native window facade inside bootstrap's private closure in every
+    // snapshot path. The marker is deliberately the only stitch point: it is
+    // not a page-visible API and it is available before __obscura_init runs.
+    let bootstrap_js = include_str!("js/bootstrap.js")
+        .replace("/* OBSCURA_WINDOWS */", include_str!("js/windows.js"));
 
     if is_cross {
         // Cross-compilation: the host V8 (linked into this build script) produces
@@ -63,6 +70,7 @@ fn main() {
         // The sidecar contains only fixed-size types (i32, u32, String, Vec) so it
         // is architecture-independent and can be reused with the target blob.
         eprintln!("[obscura-js build.rs] Extracting deno_core sidecar from host snapshot...");
+        let host_bootstrap_js = bootstrap_js.clone();
         let host_output = deno_core::snapshot::create_snapshot(
             deno_core::snapshot::CreateSnapshotOptions {
                 cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
@@ -72,7 +80,7 @@ fn main() {
                 extension_transpiler: None,
                 with_runtime_cb: Some(Box::new(move |runtime| {
                     runtime
-                        .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
+                        .execute_script("<obscura:bootstrap>", host_bootstrap_js.clone())
                         .expect("bootstrap.js should not fail during snapshot creation");
                 })),
             },
@@ -152,9 +160,43 @@ fn main() {
     }
 }
 
+fn compile_incumbent_context() {
+    // These public headers must match deno_core's linked rusty_v8, not a
+    // separately discovered Cargo registry installation. The same dependency
+    // supplies both the host snapshot generator and the target runtime.
+    let version = deno_core::v8::V8::get_version();
+    assert_eq!(
+        version.split('-').next(),
+        Some("15.0.245.2"),
+        "Refresh native/v8-150.4.0 public headers for linked V8 {version}"
+    );
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++20")
+        .include("native/v8-150.4.0/include")
+        .file("native/incumbent_context.cc")
+        // rusty_v8 already supplies the correct C++ standard library linkage.
+        .cpp_link_stdlib(None);
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+        build
+            .static_crt(features.split(',').any(|feature| feature == "crt-static"))
+            // MSVC otherwise reports C++98 even with /std:c++20.
+            .flag("/Zc:__cplusplus")
+            // Match rusty_v8: no embedded default-library CRT directives.
+            .flag("/Zl");
+    }
+
+    // cc selects TARGET's compiler and emits static archive/link-search flags.
+    // Compile before either snapshot branch, including cross-build early exits.
+    build.compile("obscura_v8_incumbent_context");
+}
+
 /// Generate a snapshot using the host V8 (for native builds or as fallback).
-fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
-    let bootstrap_js = bootstrap_js.to_string();
+fn generate_host_snapshot(bootstrap_js: String, snapshot_path: &PathBuf) {
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
             cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
@@ -164,7 +206,7 @@ fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
             extension_transpiler: None,
             with_runtime_cb: Some(Box::new(move |runtime| {
                 runtime
-                    .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
+                    .execute_script("<obscura:bootstrap>", bootstrap_js.clone())
                     .expect("bootstrap.js should not fail during snapshot creation");
             })),
         },

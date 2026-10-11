@@ -483,7 +483,12 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "runIfWaitingForDebugger" => Ok(json!({})),
+        "runIfWaitingForDebugger" => {
+            if let Some(page) = ctx.get_session_page_mut(session_id) {
+                page.set_window_debugger_wait(false);
+            }
+            Ok(json!({}))
+        }
         "getExceptionDetails" => Ok(json!({ "exceptionDetails": null })),
         "discardConsoleEntries" => Ok(json!({})),
         _ => Err(format!("Unknown Runtime method: {}", method)),

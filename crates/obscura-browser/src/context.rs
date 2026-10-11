@@ -1,11 +1,15 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use obscura_js::storage::{SharedStorage, StorageNamespace};
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
+    /// Live origin-partitioned localStorage for every page in this context.
+    /// The existing storage directory policy persists cookies only.
+    pub local_storage: SharedStorage,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -122,6 +126,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage: Arc::new(Mutex::new(StorageNamespace::default())),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -155,14 +160,19 @@ impl BrowserContext {
     }
 
     /// Create a context with the same browser configuration but independent
-    /// mutable network state. Persistent copies start with the template's
-    /// current cookies; incognito copies start empty and never write to the
-    /// template's storage directory.
+    /// mutable state. Persistent copies start with the template's current
+    /// cookies and localStorage; incognito copies start empty and never write
+    /// to the template's storage directory.
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
             cookie_jar.copy_from(&self.cookie_jar);
         }
+        let local_storage = if persistent {
+            self.local_storage.lock().expect("local storage namespace lock is poisoned").clone()
+        } else {
+            StorageNamespace::default()
+        };
 
         let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
@@ -179,6 +189,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage: Arc::new(Mutex::new(local_storage)),
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),

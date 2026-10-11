@@ -1205,6 +1205,8 @@ async fn cdp_processor(
     // a bounded 30 Hz opportunity on this connection's owning LocalSet.
     let mut screencast_tick = tokio::time::interval(tokio::time::Duration::from_millis(33));
     screencast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut window_tick = tokio::time::interval(tokio::time::Duration::from_millis(10));
+    window_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut connection_reply_tx: Option<mpsc::UnboundedSender<String>> = None;
     // A real browser renderer continues servicing timers, networking, posted
     // tasks, and animation callbacks while its DevTools client is silent. Keep
@@ -1226,6 +1228,7 @@ async fn cdp_processor(
         } else {
             let screencast_active = has_active_screencast(&ctx);
             let has_intercept_rx = intercept_rx.is_some();
+            let window_work = ctx.pages.iter().any(|page| page.has_window_work());
             tokio::select! {
                 biased;
                 msg = rx.recv() => match msg {
@@ -1249,6 +1252,7 @@ async fn cdp_processor(
                             tracing::warn!("autonomous page task failed: {error}");
                         }
                     }
+                    ctx.sync_native_windows();
                     service_live_page_render_resources(&mut ctx);
                     sync_live_page_background_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
@@ -1283,6 +1287,20 @@ async fn cdp_processor(
                     // Ready page tasks must not keep this root future running
                     // indefinitely while Tokio's network tasks wait to run.
                     tokio::task::yield_now().await;
+                    None
+                },
+                _ = window_tick.tick(), if window_work => {
+                    if let Err(error) = ctx.drive_native_windows(1).await {
+                        tracing::warn!("native window task failed: {error}");
+                    }
+                    service_live_page_render_resources(&mut ctx);
+                    sync_live_page_background_events(&mut ctx);
+                    dispatch::drain_runtime_events(&mut ctx);
+                    dispatch::drain_binding_calls(&mut ctx);
+                    dispatch::drain_frame_events(&mut ctx);
+                    forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
+                    idle_pages.clear();
+                    runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
                     None
                 },
                 Some(intercepted) = async {
@@ -1557,8 +1575,10 @@ async fn pump_live_page_event_loop(
     // A completed turn can emit events even when it leaves its page idle.
     // Publish it now, then omit idle pages until a command schedules new work;
     // otherwise an idle peer would keep a waiting connection spinning.
+    let mut groups = HashSet::new();
     let mut turns: Vec<_> = ctx.pages.iter_mut()
-        .filter(|page| page.has_js() && !idle_pages.contains(&page.id))
+        .filter(|page| page.has_js() && !idle_pages.contains(&page.id)
+            && groups.insert(page.window_group_id()))
         .map(|page| (page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
         .collect();
     std::future::poll_fn(|cx| {
@@ -2083,6 +2103,7 @@ async fn process_with_interception(
         wait_until,
         reached_network_idle,
     );
+    ctx.sync_native_windows();
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);

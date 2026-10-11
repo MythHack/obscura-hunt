@@ -1057,6 +1057,11 @@ impl RealmStates {
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
     }
+
+    pub(crate) fn by_context(&self, context: &v8::Global<v8::Context>) -> Option<SharedState> {
+        self.entries.iter().find(|(known, id, _)| known == context
+            && self.frame_timers_active(*id) == Some(true)).map(|(_, _, state)| state.clone())
+    }
 }
 
 /// The document of the realm a DOM call came from, named rather than inferred.
@@ -3597,8 +3602,8 @@ fn intercept_fulfill_response(
     })
 }
 
-// Only the eight JS arguments count; scope and state are injected by op2.
-#[op2(required(8))]
+// Only the nine JS arguments count; scope and state are injected by op2.
+#[op2(required(9))]
 #[string]
 fn op_fetch_url(
     scope: &mut v8::PinScope,
@@ -3611,12 +3616,17 @@ fn op_fetch_url(
     #[string] mode: String,
     #[string] credentials: String,
     #[serde] options: FetchOptions,
+    receiver: v8::Local<v8::Object>,
 ) -> impl Future<Output = Result<String, deno_error::JsErrorBox>> + use<> {
-    // The op function belongs to main. Capture the entered/microtask realm
-    // synchronously, before V8 loses that identity while polling native work.
+    // Capture the binding's native realm before async polling. The shared deno
+    // wrapper's incumbent context does not identify the requesting document.
     let captured = (|| {
-        let owner = fetch_realm_state(scope, &state.borrow())?;
-        let page = state.borrow().borrow::<SharedState>().clone();
+        let context = receiver.get_creation_context(scope).ok_or_else(||
+            deno_error::JsErrorBox::new("DOMExceptionSecurityError", "Blocked access to a foreign or retired document"))?;
+        let context = v8::Global::new(scope, context);
+        let (windows, root, owner) = crate::window::context_document(&state.borrow(), &context)?;
+        let page = windows.borrow().windows.get(&root)
+            .ok_or_else(|| deno_error::JsErrorBox::generic("Fetch root owner is unavailable"))?.state.clone();
         let registry = state.borrow().borrow::<Rc<RefCell<RealmStates>>>().clone();
         let (destination, cancel_rid, document_frame) = match options {
             FetchOptions::Destination(destination) => (destination, None, None),
@@ -3644,7 +3654,7 @@ fn op_fetch_url(
         }
         let initiator = FetchInitiator { frame_id, owner, generation, registry };
         initiator.ensure_live()?;
-        let parent_frame_id = if frame_id == 0 { None } else {
+        let parent_frame_id = if frame_id == calling_frame && Rc::ptr_eq(&initiator.owner, &page) { None } else {
             Some(initiator.registry.borrow().live_frame_owner(frame_id)
                 .ok_or_else(|| deno_error::JsErrorBox::generic("Fetch frame owner is unavailable"))?.0)
         };
@@ -3701,23 +3711,10 @@ impl FetchInitiator {
     }
 }
 
-fn fetch_realm_state(scope: &mut v8::PinScope, state: &OpState)
+pub(crate) fn fetch_realm_state(scope: &mut v8::PinScope, state: &OpState)
     -> Result<SharedState, deno_error::JsErrorBox>
 {
-    let current = scope.get_entered_or_microtask_context();
-    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
-    if let Some((_, frame_id, realm)) = registry.entries.iter()
-        .find(|(context, _, _)| *context == current)
-    {
-        if registry.frame_timers_active(*frame_id) != Some(true) {
-            return Err(deno_error::JsErrorBox::generic("Calling frame owner is detached or was replaced"));
-        }
-        return Ok(realm.clone());
-    }
-    if registry.main_context.as_ref().is_some_and(|context| *context == current) {
-        return Ok(state.borrow::<SharedState>().clone());
-    }
-    Err(deno_error::JsErrorBox::generic("Unknown calling fetch realm"))
+    crate::window::caller_window(scope, state).map(|(_, _, document)| document)
 }
 
 async fn fetch_url_inner(
@@ -5437,7 +5434,7 @@ mod tests {
                 "posted-task-from-op-resolution",
                 r#"
                     globalThis.__postedFromOp = 0;
-                    __obscura_test_ops.op_sleep(0).then(() => {
+                    __obscura_test_ops.op_sleep(0, globalThis).then(() => {
                         const rearm = () => scheduler.postTask(() => {
                             __postedFromOp++;
                             if (__postedFromOp < 250) rearm();
@@ -5915,8 +5912,17 @@ fn op_navigate(
     #[string] url: &str,
     #[string] method: &str,
     #[string] body: &str,
-) {
-    let gs = realm_state(scope, state);
+) -> Result<(), deno_error::JsErrorBox> {
+    let (windows, root, gs) = crate::window::caller_window(scope, state)?;
+    {
+        let mut windows = windows.borrow_mut();
+        if let Some(window) = windows.windows.get_mut(&root).filter(|window| Rc::ptr_eq(&window.state, &gs)) {
+            window.navigation_generation = window.navigation_generation.wrapping_add(1);
+            // Page may consume the pending tuple before the native drain.
+            // Supersede an older queued/root request at this task boundary.
+            windows.navigations.retain(|job| job.id != root);
+        }
+    }
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
     // updated on commit via `set_url` once the navigation is actually performed.
@@ -5924,6 +5930,9 @@ fn op_navigate(
     // write another origin's cookies through document.cookie, whose ops derive
     // the cookie domain from this URL (SOP bypass, #940).
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+    drop(gs);
+    state.waker.wake();
+    Ok(())
 }
 
 fn frame_message_queue_entry_limit() -> usize {
@@ -5998,33 +6007,88 @@ fn op_post_frame_message(
     true
 }
 
-/// Resolves after `millis`, as the timer source for child frame realms.
-///
-/// deno_core's own timer queue is not usable from a frame: `op_timer_queue`
-/// resolves per-context state that only a deno_core-created context carries,
-/// and a snapshot-restored realm has none. This resolves an ordinary promise
-/// instead, and V8 reports the frame as the microtask context, so the ops a
-/// timer callback makes still find the frame's own document.
-#[op2]
-async fn op_sleep(state: Rc<RefCell<OpState>>, #[number] millis: u64, frame_id: Option<u32>) -> bool {
-    let sleep = tokio::time::sleep(std::time::Duration::from_millis(millis));
-    let frame_id = frame_id.unwrap_or(0);
-    if frame_id == 0 { sleep.await; return true; }
-    let cancel = {
-        let state = state.borrow();
-        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+// A cancellation handle identifies a particular registered context, even when
+// a navigable retains its realm id and SharedState across document replacement.
+struct TimerContext {
+    registry: Rc<RefCell<RealmStates>>,
+    owner: std::rc::Weak<RefCell<ObscuraState>>,
+    frame_id: u32,
+    generation: u64,
+    cancel: Rc<CancelHandle>,
+}
+
+impl TimerContext {
+    fn capture(scope: &mut v8::PinScope, state: &OpState,
+        receiver: v8::Local<v8::Object>) -> Option<Self>
+    {
+        // Async ops have a shared deno JS wrapper on the incumbent stack.
+        // Authenticate the scheduling binding's real realm, not that wrapper.
+        let context = receiver.get_creation_context(scope)?;
+        let context = v8::Global::new(scope, context);
+        let (windows, root, owner) = crate::window::context_document(state, &context).ok()?;
+        let (frame_id, generation) = {
+            let owner = owner.try_borrow().ok()?;
+            (owner.frame_id, owner.document_generation)
+        };
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let cancel = {
+            let mut realms = registry.try_borrow_mut().ok()?;
+            // Attached roots and frames are already registered. A direct host
+            // sleep in the original main context needs the same teardown hook.
+            if !realms.entries.iter().any(|(_, id, _)| *id == frame_id) {
+                let windows = windows.try_borrow().ok()?;
+                let window = windows.windows.get(&root)?;
+                if window.closed || !window.main_realm || !Rc::ptr_eq(&window.state, &owner) {
+                    return None;
+                }
+                realms.register(window.context.clone(), frame_id, owner.clone());
+            }
+            realms.cancel_inactive_frame_timers();
+            if realms.frame_timers_active(frame_id) != Some(true)
+                || !realms.entries.iter().any(|(_, id, document)|
+                    *id == frame_id && Rc::ptr_eq(document, &owner)) {
+                return None;
+            }
+            realms.frame_timers.get(&frame_id)?.cancel.clone()
+        };
+        Some(Self { registry, owner: Rc::downgrade(&owner), frame_id, generation, cancel })
+    }
+
+    fn active(&self) -> bool {
+        if self.cancel.is_canceled()
+            || posted_task_owner_status(&self.owner) != PostedTaskOwnerStatus::Generation(self.generation) {
+            return false;
+        }
+        let Ok(registry) = self.registry.try_borrow() else { return false };
         registry.cancel_inactive_frame_timers();
-        registry.frame_timers.get(&frame_id).map(|timers| timers.cancel.clone())
-    };
-    let Some(cancel) = cancel else { return false };
-    sleep.or_cancel(cancel).await.is_ok()
+        registry.frame_timers_active(self.frame_id) == Some(true)
+            && registry.frame_timers.get(&self.frame_id)
+                .is_some_and(|timers| Rc::ptr_eq(&timers.cancel, &self.cancel))
+            && registry.entries.iter().any(|(_, id, owner)|
+                *id == self.frame_id && Rc::as_ptr(owner) == self.owner.as_ptr())
+    }
+}
+
+/// The host task timer source for all attached snapshot document contexts.
+/// Capture the binding's native creation context before polling loses identity.
+/// Only Rust-owned generation/cancellation state crosses the await boundary.
+#[op2]
+fn op_sleep(scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>, #[number] millis: u64,
+    receiver: v8::Local<v8::Object>)
+    -> impl Future<Output = bool> + use<>
+{
+    let context = TimerContext::capture(scope, &state.borrow(), receiver);
+    async move {
+        let Some(context) = context else { return false };
+        if !context.active() { return false; }
+        tokio::time::sleep(std::time::Duration::from_millis(millis))
+            .or_cancel(context.cancel.clone()).await.is_ok() && context.active()
+    }
 }
 
 // A child protocol identity must never alias a later document/runtime's child.
 fn allocate_frame_id() -> Option<u32> {
-    static NEXT_FRAME_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-    NEXT_FRAME_ID.try_update(std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed, |id| id.checked_add(1)).ok()
+    crate::window::allocate_navigable_id()
 }
 
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
@@ -7147,7 +7211,7 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 }
 
 pub fn build_extension() -> Extension {
-    let ops = vec![
+    let mut ops = vec![
         op_dom(),
         op_script_mark_started(),
         op_script_try_start(),
@@ -7201,6 +7265,8 @@ pub fn build_extension() -> Extension {
         op_url_encode_query(),
         op_begin_render_task(),
     ];
+    ops.extend(crate::window::ops());
+    ops.extend(crate::storage::ops());
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]

@@ -1924,11 +1924,8 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             crate::CB_TRIGGER_BACKDROP_FILTER,
             non_none_value(value),
         ),
-        "perspective" => set_containing_block_trigger(
-            style,
-            crate::CB_TRIGGER_PERSPECTIVE,
-            non_none_value(value),
-        ),
+        "perspective" => apply_perspective(style, value),
+        "zoom" => apply_zoom(style, value),
         "contain" => {
             if let Some(flags) = parse_containment(value) {
                 style.containment = flags;
@@ -2268,6 +2265,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "backdrop-filter"
             | "-webkit-backdrop-filter"
             | "perspective"
+            | "zoom"
             | "contain"
             | "will-change"
             | "content-visibility"
@@ -2316,6 +2314,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "contents"
         ),
         "direction" => matches!(value.to_ascii_lowercase().as_str(), "ltr" | "rtl"),
+        "zoom" => parse_zoom(value).is_some(),
         "position" => matches!(
             value.to_ascii_lowercase().as_str(),
             "static" | "relative" | "absolute" | "fixed" | "sticky"
@@ -3945,6 +3944,66 @@ fn parse_individual_translate(style: &mut LayoutStyle, value: &str) {
     set_containing_block_trigger(style, crate::CB_TRIGGER_TRANSLATE, true);
 }
 
+fn parse_zoom(value: &str) -> Option<f32> {
+    let mut parser = cssparser::Parser::new(value.trim());
+    let zoom = match parser.next().ok()? {
+        cssparser::Token::Number { value, .. } => *value,
+        cssparser::Token::Percentage { unit_value, .. } => *unit_value,
+        _ => return None,
+    };
+    (parser.is_exhausted() && zoom.is_finite() && zoom >= 0.0).then_some(zoom)
+}
+
+fn apply_zoom(style: &mut LayoutStyle, value: &str) {
+    let lower = value.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "inherit" => { style.zoom = None; style.zoom_inherit = true; }
+        "initial" | "unset" | "revert" | "revert-layer" => {
+            style.zoom = Some(1.0);
+            style.zoom_inherit = false;
+        }
+        _ => if let Some(zoom) = parse_zoom(value) {
+            style.zoom = Some(zoom);
+            style.zoom_inherit = false;
+        },
+    }
+}
+
+fn apply_perspective(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let (length, expression, inherit) = match lower.as_str() {
+        "inherit" => (None, None, true),
+        "none" | "initial" | "unset" | "revert" | "revert-layer" => (None, None, false),
+        _ => {
+            let Some(length) = parse_perspective_length(value) else { return };
+            (Some(length.value), length.expression, false)
+        }
+    };
+    style.perspective = length;
+    style.perspective_expression = expression;
+    style.perspective_inherit = inherit;
+    set_containing_block_trigger(style, crate::CB_TRIGGER_PERSPECTIVE, length.is_some());
+}
+
+fn parse_perspective_length(value: &str) -> Option<crate::TransformLength> {
+    if value.contains('%') { return None; }
+    if !value.contains('(') {
+        let dimension = parse_word_spacing_length(value)?;
+        let crate::Dimension::Px(pixels) = dimension.resolve(16.0, 16.0, 1.0, 1.0) else { return None };
+        return (pixels >= 0.0).then_some(crate::TransformLength { value: dimension, expression: None });
+    }
+    let expression = GridCalcExpression::parse(value)?;
+    // A perspective is a length, never a unitless mathematical number.
+    let lower = expression.expression.as_str();
+    if !["px", "pt", "em", "rem", "ex", "vw", "vh", "vmin", "vmax"]
+        .iter().any(|unit| lower.contains(unit)) { return None; }
+    Some(crate::TransformLength {
+        value: crate::Dimension::Px(0.0),
+        expression: Some(expression.expression),
+    })
+}
+
 fn non_none_value(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.eq_ignore_ascii_case("none")
@@ -4033,6 +4092,7 @@ pub(crate) struct GridCalcExpression {
     vw: std::sync::atomic::AtomicU32,
     vh: std::sync::atomic::AtomicU32,
     context_initialized: std::sync::atomic::AtomicBool,
+    zoom: f32,
 }
 
 impl GridCalcExpression {
@@ -4101,6 +4161,7 @@ impl GridCalcExpression {
             vw: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
             vh: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
             context_initialized: std::sync::atomic::AtomicBool::new(false),
+            zoom: 1.0,
         })
     }
 
@@ -4134,6 +4195,63 @@ pub(crate) fn set_grid_calc_context(
     }
 }
 
+pub(crate) fn scale_grid_lengths(style: &mut LayoutStyle, factor: f32) {
+    fn tracks(style: &mut LayoutStyle, mut apply: impl FnMut(&mut taffy::TrackSizingFunction)) {
+        for component in style.grid_template_columns.iter_mut().chain(&mut style.grid_template_rows) {
+            match component {
+                taffy::GridTemplateComponent::Single(track) => apply(track),
+                taffy::GridTemplateComponent::Repeat(repetition) => {
+                    for track in &mut repetition.tracks { apply(track); }
+                }
+            }
+        }
+        for track in style.grid_auto_columns.iter_mut().chain(&mut style.grid_auto_rows) { apply(track); }
+    }
+    tracks(style, |track| {
+        let min = track.min.into_raw();
+        let max = track.max.into_raw();
+        if min.tag() == taffy::CompactLength::LENGTH_TAG {
+            track.min = taffy::MinTrackSizingFunction::length(min.value() * factor);
+        }
+        if max.tag() == taffy::CompactLength::LENGTH_TAG {
+            track.max = taffy::MaxTrackSizingFunction::length(max.value() * factor);
+        } else if max.tag() == taffy::CompactLength::FIT_CONTENT_PX_TAG {
+            track.max = taffy::MaxTrackSizingFunction::fit_content_px(max.value() * factor);
+        }
+    });
+    // Inherited calc handles share computed font context, but zoom is a used
+    // value of this box. Give zoomed owners independent handles without cloning
+    // the ordinary document's style maps or changing the shared computed value.
+    for axis in 0..4 {
+        for index in 0..style.grid_calc_expressions[axis].len() {
+            let previous = &style.grid_calc_expressions[axis][index];
+            let old_ptr = std::sync::Arc::as_ptr(previous).cast::<()>();
+            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            let scaled = std::sync::Arc::new(GridCalcExpression {
+                expression: previous.expression.clone(),
+                em_px: AtomicU32::new(previous.em_px.load(Ordering::Relaxed)),
+                rem_px: AtomicU32::new(previous.rem_px.load(Ordering::Relaxed)),
+                vw: AtomicU32::new(previous.vw.load(Ordering::Relaxed)),
+                vh: AtomicU32::new(previous.vh.load(Ordering::Relaxed)),
+                context_initialized: AtomicBool::new(previous.context_initialized.load(Ordering::Relaxed)),
+                zoom: previous.zoom * factor,
+            });
+            let new_ptr = std::sync::Arc::as_ptr(&scaled).cast::<()>();
+            tracks(style, |track| {
+                let min = track.min.into_raw();
+                let max = track.max.into_raw();
+                if min.is_calc() && min.calc_value() == old_ptr {
+                    track.min = taffy::MinTrackSizingFunction::calc(new_ptr);
+                }
+                if max.is_calc() && max.calc_value() == old_ptr {
+                    track.max = taffy::MaxTrackSizingFunction::calc(new_ptr);
+                }
+            });
+            style.grid_calc_expressions[axis][index] = scaled;
+        }
+    }
+}
+
 /// Resolve an Arc-backed grid calc handle installed in Taffy.
 ///
 /// # Safety
@@ -4152,11 +4270,12 @@ pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
         f32::from_bits(calc.rem_px.load(Ordering::Relaxed)),
         f32::from_bits(calc.vw.load(Ordering::Relaxed)),
         f32::from_bits(calc.vh.load(Ordering::Relaxed)),
-        basis,
+        basis / calc.zoom,
     )
         .filter(|value| value.is_finite())
         .unwrap_or(0.0)
         .max(0.0)
+        * calc.zoom
 }
 
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map

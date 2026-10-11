@@ -391,7 +391,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script", globalThis
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -627,7 +627,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   }
   seen.add(url);
   const raw = await __obscuraCore.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet"
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet", globalThis
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -991,23 +991,23 @@ const _scheduleAfter = (delay, fn) => {
   if (!__obscuraCore.ops.op_async_runtime_available()) {
     return undefined;
   }
-  // A child frame realm cannot use deno_core's timer queue: op_timer_queue
-  // reads per-context state that only a deno_core-created context carries, and
-  // a realm restored from the snapshot has none, so queueing from a frame
-  // dereferences uninitialized memory. A host sleep does the same job, and
-  // because its continuation is an ordinary microtask, V8 reports the frame as
-  // the microtask context and the ops the callback makes still resolve against
-  // the frame's own document. Frame timer ids are negative so clearTimeout can
-  // tell the two queues apart. Keep cancellation state by native id and remove
-  // it on either fire or clear, so repeated clearTimeout calls do not grow a
-  // permanent set.
-  if (globalThis.__obscura_frameId) {
+  // Recheck at delivery too: a completed host sleep may still be waiting for
+  // its promise reaction when the native host replaces or closes the document.
+  const generation = __obscuraCore.ops.op_posted_task_generation(_realmFrameId);
+  // Only deno_core's original main context owns the native timer heap that
+  // its event loop dispatches. Attached snapshot contexts, including a new
+  // primary document with realm id 0, use the existing host task timer source.
+  // The continuation runs in the scheduling realm; native cancellation binds
+  // it to that document rather than a navigable's reusable realm id. Negative
+  // ids distinguish host timers for clearTimeout without exposing a new API.
+  if (!_nativeWindowMainRealm) {
     const frameTimerId = -(++_frameTimerSeq);
     const state = { cancelled: false };
     _frameTimerStates.set(frameTimerId, state);
-    __obscuraCore.ops.op_sleep(d, _realmFrameId).then(active => {
+    __obscuraCore.ops.op_sleep(d, globalThis).then(active => {
       _frameTimerStates.delete(frameTimerId);
-      if (!active || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) < 0) {
+      if (!active || generation < 0
+          || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) !== generation) {
         _frameTimerStates.clear();
         _timerStates.clear();
         _nativeTimerIds.clear();
@@ -1030,6 +1030,9 @@ const _scheduleAfter = (delay, fn) => {
   // cancel handle. A refed timer keeps the event loop alive until it fires,
   // which is how a page with only pending timers stays observable.
   return __obscuraCore.createTimer(() => {
+    if (__obscuraCore.ops.op_window_closed(_nativeWindowId)
+        || generation < 0
+        || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) !== generation) return;
     // HTML timer/observer/rAF delivery starts a new task. Freeze animation
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
@@ -4699,7 +4702,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', {destination: 'Document', frame_id: frameId}
+      'no-cors', 'same-origin', {destination: 'Document', frame_id: frameId}, globalThis
     ).then(raw => {
       // Numeric identity also distinguishes replaced owners with the same URL.
       if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
@@ -7875,7 +7878,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   let raw;
   try {
     raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
-      signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType);
+      signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType, globalThis);
   } catch (error) {
     cleanup();
     throw signalState && signalState.aborted ? signalState.reason : error;
@@ -12146,38 +12149,104 @@ function _structuredClone(value, seen) {
 globalThis.structuredClone = globalThis.structuredClone || ((v) => _structuredClone(v, new Map()));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
-// WHATWG Storage as a legacy platform object: a Proxy routes property access
-// (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
-// the named getter/setter so length/key()/iteration stay in sync with the
-// backing map. Plain prototype methods alone could not intercept direct
-// property access, so `localStorage.foo = x` never updated length before.
-globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { k = String(k); return Object.prototype.hasOwnProperty.call(this._data, k) ? this._data[k] : null; };
-Storage.prototype.setItem = function(k, v) { this._data[String(k)] = String(v); };
-Storage.prototype.removeItem = function(k) { delete this._data[String(k)]; };
-Storage.prototype.clear = function() { const d = this._data; for (const k in d) delete d[k]; };
-Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
-
-const _mkStore = () => {
-  const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
-  const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
-  return new Proxy(target, {
-    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
-    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
-    deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
-    getOwnPropertyDescriptor(t, p) {
-      if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
-        return { value: t._data[p], writable: true, enumerable: true, configurable: true };
-      return Reflect.getOwnPropertyDescriptor(t, p);
-    },
-  });
+// Storage objects hold no page-visible root identity or copied data. Every
+// operation resolves the receiver's live native document and origin partition.
+const _storageInstances = new WeakMap();
+__obscuraCore.registerErrorBuilder('DOMExceptionSecurityError', message => new DOMException(message, 'SecurityError'));
+__obscuraCore.registerErrorBuilder('DOMExceptionQuotaExceededError', message => new DOMException(message, 'QuotaExceededError'));
+const _storageCall = (receiver, action, key = '', value = '', index = 0) => {
+  const store = _storageInstances.get(receiver);
+  if (!store) throw new TypeError('Illegal invocation');
+  try {
+    return __obscuraCore.ops.op_storage(store.target, store.session, action, key, value, index);
+  } catch (error) {
+    // Shared native ops build errors in the engine realm. Web IDL exceptions
+    // belong to this Storage binding's realm, including opaque popup documents.
+    if (error.name === 'SecurityError' || error.name === 'QuotaExceededError') {
+      throw new DOMException(error.message, error.name);
+    }
+    throw error;
+  }
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+const _storageString = value => {
+  if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  return String(value);
+};
+globalThis.Storage = function Storage() { throw new TypeError('Illegal constructor'); };
+Storage.prototype.getItem = function(key) {
+  if (arguments.length < 1) throw new TypeError('getItem requires 1 argument');
+  return _storageCall(this, 'get', _storageString(key));
+};
+Storage.prototype.setItem = function(key, value) {
+  if (arguments.length < 2) throw new TypeError('setItem requires 2 arguments');
+  _storageCall(this, 'set', _storageString(key), _storageString(value));
+};
+Storage.prototype.removeItem = function(key) {
+  if (arguments.length < 1) throw new TypeError('removeItem requires 1 argument');
+  _storageCall(this, 'remove', _storageString(key));
+};
+Storage.prototype.clear = function() { _storageCall(this, 'clear'); };
+Storage.prototype.key = function(index) {
+  if (arguments.length < 1) throw new TypeError('key requires 1 argument');
+  return _storageCall(this, 'key', '', '', index >>> 0);
+};
+Object.defineProperty(Storage.prototype, 'length', {
+  get: function() { return _storageCall(this, 'length'); }, configurable: true, enumerable: true,
+});
+Object.defineProperty(Storage.prototype, Symbol.toStringTag, { value: 'Storage', configurable: true });
+
+const _mkStore = session => {
+  const target = Object.create(Storage.prototype);
+  const isReal = key => typeof key === 'symbol' || Reflect.has(target, key);
+  const proxy = new Proxy(target, {
+    get(t, key, receiver) {
+      if (isReal(key)) return Reflect.get(t, key, receiver);
+      const value = _storageCall(t, 'get', key);
+      return value === null ? undefined : value;
+    },
+    set(t, key, value) {
+      if (typeof key === 'symbol') return Reflect.set(t, key, value);
+      _storageCall(t, 'set', key, _storageString(value));
+      return true;
+    },
+    has(t, key) {
+      if (typeof key === 'symbol') return Reflect.has(t, key);
+      return isReal(key) || _storageCall(t, 'get', key) !== null;
+    },
+    deleteProperty(t, key) {
+      if (typeof key === 'symbol' || Object.prototype.hasOwnProperty.call(t, key)) return Reflect.deleteProperty(t, key);
+      _storageCall(t, 'remove', key);
+      return true;
+    },
+    ownKeys(t) {
+      const keys = _storageCall(t, 'keys').filter(key => !isReal(key));
+      return [...keys, ...Reflect.ownKeys(t)];
+    },
+    getOwnPropertyDescriptor(t, key) {
+      if (isReal(key)) return Reflect.getOwnPropertyDescriptor(t, key);
+      const value = _storageCall(t, 'get', key);
+      return value === null ? undefined
+        : { value, writable: true, enumerable: true, configurable: true };
+    },
+    defineProperty(t, key, descriptor) {
+      if (typeof key === 'symbol') return Reflect.defineProperty(t, key, descriptor);
+      if ('get' in descriptor || 'set' in descriptor || descriptor.configurable === false) return false;
+      _storageCall(t, 'set', key, _storageString(descriptor.value));
+      return true;
+    },
+    preventExtensions() { return false; },
+  });
+  const store = { target, session };
+  _storageInstances.set(target, store);
+  _storageInstances.set(proxy, store);
+  return proxy;
+};
+const _localStore = _mkStore(false);
+const _sessionStore = _mkStore(true);
+Object.defineProperties(globalThis, {
+  localStorage: { get() { _storageCall(_localStore, 'check'); return _localStore; }, configurable: true, enumerable: true },
+  sessionStorage: { get() { _storageCall(_sessionStore, 'check'); return _sessionStore; }, configurable: true, enumerable: true },
+});
 
 globalThis.btoa = globalThis.btoa || ((s) => { s = String(s); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) { const cp = s.charCodeAt(i); if (cp > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError"); b[i] = cp; } const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -14160,10 +14229,11 @@ function _iframeWindowIsLive(state) {
 function _iframeWindowSameOrigin(state) {
   if (!_iframeWindowIsLive(state) || state.opaque) return false;
   if (_frameObjects[state.frameId]) {
-    return _dom('frame_same_origin', state.frameId, state.ownerNode) === 'true';
+    return __obscuraCore.ops.op_window_realm_same_origin(state.frameId);
   }
   // The URL parser and native creator origin also cover inherited blank/srcdoc
   // documents. Serialized opaque origins are not mutually same-origin.
+  if (!__obscuraCore.ops.op_window_realm_same_origin(_realmFrameId)) return false;
   return state.inherited ? state.origin === _realmOrigin()
     : state.origin !== 'null' && state.origin === _realmOrigin();
 }
@@ -14493,8 +14563,7 @@ function _deliverRealmMessage(dataJson, origin, sourceFrameId, targetOrigin) {
   try { data = _parseFrameMessage(dataJson).v; } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
   const source = (_realmFrameId !== 0 && sourceFrameId === _realmParentFrameId)
-    ? globalThis.parent
-    : _frameWindowFor(sourceFrameId);
+    ? globalThis.parent : (_frameWindowFor(sourceFrameId) || _windowSource(sourceFrameId));
   _dispatchRealmMessage(data, origin, source);
 }
 
@@ -15551,7 +15620,6 @@ navigator.keyboard = {
 navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
-globalThis.opener = null;
 
 globalThis.Worker = class Worker {
   constructor(url) {
@@ -15801,17 +15869,8 @@ globalThis.print = function() {}; _markNative(globalThis.print);
 globalThis.alert = function() {}; _markNative(globalThis.alert);
 globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
 globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
-globalThis.open = function() { return null; }; _markNative(globalThis.open);
-globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-// `window.postMessage` targets this same window. It was a no-op, so a page
-// that posted to itself and waited for the `message` event waited forever.
-// Same realm, so this needs no host round trip; it is queued as a task because
-// postMessage never delivers synchronously.
-globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  _sendRealmMessage(_realmFrameId, data, targetOrigin);
-};
-_markNative(globalThis.postMessage);
+/* OBSCURA_WINDOWS */
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -17392,12 +17451,13 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
 ]));
 
-globalThis.__obscura_init = function() {
+globalThis.__obscura_init = function(windowId = 0) {
   // Capture realm identity once, before author code can replace public hints.
   if (!_realmRegistered) {
     _realmFrameId = globalThis.__obscura_frameId >>> 0;
     _realmParentFrameId = globalThis.__obscura_parentFrameId >>> 0;
     _realmRegistered = true;
+    _registerNativeWindow(windowId);
     // Bind window listeners to the restored realm, not the snapshot's global
     // proxy: the listener WeakMap must not carry a snapshot-era window key.
     _eventTargetAdd(globalThis, 'resize', _viewportRenderingUpdate);

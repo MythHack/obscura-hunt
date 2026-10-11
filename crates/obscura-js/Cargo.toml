@@ -18,6 +18,7 @@ render = ["dep:obscura-render", "obscura-render/paint"]
 
 [build-dependencies]
 deno_core = "0.412"
+cc = "1"
 
 [dependencies]
 obscura-dom = { workspace = true }

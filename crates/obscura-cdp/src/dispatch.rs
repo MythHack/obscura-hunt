@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page};
+use obscura_browser::window::{WindowEvent, WindowInfo};
 use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
 
@@ -73,6 +74,12 @@ pub struct CdpContext {
     page_counter: u32,
     browser_context_counter: u32,
     target_session_counter: u64,
+    pub(crate) target_discovery_sessions: HashSet<Option<String>>,
+    pub(crate) target_auto_attach_sessions: HashSet<Option<String>>,
+    pub(crate) target_session_parents: HashMap<String, Option<String>>,
+    native_windows: HashMap<String, WindowInfo>,
+    native_navigation_generations: HashMap<String, u64>,
+    pending_native_navigations: HashSet<String>,
     pub preload_scripts: Vec<(String, String)>, // (identifier, source)
     pub preload_counter: u32,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
@@ -187,6 +194,12 @@ impl CdpContext {
             page_counter: 0,
             browser_context_counter: 0,
             target_session_counter: 0,
+            target_discovery_sessions: HashSet::new(),
+            target_auto_attach_sessions: HashSet::new(),
+            target_session_parents: HashMap::new(),
+            native_windows: HashMap::new(),
+            native_navigation_generations: HashMap::new(),
+            pending_native_navigations: HashSet::new(),
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
@@ -259,6 +272,10 @@ impl CdpContext {
         let page_id = format!("page-{}", self.page_counter);
         let mut page = Page::new(page_id.clone(), context);
         page.navigate_blank();
+        if let Some(tx) = &self.intercept_tx {
+            page.set_intercept_tx(tx.clone());
+        }
+        self.native_windows.insert(page_id.clone(), page.window_info());
         self.pages.push(page);
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
@@ -330,7 +347,245 @@ impl CdpContext {
         }
     }
 
+    pub(crate) fn page_target_info(&self, page: &Page) -> serde_json::Value {
+        self.native_window_target_info(&page.window_info(), page)
+    }
+
+    fn native_window_target_info(&self, window: &WindowInfo, owner: &Page) -> serde_json::Value {
+        let mut info = json!({
+            "targetId": window.target_id,
+            "type": "page",
+            "title": window.title,
+            "url": window.url,
+            "attached": self.sessions.values().any(|target| target == &window.target_id),
+            "canAccessOpener": window.can_access_opener,
+            "browserContextId": owner.context.id,
+        });
+        if let Some(opener) = window.opener_id.and_then(|id| owner.window_target_id(id)) {
+            info["openerId"] = json!(opener);
+            if let Some(frame_id) = window.opener_frame_id {
+                let frame = self.pages.iter().find(|candidate| candidate.id == opener)
+                    .map(|candidate| candidate.frame_id.as_str()).unwrap_or(opener.as_str());
+                info["openerFrameId"] = json!(if frame_id == 0 { frame.to_string() }
+                    else { domains::page::child_frame_id(frame, frame_id) });
+            }
+        }
+        info
+    }
+
+    fn emit_target_discovery(&mut self, method: &str, params: serde_json::Value) {
+        let mut subscriptions = self.target_discovery_sessions.iter().cloned().collect::<Vec<_>>();
+        subscriptions.sort();
+        for session_id in subscriptions {
+            self.pending_events.push(CdpEvent { method: method.to_string(), params: params.clone(), session_id });
+        }
+    }
+
+    pub(crate) fn emit_target_destroyed(&mut self, target_id: &str) {
+        let mut sessions = self.sessions.iter().filter(|(_, target)| target.as_str() == target_id)
+            .map(|(session, _)| session.clone()).collect::<Vec<_>>();
+        sessions.sort_unstable();
+        for session in sessions {
+            self.pending_events.push(CdpEvent {
+                method: "Target.detachedFromTarget".to_string(),
+                params: json!({"sessionId": session, "targetId": target_id}),
+                session_id: self.target_session_parents.get(&session).cloned().flatten(),
+            });
+        }
+        // Keep the existing root destruction receipt, including without discovery.
+        self.pending_events.push(CdpEvent::new("Target.targetDestroyed", json!({"targetId": target_id})));
+        let subscriptions = self.target_discovery_sessions.iter().filter_map(Clone::clone).collect::<Vec<_>>();
+        for session in subscriptions {
+            self.pending_events.push(CdpEvent::with_session("Target.targetDestroyed", json!({"targetId": target_id}), session));
+        }
+    }
+
+    pub(crate) fn auto_attach_native_target(&mut self, target_id: &str) {
+        let mut parents = self.target_auto_attach_sessions.iter().cloned().collect::<Vec<_>>();
+        parents.sort();
+        for parent in parents {
+            let relevant = parent.as_ref().and_then(|session| self.sessions.get(session))
+                .filter(|target| target.as_str() != "browser");
+            if let Some(opener) = relevant {
+                let Some(page) = self.get_page(target_id) else { continue };
+                if page.window_info().opener_id.and_then(|id| page.window_target_id(id)).as_ref() != Some(opener) {
+                    continue;
+                }
+            }
+            if self.target_session_parents.iter().any(|(session, owner)| owner == &parent
+                && self.sessions.get(session).is_some_and(|target| target == target_id)) {
+                continue;
+            }
+            let session = self.next_target_session(target_id);
+            self.sessions.insert(session.clone(), target_id.to_string());
+            self.target_session_parents.insert(session.clone(), parent.clone());
+            let Some(page) = self.get_page(target_id) else { continue };
+            let info = self.page_target_info(page);
+            self.pending_events.push(CdpEvent {
+                method: "Target.attachedToTarget".to_string(),
+                params: json!({"sessionId": session, "targetInfo": info, "waitingForDebugger": false}),
+                session_id: parent,
+            });
+        }
+    }
+
+    pub(crate) fn record_native_navigation(&mut self, page_id: &str) {
+        if let Some(page) = self.get_page(page_id) {
+            let generation = page.window_document_generation();
+            self.native_navigation_generations.insert(page_id.to_string(), generation);
+            self.pending_native_navigations.remove(page_id);
+        }
+    }
+
+    fn emit_native_navigation_events(&mut self) {
+        let pending = std::mem::take(&mut self.pending_native_navigations);
+        for page_id in pending {
+            let Some(page) = self.get_page(&page_id) else {
+                self.pending_native_navigations.insert(page_id);
+                continue;
+            };
+            let generation = page.window_document_generation();
+            // The realm-install receipt precedes native loading. Wait for the
+            // completed Page, including its real network and lifecycle state.
+            if page.js.as_ref().is_none_or(|js| js.window_document_generation() != generation) {
+                self.pending_native_navigations.insert(page_id);
+                continue;
+            }
+            if self.native_navigation_generations.get(&page_id) == Some(&generation) { continue; }
+            if !page.lifecycle.is_loaded() {
+                self.pending_native_navigations.insert(page_id);
+                continue;
+            }
+            let page = self.get_page_mut(&page_id).unwrap();
+            page.sync_js_network_events();
+            let frame_id = page.frame_id.clone();
+            let page_url = page.url_string();
+            let network_events = page.network_events.drain(..).collect::<Vec<_>>();
+            let reached_network_idle = page.lifecycle.is_network_idle();
+            let sessions = domains::page::network_observer_sessions(self, &page_id, &None);
+            let source = sessions.first().cloned();
+            let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+            let event_start = self.pending_events.len();
+            domains::page::emit_navigation_events(self, &source, &frame_id, &loader_id,
+                &page_url, &page_id, &network_events, obscura_browser::lifecycle::WaitUntil::Load,
+                reached_network_idle);
+            // The canonical emitter already fans out Network and Runtime
+            // events. Every attached page session also needs the frame URL.
+            let event_end = self.pending_events.len();
+            for session in sessions.into_iter().skip(1) {
+                for index in event_start..event_end {
+                    let event = &self.pending_events[index];
+                    if event.method.starts_with("Page.") && event.session_id == source {
+                        let copy = CdpEvent {
+                            method: event.method.clone(), params: event.params.clone(),
+                            session_id: Some(session.clone()),
+                        };
+                        self.pending_events.push(copy);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adopt the exact native popup Page roots and retain lifecycle receipts for
+    /// windows closed before adoption. Native jobs own loading and proxy lifetime.
+    pub(crate) fn sync_native_windows(&mut self) {
+        let mut index = 0;
+        while index < self.pages.len() {
+            let popups = self.pages[index].take_popup_pages();
+            for page in popups {
+                if self.get_page(&page.id).is_none() {
+                    self.current_loader_ids.insert(page.id.clone(), format!("loader-blank-{}", page.id));
+                    self.pages.push(page);
+                }
+            }
+            index += 1;
+        }
+        let mut opened = Vec::new();
+        let mut created = Vec::new();
+        let mut closed = Vec::new();
+        for (owner, page) in self.pages.iter().enumerate() {
+            for event in page.take_window_events() {
+                match event {
+                    WindowEvent::Open { source, url, name, features, user_gesture, .. } => {
+                        opened.push((source, url, name, features, user_gesture));
+                    }
+                    WindowEvent::Created(window) => created.push((window, owner)),
+                    WindowEvent::Closed(window) => closed.push(window.target_id),
+                    WindowEvent::Navigated(window) => { self.pending_native_navigations.insert(window.target_id); }
+                }
+            }
+        }
+        for (source, url, name, features, user_gesture) in opened {
+            let Some(page) = self.pages.iter().find(|page| page.window_info().id == source) else { continue };
+            let sessions = self.sessions.iter().filter(|(_, target)| **target == page.id)
+                .map(|(session, _)| session.clone()).collect::<Vec<_>>();
+            for session in sessions {
+                self.pending_events.push(CdpEvent::with_session("Page.windowOpen", json!({
+                    "url": url, "windowName": name, "windowFeatures": features, "userGesture": user_gesture,
+                }), session));
+            }
+        }
+        for (window, owner) in created {
+            if self.native_windows.contains_key(&window.target_id) { continue; }
+            let info = self.native_window_target_info(&window, &self.pages[owner]);
+            self.emit_target_discovery("Target.targetCreated", json!({"targetInfo": info}));
+            if self.get_page(&window.target_id).is_some_and(|page| !page.window_info().closed) {
+                self.auto_attach_native_target(&window.target_id);
+            }
+            self.native_windows.insert(window.target_id.clone(), window);
+        }
+        for target_id in closed {
+            if self.native_windows.contains_key(&target_id) {
+                self.emit_target_destroyed(&target_id);
+            }
+            self.remove_page(&target_id);
+        }
+        let snapshots = self.pages.iter().map(Page::window_info).collect::<Vec<_>>();
+        for window in snapshots {
+            if window.closed {
+                if self.native_windows.contains_key(&window.target_id) {
+                    self.emit_target_destroyed(&window.target_id);
+                }
+                self.remove_page(&window.target_id);
+                continue;
+            }
+            let previous = self.native_windows.insert(window.target_id.clone(), window.clone());
+            let Some(page) = self.get_page(&window.target_id) else { continue };
+            let info = self.page_target_info(page);
+            match previous {
+                None => {
+                    self.emit_target_discovery("Target.targetCreated", json!({"targetInfo": info}));
+                    self.auto_attach_native_target(&window.target_id);
+                }
+                Some(previous) if previous.url != window.url || previous.title != window.title
+                    || previous.opener_id != window.opener_id || previous.can_access_opener != window.can_access_opener => {
+                    self.emit_target_discovery("Target.targetInfoChanged", json!({"targetInfo": info}));
+                }
+                _ => {}
+            }
+        }
+        self.emit_native_navigation_events();
+    }
+
+    pub(crate) async fn drive_native_windows(&mut self, budget_ms: u64) -> Result<(), String> {
+        let mut groups = HashSet::new();
+        for page in &mut self.pages {
+            if !page.window_info().closed && page.has_js() && groups.insert(page.window_group_id()) {
+                page.drive_windows(budget_ms).await.map_err(|error| error.to_string())?;
+            }
+        }
+        self.sync_native_windows();
+        Ok(())
+    }
+
     pub fn remove_page(&mut self, id: &str) {
+        if let Some(page) = self.get_page_mut(id) {
+            page.close_window();
+        }
+        self.native_windows.remove(id);
+        self.native_navigation_generations.remove(id);
+        self.pending_native_navigations.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -349,6 +604,9 @@ impl CdpContext {
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
+            self.target_session_parents.remove(session_id);
+            self.target_discovery_sessions.remove(&Some(session_id.clone()));
+            self.target_auto_attach_sessions.remove(&Some(session_id.clone()));
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -805,8 +1063,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             );
         }
     };
+    ctx.sync_native_windows();
 
-    let result = match domain {
+    let mut result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
@@ -841,6 +1100,13 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
+
+    ctx.sync_native_windows();
+    if !is_v8_free_method(&req.method) {
+        if let Err(error) = ctx.drive_native_windows(1).await {
+            if result.is_ok() { result = Err(error); }
+        }
+    }
 
     #[cfg(feature = "render")]
     if result.is_ok()

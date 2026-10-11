@@ -2303,7 +2303,8 @@ fn resolve_transform_length(
     viewport: (f32, f32),
 ) -> f32 {
     let basis = if axis == 0 { rect.width } else { rect.height };
-    let em = style.font_size.unwrap_or(16.0);
+    let zoom = style.used_zoom();
+    let em = style.font_size.unwrap_or(16.0) / zoom;
     length
         .expression
         .as_deref()
@@ -2314,9 +2315,10 @@ fn resolve_transform_length(
                 root_font_size,
                 viewport.0 / 100.0,
                 viewport.1 / 100.0,
-                basis,
+                basis / zoom,
             )
         })
+        .map(|pixels| pixels * zoom)
         .unwrap_or_else(|| resolve_translate(length.value, basis))
 }
 
@@ -5114,6 +5116,13 @@ fn layout_dom_once(
         Some((retained, fresh)) => (retained.styles, retained.custom_properties, Some(fresh)),
         None => (HashMap::new(), HashMap::new(), None),
     };
+    for style in styles.values_mut() {
+        if style.zoom_lengths_scaled {
+            let factor = 1.0 / style.effective_zoom;
+            style.zoom_lengths_scaled = false;
+            style.scale_used_lengths(factor);
+        }
+    }
     let root_props = std::rc::Rc::new(HashMap::new());
     let mut evaluator =
         snapshot.map(|snapshot| crate::css::ContainerQueryEvaluator::new(tree, snapshot));
@@ -5236,6 +5245,9 @@ fn layout_dom_once(
             letter_spacing: f32,
             word_spacing: f32,
             letter_spacing_non_normal: bool,
+            perspective: Option<crate::Dimension>,
+            zoom: f32,
+            effective_zoom: f32,
             container_type: crate::ContainerType,
             containment: u8,
             container_names: Vec<String>,
@@ -5299,6 +5311,9 @@ fn layout_dom_once(
                     letter_spacing: 0.0,
                     word_spacing: 0.0,
                     letter_spacing_non_normal: false,
+                    perspective: None,
+                    zoom: 1.0,
+                    effective_zoom: 1.0,
                     container_type: crate::ContainerType::Normal,
                     containment: 0,
                     container_names: Vec::new(),
@@ -5369,6 +5384,20 @@ fn layout_dom_once(
         let mut definite_height_nodes = HashSet::new();
         let mut queue = vec![(root_id, root_inh)];
         while let Some((id, mut inh)) = queue.pop() {
+            if let Some(style) = styles.get_mut(&id) {
+                if style.zoom_inherit {
+                    style.zoom = Some(inh.zoom);
+                    style.zoom_inherit = false;
+                }
+                inh.zoom = style.zoom.unwrap_or(1.0);
+                let local_zoom = if inh.zoom == 0.0 { 1.0 } else { inh.zoom };
+                style.effective_zoom = inh.effective_zoom * local_zoom;
+                inh.effective_zoom = style.effective_zoom;
+                // Percentage/functional lengths use the containing block in
+                // this element's local CSS pixels, not its ancestor's pixels.
+                inh.cb_width /= local_zoom;
+                inh.cb_height /= local_zoom;
+            }
             // Default the child containing-block width to this element's own
             // (updated to its content width inside the block below).
             let mut child_cb_width = inh.cb_width;
@@ -5436,6 +5465,7 @@ fn layout_dom_once(
                     if let Some(non_normal) = style.letter_spacing_non_normal {
                         inh.letter_spacing_non_normal = non_normal;
                     }
+                    inh.perspective = style.perspective;
                     inh.container_type = style.container_type;
                     inh.containment = style.containment;
                     inh.container_names.clone_from(&style.container_names);
@@ -5645,6 +5675,22 @@ fn layout_dom_once(
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
                 crate::style::set_grid_calc_context(style, em_px, root_fs, vw, vh);
+                if style.perspective_inherit {
+                    style.perspective = inh.perspective;
+                    style.perspective_expression = None;
+                    style.perspective_inherit = false;
+                } else if let Some(expression) = style.perspective_expression.as_deref() {
+                    style.perspective = crate::style::resolve_contextual_length(
+                        expression, em_px, root_fs, vw, vh, 0.0,
+                    ).filter(|pixels| pixels.is_finite()).map(|pixels| crate::Dimension::Px(pixels.max(0.0)));
+                } else if let Some(length) = style.perspective {
+                    style.perspective = Some(length.resolve(em_px, root_fs, vw, vh));
+                }
+                inh.perspective = style.perspective;
+                style.containing_block_triggers &= !crate::CB_TRIGGER_PERSPECTIVE;
+                if style.perspective.is_some() {
+                    style.containing_block_triggers |= crate::CB_TRIGGER_PERSPECTIVE;
+                }
                 if let Some(expression) = style.letter_spacing_expression.as_deref() {
                     style.letter_spacing = crate::style::resolve_contextual_length(
                         expression, em_px, root_fs, vw, vh, em_px,
@@ -6789,6 +6835,16 @@ fn layout_dom_once(
                 }
             }
         }
+        // Zoom changes used lengths before Taffy and text shaping. Normal-flow
+        // siblings therefore move, descendants inherit the effective scale,
+        // and paint/hit testing consume the same real native geometry.
+        for style in styles.values_mut() {
+            style.zoom_lengths_scaled = true;
+            if style.effective_zoom != 1.0 && style.font_size.is_none() {
+                style.font_size = Some(16.0);
+            }
+            style.scale_used_lengths(style.effective_zoom);
+        }
 
         let deferred_cyclic_inline_sizes =
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
@@ -7595,7 +7651,7 @@ fn layout_dom_once(
     if let Some(root_id) = root {
         let root_font_size = styles
             .get(&root_id)
-            .and_then(|style| style.font_size)
+            .map(|style| style.font_size.unwrap_or(16.0) / style.used_zoom())
             .unwrap_or(16.0);
         resolve_clip_rects(
             tree,

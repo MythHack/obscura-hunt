@@ -106,6 +106,20 @@ not run page tasks or force collection. `embedderHeapUsedSize` is zero because
 Obscura's Rust DOM is not a V8-managed cppgc heap; Rust allocations and renderer
 memory are not included.
 
+## Related windows
+
+`window.open()` creates a native document context synchronously, so a same-origin
+initial `about:blank` window supports real DOM objects and functions before its
+URL loads. Named windows are reused; retained `WindowProxy` objects follow
+navigation and closure. Each navigated root has an independent module map.
+
+Popup loading and messages continue while a CDP evaluation awaits a promise.
+`postMessage` uses structured clone and native source/origin checks; cross-origin
+DOM access is denied. `noopener` returns no handle and creates no opener link.
+CDP target discovery and attachment reflect these native windows, rather than
+creating substitute page objects. Debugger-start pausing is not supported and
+is not advertised as active.
+
 ## Application timing
 
 Page scripts can record `performance.mark()` and `performance.measure()`

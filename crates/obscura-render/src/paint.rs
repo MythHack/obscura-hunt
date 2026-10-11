@@ -1470,8 +1470,8 @@ impl PreparedRender {
             return Some((0.0, 0.0));
         }
         Some((
-            (rect.width - style.border.left - style.border.right).max(0.0),
-            (rect.height - style.border.top - style.border.bottom).max(0.0),
+            (rect.width - style.border.left - style.border.right).max(0.0) / style.used_zoom(),
+            (rect.height - style.border.top - style.border.bottom).max(0.0) / style.used_zoom(),
         ))
     }
 
@@ -1484,7 +1484,7 @@ impl PreparedRender {
         if style.ignores_used_box_sizes() {
             return Some((0.0, 0.0));
         }
-        Some((rect.width.max(0.0), rect.height.max(0.0)))
+        Some((rect.width.max(0.0) / style.used_zoom(), rect.height.max(0.0) / style.used_zoom()))
     }
 
     /// Whether hit testing must ignore this element's generated box.
@@ -1695,9 +1695,11 @@ impl PreparedRender {
         id: obscura_dom::tree::NodeId,
     ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
+        let zoom = style.used_zoom();
+        let unzoom = |length| unzoom_dimension(length, zoom);
         let rect = self.layout.rects.get(&id);
         let mut out = non_geometric_computed_style(style);
-        out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
+        out.insert("font-size", css_px(style.font_size.unwrap_or(16.0) / zoom));
         out.insert(
             "font-weight",
             style
@@ -1712,14 +1714,14 @@ impl PreparedRender {
             "line-height",
             match style.line_height.unwrap_or(crate::LineHeight::Normal) {
                 crate::LineHeight::Normal => "normal".to_string(),
-                _ => css_px(self.layout.text_engine.selected_line_height(style)),
+                _ => css_px(self.layout.text_engine.selected_line_height(style) / zoom),
             },
         );
         out.insert(
             "letter-spacing",
             match style.letter_spacing.unwrap_or(0.0) {
                 value if value == 0.0 => "normal".to_string(),
-                value => css_px(value),
+                value => css_px(value / zoom),
             },
         );
         out.insert(
@@ -1787,8 +1789,8 @@ impl PreparedRender {
         );
 
         if style.ignores_used_box_sizes() {
-            out.insert("width", dimension_css(style.width, "auto"));
-            out.insert("height", dimension_css(style.height, "auto"));
+            out.insert("width", dimension_css(unzoom(style.width), "auto"));
+            out.insert("height", dimension_css(unzoom(style.height), "auto"));
         } else if let Some(rect) = rect {
             let horizontal_non_content =
                 style.border.left + style.border.right + style.padding.left + style.padding.right;
@@ -1801,16 +1803,16 @@ impl PreparedRender {
                     (rect.height - vertical_non_content).max(0.0),
                 ),
             };
-            out.insert("width", css_px(width));
-            out.insert("height", css_px(height));
+            out.insert("width", css_px(width / zoom));
+            out.insert("height", css_px(height / zoom));
         } else {
-            out.insert("width", dimension_css(style.width, "auto"));
-            out.insert("height", dimension_css(style.height, "auto"));
+            out.insert("width", dimension_css(unzoom(style.width), "auto"));
+            out.insert("height", dimension_css(unzoom(style.height), "auto"));
         }
-        out.insert("min-width", dimension_css(style.min_width, "auto"));
-        out.insert("min-height", dimension_css(style.min_height, "auto"));
-        out.insert("max-width", dimension_css(style.max_width, "none"));
-        out.insert("max-height", dimension_css(style.max_height, "none"));
+        out.insert("min-width", dimension_css(unzoom(style.min_width), "auto"));
+        out.insert("min-height", dimension_css(unzoom(style.min_height), "auto"));
+        out.insert("max-width", dimension_css(unzoom(style.max_width), "none"));
+        out.insert("max-height", dimension_css(unzoom(style.max_height), "none"));
         out.insert(
             "box-sizing",
             if style.box_sizing == crate::BoxSizing::BorderBox {
@@ -1843,7 +1845,7 @@ impl PreparedRender {
                 if auto {
                     "auto".to_string()
                 } else {
-                    css_px(value)
+                    css_px(value / zoom)
                 },
             );
         }
@@ -1857,7 +1859,7 @@ impl PreparedRender {
             ("border-bottom-width", style.border.bottom),
             ("border-left-width", style.border.left),
         ] {
-            out.insert(name, css_px(value));
+            out.insert(name, css_px(value / zoom));
         }
         let current_color = style.color.unwrap_or([0, 0, 0, 255]);
         for (name, color) in [
@@ -1895,15 +1897,18 @@ impl PreparedRender {
                 style.border_model.radii.bottom_left,
             ),
         ] {
+            let mut radius = radius;
+            radius.x.length /= zoom;
+            radius.y.length /= zoom;
             out.insert(name, corner_radius_css(radius));
         }
-        out.insert("outline-width", css_px(style.outline.used_width()));
+        out.insert("outline-width", css_px(style.outline.used_width() / zoom));
         out.insert("outline-style", style.outline.style.css_name().to_string());
         out.insert(
             "outline-color",
             css_color(style.outline.color.unwrap_or(current_color)),
         );
-        out.insert("outline-offset", css_px(style.outline.offset));
+        out.insert("outline-offset", css_px(style.outline.offset / zoom));
 
         out.insert(
             "flex-direction",
@@ -1952,11 +1957,11 @@ impl PreparedRender {
             "column-gap",
             style
                 .column_gap
-                .map_or_else(|| "normal".to_string(), css_px),
+                .map_or_else(|| "normal".to_string(), |value| css_px(value / zoom)),
         );
         out.insert(
             "row-gap",
-            style.row_gap.map_or_else(|| "normal".to_string(), css_px),
+            style.row_gap.map_or_else(|| "normal".to_string(), |value| css_px(value / zoom)),
         );
         out.insert(
             "grid-auto-flow",
@@ -1978,7 +1983,7 @@ impl PreparedRender {
             "translate",
             style.individual_translate.map_or_else(
                 || "none".to_string(),
-                |(x, y)| format!("{} {}", dimension_css(x, "0px"), dimension_css(y, "0px")),
+                |(x, y)| format!("{} {}", dimension_css(unzoom(x), "0px"), dimension_css(unzoom(y), "0px")),
             ),
         );
         out.insert(
@@ -2284,6 +2289,10 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
         .to_string(),
     );
     out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
+    out.insert("zoom", css_number(style.zoom.unwrap_or(1.0)));
+    out.insert("perspective", style.perspective.map_or_else(
+        || "none".to_string(), |length| dimension_css(length, "none"),
+    ));
     out.insert(
         "background-color",
         css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
@@ -2350,6 +2359,13 @@ fn css_number(value: f32) -> String {
 
 fn css_px(value: f32) -> String {
     format!("{}px", css_number(if value == 0.0 { 0.0 } else { value }))
+}
+
+fn unzoom_dimension(value: crate::Dimension, zoom: f32) -> crate::Dimension {
+    match value {
+        crate::Dimension::Px(value) => crate::Dimension::Px(value / zoom),
+        other => other,
+    }
 }
 
 fn dimension_css(value: crate::Dimension, auto: &str) -> String {
@@ -2457,8 +2473,8 @@ fn transform_css(
         css_number(matrix.b),
         css_number(matrix.c),
         css_number(matrix.d),
-        css_number(matrix.e),
-        css_number(matrix.f),
+        css_number(matrix.e / style.used_zoom()),
+        css_number(matrix.f / style.used_zoom()),
     )
 }
 
@@ -2468,8 +2484,8 @@ fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) 
         crate::Dimension::Percent(0.5),
     ));
     let resolve = |value: crate::Dimension, axis: f32| match value {
-        crate::Dimension::Percent(fraction) => css_px(fraction * axis),
-        other => dimension_css(other, "0px"),
+        crate::Dimension::Percent(fraction) => css_px(fraction * axis / style.used_zoom()),
+        other => dimension_css(unzoom_dimension(other, style.used_zoom()), "0px"),
     };
     let (width, height) = rect.map_or((0.0, 0.0), |rect| (rect.width, rect.height));
     format!("{} {}", resolve(x, width), resolve(y, height))
@@ -3117,7 +3133,7 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .ok()
         .flatten()
         .and_then(|root| laid.styles.get(&root))
-        .and_then(|style| style.font_size)
+        .map(|style| style.font_size.unwrap_or(16.0) / style.used_zoom())
         .unwrap_or(16.0);
     Some(PreparedRender {
         viewport,
@@ -3839,6 +3855,7 @@ fn paint_canvas_background(
             style.font_size.unwrap_or(16.0),
             root_font_size,
             viewport,
+            style.used_zoom(),
             image_cache,
         ) {
             paint_image(
@@ -3917,7 +3934,7 @@ fn paint_laid_dom_scrolled(
         .ok()
         .flatten()
         .and_then(|root| laid.styles.get(&root))
-        .and_then(|style| style.font_size)
+        .map(|style| style.font_size.unwrap_or(16.0) / style.used_zoom())
         .unwrap_or(16.0);
     if paint_root.is_none() {
         if let Some(canvas) = canvas_background {
@@ -4760,6 +4777,7 @@ fn paint_laid_dom_scrolled(
                     style.font_size.unwrap_or(16.0),
                     root_font_size,
                     viewport,
+                    style.used_zoom(),
                     image_cache,
                 ) {
                     // A background layer is always clipped to its owner's border
@@ -5708,6 +5726,7 @@ fn paint_inline_fragment_decorations(
                 fragment_style.font_size.unwrap_or(16.0),
                 root_font_size,
                 viewport,
+                fragment_style.used_zoom(),
                 image_cache,
             ) {
                 paint_image(
@@ -9124,6 +9143,7 @@ fn background_image_rect(
     em: f32,
     rem: f32,
     viewport: (f32, f32),
+    zoom: f32,
     cache: &mut RenderResourceCache,
 ) -> Option<crate::Rect> {
     let bytes = fetch_bytes(src, base_url, cache)?;
@@ -9132,17 +9152,20 @@ fn background_image_rect(
     } else {
         image_dimensions(&bytes).map(|(width, height)| (width as f32, height as f32))
     };
+    // Authored expressions and intrinsic metadata are in local CSS pixels;
+    // box geometry and explicit_size already contain the effective zoom.
+    // Resolve against local bases, then convert the result to used pixels once.
     let expression_size = size_expression.and_then(|expression| {
         let components = split_background_size_components(expression);
         let width = components.first().and_then(|value| {
             (!value.eq_ignore_ascii_case("auto")).then(|| {
                 crate::style::resolve_contextual_length(
                     value,
-                    em,
+                    em / zoom,
                     rem,
                     viewport.0 / 100.0,
                     viewport.1 / 100.0,
-                    box_rect.width,
+                    box_rect.width / zoom,
                 )
             })?
         });
@@ -9150,11 +9173,11 @@ fn background_image_rect(
             (!value.eq_ignore_ascii_case("auto")).then(|| {
                 crate::style::resolve_contextual_length(
                     value,
-                    em,
+                    em / zoom,
                     rem,
                     viewport.0 / 100.0,
                     viewport.1 / 100.0,
-                    box_rect.height,
+                    box_rect.height / zoom,
                 )
             })?
         });
@@ -9165,7 +9188,7 @@ fn background_image_rect(
             (None, None, Some(intrinsic)) => Some(intrinsic),
             _ => None,
         }
-    });
+    }).map(|(width, height)| (width * zoom, height * zoom));
     // `cover` and `contain` are complete sizing algorithms, not contextual
     // lengths. The style layer deliberately retains the authored token string
     // for CSS math, so a keyword can also appear in `size_expression`; run the
@@ -9176,7 +9199,7 @@ fn background_image_rect(
         let scale = match fit {
             crate::ObjectFit::Cover => (box_rect.width / iw).max(box_rect.height / ih),
             crate::ObjectFit::Contain => (box_rect.width / iw).min(box_rect.height / ih),
-            _ => 1.0,
+            _ => zoom,
         };
         (iw * scale, ih * scale)
     } else if let Some(size) = expression_size {
@@ -9184,7 +9207,8 @@ fn background_image_rect(
     } else if let Some(size) = explicit_size {
         size
     } else {
-        intrinsic.unwrap_or((box_rect.width, box_rect.height))
+        intrinsic.map(|(width, height)| (width * zoom, height * zoom))
+            .unwrap_or((box_rect.width, box_rect.height))
     };
     if width <= 0.0 || height <= 0.0 {
         return None;
@@ -9418,6 +9442,7 @@ fn paint_in_flow_generated_box(
             style.font_size.unwrap_or(16.0),
             root_font_size,
             viewport,
+            style.used_zoom(),
             image_cache,
         ) {
             paint_image(
@@ -9659,6 +9684,7 @@ fn paint_positioned_pseudo(
             em,
             root_font_size,
             viewport,
+            style.used_zoom(),
             image_cache,
         ) {
             paint_image(
@@ -15331,6 +15357,7 @@ mod tests {
             10.0,
             10.0,
             (1280.0, 720.0),
+            1.0,
             &mut cache,
         )
         .unwrap();

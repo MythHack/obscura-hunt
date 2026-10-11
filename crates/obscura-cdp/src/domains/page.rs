@@ -893,6 +893,7 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    ctx.record_native_navigation(page_id);
     let event_start = ctx.pending_events.len();
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
@@ -1096,29 +1097,13 @@ pub fn emit_navigation_events(
     });
     ctx.pending_events.extend(phase3);
 
-    // Target.targetInfoChanged: strict CDP clients (browser-use, and
-    // Puppeteer/Playwright `page.url()` tracking) cache the TargetInfo from
-    // attachedToTarget and only refresh it on this event. Without it they keep
-    // reporting the pre-navigation url/title (about:blank) and never see the
-    // loaded page. Emit it browser-level (no sessionId) with the new url/title.
-    let (tic_title, tic_ctx) = ctx
-        .get_page(page_id)
-        .map(|p| (p.title.clone(), p.context.id.clone()))
-        .unwrap_or_default();
-    ctx.pending_events.push(CdpEvent::new(
-        "Target.targetInfoChanged",
-        json!({
-            "targetInfo": {
-                "targetId": page_id,
-                "type": "page",
-                "title": tic_title,
-                "url": page_url,
-                "attached": true,
-                "canAccessOpener": false,
-                "browserContextId": tic_ctx,
-            }
-        }),
-    ));
+    // Refresh target metadata from the native window, including its actual
+    // opener relationship, rather than replacing popup metadata with a tab.
+    if let Some(info) = ctx.get_page(page_id).map(|page| ctx.page_target_info(page)) {
+        ctx.pending_events.push(CdpEvent::new(
+            "Target.targetInfoChanged", json!({"targetInfo": info}),
+        ));
+    }
     fan_out_network_events(ctx, page_id, session_id, event_start);
 }
 

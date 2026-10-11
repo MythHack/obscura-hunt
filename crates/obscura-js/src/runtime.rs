@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::marker::PhantomData;
+#[cfg(test)]
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -256,6 +256,10 @@ impl Drop for CdpRealmScope {
 
 pub struct ObscuraJsRuntime {
     state: Rc<RefCell<ObscuraState>>,
+    window_id: crate::window::WindowId,
+    root_context: v8::Global<v8::Context>,
+    module_realm: deno_core::BrowserRealm,
+    windows: crate::window::SharedWindows,
     object_store: HashMap<String, String>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
@@ -293,7 +297,7 @@ pub struct ObscuraJsRuntime {
     // Keep the runtime last: custom `Drop` enters its isolate, then every
     // V8-backed field above is released before `OwnedIsolate` performs the
     // matching exit and disposes the isolate.
-    js_runtime: JsRuntime,
+    js_runtime: Rc<RefCell<JsRuntime>>,
 }
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
@@ -416,86 +420,20 @@ const WATCHDOG_SCHEDULING_MARGIN_MS: u64 = 500;
 /// So the isolate is exited once construction finishes and entered again only
 /// around work that touches V8. Entries are then properly nested no matter how
 /// many pages exist or what order they are used and dropped in.
-struct EnteredRuntime<'a>(&'a mut JsRuntime);
+struct EnteredRuntime<'a>(std::cell::RefMut<'a, JsRuntime>);
 
-/// Enters an isolate only while an async deno_core operation is being polled.
-/// Holding an entry across `.await` would let interleaved page futures violate
-/// V8's per-thread isolate stack.
-struct EnteredRuntimeFuture<F> {
-    isolate: *mut deno_core::v8::Isolate,
-    future: Option<Pin<Box<F>>>,
-    _not_send: PhantomData<Rc<()>>,
-}
-
-struct IsolateEntry(*mut deno_core::v8::Isolate);
-
-impl IsolateEntry {
-    unsafe fn new(isolate: *mut deno_core::v8::Isolate) -> Self {
-        unsafe { (&mut *isolate).enter() };
-        Self(isolate)
-    }
-}
-
-impl Drop for IsolateEntry {
-    fn drop(&mut self) {
-        unsafe { (&mut *self.0).exit() };
-    }
-}
-
-impl<F: Future> Future for EnteredRuntimeFuture<F> {
-    type Output = F::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: construction ties the pointer and future to the same
-        // borrowed JsRuntime, which cannot move or drop while this exists.
-        let this = unsafe { self.get_unchecked_mut() };
-        let _entry = unsafe { IsolateEntry::new(this.isolate) };
-        this.future
-            .as_mut()
-            .expect("entered runtime future polled after drop")
-            .as_mut()
-            .poll(cx)
-    }
-}
-
-impl<F> Drop for EnteredRuntimeFuture<F> {
-    fn drop(&mut self) {
-        // deno_core futures can own V8 handles, so drop them while their
-        // isolate is current too.
-        let _entry = unsafe { IsolateEntry::new(self.isolate) };
-        drop(self.future.take());
-    }
-}
-
-fn entered_runtime_future<'a, F>(
-    runtime: &'a mut JsRuntime,
-    make_future: impl FnOnce(&'a mut JsRuntime) -> F,
-) -> EnteredRuntimeFuture<F>
-where
-    F: Future,
-{
-    let isolate: *mut deno_core::v8::Isolate = &mut **runtime.v8_isolate();
-    let entry = unsafe { IsolateEntry::new(isolate) };
-    let future = Box::pin(make_future(runtime));
-    drop(entry);
-    EnteredRuntimeFuture {
-        isolate,
-        future: Some(future),
-        _not_send: PhantomData,
-    }
-}
 
 impl std::ops::Deref for EnteredRuntime<'_> {
     type Target = JsRuntime;
 
     fn deref(&self) -> &JsRuntime {
-        self.0
+        &self.0
     }
 }
 
 impl std::ops::DerefMut for EnteredRuntime<'_> {
     fn deref_mut(&mut self) -> &mut JsRuntime {
-        self.0
+        &mut self.0
     }
 }
 
@@ -513,23 +451,12 @@ impl Drop for EnteredRuntime<'_> {
 
 impl Drop for ObscuraJsRuntime {
     fn drop(&mut self) {
-        // Background render-resource loads belong to this runtime's document;
-        // a dropped JoinHandle would only detach them (the page also calls
-        // `abandon_render_resources`, a directly embedded runtime may not).
         #[cfg(feature = "render")]
-        for task in self.state.borrow_mut().render_resource_tasks.drain(..) {
-            task.abort();
+        if Rc::strong_count(&self.state) == 1 {
+            for task in self.state.borrow_mut().render_resource_tasks.drain(..) { task.abort(); }
         }
-        // Teardown needs the isolate current as much as any other V8 work:
-        // deno_core's context cleanup clears the context's embedder slots, and
-        // rusty_v8's `OwnedIsolate::drop` asserts it before disposing. Both run
-        // when `js_runtime` is dropped, immediately after this returns, and
-        // that `OwnedIsolate::drop` performs the matching exit.
-        //
-        // SAFETY: `enter` only pushes this isolate onto the current thread's
-        // entry stack; the pop is guaranteed by the drop that follows.
-        unsafe {
-            self.js_runtime.v8_isolate().enter();
+        if Rc::strong_count(&self.js_runtime) == 1 {
+            unsafe { self.js_runtime.borrow_mut().v8_isolate().enter(); }
         }
     }
 }
@@ -539,12 +466,211 @@ impl ObscuraJsRuntime {
     /// guard lives. Every path that touches V8 goes through here; see
     /// [`EnteredRuntime`] for why.
     fn runtime(&mut self) -> EnteredRuntime<'_> {
-        // SAFETY: entering is always sound -- it pushes this isolate onto the
-        // current thread's entry stack -- and the guard's `Drop` pops it.
-        unsafe {
-            self.js_runtime.v8_isolate().enter();
+        let mut runtime = self.js_runtime.borrow_mut();
+        unsafe { runtime.v8_isolate().enter(); }
+        EnteredRuntime(runtime)
+    }
+
+    pub fn window_id(&self) -> crate::window::WindowId { self.window_id }
+
+    pub fn window_info(&self) -> crate::window::WindowInfo {
+        self.windows.borrow().info(self.window_id).expect("runtime window is registered")
+    }
+
+    pub fn window_target_id(&self, id: crate::window::WindowId) -> Option<String> {
+        self.windows.borrow().target_id(id)
+    }
+
+    pub fn window_group_id(&self) -> crate::window::WindowId { self.windows.borrow().engine_id() }
+
+    pub fn set_window_target_id(&self, target_id: &str) {
+        self.windows.borrow_mut().set_target_id(self.window_id, target_id);
+    }
+
+    pub fn set_local_storage(&self, storage: crate::storage::SharedStorage) {
+        self.windows.borrow_mut().local_storage = storage;
+    }
+
+    pub fn take_created_windows(&self) -> Vec<crate::window::WindowId> {
+        self.windows.borrow_mut().take_created()
+    }
+
+    pub fn take_window_events(&self) -> Vec<crate::window::WindowEvent> {
+        self.windows.borrow_mut().take_events()
+    }
+
+    pub fn has_window_work(&self) -> bool {
+        let windows = self.windows.borrow();
+        windows.has_work() || windows.windows.values().any(|window| !window.closed
+            && (window.module_realm.has_pending() || window.state.borrow().pending_navigation.is_some()))
+    }
+
+    pub fn window_document_generation(&self) -> u64 { self.state.borrow().document_generation }
+
+    pub fn window_navigation_valid(&self, navigation: &crate::window::WindowNavigation) -> bool {
+        self.windows.borrow().windows.get(&navigation.id)
+            .is_some_and(|window| !window.closed && window.navigation_generation == navigation.generation)
+    }
+
+    pub fn take_window_navigations(&self) -> Vec<crate::window::WindowNavigation> {
+        let mut windows = self.windows.borrow_mut();
+        let mut pending = Vec::new();
+        for window in windows.windows.values_mut().filter(|window| !window.closed && window.id != self.window_id) {
+            let mut state = window.state.borrow_mut();
+            if let Some((url, method, body)) = state.pending_navigation.take() {
+                window.navigation_generation = window.navigation_generation.wrapping_add(1);
+                pending.push(crate::window::WindowNavigation { id: window.id, url, method, body,
+                    source_url: state.url.clone(), noreferrer: false, generation: window.navigation_generation });
+            }
         }
-        EnteredRuntime(&mut self.js_runtime)
+        for job in pending {
+            windows.navigations.retain(|old| old.id != job.id);
+            windows.navigations.push_back(job);
+        }
+        windows.take_navigations()
+    }
+
+    pub fn close_window(&mut self) {
+        let id = self.window_id;
+        let mut entered = self.runtime();
+        let context = entered.main_context();
+        let op_state = entered.op_state();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        crate::window::close_window(scope, &op_state.borrow(), id);
+    }
+
+    pub fn set_window_debugger_wait(&self, waiting: bool) {
+        self.windows.borrow_mut().set_debugger_wait(self.window_id, waiting);
+    }
+
+    pub fn set_popup_debugger_wait(&self, waiting: bool) {
+        self.windows.borrow_mut().set_popup_debugger_wait(self.window_id, waiting);
+    }
+
+    pub fn notify_window_navigated(&self) {
+        let mut windows = self.windows.borrow_mut();
+        if let Some(info) = windows.info(self.window_id) {
+            windows.events.push_back(crate::window::WindowEvent::Navigated(info));
+        }
+    }
+
+    /// Attach to an already-created document, without making a replacement blank.
+    pub fn for_window(&self, id: crate::window::WindowId) -> Result<Self, String> {
+        let windows = self.windows.borrow();
+        let window = windows.windows.get(&id).filter(|window| !window.closed).ok_or("Window is closed")?;
+        let import_map = window.state.borrow().import_map.clone();
+        Ok(Self { state: window.state.clone(), window_id: id, root_context: window.context.clone(),
+            module_realm: window.module_realm.clone(), windows: self.windows.clone(),
+            object_store: HashMap::new(), evaluation_recipes: HashMap::new(), object_counter: 0,
+            cdp_frame_id: Rc::new(std::cell::Cell::new(0)), import_map,
+            module_load_activity: window.loader.activity(), isolate_handle: self.isolate_handle.clone(),
+            heap_limit_state: self.heap_limit_state.clone(), module_evaluations: HashMap::new(),
+            loaded_module_specifiers: window.loader.loaded_specifiers(), evaluated_module_specifiers: HashMap::new(),
+            ops_handoff: self.ops_handoff.clone(), js_runtime: self.js_runtime.clone() })
+    }
+
+    fn sync_window_document(&mut self) {
+        let current = {
+            let windows = self.windows.borrow();
+            windows.windows.get(&self.window_id).filter(|window| window.context != self.root_context)
+                .map(|window| (window.context.clone(), window.module_realm.clone(), window.loader.clone()))
+        };
+        if let Some((context, realm, loader)) = current {
+            self.root_context = context;
+            self.module_realm = realm;
+            self.import_map = self.state.borrow().import_map.clone();
+            self.module_load_activity = loader.activity();
+            self.loaded_module_specifiers = loader.loaded_specifiers();
+            self.module_evaluations.clear();
+            self.evaluated_module_specifiers.clear();
+            self.object_store.clear();
+            self.evaluation_recipes.clear();
+        }
+    }
+
+    /// Replace only this document's context and module registry, retaining its
+    /// native navigable, engine, transport and storage namespaces.
+    pub fn refresh_window_realm(&mut self) -> Result<(), String> {
+        self.sync_window_document();
+        let (previous, previous_realm, main_realm, proxy_url, realm_id) = {
+            let windows = self.windows.borrow();
+            let window = windows.windows.get(&self.window_id).filter(|window| !window.closed).ok_or("Window is closed")?;
+            (window.context.clone(), window.module_realm.clone(), window.main_realm,
+                window.loader.proxy_url.clone(), window.realm_id)
+        };
+        let context = self.create_realm_context().ok_or("Window context creation failed")?;
+        if !self.share_ops_with_realm(&context) { return Err("Window op binding failed".to_string()); }
+        self.copy_identity_to_realm(&context);
+        let base_url = {
+            let mut state = self.state.borrow_mut();
+            state.frame_id = realm_id;
+            state.document_generation = state.document_generation.wrapping_add(1);
+            state.about_base_url = None;
+            state.inherited_origin = None;
+            state.import_map = Rc::new(RefCell::new(ImportMap::default()));
+            state.url.clone()
+        };
+        let peer_context = {
+            let windows = self.windows.borrow();
+            let origin = crate::window::origin(&self.state.borrow());
+            let group = windows.windows.get(&self.window_id).ok_or("Window is closed")?.group;
+            windows.windows.values().find(|window| window.id != self.window_id
+                && !window.closed && window.group == group && origin != "null"
+                && crate::window::origin(&window.state.borrow()) == origin)
+                .map(|window| window.context.clone())
+        };
+        let import_map = self.state.borrow().import_map.clone();
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base_url, proxy_url, &self.state, import_map));
+        let module_realm = {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), main);
+            if !main_realm { previous_realm.retire(scope); }
+            let context = v8::Local::new(scope, &context);
+            if let Some(peer) = peer_context {
+                let peer = v8::Local::new(scope, peer);
+                context.set_security_token(peer.get_security_token(scope));
+            }
+            deno_core::BrowserRealm::attach(scope, context, loader.clone())
+        };
+        let realms = self.realm_states();
+        realms.borrow_mut().forget(&previous);
+        realms.borrow_mut().register(context.clone(), realm_id, self.state.clone());
+        {
+            let mut windows = self.windows.borrow_mut();
+            let window = windows.windows.get_mut(&self.window_id).ok_or("Window is closed")?;
+            let old_realm = window.realm_id;
+            window.context = context;
+            window.module_realm = module_realm;
+            window.loader = loader;
+            window.realm_id = realm_id;
+            window.main_realm = false;
+            windows.callbacks.remove(&old_realm);
+            windows.root_realms.insert(realm_id, self.window_id);
+        }
+        self.sync_window_document();
+        self.execute_runtime_script("<obscura:new-window-document>", format!(
+            "globalThis.__obscura_objects = {{}}; globalThis.__obscura_frameId = {realm_id}; globalThis.__obscura_parentFrameId = 0;"))?;
+        Ok(())
+    }
+
+    /// Every scope, isolate entry and RefMut ends before returning Pending.
+    pub fn poll_windows(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), String>> {
+        let windows = self.windows.clone();
+        {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), main);
+            if let Err(error) = crate::window::deliver_messages(scope, &windows) { return Poll::Ready(Err(error)); }
+        }
+        let result = self.runtime().poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
+            .map(|result| result.map_err(|error| format!("Event loop error: {error}")));
+        if matches!(result, Poll::Ready(Ok(()))) && !windows.borrow().messages.is_empty() {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            result
+        }
     }
 
     /// Read native isolate statistics without evaluating scripts or forcing GC.
@@ -566,6 +692,7 @@ impl ObscuraJsRuntime {
         // heap-limit termination before any later task enters V8 even when the
         // caller that triggered it did not need the error value.
         self.recover_heap_limit();
+        self.sync_window_document();
         begin_animation_task(&mut self.state.borrow_mut());
     }
     pub fn new() -> Self {
@@ -580,6 +707,11 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        Self::with_window_id(base_url, proxy_url, crate::window::allocate_window_id())
+    }
+
+    /// Bind a root reserved by Page before its first document is initialized.
+    pub fn with_window_id(base_url: &str, proxy_url: Option<String>, window_id: crate::window::WindowId) -> Self {
         // A runtime is about to initialize the V8 platform; from here on a
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
@@ -615,7 +747,7 @@ impl ObscuraJsRuntime {
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
-                module_loader: Some(module_loader),
+                module_loader: Some(module_loader.clone()),
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
             });
@@ -653,9 +785,18 @@ impl ObscuraJsRuntime {
 
             (runtime, isolate_handle, heap_limit_state)
         };
+        let root_context = runtime.main_context();
+        let module_realm = runtime.browser_main_realm();
+        let windows = Rc::new(RefCell::new(crate::window::WindowRegistry::new(
+            window_id, root_context.clone(), state.clone(), module_realm.clone(), module_loader)));
+        runtime.op_state().borrow_mut().put(windows.clone());
 
         let mut instance = ObscuraJsRuntime {
             state,
+            window_id,
+            root_context,
+            module_realm,
+            windows,
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
             object_counter: 0,
@@ -668,7 +809,7 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
-            js_runtime: runtime,
+            js_runtime: Rc::new(RefCell::new(runtime)),
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
@@ -683,7 +824,7 @@ impl ObscuraJsRuntime {
         // SAFETY: this isolate is the current one -- it was entered above and
         // nothing on this thread has entered another since.
         unsafe {
-            instance.js_runtime.v8_isolate().exit();
+            instance.js_runtime.borrow_mut().v8_isolate().exit();
         }
 
         instance
@@ -1012,7 +1153,11 @@ impl ObscuraJsRuntime {
 
     fn cdp_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
         let frame_id = self.cdp_frame_id.get();
-        if frame_id == 0 { return Ok(self.runtime().main_context()); }
+        if frame_id == 0 {
+            return self.windows.borrow().windows.get(&self.window_id)
+                .filter(|window| !window.closed).map(|window| window.context.clone())
+                .ok_or_else(|| "Window is closed".to_string());
+        }
         self.realm_states().borrow().context(frame_id)
             .ok_or_else(|| "Cannot find live child frame context".to_string())
     }
@@ -1135,7 +1280,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        let main = self.runtime().main_context();
+        let main = self.root_context.clone();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         v8::scope!(let scope, isolate);
@@ -1211,7 +1356,7 @@ impl ObscuraJsRuntime {
         target_origin: &str,
     ) -> Result<(), String> {
         let context = if target_frame_id == 0 {
-            self.runtime().main_context()
+            self.cdp_context()?
         } else {
             self.realm_states().borrow().context(target_frame_id)
                 .ok_or("Cannot find live child frame context")?
@@ -1243,7 +1388,7 @@ impl ObscuraJsRuntime {
     /// The table ops consult to find the calling realm's document.
     pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
         // `op_state` is a plain Rust-side table; no V8 access, no guard.
-        self.js_runtime
+        self.js_runtime.borrow()
             .op_state()
             .borrow()
             .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
@@ -1305,15 +1450,16 @@ impl ObscuraJsRuntime {
         name: &'static str,
         source: String,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
-        let result = if self.cdp_frame_id.get() == 0 {
-            self.runtime().execute_script(name, source).map_err(|error| error.to_string())
-        } else {
-            let context = self.cdp_context()?;
+        let context = self.cdp_context()?;
+        let result = {
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), context);
             v8::tc_scope!(let scope, scope);
             let code = v8::String::new(scope, &source).ok_or("source too large")?;
-            match v8::Script::compile(scope, code, None).and_then(|script| script.run(scope)) {
+            let resource_name = v8::String::new(scope, name).ok_or("script name too large")?;
+            let origin = v8::ScriptOrigin::new(scope, resource_name.into(), 0, 0, false, 0,
+                None, false, false, false, None);
+            match v8::Script::compile(scope, code, Some(&origin)).and_then(|script| script.run(scope)) {
                 Some(value) => Ok(v8::Global::new(scope, value)),
                 None => Err(exception_text(scope)),
             }
@@ -2531,10 +2677,9 @@ impl ObscuraJsRuntime {
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
         self.state.borrow_mut().navigation_timing.record("domLoading");
-        let _ = self.execute_runtime_script(
-            "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
-        );
+        let source = format!("globalThis.__obscura_frameId = {}; globalThis.__obscura_init({});",
+            self.state.borrow().frame_id, self.window_id);
+        let _ = self.execute_runtime_script("<obscura:page-init>", source);
     }
 
     pub fn navigation_timing(&self) -> crate::ops::NavigationTiming {
@@ -3051,6 +3196,38 @@ impl ObscuraJsRuntime {
         self.evaluate_prepared_module(prepared, remaining_ms).await
     }
 
+    async fn load_browser_module(
+        &mut self,
+        specifier: &deno_core::ModuleSpecifier,
+        code: Option<deno_core::ModuleCodeString>,
+    ) -> Result<deno_core::ModuleId, String> {
+        self.begin_javascript_task();
+        let realm = self.module_realm.clone();
+        let mut load = realm.start_load(specifier, code);
+        std::future::poll_fn(|cx| {
+            let result = {
+                let context = self.root_context.clone();
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context);
+                realm.poll_load(&mut load, cx, scope)
+                    .map(|result| result.map_err(|error| error.to_string()))
+            };
+            if result.is_ready() { return result; }
+            if let Poll::Ready(Err(error)) = self.poll_windows(cx) {
+                return Poll::Ready(Err(error));
+            }
+            Poll::Pending
+        }).await
+    }
+
+    fn browser_module_namespace(&mut self, id: deno_core::ModuleId) -> Result<(), String> {
+        let context = self.root_context.clone();
+        let realm = self.module_realm.clone();
+        let mut entered = self.runtime();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        realm.get_module_namespace(scope, id).map(|_| ()).map_err(|error| error.to_string())
+    }
+
     pub async fn prepare_module(
         &mut self,
         url: &str,
@@ -3068,9 +3245,7 @@ impl ObscuraJsRuntime {
         // the first import edge.
         // The caller sizes the budget: short for enhancement modules on an
         // already-rendered page, full for an unmounted SPA shell (#205).
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
-            runtime.load_side_es_module(&specifier)
-        });
+        let load = self.load_browser_module(&specifier, None);
         let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Module load error: {}", e)),
@@ -3127,17 +3302,18 @@ impl ObscuraJsRuntime {
         // observable when mod_evaluate checks V8's private module status, so
         // contain that dependency assertion at this boundary as well.
         let evaluation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.runtime().mod_evaluate(module_id)
+            let context = self.root_context.clone();
+            let realm = self.module_realm.clone();
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            realm.mod_evaluate(scope, module_id)
         }));
         let result = match evaluation {
             Ok(result) => result,
             Err(payload) => {
                 let message = panic_payload_message(payload.as_ref());
                 let outcome = if message.contains("Module already evaluated") {
-                    self.runtime()
-                        .get_module_namespace(module_id)
-                        .map(|_| ())
-                        .map_err(|error| format!("{} eval error: {}", what, error))
+                    self.browser_module_namespace(module_id)
                 } else {
                     Err(format!("{} evaluation panicked: {}", what, message))
                 };
@@ -3150,21 +3326,18 @@ impl ObscuraJsRuntime {
         let outcome = tokio::time::timeout(
             budget,
             std::future::poll_fn(|cx| {
-                let mut entered = self.runtime();
-                match entered.poll_event_loop(cx, deno_core::PollEventLoopOptions::default()) {
-                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                    Poll::Ready(Ok(())) => result.as_mut().poll(cx),
-                    Poll::Pending => result.as_mut().poll(cx),
+                if let Poll::Ready(Err(error)) = self.poll_windows(cx) {
+                    return Poll::Ready(Err(error));
                 }
+                let _entered = self.runtime();
+                result.as_mut().poll(cx).map(|result| result.map_err(|error| error.to_string()))
             }),
         )
         .await;
 
         let outcome = match outcome {
             Ok(Ok(())) => self
-                .runtime()
-                .get_module_namespace(module_id)
-                .map(|_| ())
+                .browser_module_namespace(module_id)
                 .map_err(|error| format!("{} eval error: {}", what, error)),
             Ok(Err(e)) => Err(format!("{} eval error: {}", what, e)),
             Err(_) => Err(format!(
@@ -3212,12 +3385,8 @@ impl ObscuraJsRuntime {
             .unwrap_or_else(|_| deno_core::ModuleSpecifier::parse("about:blank").unwrap());
         let loaded_start = self.loaded_module_specifiers.borrow().len();
 
-        let load = entered_runtime_future(&mut self.js_runtime, |runtime| {
-            runtime.load_side_es_module_from_code(
-                &specifier,
-                deno_core::ModuleCodeString::from(code.to_string()),
-            )
-        });
+        let load = self.load_browser_module(
+            &specifier, Some(deno_core::ModuleCodeString::from(code.to_string())));
         let module_id = match tokio::time::timeout(budget, load).await {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => return Err(format!("Inline module load error: {}", e)),
@@ -3315,8 +3484,8 @@ impl ObscuraJsRuntime {
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
         let result: Result<(), (String, Option<Box<deno_core::error::JsError>>)> = (|| {
+            let context = self.cdp_context().map_err(|error| (error, None))?;
             let mut entered = self.runtime();
-            let context = entered.main_context();
             let isolate = entered.v8_isolate();
             v8::scope!(let scope, isolate);
             let context = v8::Local::new(scope, context);
@@ -3467,12 +3636,7 @@ impl ObscuraJsRuntime {
         // (document.fonts.load(...).then(...), framework post-render hooks,
         // and hydration follow-ups all rely on this boundary).
         self.runtime().v8_isolate().perform_microtask_checkpoint();
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
-            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
-        });
-        let result = event_loop
-            .await
-            .map_err(|e| format!("Event loop error: {}", e));
+        let result = std::future::poll_fn(|cx| self.poll_windows(cx)).await;
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         self.finish_heap_checked(result)
     }
@@ -3488,9 +3652,7 @@ impl ObscuraJsRuntime {
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
-            let tick = self
-                .runtime()
-                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let tick = self.poll_windows(cx);
             match tick {
                 std::task::Poll::Ready(Err(error)) => {
                     std::task::Poll::Ready(Err(format!("Event loop error: {error}")))
@@ -3725,9 +3887,7 @@ impl ObscuraJsRuntime {
         let mut waiting_for_wake = false;
         let result = std::future::poll_fn(|cx| {
             let task_generation = self.state.borrow().animation_task_generation;
-            let tick = self
-                .runtime()
-                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let tick = self.poll_windows(cx);
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
                 std::task::Poll::Ready(Err(error)) => {
@@ -3792,9 +3952,7 @@ impl ObscuraJsRuntime {
                 isolate_handle.clone(),
                 std::time::Duration::from_millis(AUTONOMOUS_TASK_WATCHDOG_MS),
             );
-            let tick = self
-                .runtime()
-                .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
+            let tick = self.poll_windows(cx);
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
                 self.runtime().v8_isolate().cancel_terminate_execution();
@@ -4010,9 +4168,7 @@ impl ObscuraJsRuntime {
     pub async fn resolve_promises(&mut self) {
         self.begin_javascript_task();
         // Default settle: just pump until idle or 5s.
-        let event_loop = entered_runtime_future(&mut self.js_runtime, |runtime| {
-            runtime.run_event_loop(deno_core::PollEventLoopOptions::default())
-        });
+        let event_loop = std::future::poll_fn(|cx| self.poll_windows(cx));
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_loop).await;
         self.recover_heap_limit();
     }

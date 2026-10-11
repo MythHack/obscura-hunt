@@ -6,6 +6,7 @@ pub mod page;
 #[cfg(feature = "render")]
 pub mod pdf;
 pub mod profiles;
+pub mod window;
 
 pub use context::BrowserContext;
 pub use lifecycle::{LifecycleState, WaitUntil};
@@ -16,6 +17,7 @@ pub use obscura_js::{
     CaptureError, CaptureRegion,
 };
 pub use page::{NetworkEvent, Page, PageError};
+pub use window::{WindowEvent, WindowId, WindowInfo};
 #[cfg(feature = "render")]
 pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,

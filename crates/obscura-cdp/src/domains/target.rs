@@ -12,54 +12,31 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "setDiscoverTargets" => {
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetCreated",
-                json!({
-                    "targetInfo": {
-                        "targetId": "browser",
-                        "type": "browser",
-                        "title": "",
-                        "url": "",
-                        "attached": true,
-                        "canAccessOpener": false,
-                        "browserContextId": "",
-                    }
-                }),
-            ));
-            for page in &ctx.pages {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.targetCreated",
-                    json!({
-                        "targetInfo": {
-                            "targetId": page.id,
-                            "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": false,
-                            "canAccessOpener": false,
-                            "browserContextId": page.context.id,
-                        }
-                    }),
-                ));
+            let discover = params.get("discover").and_then(Value::as_bool).unwrap_or(false);
+            if !discover {
+                ctx.target_discovery_sessions.remove(parent_session_id);
+                return Ok(json!({}));
+            }
+            if !ctx.target_discovery_sessions.insert(parent_session_id.clone()) {
+                return Ok(json!({}));
+            }
+            let mut targets = vec![json!({
+                "targetId": "browser", "type": "browser", "title": "", "url": "",
+                "attached": true, "canAccessOpener": false, "browserContextId": "",
+            })];
+            targets.extend(ctx.pages.iter().filter(|page| !page.window_info().closed)
+                .map(|page| ctx.page_target_info(page)));
+            for info in targets {
+                ctx.pending_events.push(CdpEvent {
+                    method: "Target.targetCreated".to_string(),
+                    params: json!({"targetInfo": info}), session_id: parent_session_id.clone(),
+                });
             }
             Ok(json!({}))
         }
         "getTargets" => {
-            let targets: Vec<Value> = ctx
-                .pages
-                .iter()
-                .map(|page| {
-                    json!({
-                        "targetId": page.id,
-                        "type": "page",
-                        "title": page.title,
-                        "url": page.url_string(),
-                        "attached": true,
-                        "canAccessOpener": false,
-                        "browserContextId": page.context.id,
-                    })
-                })
-                .collect();
+            let targets = ctx.pages.iter().filter(|page| !page.window_info().closed)
+                .map(|page| ctx.page_target_info(page)).collect::<Vec<_>>();
             Ok(json!({ "targetInfos": targets }))
         }
         "createTarget" => {
@@ -108,22 +85,11 @@ pub async fn handle(
             }
 
             ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.target_session_parents.insert(session_id.clone(), parent_session_id.clone());
 
             if let Some(page) = ctx.get_page(&page_id) {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.targetCreated",
-                    json!({
-                        "targetInfo": {
-                            "targetId": page_id,
-                            "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": false,
-                            "canAccessOpener": false,
-                            "browserContextId": page.context.id,
-                        }
-                    }),
-                ));
+                let info = ctx.page_target_info(page);
+                ctx.pending_events.push(CdpEvent::new("Target.targetCreated", json!({"targetInfo": info})));
             }
 
             if let Some(page) = ctx.get_page(&page_id) {
@@ -131,15 +97,7 @@ pub async fn handle(
                     "Target.attachedToTarget",
                     json!({
                         "sessionId": session_id,
-                        "targetInfo": {
-                            "targetId": page_id,
-                            "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": true,
-                            "canAccessOpener": false,
-                            "browserContextId": page.context.id,
-                        },
+                        "targetInfo": ctx.page_target_info(page),
                         "waitingForDebugger": false,
                     }),
                 ));
@@ -185,19 +143,12 @@ pub async fn handle(
             let session_id = ctx.next_target_session(target_id);
             ctx.sessions
                 .insert(session_id.clone(), target_id.to_string());
+            ctx.target_session_parents.insert(session_id.clone(), parent_session_id.clone());
 
             if let Some(page) = ctx.get_page(target_id) {
                 let params = json!({
                     "sessionId": session_id,
-                    "targetInfo": {
-                        "targetId": target_id,
-                        "type": "page",
-                        "title": page.title,
-                        "url": page.url_string(),
-                        "attached": true,
-                        "canAccessOpener": false,
-                        "browserContextId": page.context.id,
-                    },
+                    "targetInfo": ctx.page_target_info(page),
                     "waitingForDebugger": false,
                 });
                 let event = match parent_session_id {
@@ -218,32 +169,35 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let mut sessions = ctx.sessions.iter()
-                .filter(|(_, page_id)| page_id.as_str() == target_id)
-                .map(|(session_id, _)| session_id.clone())
-                .collect::<Vec<_>>();
-            sessions.sort_unstable();
-            for session_id in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetId": target_id,
-                    }),
-                ));
-            }
-            ctx.pending_events.push(CdpEvent::new(
-                "Target.targetDestroyed",
-                json!({ "targetId": target_id }),
-            ));
-
-            ctx.remove_page(target_id);
+            let Some(page) = ctx.get_page_mut(target_id) else {
+                return Ok(json!({"success": false}));
+            };
+            page.close_window();
+            ctx.sync_native_windows();
             Ok(json!({ "success": true }))
         }
-        "setAutoAttach" => Ok(json!({})),
+        "setAutoAttach" => {
+            if params.get("autoAttach").and_then(Value::as_bool) == Some(true)
+                && params.get("waitForDebuggerOnStart").and_then(Value::as_bool) == Some(true)
+            {
+                return Err("Target.setAutoAttach waitForDebuggerOnStart is not supported".to_string());
+            }
+            if params.get("autoAttach").and_then(Value::as_bool).unwrap_or(false) {
+                ctx.target_auto_attach_sessions.insert(parent_session_id.clone());
+                let targets = ctx.pages.iter().filter(|page| page.window_info().created_by_script)
+                    .map(|page| page.id.clone()).collect::<Vec<_>>();
+                for target in targets { ctx.auto_attach_native_target(&target); }
+            } else {
+                ctx.target_auto_attach_sessions.remove(parent_session_id);
+            }
+            Ok(json!({}))
+        }
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 let page_id = ctx.sessions.remove(session_id);
+                ctx.target_session_parents.remove(session_id);
+                ctx.target_discovery_sessions.remove(&Some(session_id.to_string()));
+                ctx.target_auto_attach_sessions.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
@@ -275,28 +229,16 @@ pub async fn handle(
                 .get("browserContextId")
                 .and_then(|v| v.as_str())
                 .ok_or("browserContextId required")?;
-            let sessions: Vec<(String, String)> = ctx
-                .sessions
-                .iter()
-                .filter_map(|(session_id, page_id)| {
-                    ctx.get_page(page_id)
-                        .filter(|page| page.context.id == context_id)
-                        .map(|_| (session_id.clone(), page_id.clone()))
-                })
-                .collect();
-            let page_ids = ctx.dispose_browser_context(context_id)?;
-            for (session_id, page_id) in sessions {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.detachedFromTarget",
-                    json!({ "sessionId": session_id, "targetId": page_id }),
-                ));
+            let page_ids = ctx.pages.iter().filter(|page| page.context.id == context_id)
+                .map(|page| page.id.clone()).collect::<Vec<_>>();
+            if context_id == ctx.default_context.id {
+                return Err("The default browser context cannot be disposed".to_string());
             }
-            for page_id in page_ids {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.targetDestroyed",
-                    json!({ "targetId": page_id }),
-                ));
+            if ctx.browser_context(context_id).is_none() {
+                return Err(format!("Browser context not found: {context_id}"));
             }
+            for page_id in &page_ids { ctx.emit_target_destroyed(page_id); }
+            ctx.dispose_browser_context(context_id)?;
             Ok(json!({}))
         }
         "getTargetInfo" => {
@@ -304,17 +246,7 @@ pub async fn handle(
             match target_id {
                 Some(id) => {
                     let page = ctx.get_page(id).ok_or("Target not found")?;
-                    Ok(json!({
-                        "targetInfo": {
-                            "targetId": id,
-                            "type": "page",
-                            "title": page.title,
-                            "url": page.url_string(),
-                            "attached": true,
-                            "canAccessOpener": false,
-                            "browserContextId": page.context.id,
-                        }
-                    }))
+                    Ok(json!({"targetInfo": ctx.page_target_info(page)}))
                 }
                 None => {
                     // canAccessOpener is required on every TargetInfo per the
