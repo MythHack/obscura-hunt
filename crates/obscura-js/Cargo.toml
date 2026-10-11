@@ -40,6 +40,8 @@ html5ever = { workspace = true }
 # deno_core 0.412.0 pins deno_error (and its derive macro) to 0.7.1.
 deno_error = "=0.7.1"
 base64 = { workspace = true }
+# Fetch-standard data URL parsing and streaming, bounded byte decoding.
+data-url = "0.3.2"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,

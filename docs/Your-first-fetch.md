@@ -27,16 +27,14 @@ obscura fetch https://news.ycombinator.com \
 
 ## Multi-statement eval
 
-`--eval` evaluates one expression. For multiple statements, wrap in an IIFE:
+`--eval` accepts JavaScript Script statements and expressions and returns the final completion value:
 
 ```bash
-obscura fetch https://example.com --eval "(function(){
-  const links = document.querySelectorAll('a');
-  return Array.from(links).map(a => a.href);
-})()"
+obscura fetch https://example.com --eval "const links = document.querySelectorAll('a');
+  Array.from(links).map(a => a.href)"
 ```
 
-A bare block starting with `const` or `let` returns `null` because V8 gives top-level declarations an empty completion value.
+A declaration-only script has an empty completion value, returned as `null`. An IIFE is optional when you want an explicit return scope: `(function(){ ...; return result; })()`.
 
 ## Wait for the right moment
 
@@ -54,6 +52,21 @@ obscura fetch https://my-spa.example --wait-until domcontentloaded --eval "docum
 | `networkidle0`     | 0 network connections active for 500ms        |
 
 (When driving obscura via Puppeteer or Playwright the default is `domcontentloaded` to match client expectations.)
+
+## Scripted `fetch()`
+
+Page JavaScript uses the current document's native origin for `fetch()` and
+XHR. `mode: 'same-origin'` rejects cross-origin network URLs before a request
+is sent, including interception URL rewrites and every redirect. This applies
+to both the regular and stealth transports; an isolated CDP world's universal
+DOM access does not disable request-mode or private-network protection.
+
+`data:` URLs are decoded locally into a 200 response with their content type
+and exact body bytes. They also work with `mode: 'same-origin'`; fragments are
+excluded from the response URL and body. Decoding observes
+`OBSCURA_FETCH_MAX_BODY_BYTES`. Other non-HTTP schemes are not accepted by
+scripted fetch. Network and policy failures reject with `TypeError`, while an
+aborted signal retains its abort reason (`AbortError` by default).
 
 ## Common flags
 

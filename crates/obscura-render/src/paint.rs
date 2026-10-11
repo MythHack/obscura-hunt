@@ -84,6 +84,7 @@ enum CachedResource {
         bytes: Arc<[u8]>,
         intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
         static_raster: std::sync::OnceLock<bool>,
+        decoded_font: Option<Arc<Vec<u8>>>,
     },
     Missing(std::time::Instant),
 }
@@ -608,6 +609,7 @@ impl RenderResourceCache {
             bytes,
             intrinsic: std::sync::OnceLock::new(),
             static_raster: std::sync::OnceLock::new(),
+            decoded_font: None,
         });
     }
 
@@ -634,8 +636,9 @@ impl RenderResourceCache {
     }
 
     fn remove_entry(&mut self, url: &str) {
-        if let Some(CachedResource::Bytes { bytes, .. }) = self.entries.remove(url) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len());
+        if let Some(CachedResource::Bytes { bytes, decoded_font, .. }) = self.entries.remove(url) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len()
+                + decoded_font.as_ref().map_or(0, |font| font.len()));
         }
         self.raster_paints.retain(|entry| {
             if entry.resource_key == url {
@@ -1458,6 +1461,61 @@ impl PreparedRender {
         )
     }
 
+    /// Camera/viewport-clipped border-plane polygon in viewport CSS pixels.
+    /// Retained border boxes use zoomed layout units. Overflow and clip-path
+    /// masks are additionally checked by viewport_to_local at the actual point.
+    pub fn viewport_polygon(&self, tree: &DomTree, id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState) -> Option<crate::ProjectedPolygon> {
+        if crate::dom::backface_culled(tree,&self.layout,id,self.root_font_size,self.viewport) { return None; }
+        let rect = *self.layout.rects.get(&id)?;
+        let movement = scroll.movement_for(id);
+        let transform = crate::VisualTransform::translate(movement.0,movement.1)
+            .then(self.layout.transforms.get(&id).copied().unwrap_or_default());
+        transform.inverse()?;
+        transform.project_rect(rect,Some(crate::Rect { x:0.,y:0.,width:self.viewport.0,height:self.viewport.1 }))
+    }
+
+    /// Invert a viewport CSS-pixel point to untransformed border-box-local
+    /// used layout coordinates (including zoom). Includes scrolling and all
+    /// ancestor transforms; camera/backface/singular/clip rejection returns None.
+    pub fn viewport_to_local(&self, tree: &DomTree, id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState, x:f32,y:f32) -> Option<(f32,f32)> {
+        if !self.viewport_polygon(tree,id,scroll)?.contains(x,y) { return None; }
+        if !point_in_visual_clips(tree,&self.layout,scroll,id,x,y) { return None; }
+        let movement = scroll.movement_for(id);
+        let local = self.layout.transforms.get(&id).copied().unwrap_or_default()
+            .inverse()?.map_point(x-movement.0,y-movement.1)?;
+        let rect = self.layout.rects.get(&id)?;
+        Some((local.0-rect.x,local.1-rect.y))
+    }
+
+    /// Project an exact border-box-local point in used layout units (including
+    /// zoom), without substituting the transformed box's axis-aligned bounds.
+    /// Off-viewport corners remain available to CSSOM/CDP; points behind the
+    /// camera, singular planes and hidden backfaces do not.
+    pub fn local_to_viewport(&self, tree: &DomTree, id: obscura_dom::tree::NodeId,
+        scroll: &ResolvedScrollState, x: f32, y: f32) -> Option<(f32, f32)> {
+        if crate::dom::backface_culled(tree, &self.layout, id, self.root_font_size, self.viewport) {
+            return None;
+        }
+        let rect = self.layout.rects.get(&id)?;
+        let transform = self.layout.transforms.get(&id).copied().unwrap_or_default();
+        transform.inverse()?;
+        let movement = scroll.movement_for(id);
+        let point = match transform {
+            crate::VisualTransform::Affine(matrix) => matrix.map_point(rect.x + x, rect.y + y),
+            crate::VisualTransform::Projective(matrix) => {
+                let point = matrix.homogeneous(rect.x + x, rect.y + y);
+                if point.iter().any(|value| !value.is_finite()) || point[3] < 1.0e-5 {
+                    return None;
+                }
+                ((point[0] / point[3]) as f32, (point[1] / point[3]) as f32)
+            }
+        };
+        let point = (point.0 + movement.0, point.1 + movement.1);
+        (point.0.is_finite() && point.1.is_finite()).then_some(point)
+    }
+
     /// Unscaled padding-box size used by CSSOM View's `clientWidth` and
     /// `clientHeight`. Layout rects are border boxes, so remove the resolved
     /// borders but retain padding. This deliberately ignores visual
@@ -1507,52 +1565,6 @@ impl PreparedRender {
         x: f32,
         y: f32,
     ) -> Option<obscura_dom::tree::NodeId> {
-        fn stacking_path(
-            tree: &DomTree,
-            laid: &crate::DomLayout,
-            id: obscura_dom::tree::NodeId,
-        ) -> Vec<i32> {
-            // Stacking contexts are inherited through the DOM ancestor chain.
-            // The rendered-parent helper deliberately skips some framework
-            // wrapper boxes; using it here can detach a control from a fixed
-            // ancestor's context and make the ancestor win its own hit test.
-            let mut ancestors = tree.ancestors(id);
-            ancestors.insert(0, id);
-            ancestors.reverse();
-            ancestors
-                .into_iter()
-                .filter_map(|node| stacking_z_index(tree, laid, node))
-                .collect()
-        }
-
-        fn compare_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
-            use std::cmp::Ordering;
-            let common = a.len().min(b.len());
-            for index in 0..common {
-                let order = a[index].cmp(&b[index]);
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            if a.len() == b.len() {
-                return Ordering::Equal;
-            }
-            // Ending the path means normal-flow content in this stacking
-            // context: it paints after a negative child context and before a
-            // zero-or-positive child context.
-            if a.len() == common {
-                if b[common] < 0 {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            } else if a[common] < 0 {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-
         if !x.is_finite()
             || !y.is_finite()
             || x < 0.0
@@ -1562,16 +1574,6 @@ impl PreparedRender {
         {
             return None;
         }
-        let point = crate::Rect {
-            x,
-            y,
-            // `f32::EPSILON` is smaller than one ULP at ordinary viewport
-            // coordinates, so x + width can round back to x and appear empty
-            // to `intersect_rect`. A sub-pixel probe remains point-like while
-            // retaining a representable extent across the supported viewport.
-            width: 0.001,
-            height: 0.001,
-        };
         let mut best: Option<(Vec<i32>, bool, usize, usize, obscura_dom::tree::NodeId)> = None;
         for (order, id) in crate::dom::rendered_descendants(tree, tree.document())
             .into_iter()
@@ -1593,18 +1595,15 @@ impl PreparedRender {
             if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
                 continue;
             }
-            if scroll
-                .inherited_clip_for(id)
-                .is_some_and(|clip| clip.intersect_rect(&point).is_none())
-            {
-                continue;
-            }
+            if self.viewport_to_local(tree,id,scroll,x,y).is_none() { continue; }
             let path = stacking_path(tree, &self.layout, id);
             let positioned = style.position.is_some() || style.position_fixed || style.position_sticky;
             let depth = tree.ancestors(id).len();
             let replace = best
                 .as_ref()
                 .is_none_or(|(best_path, best_positioned, best_depth, best_order, best_id)| {
+                    let visual_depth = compare_preserve_depth(tree, &self.layout, scroll, id, *best_id, x, y);
+                    if visual_depth != std::cmp::Ordering::Equal { return visual_depth.is_gt(); }
                     let stacking = compare_stacking_paths(&path, best_path);
                     if stacking != std::cmp::Ordering::Equal {
                         return stacking.is_gt();
@@ -1644,7 +1643,7 @@ impl PreparedRender {
             let movement = scroll.movement_for(parent);
             let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
             let Some(inverse) = transform.inverse() else { continue; };
-            let (local_x, local_y) = inverse.map_point(x - movement.0, y - movement.1);
+            let Some((local_x, local_y)) = inverse.map_point(x - movement.0, y - movement.1) else { continue; };
             let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
                 .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
             let best = indices.filter_map(|index|
@@ -1675,8 +1674,11 @@ impl PreparedRender {
             for index in indices {
                 let Some(rect) = self.layout.text_engine.caret_rect(index, parent,
                     tree, &self.layout.styles, node, offset) else { continue; };
-                let mut rect = self.layout.transforms.get(&parent).copied()
-                    .unwrap_or_default().map_rect(rect);
+                if crate::dom::backface_culled(tree, &self.layout, parent, self.root_font_size, self.viewport) { continue; }
+                let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
+                if transform.inverse().is_none() { continue; }
+                let Some(polygon) = transform.project_rect(rect, None) else { continue; };
+                let mut rect = polygon.bounds();
                 let movement = scroll.movement_for(parent);
                 rect.x += movement.0;
                 rect.y += movement.1;
@@ -1979,6 +1981,11 @@ impl PreparedRender {
             transform_css(style, rect, self.root_font_size, self.viewport),
         );
         out.insert("transform-origin", transform_origin_css(style, rect));
+        let (px,py) = style.perspective_origin.unwrap_or((crate::Dimension::Percent(0.5),crate::Dimension::Percent(0.5)));
+        out.insert("perspective-origin",format!("{} {}",origin_component_css(px,rect.map(|r| r.width),zoom),
+            origin_component_css(py,rect.map(|r| r.height),zoom)));
+        out.insert("transform-style",if style.preserve_3d { "preserve-3d" } else { "flat" }.to_string());
+        out.insert("backface-visibility",if style.backface_hidden { "hidden" } else { "visible" }.to_string());
         out.insert(
             "translate",
             style.individual_translate.map_or_else(
@@ -2291,7 +2298,7 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
     out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
     out.insert("zoom", css_number(style.zoom.unwrap_or(1.0)));
     out.insert("perspective", style.perspective.map_or_else(
-        || "none".to_string(), |length| dimension_css(length, "none"),
+        || "none".to_string(), |length| dimension_css(unzoom_dimension(length, style.used_zoom()), "none"),
     ));
     out.insert(
         "background-color",
@@ -2467,15 +2474,16 @@ fn transform_css(
         root_font_size,
         viewport,
     );
-    format!(
-        "matrix({}, {}, {}, {}, {}, {})",
-        css_number(matrix.a),
-        css_number(matrix.b),
-        css_number(matrix.c),
-        css_number(matrix.d),
-        css_number(matrix.e / style.used_zoom()),
-        css_number(matrix.f / style.used_zoom()),
-    )
+    if let Some(matrix) = matrix.affine() {
+        format!("matrix({}, {}, {}, {}, {}, {})", css_number(matrix.a), css_number(matrix.b),
+            css_number(matrix.c), css_number(matrix.d), css_number(matrix.e / style.used_zoom()),
+            css_number(matrix.f / style.used_zoom()))
+    } else {
+        let mut matrix = matrix.matrix().0;
+        for i in [12,13,14] { matrix[i] /= style.used_zoom(); }
+        for i in [3,7,11] { matrix[i] *= style.used_zoom(); }
+        format!("matrix3d({})", matrix.iter().map(|v| css_number(*v)).collect::<Vec<_>>().join(", "))
+    }
 }
 
 fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) -> String {
@@ -2488,7 +2496,18 @@ fn transform_origin_css(style: &crate::LayoutStyle, rect: Option<&crate::Rect>) 
         other => dimension_css(unzoom_dimension(other, style.used_zoom()), "0px"),
     };
     let (width, height) = rect.map_or((0.0, 0.0), |rect| (rect.width, rect.height));
-    format!("{} {}", resolve(x, width), resolve(y, height))
+    let origin = format!("{} {}", resolve(x, width), resolve(y, height));
+    match style.transform_origin_z {
+        Some(crate::Dimension::Px(z)) if z != 0. => format!("{origin} {}", css_px(z / style.used_zoom())),
+        _ => origin,
+    }
+}
+
+fn origin_component_css(value: crate::Dimension, axis: Option<f32>, zoom:f32) -> String {
+    match value {
+        crate::Dimension::Percent(p) => css_px(p * axis.unwrap_or(0.) / zoom),
+        v => dimension_css(unzoom_dimension(v,zoom),"0px"),
+    }
 }
 
 /// Render `tree` at `viewport` (width, height) in CSS pixels to a Pixmap, or
@@ -3239,6 +3258,7 @@ fn paint_prepared_with_surface_color(
         1.0,
         false,
         canvas_background,
+        None,
     )
 }
 
@@ -3328,6 +3348,7 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
         1.0,
         false,
         canvas_background,
+        None,
     )
 }
 
@@ -3483,6 +3504,7 @@ fn paint_prepared_region_with_scroll_policy(
         raster_scale,
         print_economy,
         canvas_background,
+        None,
     )
     .ok_or(CaptureError::PaintFailed)?;
 
@@ -3630,6 +3652,31 @@ fn stacking_z_index(
     None
 }
 
+fn stacking_path(tree: &DomTree, laid: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId) -> Vec<i32> {
+    // Stacking contexts follow DOM ancestry even when a rendered wrapper's
+    // box is skipped. Paint and pointer ties must use the same context chain.
+    let mut ancestors = tree.ancestors(id);
+    ancestors.insert(0, id);
+    ancestors.reverse();
+    ancestors.into_iter().filter_map(|node| stacking_z_index(tree, laid, node)).collect()
+}
+
+fn compare_stacking_paths(a: &[i32], b: &[i32]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let common = a.len().min(b.len());
+    for index in 0..common {
+        let order = a[index].cmp(&b[index]);
+        if order != Ordering::Equal { return order; }
+    }
+    if a.len() == b.len() { return Ordering::Equal; }
+    // Normal-flow content follows negative child contexts and precedes
+    // zero-or-positive child contexts.
+    if a.len() == common {
+        if b[common] < 0 { Ordering::Greater } else { Ordering::Less }
+    } else if a[common] < 0 { Ordering::Less } else { Ordering::Greater }
+}
+
 /// Whether this box participates in the float painting band of its current
 /// stacking context. A retained `float` declaration has no effect on an
 /// absolutely positioned box or on a flex/grid item, matching layout's
@@ -3674,6 +3721,266 @@ fn has_authored_transform(style: &crate::LayoutStyle) -> bool {
         || style.individual_scale.is_some()
 }
 
+fn has_visual_transform(tree:&DomTree, laid:&crate::DomLayout, id:obscura_dom::tree::NodeId) -> bool {
+    laid.styles.get(&id).is_some_and(|s| !s.ignores_used_box_sizes()
+        && (has_authored_transform(s) || crate::dom::preserves_3d(s)))
+        || crate::dom::rendered_parent(tree,id).and_then(|p| laid.styles.get(&p))
+            .is_some_and(|s| s.perspective.is_some())
+}
+
+fn preserve_context_plane(tree: &DomTree, laid: &crate::DomLayout,
+    id: obscura_dom::tree::NodeId) -> Option<(obscura_dom::tree::NodeId, obscura_dom::tree::NodeId)> {
+    let mut plane = id;
+    let mut current = Some(id);
+    while let Some(node) = current {
+        if laid.styles.get(&node).is_some_and(crate::dom::preserves_3d) {
+            let mut root = node;
+            while let Some(parent) = crate::dom::rendered_parent(tree, root) {
+                if !laid.styles.get(&parent).is_some_and(crate::dom::preserves_3d) { break; }
+                root = parent;
+            }
+            return Some((root, plane));
+        }
+        plane = node;
+        current = crate::dom::rendered_parent(tree, node);
+    }
+    None
+}
+
+fn plane_depth_at(transform: crate::VisualTransform, inverse: crate::PlaneInverse,
+    x: f32, y: f32) -> Option<f64> {
+    let (x, y) = inverse.map_point(x, y)?;
+    let point = transform.matrix().homogeneous(x, y);
+    (point[3] >= 1.0e-5 && point.iter().all(|v| v.is_finite()))
+        .then_some(point[2] / point[3])
+}
+
+fn compare_preserve_depth(tree: &DomTree, laid: &crate::DomLayout, scroll: &ResolvedScrollState,
+    a: obscura_dom::tree::NodeId, b: obscura_dom::tree::NodeId, x: f32, y: f32) -> std::cmp::Ordering {
+    let (Some((context_a, plane_a)), Some((context_b, plane_b))) =
+        (preserve_context_plane(tree, laid, a), preserve_context_plane(tree, laid, b)) else {
+        return std::cmp::Ordering::Equal;
+    };
+    if context_a != context_b || plane_a == plane_b { return std::cmp::Ordering::Equal; }
+    let depth = |node| {
+        let movement = scroll.movement_for(node);
+        let transform = laid.transforms.get(&node).copied().unwrap_or_default();
+        plane_depth_at(transform, transform.inverse()?, x - movement.0, y - movement.1)
+    };
+    match (depth(plane_a), depth(plane_b)) {
+        (Some(a), Some(b)) if (a - b).abs() > 1.0e-5 => a.total_cmp(&b),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+/// A preserve-3d context consists of individual border planes; a flat/grouped
+/// child owns one complete subtree surface and ends accumulation of depth.
+fn preserve_context_planes(tree: &DomTree, laid: &crate::DomLayout,
+    root: obscura_dom::tree::NodeId, root_font_size: f32, viewport: (f32, f32))
+    -> Vec<(obscura_dom::tree::NodeId, crate::VisualTransform, Vec<i32>)> {
+    let mut planes = Vec::new();
+    let mut pending = vec![(root, crate::dom::local_visual_transform(tree, laid, root, root_font_size, viewport))];
+    while let Some((node, transform)) = pending.pop() {
+        let Some(style) = laid.styles.get(&node) else { continue; };
+        if style.display == crate::Display::None { continue; }
+        if !style.display_contents { planes.push((node, transform, Vec::new())); }
+        if !style.display_contents && !crate::dom::preserves_3d(style) { continue; }
+        let camera = laid.rects.get(&node).map_or(crate::VisualTransform::IDENTITY,
+            |rect| crate::dom::resolved_perspective_matrix(style, rect));
+        for child in crate::dom::rendered_children(tree, node).into_iter().rev() {
+            if !tree.get_node(child).is_some_and(|node| node.is_element()) { continue; }
+            let Some(child_style) = laid.styles.get(&child) else { continue; };
+            let rect = laid.rects.get(&child).copied().unwrap_or_default();
+            let own = if child_style.ignores_used_box_sizes() { crate::VisualTransform::IDENTITY }
+                else { crate::dom::resolved_transform_matrix(child_style, &rect, root_font_size, viewport) };
+            pending.push((child, transform.then(camera).then(own)));
+        }
+    }
+    // Depth wins at each sample; coplanar samples retain CSS paint order.
+    // Affine-only contexts stay on their existing direct composition path.
+    if planes.iter().any(|(_, matrix, _)| matrix.affine().is_none()) {
+        for (node, _, path) in &mut planes { *path = stacking_path(tree, laid, *node); }
+        planes.sort_by(|a, b| compare_stacking_paths(&a.2, &b.2));
+    }
+    planes
+}
+
+fn retain_plane_nodes(tree: &DomTree, nodes: &mut Vec<obscura_dom::tree::NodeId>,
+    root: Option<obscura_dom::tree::NodeId>, excluded: &std::collections::HashSet<obscura_dom::tree::NodeId>) {
+    let mut skip = std::collections::HashSet::new();
+    nodes.retain(|&node| {
+        let excluded = Some(node) != root && (excluded.contains(&node)
+            || crate::dom::rendered_parent(tree, node).is_some_and(|parent| skip.contains(&parent)));
+        if excluded { skip.insert(node); }
+        !excluded
+    });
+}
+
+fn projected_source_bounds(transform:crate::VisualTransform, source:crate::Rect, target:crate::Rect) -> Option<crate::Rect> {
+    if let Some(a) = transform.affine() { return source.intersect(&a.inverse()?.map_rect(target)); }
+    let inverse = transform.inverse()?;
+    let polygon = transform.project_rect(source,Some(target))?;
+    let mut bounds:Option<crate::Rect> = None;
+    for &(x,y) in polygon.points() {
+        let (x,y) = inverse.map_point(x,y)?;
+        let p=crate::Rect { x,y,width:0.,height:0. };
+        bounds=Some(bounds.map_or(p,|b| b.union(&p)));
+    }
+    bounds.and_then(|b| source.intersect(&crate::Rect { x:b.x-1.,y:b.y-1.,width:b.width+2.,height:b.height+2. }))
+}
+
+fn sample_premultiplied(source:&Pixmap, x:f32,y:f32) -> [f32;4] {
+    let x=x-0.5; let y=y-0.5;
+    let ix=x.floor() as i32; let iy=y.floor() as i32;
+    let fx=x-x.floor(); let fy=y-y.floor();
+    let mut out=[0.;4];
+    for (dx,wx) in [(0,1.-fx),(1,fx)] {
+        for (dy,wy) in [(0,1.-fy),(1,fy)] {
+            let (px,py)=(ix+dx,iy+dy);
+            if px < 0 || py < 0 || px >= source.width() as i32 || py >= source.height() as i32 { continue; }
+            let offset=(py as usize * source.width() as usize + px as usize)*4;
+            for c in 0..4 { out[c]+=f32::from(source.data()[offset+c]) * wx*wy/255.; }
+        }
+    }
+    out
+}
+
+fn source_over_pixel(destination:&mut [u8], color:[f32;4]) {
+    let inverse=1.-color[3].clamp(0.,1.);
+    for c in 0..4 {
+        destination[c]=(color[c]*255.+f32::from(destination[c])*inverse).round().clamp(0.,255.) as u8;
+    }
+    // Rounding must retain tiny-skia's premultiplied-alpha invariant.
+    for c in 0..3 { destination[c]=destination[c].min(destination[3]); }
+}
+
+fn composite_projected_plane(destination:&mut Pixmap, source:&Pixmap, transform:crate::VisualTransform,
+    source_scale:f32, destination_scale:f32, mask:Option<&tiny_skia::Mask>) {
+    let Some(inverse)=transform.inverse() else { return; };
+    let target=crate::Rect { x:0.,y:0.,width:destination.width() as f32/destination_scale,
+        height:destination.height() as f32/destination_scale };
+    let source_rect=crate::Rect { x:0.,y:0.,width:source.width() as f32/source_scale,height:source.height() as f32/source_scale };
+    let Some(polygon)=transform.project_rect(source_rect,Some(target)) else { return; };
+    let bounds=polygon.bounds();
+    let width=destination.width() as usize;
+    let (x0,y0)=((bounds.x*destination_scale).floor().max(0.) as usize,(bounds.y*destination_scale).floor().max(0.) as usize);
+    let (x1,y1)=(((bounds.x+bounds.width)*destination_scale).ceil().min(destination.width() as f32) as usize,
+        ((bounds.y+bounds.height)*destination_scale).ceil().min(destination.height() as f32) as usize);
+    for y in y0..y1 { for x in x0..x1 {
+        let index=y*width+x;
+        let coverage=mask.map_or(1.,|m| f32::from(m.data()[index])/255.);
+        if coverage == 0. { continue; }
+        let mut color=[0.;4];
+        for (dx,dy) in [(0.25,0.25),(0.75,0.25),(0.25,0.75),(0.75,0.75)] {
+            let (sx,sy)=((x as f32+dx)/destination_scale,(y as f32+dy)/destination_scale);
+            if !polygon.contains(sx,sy) { continue; }
+            let Some((lx,ly))=inverse.map_point(sx,sy) else { continue; };
+            let sampled=sample_premultiplied(source,lx*source_scale,ly*source_scale);
+            for c in 0..4 { color[c]+=sampled[c]*0.25*coverage; }
+        }
+        if color[3] > 0. { source_over_pixel(&mut destination.data_mut()[index*4..index*4+4],color); }
+    }}
+}
+
+struct ProjectivePaintPlane {
+    source: Pixmap,
+    transform: crate::VisualTransform,
+    inverse: crate::PlaneInverse,
+    polygon: crate::ProjectedPolygon,
+    source_scale: f32,
+}
+
+/// Resolve coverage and depth at the same subpixel position. Sorting one
+/// reusable scratch list handles intersecting translucent planes, unlike a
+/// centre-depth painter sort or a nearest-only opaque z buffer.
+fn composite_preserved_planes(destination: &mut Pixmap, planes: &[ProjectivePaintPlane],
+    destination_scale: f32, mask: Option<&tiny_skia::Mask>) {
+    let Some(bounds) = planes.iter().map(|plane| plane.polygon.bounds()).reduce(|a, b| a.union(&b)) else { return; };
+    let width = destination.width() as usize;
+    let x0 = (bounds.x * destination_scale).floor().max(0.) as usize;
+    let y0 = (bounds.y * destination_scale).floor().max(0.) as usize;
+    let x1 = ((bounds.x + bounds.width) * destination_scale).ceil().min(destination.width() as f32) as usize;
+    let y1 = ((bounds.y + bounds.height) * destination_scale).ceil().min(destination.height() as f32) as usize;
+    let mut samples = Vec::with_capacity(planes.len());
+    for y in y0..y1 { for x in x0..x1 {
+        let index = y * width + x;
+        let coverage = mask.map_or(1., |mask| f32::from(mask.data()[index]) / 255.);
+        if coverage == 0. { continue; }
+        let mut color = [0.; 4];
+        for (dx, dy) in [(0.25,0.25), (0.75,0.25), (0.25,0.75), (0.75,0.75)] {
+            let (sx, sy) = ((x as f32 + dx) / destination_scale, (y as f32 + dy) / destination_scale);
+            samples.clear();
+            for (order, plane) in planes.iter().enumerate() {
+                if !plane.polygon.contains(sx, sy) { continue; }
+                let Some((lx, ly)) = plane.inverse.map_point(sx, sy) else { continue; };
+                let point = plane.transform.matrix().homogeneous(lx, ly);
+                if point[3] < 1.0e-5 || point.iter().any(|value| !value.is_finite()) { continue; }
+                let sampled = sample_premultiplied(&plane.source, lx * plane.source_scale, ly * plane.source_scale);
+                if sampled[3] > 0. { samples.push((point[2] / point[3], order, sampled)); }
+            }
+            samples.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut sample = [0.; 4];
+            for &(_, _, incoming) in &samples {
+                for channel in 0..4 { sample[channel] = incoming[channel] + sample[channel] * (1. - incoming[3]); }
+            }
+            for channel in 0..4 { color[channel] += sample[channel] * 0.25 * coverage; }
+        }
+        if color[3] > 0. { source_over_pixel(&mut destination.data_mut()[index * 4..index * 4 + 4], color); }
+    }}
+}
+
+fn point_in_local_masks(rect:&crate::Rect, style:&crate::LayoutStyle, x:f32,y:f32, overflow:bool) -> bool {
+    if overflow && style.overflow_hidden && !style.overflow_propagated_to_viewport {
+        let (left,top)=(rect.x+style.border.left,rect.y+style.border.top);
+        let (right,bottom)=(rect.x+rect.width-style.border.right,rect.y+rect.height-style.border.bottom);
+        if style.clips_overflow_x() && (x < left || x >= right) { return false; }
+        if style.clips_overflow_y() && (y < top || y >= bottom) { return false; }
+        if style.clips_overflow_x() && style.clips_overflow_y() {
+            let r=style.border_model.radii.resolve(rect.width,rect.height).inset(crate::Sides {
+                left:style.border.left,top:style.border.top,right:style.border.right,bottom:style.border.bottom });
+            for ((rx,ry),cx,cy,inside) in [(r.top_left,left+r.top_left.0,top+r.top_left.1,x<left+r.top_left.0&&y<top+r.top_left.1),
+                (r.top_right,right-r.top_right.0,top+r.top_right.1,x>right-r.top_right.0&&y<top+r.top_right.1),
+                (r.bottom_right,right-r.bottom_right.0,bottom-r.bottom_right.1,x>right-r.bottom_right.0&&y>bottom-r.bottom_right.1),
+                (r.bottom_left,left+r.bottom_left.0,bottom-r.bottom_left.1,x<left+r.bottom_left.0&&y>bottom-r.bottom_left.1)] {
+                if inside && rx > 0. && ry > 0. && ((x-cx)/rx).powi(2)+((y-cy)/ry).powi(2) > 1. { return false; }
+            }
+        }
+    }
+    if let Some(polygon)=&style.clip_path {
+        if polygon.points.len()<3 { return false; }
+        let point=|i:usize| { let (px,py)=polygon.points[i];
+            (rect.x+crate::dom::resolve_translate(px,rect.width),rect.y+crate::dom::resolve_translate(py,rect.height)) };
+        let mut winding=0_i32;
+        for i in 0..polygon.points.len() {
+            let a=point(i); let b=point((i+1)%polygon.points.len());
+            let cross=(b.0-a.0)*(y-a.1)-(b.1-a.1)*(x-a.0);
+            if a.1<=y && b.1>y && cross>0. { winding+=1; }
+            if a.1>y && b.1<=y && cross<0. { winding-=1; }
+        }
+        return match polygon.fill_rule { crate::ClipPathFillRule::Nonzero => winding!=0,
+            crate::ClipPathFillRule::Evenodd => winding.abs()%2==1 };
+    }
+    true
+}
+
+fn point_in_visual_clips(tree:&DomTree, laid:&crate::DomLayout, scroll:&ResolvedScrollState,
+    id:obscura_dom::tree::NodeId,x:f32,y:f32) -> bool {
+    let mut owner=Some(id);
+    while let Some(node)=owner {
+        if let (Some(style),Some(rect))=(laid.styles.get(&node),laid.rects.get(&node)) {
+            if style.clip_path.is_some() || (node!=id && style.overflow_hidden && !style.overflow_propagated_to_viewport) {
+                let movement=scroll.movement_for(node);
+                let transform=laid.transforms.get(&node).copied().unwrap_or_default();
+                let Some(local)=transform.inverse().and_then(|i| i.map_point(x-movement.0,y-movement.1)) else { return false; };
+                let homogeneous=transform.matrix().homogeneous(local.0,local.1);
+                if homogeneous[3]<1.0e-5 || !point_in_local_masks(rect,style,local.0,local.1,node!=id) { return false; }
+            }
+        }
+        owner=crate::dom::rendered_parent(tree,node);
+    }
+    true
+}
+
 /// Untransformed source bounds for one atomic transform layer, expressed in
 /// the parent surface's coordinates. Keeping this tight both preserves source
 /// pixels that begin outside the viewport and avoids a viewport-sized surface
@@ -3683,30 +3990,56 @@ fn transform_subtree_source_bounds(
     laid: &crate::DomLayout,
     scroll_state: &ScrollPaintState<'_>,
     root: obscura_dom::tree::NodeId,
+    excluded_planes: Option<&std::collections::HashSet<obscura_dom::tree::NodeId>>,
 ) -> Option<crate::Rect> {
     let mut bounds: Option<crate::Rect> = None;
-    for id in std::iter::once(root).chain(crate::dom::rendered_descendants(tree, root)) {
-        let Some(rect) = laid.rects.get(&id) else {
-            continue;
+    let root_offset = scroll_state.translation_for(laid, root);
+    let root_authored = laid.translates.get(&root).copied().unwrap_or((0., 0.));
+    let root_movement = (root_offset.0 - root_authored.0, root_offset.1 - root_authored.1);
+    let root_font_size = tree.query_selector("html").ok().flatten()
+        .and_then(|node| laid.styles.get(&node)).map_or(16., |style| style.font_size.unwrap_or(16.) / style.used_zoom());
+    let mut pending = vec![(root, crate::VisualTransform::IDENTITY, false)];
+    while let Some((id, transform, parent_preserves)) = pending.pop() {
+        let style = laid.styles.get(&id);
+        if style.is_some_and(|style| style.display == crate::Display::None) { continue; }
+        let authored = laid.translates.get(&id).copied().unwrap_or((0., 0.));
+        let offset = scroll_state.translation_for(laid, id);
+        let shift = (root_offset.0 + offset.0 - authored.0 - root_movement.0,
+            root_offset.1 + offset.1 - authored.1 - root_movement.1);
+        let mut include = |rect| {
+            let mut visual = transform.map_rect(rect);
+            visual.x += shift.0;
+            visual.y += shift.1;
+            if visual.width > 0. && visual.height > 0. {
+                bounds = Some(bounds.map_or(visual, |current| current.union(&visual)));
+            }
         };
-        let (x, y) = scroll_state.translation_for(laid, id);
-        let mut visual = crate::Rect {
-            x: rect.x + x,
-            y: rect.y + y,
-            width: rect.width,
-            height: rect.height,
-        };
-        if let Some(style) = laid.styles.get(&id) {
-            // The atomic source surface must retain every primitive that can
-            // extend beyond the border box. In particular, a thick outline
-            // is transformed with the element and cannot be reconstructed
-            // after the tight source layer has already clipped it.
-            visual = non_text_ink_bounds(&visual, style);
+        if let Some(rect) = laid.rects.get(&id) {
+            include(style.map_or(*rect, |style| non_text_ink_bounds(rect, style)));
         }
-        bounds = Some(match bounds {
-            Some(current) => current.union(&visual),
-            None => visual,
+        if let Some(runs) = laid.text_runs.get(&id) {
+            for (rect, _) in runs { include(*rect); }
+        }
+        for generated in laid.generated_boxes.iter().filter(|generated| generated.host == id) {
+            include(generated.rect);
+        }
+        let preserves = style.is_some_and(crate::dom::preserves_3d);
+        let children = style.map_or(transform, |style| {
+            if style.ignores_used_box_sizes() { return transform; }
+            let matrix = if !preserves && (transform.affine().is_none() || parent_preserves) {
+                transform.flatten_children()
+            } else { transform };
+            let rect = laid.rects.get(&id).copied().unwrap_or_default();
+            matrix.then(crate::dom::resolved_perspective_matrix(style, &rect))
         });
+        for child in crate::dom::rendered_children(tree, id).into_iter().rev() {
+            if excluded_planes.is_some_and(|excluded| excluded.contains(&child)) { continue; }
+            let own = laid.styles.get(&child).zip(laid.rects.get(&child))
+                .filter(|(style, _)| !style.ignores_used_box_sizes())
+                .map_or(crate::VisualTransform::IDENTITY, |(style, rect)|
+                    crate::dom::resolved_transform_matrix(style, rect, root_font_size, scroll_state.viewport));
+            pending.push((child, children.then(own), preserves));
+        }
     }
     bounds.map(|bounds| crate::Rect {
         x: bounds.x - 2.0,
@@ -3903,6 +4236,7 @@ fn paint_laid_dom_scrolled(
     raster_scale: f32,
     print_economy: bool,
     canvas_background: Option<CanvasBackground>,
+    excluded_planes: Option<&std::collections::HashSet<obscura_dom::tree::NodeId>>,
 ) -> Option<Pixmap> {
     let scroll_state = match resolved_scroll {
         Some(resolved) => ScrollPaintState::from_resolved(
@@ -4021,6 +4355,9 @@ fn paint_laid_dom_scrolled(
         tree,
         paint_root.unwrap_or_else(|| tree.document()),
     ));
+    if let Some(excluded) = excluded_planes {
+        retain_plane_nodes(tree, &mut paint_nodes, paint_root, excluded);
+    }
     for nid in paint_nodes.iter().copied() {
         if consumed.contains(&nid) {
             continue;
@@ -4032,7 +4369,7 @@ fn paint_laid_dom_scrolled(
                 .and_then(|style| style.opacity)
                 .is_some_and(|opacity| opacity.clamp(0.0, 1.0) < 1.0);
         let is_transform_root = suppress_transform_for != Some(nid)
-            && laid.styles.get(&nid).is_some_and(has_authored_transform);
+            && has_visual_transform(tree,laid,nid);
         let z = (suppress_stacking_for != Some(nid))
             .then(|| stacking_z_index(tree, laid, nid))
             .flatten();
@@ -4174,6 +4511,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                excluded_planes,
             )?;
             continue;
         }
@@ -4211,6 +4549,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                excluded_planes,
             )?;
             continue;
         }
@@ -4279,11 +4618,68 @@ fn paint_laid_dom_scrolled(
             None => continue,
         };
 
-        if suppress_transform_for != Some(nid) && has_authored_transform(style) {
+        if suppress_transform_for != Some(nid) && has_visual_transform(tree,laid,nid) {
             opacity_subtree_skip.insert(nid);
             opacity_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
-            let transform =
-                crate::dom::resolved_transform_matrix(style, &rect, root_font_size, viewport);
+            let transform = crate::dom::local_visual_transform(tree,laid,nid,root_font_size,viewport);
+            if crate::dom::preserves_3d(style) {
+                let context = preserve_context_planes(tree, laid, nid, root_font_size, viewport);
+                if context.iter().any(|(_, matrix, _)| matrix.affine().is_none()) {
+                    let mut excluded = context.iter().map(|(node, _, _)| *node).collect::<std::collections::HashSet<_>>();
+                    if let Some(outer) = excluded_planes { excluded.extend(outer); }
+                    let inherited = laid.translates.get(&nid).copied().unwrap_or((0., 0.));
+                    let own_translation = crate::dom::resolved_transform_matrix(style, &rect, root_font_size, viewport)
+                        .affine().filter(|matrix| matrix.is_translation()).map_or((0., 0.), |matrix| (matrix.e, matrix.f));
+                    let inherited = (inherited.0 - own_translation.0, inherited.1 - own_translation.1);
+                    let outside_overflow_clip = scroll_state.overflow_clip_for(laid, nid);
+                    let target = paint_surface_rect(&pixmap, raster_scale);
+                    let mut planes = Vec::with_capacity(context.len());
+                    let mut live_bytes = pixmap.data().len() as u64;
+                    for (plane, matrix, _) in context {
+                        if crate::dom::backface_culled(tree, laid, plane, root_font_size, viewport) { continue; }
+                        let translation = scroll_state.translation_for(laid, plane);
+                        let authored = laid.translates.get(&plane).copied().unwrap_or((0., 0.));
+                        let shift = (translation.0 - authored.0 + inherited.0, translation.1 - authored.1 + inherited.1);
+                        let display = crate::VisualTransform::translate(shift.0, shift.1).then(matrix);
+                        let Some(bounds) = transform_subtree_source_bounds(tree, laid, &scroll_state, plane, Some(&excluded))
+                            .map(|mut bounds| { bounds.x -= translation.0; bounds.y -= translation.1; bounds })
+                            .and_then(|bounds| projected_source_bounds(display, bounds, target)) else { continue; };
+                        let (left, top) = (bounds.x.floor(), bounds.y.floor());
+                        let layer_width = ((bounds.x + bounds.width).ceil() - left).max(1.) * raster_scale;
+                        let layer_height = ((bounds.y + bounds.height).ceil() - top).max(1.) * raster_scale;
+                        if !layer_width.is_finite() || !layer_height.is_finite()
+                            || layer_width > MAX_CAPTURE_DIMENSION as f32 || layer_height > MAX_CAPTURE_DIMENSION as f32 {
+                            return None;
+                        }
+                        let (layer_width, layer_height) = (layer_width.ceil() as u32, layer_height.ceil() as u32);
+                        let pixels = u64::from(layer_width) * u64::from(layer_height);
+                        live_bytes = live_bytes.checked_add(pixels.checked_mul(4)?)?;
+                        if pixels > MAX_CAPTURE_PIXELS || live_bytes > MAX_CAPTURE_PEAK_BYTES { return None; }
+                        let layer = Pixmap::new(layer_width, layer_height)?;
+                        let layer = paint_laid_dom_scrolled(
+                            tree, viewport, base_url, scroll, resolved_scroll, Some(&scroll_state), layer,
+                            image_cache, selected_images, canvas_surfaces, svg_fonts, content_size,
+                            viewport_fixed, sticky, scroll_tree, laid, Some(plane), suppress_opacity_for,
+                            Some(plane), Some(plane), Some(plane), surface_extent,
+                            (surface_offset.0 - translation.0 - left, surface_offset.1 - translation.1 - top),
+                            raster_scale, print_economy, canvas_background, Some(&excluded),
+                        )?;
+                        let transform = display.then(crate::VisualTransform::translate(left, top));
+                        let Some(inverse) = transform.inverse() else { continue; };
+                        let source_rect = crate::Rect { x: 0., y: 0.,
+                            width: layer_width as f32 / raster_scale, height: layer_height as f32 / raster_scale };
+                        let Some(polygon) = transform.project_rect(source_rect, Some(target)) else { continue; };
+                        planes.push(ProjectivePaintPlane { source: layer, transform, inverse, polygon, source_scale: raster_scale });
+                    }
+                    let clip_mask = outside_overflow_clip.as_ref().and_then(|clip| cached_overflow_clip_mask(
+                        &mut overflow_mask_cache, pixmap.width(), pixmap.height(), clip,
+                        scroll_state.surface_extent.unwrap_or(viewport),
+                    ));
+                    composite_preserved_planes(&mut pixmap, &planes, raster_scale, clip_mask.as_deref());
+                    continue;
+                }
+            }
+            if crate::dom::backface_culled(tree,laid,nid,root_font_size,viewport) { continue; }
             if transform.is_translation() {
                 // Translation-only transforms retain the direct offset path:
                 // no surface allocation and no resampling for carousels and
@@ -4315,6 +4711,7 @@ fn paint_laid_dom_scrolled(
                     raster_scale,
                     print_economy,
                     canvas_background,
+                    excluded_planes,
                 )?;
                 continue;
             }
@@ -4328,15 +4725,18 @@ fn paint_laid_dom_scrolled(
             let outside_clip = outside_overflow_clip
                 .as_ref()
                 .map(|clip| clip.viewport_rect(scroll_state.surface_extent.unwrap_or(viewport)));
+            let own_translation = crate::dom::resolved_transform_matrix(style,&rect,root_font_size,viewport)
+                .affine().filter(|a| a.is_translation()).map_or((0.,0.),|a| (a.e,a.f));
             let movement = scroll_state.translation_for(laid, nid);
-            let display_transform = crate::Affine2::translate(movement.0, movement.1)
+            let movement = (movement.0-own_translation.0,movement.1-own_translation.1);
+            let display_transform = crate::VisualTransform::translate(movement.0, movement.1)
                 .then(transform)
-                .then(crate::Affine2::translate(-movement.0, -movement.1));
+                .then(crate::VisualTransform::translate(-movement.0, -movement.1));
             let target = crate::Rect {
                 x: 0.0,
                 y: 0.0,
-                width: pixmap.width() as f32,
-                height: pixmap.height() as f32,
+                width: pixmap.width() as f32 / raster_scale,
+                height: pixmap.height() as f32 / raster_scale,
             };
             let target = match outside_clip {
                 Some(clip) => match target.intersect(&clip) {
@@ -4345,14 +4745,11 @@ fn paint_laid_dom_scrolled(
                 },
                 None => target,
             };
-            let Some(inverse) = display_transform.inverse() else {
-                // A singular transform has no two-dimensional painted area.
-                continue;
-            };
-            let needed_source = inverse.map_rect(target);
+            if display_transform.inverse().is_none() { continue; }
             let Some(source_bounds) =
-                transform_subtree_source_bounds(tree, laid, &scroll_state, nid)
-                    .and_then(|bounds| bounds.intersect(&needed_source))
+                transform_subtree_source_bounds(tree, laid, &scroll_state, nid, excluded_planes)
+                    .map(|mut bounds| { bounds.x-=own_translation.0; bounds.y-=own_translation.1; bounds })
+                    .and_then(|bounds| projected_source_bounds(display_transform,bounds,target))
             else {
                 continue;
             };
@@ -4360,8 +4757,9 @@ fn paint_laid_dom_scrolled(
             let top = source_bounds.y.floor();
             let right = (source_bounds.x + source_bounds.width).ceil();
             let bottom = (source_bounds.y + source_bounds.height).ceil();
-            let layer_width = (right - left).max(1.0) as u32;
-            let layer_height = (bottom - top).max(1.0) as u32;
+            let source_scale = if display_transform.affine().is_some() { 1. } else { raster_scale };
+            let layer_width = ((right - left).max(1.0) * source_scale).ceil() as u32;
+            let layer_height = ((bottom - top).max(1.0) * source_scale).ceil() as u32;
             // A near-singular transform can inverse-map the viewport to a layer
             // far larger than any sane allocation. tiny-skia's Pixmap::new would
             // try to allocate the buffer and OOM-abort the process, so cap the
@@ -4402,23 +4800,15 @@ fn paint_laid_dom_scrolled(
                 Some(nid),
                 surface_extent,
                 (
-                    surface_offset.0 + layer_delta.0,
-                    surface_offset.1 + layer_delta.1,
+                    surface_offset.0 + layer_delta.0 - own_translation.0,
+                    surface_offset.1 + layer_delta.1 - own_translation.1,
                 ),
-                raster_scale,
+                source_scale,
                 print_economy,
                 canvas_background,
+                excluded_planes,
             )?;
-            let transform =
-                display_transform.then(crate::Affine2::translate(-layer_delta.0, -layer_delta.1));
-            let transform = Transform::from_row(
-                transform.a,
-                transform.b,
-                transform.c,
-                transform.d,
-                transform.e,
-                transform.f,
-            );
+            let transform = display_transform.then(crate::VisualTransform::translate(-layer_delta.0, -layer_delta.1));
             let clip_mask = outside_overflow_clip.as_ref().and_then(|clip| {
                 cached_overflow_clip_mask(
                     &mut overflow_mask_cache,
@@ -4428,14 +4818,13 @@ fn paint_laid_dom_scrolled(
                     scroll_state.surface_extent.unwrap_or(viewport),
                 )
             });
-            pixmap.draw_pixmap(
-                0,
-                0,
-                layer.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                transform,
-                clip_mask.as_deref(),
-            );
+            if let Some(transform) = transform.affine() {
+                pixmap.draw_pixmap(0,0,layer.as_ref(),&tiny_skia::PixmapPaint::default(),
+                    Transform::from_row(transform.a,transform.b,transform.c,transform.d,transform.e,transform.f),
+                    clip_mask.as_deref());
+            } else {
+                composite_projected_plane(&mut pixmap,&layer,transform,source_scale,raster_scale,clip_mask.as_deref());
+            }
             continue;
         }
 
@@ -4482,6 +4871,7 @@ fn paint_laid_dom_scrolled(
                 raster_scale,
                 print_economy,
                 canvas_background,
+                excluded_planes,
             )?;
             let group_paint = tiny_skia::PixmapPaint {
                 opacity: own_opacity,
@@ -7592,11 +7982,9 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     }
 }
 
-/// Fetch the Latin/ASCII face from each authored `@font-face` rule and decode
-/// WOFF/WOFF2 into the sfnt bytes consumed by fontdb/cosmic-text. Unicode-range
-/// filtering is load-bearing for performance: generated font packages commonly
-/// emit six or seven script subsets per face, while an English page needs only
-/// the subset containing ASCII.
+/// Select the subsets needed by document text, then decode WOFF/WOFF2 into
+/// the sfnt bytes consumed by fontdb/cosmic-text. The text repertoire is a
+/// Unicode-sized bounded bitset, not an ASCII heuristic or a fetch-all policy.
 fn collect_web_fonts(
     tree: &DomTree,
     base_url: Option<&str>,
@@ -7613,6 +8001,7 @@ fn collect_web_fonts(
     let mut seen = std::collections::HashSet::new();
     let mut fonts = Vec::new();
     let mut rules = Vec::new();
+    let points = document_font_codepoints(tree);
 
     for nid in crate::dom::rendered_descendants(tree, tree.document()) {
         // Inspect tags without copying unrelated script/text payloads.
@@ -7623,7 +8012,7 @@ fn collect_web_fonts(
         }
         let css = tree.text_content(nid);
         for face in font_face_blocks(&css) {
-            if !font_face_covers_ascii(face) {
+            if !font_face_covers_text(face, &points) {
                 continue;
             }
             let sources: Vec<_> = font_face_urls(face)
@@ -7647,7 +8036,7 @@ fn collect_web_fonts(
             "src:{};font-weight:{};font-style:{};unicode-range:{}",
             face.source, face.weight, face.style, face.unicode_range
         );
-        if !font_face_covers_ascii(&descriptor_block) {
+        if !font_face_covers_text(&descriptor_block, &points) {
             continue;
         }
         let sources: Vec<_> = font_face_urls(&descriptor_block)
@@ -7760,25 +8149,489 @@ fn fetch_and_decode_font(
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
-    let compressed = fetch_font_bytes(src, base_url, cache)?;
-    if compressed.len() > 8 * 1024 * 1024 {
+    let key = font_resource_key(src, base_url);
+    if let Some(decoded) = cache.cached_decoded_font(&key) { return Some(decoded); }
+    let compressed = if src.starts_with("obscura-font:") {
+        cache.cached_font_bytes(src)?
+    } else if src.starts_with("data:") {
+        Arc::from(font_data_url_bytes(src)?)
+    } else {
+        fetch_font_bytes(src, base_url, cache)?
+    };
+    let decoded = Arc::new(decode_font_bytes(&compressed)?.into_owned());
+    if !cache.has_cached_bytes(&key) { cache.seed_shared(key.clone(), compressed); }
+    cache.cache_decoded_font(&key, decoded.clone());
+    Some(decoded)
+}
+
+/// Decode and validate the same real fonts used by shaping. Raw sfnt data is
+/// borrowed so a lifecycle check does not copy a complete font body.
+pub fn decode_font_bytes(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if bytes.len() > FONT_MAX_DECODED {
         return None;
     }
-    let decoded = match compressed.get(..4) {
-        Some(b"wOF2") => wuff::decompress_woff2(&compressed)
-            .ok()
-            .map(std::sync::Arc::new),
-        Some(b"wOFF") => wuff::decompress_woff1(&compressed)
-            .ok()
-            .map(std::sync::Arc::new),
-        // TrueType/OpenType collections and raw sfnt fonts already have the
-        // representation fontdb expects.
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => {
-            Some(std::sync::Arc::new(compressed.as_ref().to_vec()))
+    let decoded = match bytes.get(..4) {
+        Some(b"wOF2") => {
+            let bounds = woff2_allocation_bounds(bytes)?;
+            let decoded = wuff::decompress_woff2_with_custom_brotli(bytes, &mut |compressed, size| {
+                let invalid = || Box::new(wuff::WuffErr::GenericError) as Box<dyn std::error::Error>;
+                if size != bounds.stream_size || size > FONT_MAX_DECODED {
+                    return Err(invalid());
+                }
+                use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
+                let mut output = vec![0; size];
+                let mut available_in = compressed.len();
+                let mut input_offset = 0;
+                let mut available_out = size;
+                let mut output_offset = 0;
+                let mut total_out = 0;
+                let mut state = BrotliState::new(StandardAlloc::default(), StandardAlloc::default(), StandardAlloc::default());
+                let result = BrotliDecompressStream(&mut available_in, &mut input_offset, compressed,
+                    &mut available_out, &mut output_offset, &mut output, &mut total_out, &mut state);
+                if !matches!(result, BrotliResult::ResultSuccess) || output_offset != size
+                    || woff2_reconstruction_bounds(&bounds, &output).is_none() {
+                    return Err(invalid());
+                }
+                Ok(output)
+            }).ok()?;
+            std::borrow::Cow::Owned(decoded)
         }
-        _ => None,
-    }?;
-    (decoded.len() <= 32 * 1024 * 1024).then_some(decoded)
+        Some(b"wOFF") => {
+            woff1_allocation_bounds(bytes)?;
+            std::borrow::Cow::Owned(wuff::decompress_woff1(bytes).ok()?)
+        }
+        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => std::borrow::Cow::Borrowed(bytes),
+        _ => return None,
+    };
+    if decoded.len() > FONT_MAX_DECODED {
+        return None;
+    }
+    let count = cosmic_text::ttf_parser::fonts_in_collection(&decoded).unwrap_or(1);
+    // Collections must have genuine sfnt faces, not just the right magic.
+    if count == 0 || count > 64 || !(0..count).all(|index| {
+        cosmic_text::ttf_parser::Face::parse(&decoded, index).is_ok_and(|face| {
+            let tables = face.tables();
+            face.number_of_glyphs() > 0 && tables.cmap.is_some()
+                && (tables.glyf.is_some() || tables.cff.is_some() || tables.cff2.is_some())
+        })
+    }) {
+        return None;
+    }
+    Some(decoded)
+}
+
+const FONT_MAX_COMPRESSED: usize = 8 * 1024 * 1024;
+const FONT_MAX_DECODED: usize = 32 * 1024 * 1024;
+
+fn font_take<'a>(input: &mut &'a [u8], size: usize) -> Option<&'a [u8]> {
+    let (value, rest) = input.split_at_checked(size)?;
+    *input = rest;
+    Some(value)
+}
+
+fn font_u16(input: &mut &[u8]) -> Option<usize> {
+    Some(u16::from_be_bytes(font_take(input, 2)?.try_into().ok()?) as usize)
+}
+
+fn font_u32(input: &mut &[u8]) -> Option<usize> {
+    Some(u32::from_be_bytes(font_take(input, 4)?.try_into().ok()?) as usize)
+}
+
+fn font_base128(input: &mut &[u8]) -> Option<usize> {
+    let mut value = 0u32;
+    for index in 0..5 {
+        let byte = font_take(input, 1)?[0];
+        if index == 0 && byte == 0x80 || value & 0xfe000000 != 0 {
+            return None;
+        }
+        value = (value << 7) | u32::from(byte & 0x7f);
+        if byte & 0x80 == 0 { return Some(value as usize); }
+    }
+    None
+}
+
+fn font_255(input: &mut &[u8]) -> Option<usize> {
+    match font_take(input, 1)?[0] {
+        253 => font_u16(input),
+        254 => Some(506 + usize::from(font_take(input, 1)?[0])),
+        255 => Some(253 + usize::from(font_take(input, 1)?[0])),
+        value => Some(usize::from(value)),
+    }
+}
+
+fn font_padded(size: usize) -> Option<usize> {
+    Some(size.checked_add(3)? & !3)
+}
+
+fn font_bounded_add(total: &mut usize, size: usize) -> Option<()> {
+    *total = total.checked_add(size)?;
+    (*total <= FONT_MAX_DECODED).then_some(())
+}
+
+fn woff1_allocation_bounds(bytes: &[u8]) -> Option<()> {
+    if bytes.len() > FONT_MAX_COMPRESSED || bytes.len() < 44 { return None; }
+    let mut header = &bytes[8..];
+    if font_u32(&mut header)? != bytes.len() { return None; }
+    let count = font_u16(&mut header)?;
+    if count == 0 || font_u16(&mut header)? != 0 { return None; }
+    let advertised = font_u32(&mut header)?;
+    if advertised == 0 || advertised > FONT_MAX_DECODED { return None; }
+    let mut directory = bytes.get(44..44usize.checked_add(count.checked_mul(20)?)?)?;
+    let mut reconstructed = 12 + count * 16;
+    for _ in 0..count {
+        font_take(&mut directory, 4)?;
+        let offset = font_u32(&mut directory)?;
+        let compressed = font_u32(&mut directory)?;
+        let original = font_u32(&mut directory)?;
+        font_take(&mut directory, 4)?;
+        if compressed > original || offset < 44 + count * 20 {
+            return None;
+        }
+        bytes.get(offset..offset.checked_add(compressed)?)?;
+        font_bounded_add(&mut reconstructed, font_padded(original)?)?;
+    }
+    (reconstructed == advertised).then_some(())
+}
+
+struct Woff2BoundTable {
+    tag: Option<[u8; 4]>,
+    transformed: bool,
+    original: usize,
+    offset: usize,
+    length: usize,
+}
+
+struct Woff2AllocationBounds {
+    tables: Vec<Woff2BoundTable>,
+    fonts: Vec<Vec<usize>>,
+    stream_size: usize,
+    header_size: usize,
+}
+
+fn woff2_allocation_bounds(bytes: &[u8]) -> Option<Woff2AllocationBounds> {
+    if bytes.len() > FONT_MAX_COMPRESSED || bytes.len() < 48 { return None; }
+    let mut header = &bytes[8..];
+    if font_u32(&mut header)? != bytes.len() { return None; }
+    let count = font_u16(&mut header)?;
+    font_u16(&mut header)?;
+    let advertised = font_u32(&mut header)?;
+    if count == 0 || advertised == 0 || advertised > FONT_MAX_DECODED { return None; }
+    let compressed_size = font_u32(&mut header)?;
+    let mut directory = &bytes[48..];
+    let mut tables = Vec::with_capacity(count.min(directory.len() / 2));
+    let mut stream_size = 0;
+    let mut original_size = 0;
+    for _ in 0..count {
+        let flags = font_take(&mut directory, 1)?[0];
+        let tag = match flags & 63 {
+            2 => Some(*b"hhea"), 3 => Some(*b"hmtx"),
+            10 => Some(*b"glyf"), 11 => Some(*b"loca"),
+            63 => Some(font_take(&mut directory, 4)?.try_into().ok()?),
+            _ => None,
+        };
+        let version = flags >> 6;
+        let transformed = if matches!(tag.as_ref(), Some(b"glyf" | b"loca")) {
+            version == 0
+        } else { version != 0 };
+        let original = font_base128(&mut directory)?;
+        let length = if transformed { font_base128(&mut directory)? } else { original };
+        if transformed && (tag == Some(*b"loca") && length != 0
+            || !matches!(tag.as_ref(), Some(b"glyf" | b"loca" | b"hmtx"))) {
+            return None;
+        }
+        let offset = stream_size;
+        font_bounded_add(&mut stream_size, length)?;
+        font_bounded_add(&mut original_size, font_padded(original)?)?;
+        tables.push(Woff2BoundTable { tag, transformed, original, offset, length });
+    }
+    let mut fonts = Vec::new();
+    let mut header_size;
+    let capacity_header;
+    if bytes.get(4..8)? == b"ttcf" {
+        let version = font_u32(&mut directory)?;
+        if version != 0x10000 && version != 0x20000 { return None; }
+        let font_count = font_255(&mut directory)?;
+        if font_count == 0 || font_count > 64 { return None; }
+        header_size = 12 + font_count * 4 + if version == 0x20000 { 12 } else { 0 };
+        capacity_header = header_size;
+        for _ in 0..font_count {
+            let table_count = font_255(&mut directory)?;
+            font_take(&mut directory, 4)?;
+            if table_count == 0 || table_count > count { return None; }
+            font_bounded_add(&mut header_size, 12 + table_count * 16)?;
+            let mut indices = Vec::with_capacity(table_count.min(directory.len()));
+            for _ in 0..table_count {
+                let index = font_255(&mut directory)?;
+                if index >= count { return None; }
+                indices.push(index);
+            }
+            fonts.push(indices);
+        }
+    } else {
+        // wuff's synthetic single-font directory includes a collection-header
+        // capacity hint although the emitted sfnt header has only 12 bytes.
+        header_size = 12 + count * 16;
+        capacity_header = 16;
+        fonts.push((0..count).collect());
+    }
+    font_bounded_add(&mut original_size, header_size)?;
+    let capacity_size = original_size.checked_add(capacity_header)?;
+    if capacity_size > FONT_MAX_DECODED && !(stream_size <= advertised && advertised <= capacity_size) {
+        return None;
+    }
+    font_take(&mut directory, compressed_size)?;
+    Some(Woff2AllocationBounds { tables, fonts, stream_size, header_size })
+}
+
+fn woff2_reconstruction_bounds(bounds: &Woff2AllocationBounds, stream: &[u8]) -> Option<()> {
+    let mut sizes = Vec::with_capacity(bounds.tables.len());
+    let mut glyphs = Vec::with_capacity(bounds.tables.len());
+    for table in &bounds.tables {
+        let data = stream.get(table.offset..table.offset.checked_add(table.length)?)?;
+        if table.transformed && table.tag == Some(*b"glyf") {
+            let (glyf, loca, count) = woff2_glyf_allocation_bounds(data)?;
+            sizes.push(glyf);
+            glyphs.push(Some((loca, count)));
+        } else {
+            sizes.push(table.length);
+            glyphs.push(None);
+        }
+    }
+    for indices in &bounds.fonts {
+        let find = |tag| indices.iter().copied().find(|index| bounds.tables[*index].tag == Some(tag));
+        if let Some(glyf_index) = find(*b"glyf") {
+            if let Some((loca_size, count)) = glyphs[glyf_index] {
+                let loca_index = find(*b"loca")?;
+                let loca = &bounds.tables[loca_index];
+                if !loca.transformed || loca.original != loca_size { return None; }
+                sizes[loca_index] = loca_size;
+                if let Some(hmtx_index) = find(*b"hmtx") {
+                    if bounds.tables[hmtx_index].transformed {
+                        let hhea = &bounds.tables[find(*b"hhea")?];
+                        let mut metrics = stream.get(hhea.offset.checked_add(34)?..hhea.offset.checked_add(hhea.length)?)?;
+                        let metrics = font_u16(&mut metrics)?;
+                        if metrics == 0 || metrics > count { return None; }
+                        let actual = count * 2 + metrics * 2;
+                        if bounds.tables[hmtx_index].original != actual { return None; }
+                        sizes[hmtx_index] = actual;
+                    }
+                }
+            }
+        }
+    }
+    let mut total = bounds.header_size;
+    for size in sizes { font_bounded_add(&mut total, font_padded(size)?)?; }
+    Some(())
+}
+
+// This scanner does not decode a font. It accounts for the exact bytes wuff
+// will reconstruct and rejects oversized scratch/output allocations before
+// entering its glyf transformer, including dishonest origLength values.
+fn woff2_glyf_allocation_bounds(data: &[u8]) -> Option<(usize, usize, usize)> {
+    let mut header = data;
+    font_u16(&mut header)?;
+    let flags = font_u16(&mut header)?;
+    let count = font_u16(&mut header)?;
+    let index_format = font_u16(&mut header)?;
+    if index_format > 1 { return None; }
+    let mut lengths = [0; 7];
+    for length in &mut lengths { *length = font_u32(&mut header)?; }
+    let mut payload = data.get(36..)?;
+    let mut contours = font_take(&mut payload, lengths[0])?;
+    let mut points = font_take(&mut payload, lengths[1])?;
+    let mut point_flags = font_take(&mut payload, lengths[2])?;
+    let mut triplets = font_take(&mut payload, lengths[3])?;
+    let mut composites = font_take(&mut payload, lengths[4])?;
+    let mut bbox = font_take(&mut payload, lengths[5])?;
+    let mut instructions = font_take(&mut payload, lengths[6])?;
+    let bitmap = font_take(&mut bbox, count.div_ceil(32) * 4)?;
+    let overlap = if flags & 1 != 0 { Some(font_take(&mut payload, count.div_ceil(8))?) } else { None };
+    let mut output = 0;
+    for glyph in 0..count {
+        let contour_count = font_u16(&mut contours)?;
+        let has_bbox = bitmap[glyph / 8] & (0x80 >> (glyph % 8)) != 0;
+        let mut glyph_size = 0;
+        if contour_count == 0xffff {
+            if !has_bbox { return None; }
+            font_take(&mut bbox, 8)?;
+            glyph_size = 10;
+            let mut has_instructions = false;
+            loop {
+                let flags = font_u16(&mut composites)?;
+                has_instructions |= flags & 0x100 != 0;
+                let size = 2 + if flags & 1 != 0 { 4 } else { 2 }
+                    + if flags & 8 != 0 { 2 } else if flags & 0x40 != 0 { 4 }
+                      else if flags & 0x80 != 0 { 8 } else { 0 };
+                font_take(&mut composites, size)?;
+                font_bounded_add(&mut glyph_size, 2 + size)?;
+                if flags & 0x20 == 0 { break; }
+            }
+            if has_instructions {
+                let size = font_255(&mut triplets)?;
+                font_take(&mut instructions, size)?;
+                font_bounded_add(&mut glyph_size, 2 + size)?;
+            }
+        } else if contour_count > 0 {
+            let mut point_count = 0usize;
+            for _ in 0..contour_count {
+                point_count = point_count.checked_add(font_255(&mut points)?)?;
+                // wuff allocates its point vector before validating endPts.
+                if point_count > 65536 { return None; }
+            }
+            let source_flags = font_take(&mut point_flags, point_count)?;
+            glyph_size = 12 + contour_count * 2;
+            let mut last_flag = None;
+            let mut run = 0;
+            let mut x = 0i32;
+            let mut y = 0i32;
+            for (point, &source_flag) in source_flags.iter().enumerate() {
+                let (dx, dy) = woff2_triplet_delta(source_flag & 0x7f, &mut triplets)?;
+                x = x.checked_add(dx)?;
+                y = y.checked_add(dy)?;
+                let axis = |delta: i32, short, same| {
+                    if delta == 0 { (same, 0) }
+                    else if (-255..=255).contains(&delta) { (short | if delta > 0 { same } else { 0 }, 1) }
+                    else { (0, 2) }
+                };
+                let (x_flag, x_bytes) = axis(dx, 2, 16);
+                let (y_flag, y_bytes) = axis(dy, 4, 32);
+                let flag = u8::from(source_flag & 0x80 == 0) | x_flag | y_flag
+                    | if point == 0 && overlap.is_some_and(|bitmap| bitmap[glyph / 8] & (0x80 >> (glyph % 8)) != 0) { 64 } else { 0 };
+                font_bounded_add(&mut glyph_size, x_bytes + y_bytes)?;
+                if last_flag == Some(flag) && run < 256 { run += 1; }
+                else {
+                    if run > 0 { font_bounded_add(&mut glyph_size, if run == 1 { 1 } else { 2 })?; }
+                    last_flag = Some(flag);
+                    run = 1;
+                }
+            }
+            if run > 0 { font_bounded_add(&mut glyph_size, if run == 1 { 1 } else { 2 })?; }
+            let instruction_size = font_255(&mut triplets)?;
+            font_take(&mut instructions, instruction_size)?;
+            font_bounded_add(&mut glyph_size, instruction_size)?;
+            if has_bbox { font_take(&mut bbox, 8)?; }
+            // Account for the transformer's per-glyph reserve, not only the
+            // tighter encoded output size calculated above.
+            if 12 + contour_count * 2 + point_count * 5 + instruction_size > FONT_MAX_DECODED { return None; }
+        } else if has_bbox { return None; }
+        font_bounded_add(&mut output, font_padded(glyph_size)?)?;
+    }
+    if index_format == 0 && output > 0x1fffe { return None; }
+    Some((output, (count + 1) * if index_format == 0 { 2 } else { 4 }, count))
+}
+
+fn woff2_triplet_delta(flag: u8, input: &mut &[u8]) -> Option<(i32, i32)> {
+    let sign = |flag: u8, value: i32| if flag & 1 != 0 { value } else { -value };
+    let length = if flag < 84 { 1 } else if flag < 120 { 2 } else if flag < 124 { 3 } else { 4 };
+    let data = font_take(input, length)?;
+    let (x, y) = if flag < 10 {
+        (0, (i32::from(flag & 14) << 7) + i32::from(data[0]))
+    } else if flag < 20 {
+        ((i32::from((flag - 10) & 14) << 7) + i32::from(data[0]), 0)
+    } else if flag < 84 {
+        let bits = flag - 20;
+        (1 + i32::from(bits & 0x30) + i32::from(data[0] >> 4),
+         1 + i32::from((bits & 0x0c) << 2) + i32::from(data[0] & 0x0f))
+    } else if flag < 120 {
+        let bits = flag - 84;
+        (1 + (i32::from(bits / 12) << 8) + i32::from(data[0]),
+         1 + (i32::from((bits % 12) >> 2) << 8) + i32::from(data[1]))
+    } else if flag < 124 {
+        ((i32::from(data[0]) << 4) + i32::from(data[1] >> 4),
+         (i32::from(data[1] & 0x0f) << 8) + i32::from(data[2]))
+    } else {
+        ((i32::from(data[0]) << 8) + i32::from(data[1]),
+         (i32::from(data[2]) << 8) + i32::from(data[3]))
+    };
+    Some((sign(flag, x), sign(if flag < 10 { flag } else { flag >> 1 }, y)))
+}
+
+impl RenderResourceCache {
+    /// Lifecycle consumers only inspect retained page-transport bytes here;
+    /// this lookup never opens the renderer's compatibility HTTP loader.
+    pub fn cached_font_bytes(&self, url: &str) -> Option<Arc<[u8]>> {
+        match self.entries.get(&network_resource_url(url))? {
+            CachedResource::Bytes { bytes, .. } => Some(Arc::clone(bytes)),
+            CachedResource::Missing(_) => None,
+        }
+    }
+
+    pub fn cached_decoded_font(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+        match self.entries.get(&network_resource_url(url))? {
+            CachedResource::Bytes { decoded_font, .. } => decoded_font.clone(),
+            CachedResource::Missing(_) => None,
+        }
+    }
+
+    /// Decoded font bodies count against the existing page cache byte budget.
+    /// The caller still owns the font if this cache cannot retain both forms.
+    pub fn cache_decoded_font(&mut self, url: &str, font: Arc<Vec<u8>>) {
+        let key = network_resource_url(url);
+        let Some(CachedResource::Bytes { bytes, decoded_font, .. }) = self.entries.get(&key) else { return };
+        if decoded_font.is_some() || bytes.len().saturating_add(font.len()) > self.max_bytes { return; }
+        while self.retained_bytes.saturating_add(font.len()) > self.max_bytes {
+            let Some(index) = self.order.iter().position(|entry| entry != &key) else { return };
+            let Some(oldest) = self.order.remove(index) else { return };
+            self.remove_entry(&oldest);
+        }
+        if let Some(CachedResource::Bytes { decoded_font, .. }) = self.entries.get_mut(&key) {
+            self.retained_bytes += font.len();
+            *decoded_font = Some(font);
+        }
+    }
+}
+
+/// Resolve FontFace sources with the renderer's source-order/format policy.
+pub fn font_face_source_urls(source: &str, base_url: Option<&str>) -> Vec<String> {
+    font_face_urls(&format!("src:{source}"))
+        .into_iter()
+        .filter(|src| font_source_may_be_supported(src))
+        .take(32)
+        .filter_map(|src| url::Url::parse(&src).ok().or_else(|| {
+            base_url.and_then(|base| url::Url::parse(base).ok())
+                .and_then(|base| base.join(&src).ok())
+        }))
+        .map(|mut url| { url.set_fragment(None); url.to_string() })
+        .collect()
+}
+
+/// Decode data-backed fonts without allocating beyond the compressed limit.
+pub fn font_data_url_bytes(source: &str) -> Option<Vec<u8>> {
+    const MAX: usize = 8 * 1024 * 1024;
+    let rest = source.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if meta.split(';').any(|label| label.eq_ignore_ascii_case("base64")) {
+        if data.len() > MAX.div_ceil(3) * 4 {
+            return None;
+        }
+        use base64::Engine;
+        let mut bytes = vec![0; (data.len().div_ceil(4) * 3).min(MAX)];
+        let length = base64::engine::general_purpose::STANDARD.decode_slice(data, &mut bytes).ok()?;
+        bytes.truncate(length);
+        Some(bytes)
+    } else {
+        if data.len() > MAX * 3 {
+            return None;
+        }
+        let input = data.as_bytes();
+        let mut bytes = Vec::with_capacity(input.len().min(MAX));
+        let mut index = 0;
+        while index < input.len() {
+            if bytes.len() == MAX { return None; }
+            if input[index] == b'%' && index + 2 < input.len() {
+                let hi = (input[index + 1] as char).to_digit(16);
+                let lo = (input[index + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    bytes.push((hi * 16 + lo) as u8);
+                    index += 3;
+                    continue;
+                }
+            }
+            bytes.push(input[index]);
+            index += 1;
+        }
+        Some(bytes)
+    }
 }
 
 fn font_face_blocks(css: &str) -> Vec<&str> {
@@ -7890,7 +8743,7 @@ fn font_face_italic(face: &str) -> Option<bool> {
     })
 }
 
-fn font_face_covers_ascii(face: &str) -> bool {
+fn font_face_covers_text(face: &str, points: &[u64]) -> bool {
     let Some(range) = font_face_declaration(face, "unicode-range") else {
         return true;
     };
@@ -7913,8 +8766,50 @@ fn font_face_covers_ascii(face: &str) -> bool {
             let point = u32::from_str_radix(value, 16).ok();
             (point, point)
         };
-        matches!((start, end), (Some(start), Some(end)) if start <= 0x7e && end >= 0x20)
+        matches!((start, end), (Some(start), Some(end)) if start <= end && start <= 0x10ffff
+            && font_codepoints_intersect(points, start, end.min(0x10ffff)))
     })
+}
+
+fn font_codepoints_intersect(points: &[u64], start: u32, end: u32) -> bool {
+    let first = start as usize / 64;
+    let last = (end as usize / 64).min(points.len().saturating_sub(1));
+    if first > last || points.is_empty() {
+        return false;
+    }
+    (first..=last).any(|index| {
+        let low = if index == first { u64::MAX << (start % 64) } else { u64::MAX };
+        let high = if index == end as usize / 64 { u64::MAX >> (63 - end % 64) } else { u64::MAX };
+        points[index] & low & high != 0
+    })
+}
+
+fn add_font_codepoints(points: &mut Vec<u64>, text: &str) {
+    for ch in text.chars() {
+        let point = ch as usize;
+        if points.len() <= point / 64 {
+            points.resize(point / 64 + 1, 0);
+        }
+        points[point / 64] |= 1u64 << (point % 64);
+    }
+}
+
+fn document_font_codepoints(tree: &DomTree) -> Vec<u64> {
+    let mut points = Vec::new();
+    for id in crate::dom::rendered_descendants(tree, tree.document()) {
+        tree.with_node(id, |node| {
+            let obscura_dom::tree::NodeData::Text { contents } = &node.data else { return };
+            let inert = node.parent.and_then(|parent| tree.with_node(parent, |parent| {
+                parent.as_element().is_some_and(|element| {
+                    matches!(&*element.local, "script" | "style" | "template" | "noscript")
+                })
+            })).unwrap_or(false);
+            if !inert {
+                add_font_codepoints(&mut points, contents);
+            }
+        });
+    }
+    points
 }
 
 fn font_face_urls(face: &str) -> Vec<String> {
@@ -17736,8 +18631,14 @@ mod tests {
         "#;
         let faces = font_face_blocks(css);
         assert_eq!(faces.len(), 2);
-        assert!(!font_face_covers_ascii(faces[0]));
-        assert!(font_face_covers_ascii(faces[1]));
+        let mut points = Vec::new();
+        add_font_codepoints(&mut points, "Example");
+        assert!(!font_face_covers_text(faces[0], &points));
+        assert!(font_face_covers_text(faces[1], &points));
+        let mut cyrillic = Vec::new();
+        add_font_codepoints(&mut cyrillic, "Ж");
+        assert!(font_face_covers_text(faces[0], &cyrillic));
+        assert!(!font_face_covers_text(faces[1], &cyrillic));
         assert_eq!(font_face_family(faces[1]).as_deref(), Some("Example"));
         assert_eq!(font_face_weight(faces[1]), Some((350, 650)));
         assert_eq!(font_face_italic(faces[1]), Some(true));
@@ -17754,7 +18655,7 @@ mod tests {
     fn font_face_without_unicode_range_is_general_purpose() {
         let css = r#"@font-face{font-family:Example;src:url(example.otf)}"#;
         let face = font_face_blocks(css)[0];
-        assert!(font_face_covers_ascii(face));
+        assert!(font_face_covers_text(face, &[]));
         assert_eq!(font_face_urls(face), vec!["example.otf"]);
     }
 

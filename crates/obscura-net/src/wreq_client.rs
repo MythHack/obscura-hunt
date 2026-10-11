@@ -428,7 +428,7 @@ impl StealthHttpClient {
                 crate::client::merge_response_header(
                     &mut response_headers,
                     k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_string(),
+                    crate::client::decode_response_header_value(v.as_bytes()),
                 );
             }
 
@@ -570,16 +570,16 @@ impl StealthHttpClient {
         let mut response_headers: HashMap<String, String> = HashMap::new();
         for (name, value) in resp.headers().iter() {
             let name = name.as_str();
-            let value = value.to_str().unwrap_or("");
+            let value = crate::client::decode_response_header_value(value.as_bytes());
             if matches!(name, "content-security-policy" | "x-frame-options") {
                 response_headers.entry(name.to_string())
                     .and_modify(|existing| {
                         existing.push_str(", ");
-                        existing.push_str(value);
+                        existing.push_str(&value);
                     })
-                    .or_insert_with(|| value.to_string());
+                    .or_insert(value);
             } else {
-                response_headers.insert(name.to_string(), value.to_string());
+                response_headers.insert(name.to_string(), value);
             }
         }
         let body_url = url.clone();

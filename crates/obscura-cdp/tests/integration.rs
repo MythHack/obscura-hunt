@@ -35,6 +35,7 @@ integration_tests!(
     document_write_lifecycle,
     dynamic_script_onload_fires,
     dynamic_stylesheet_onload_fires,
+    embedding_policies,
     execution_context_ownership,
     execution_context_pruned_on_navigation,
     file_navigation_gate,

@@ -1,42 +1,54 @@
-use obscura_browser::Page;
+use obscura_js::runtime::CdpExecutionWorld;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use serde_json::{json, Value};
 
-use crate::dispatch::CdpContext;
+use crate::dispatch::{CdpContext, NodeRecord};
 
-/// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
-/// and `objectId` in that order. Playwright commonly passes only `objectId`
-/// (returned by a prior `DOM.resolveNode`); without this fallback those
-/// requests silently default to node 0 and click the wrong element.
-fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
-    reject_child_node_handle(page, params)?;
-    if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64()) {
-        return Ok(nid);
-    }
-    if let Some(nid) = params.get("backendNodeId").and_then(|v| v.as_u64()) {
-        return Ok(nid);
-    }
-    if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-        let code = format!(
-            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects[{}]; \
-             return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-            crate::util::object_id_literal(oid)
-        );
-        let result = page.evaluate(&code);
-        let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
-        if nid < 0 {
-            return Err(format!("objectId {oid} could not be resolved to a node"));
+fn resolve_node_id(ctx: &mut CdpContext, session: &Option<String>, params: &Value)
+    -> Result<(CdpExecutionWorld, u32), String>
+{
+    if let Some(id) = params.get("nodeId").or_else(|| params.get("backendNodeId")).and_then(Value::as_u64) {
+        let record = ctx.backend_nodes.get(&id).cloned().ok_or("Cannot find node in the current document")?;
+        let page = ctx.get_session_page_mut(session).ok_or("No page")?;
+        let js = page.js.as_mut().ok_or("No JavaScript runtime")?;
+        if record.page_id != page.id || js.cdp_document_generation(record.frame_id).ok() != Some(record.document_generation) {
+            return Err("Cannot find node in the current document".to_string());
         }
-        return Ok(nid as u64);
+        if !js.with_dom_in_frame(record.frame_id, |dom| dom.get_node(NodeId::new(record.node_id)).is_some())? {
+            return Err("Cannot find node in the current document".to_string());
+        }
+        return Ok((CdpExecutionWorld { frame_id: record.frame_id, world_id: None }, record.node_id));
+    }
+    if let Some(id) = params.get("objectId").and_then(Value::as_str) {
+        let page = ctx.get_session_page_mut(session).ok_or("No page")?;
+        return page.js.as_mut().ok_or("No JavaScript runtime")?.object_node_id(id);
     }
     Err("nodeId, backendNodeId, or objectId required".to_string())
 }
 
-fn reject_child_node_handle(page: &Page, params: &Value) -> Result<(), String> {
-    if let Some(id) = params.get("objectId").and_then(Value::as_str) {
-        if page.object_frame_id(id)? != 0 {
-            return Err("Child DOM node handles require frame-scoped backend node IDs, which are not supported".to_string());
+pub(crate) fn backend_node_id(ctx: &mut CdpContext, session: &Option<String>, frame_id: u32, node_id: u32) -> Result<u64, String> {
+    let page = ctx.get_session_page(session).ok_or("No page")?;
+    let record = NodeRecord {
+        page_id: page.id.clone(), frame_id, node_id,
+        document_generation: page.js.as_ref().ok_or("No JavaScript runtime")?.cdp_document_generation(frame_id)?,
+    };
+    if let Some(id) = ctx.backend_node_ids.get(&record) { return Ok(*id); }
+    let id = ctx.next_backend_node_id;
+    ctx.next_backend_node_id = id.checked_add(1).ok_or("Backend node id space exhausted")?;
+    ctx.backend_nodes.insert(id, record.clone());
+    ctx.backend_node_ids.insert(record, id);
+    Ok(id)
+}
+
+fn scope_node_tree(ctx: &mut CdpContext, session: &Option<String>, frame_id: u32, root: &mut Value) -> Result<(), String> {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if let Some(native) = node["nodeId"].as_u64() {
+            let id = backend_node_id(ctx, session, frame_id, u32::try_from(native).map_err(|_| "Invalid native node id")?)?;
+            node["nodeId"] = json!(id);
+            node["backendNodeId"] = json!(id);
         }
+        if let Some(children) = node.get_mut("children").and_then(Value::as_array_mut) { pending.extend(children.iter_mut()); }
     }
     Ok(())
 }
@@ -109,157 +121,88 @@ pub async fn handle(
             let id = params.get("frameId").and_then(Value::as_str).ok_or("frameId required")?;
             let frame_id = super::page::native_frame_id(page, id)?;
             let (parent, owner) = page.live_frame_owner(frame_id).ok_or("No live owner for frame")?;
-            if parent != 0 {
-                return Err("Nested frame owner backend node IDs are not supported".to_string());
-            }
-            Ok(json!({"nodeId": owner.index(), "backendNodeId": owner.index()}))
+            let native_node = owner.index() as u32;
+            let id = backend_node_id(ctx, session_id, parent, native_node)?;
+            Ok(json!({"nodeId": id, "backendNodeId": id}))
         }
         "enable" => Ok(json!({})),
         "getDocument" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(2);
-            page.with_dom(|dom| {
-                let node = serialize_node(dom, dom.document(), depth as u32, 0);
-                json!({ "root": node })
-            }).ok_or_else(|| "No DOM loaded".to_string())
+            let mut root = page.with_dom(|dom| serialize_node(dom, dom.document(), depth as u32, 0))
+                .ok_or("No DOM loaded")?;
+            scope_node_tree(ctx, session_id, 0, &mut root)?;
+            Ok(json!({"root": root}))
         }
         "querySelector" => {
+            let selector = params.get("selector").and_then(Value::as_str).ok_or("selector required")?;
+            let owner = if params.get("nodeId").is_some() { Some(resolve_node_id(ctx, session_id, params)?) } else { None };
+            let frame_id = owner.map_or(0, |(world, _)| world.frame_id);
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let result = page.with_dom(|dom| {
-                dom.query_selector(selector).ok().flatten().map(|id| id.index()).unwrap_or(0)
-            }).unwrap_or(0);
-            Ok(json!({ "nodeId": result }))
+            let result = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(frame_id, |dom| {
+                dom.query_selector_from(owner.map_or(dom.document(), |(_, node)| NodeId::new(node)), selector)
+            })??;
+            let id = match result { Some(node) => backend_node_id(ctx, session_id, frame_id, node.index() as u32)?, None => 0 };
+            Ok(json!({"nodeId": id}))
         }
         "querySelectorAll" => {
+            let selector = params.get("selector").and_then(Value::as_str).ok_or("selector required")?;
+            let owner = if params.get("nodeId").is_some() { Some(resolve_node_id(ctx, session_id, params)?) } else { None };
+            let frame_id = owner.map_or(0, |(world, _)| world.frame_id);
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let ids = page.with_dom(|dom| {
-                dom.query_selector_all(selector).ok()
-                    .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
+            let nodes = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(frame_id, |dom| {
+                dom.query_selector_all_from(owner.map_or(dom.document(), |(_, node)| NodeId::new(node)), selector)
+            })??;
+            let ids = nodes.into_iter().map(|node| backend_node_id(ctx, session_id, frame_id, node.index() as u32))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-                .ok_or("nodeId required")?;
-            let html = page.with_dom(|dom| {
-                dom.outer_html(NodeId::new(node_id as u32))
-            }).unwrap_or_default();
+            let html = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(world.frame_id, |dom| {
+                dom.outer_html(NodeId::new(node_id))
+            })?;
             Ok(json!({ "outerHTML": html }))
         }
         "describeNode" => {
-            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            reject_child_node_handle(page, params)?;
-            let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
-
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-            {
-                nid
-            } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects[{}]; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    crate::util::object_id_literal(oid)
-                );
-                let result = page.evaluate(&code);
-                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
-                // saturate to 0 (the document root), so check before casting.
-                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
-                if nid < 0 {
-                    return Err(format!("objectId {oid} could not be resolved to a node"));
-                }
-                nid as u64
-            } else {
-                return Err("nodeId or objectId required".to_string());
-            };
-
-            let node = page.with_dom(|dom| {
-                serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0)
-            }).unwrap_or(json!(null));
-            Ok(json!({ "node": node }))
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
+            let depth = params.get("depth").and_then(Value::as_i64).unwrap_or(0);
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let mut node = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(world.frame_id, |dom| {
+                serialize_node(dom, NodeId::new(node_id), depth as u32, 0)
+            })?;
+            scope_node_tree(ctx, session_id, world.frame_id, &mut node)?;
+            Ok(json!({"node":node}))
         }
         "resolveNode" => {
-            let frame_id = super::runtime::validate_context(params, "executionContextId", ctx, session_id, "resolveNode")?.unwrap_or(0);
-            if frame_id != 0 {
-                return Err("Child DOM backend node IDs are not supported".to_string());
+            let requested = super::runtime::validate_context(params, "executionContextId", ctx, session_id, "resolveNode")?;
+            let (owner, node_id) = resolve_node_id(ctx, session_id, params)?;
+            let world = requested.unwrap_or(CdpExecutionWorld { frame_id: owner.frame_id, world_id: None });
+            if world.frame_id != owner.frame_id {
+                return Err("Node belongs to a different frame document".to_string());
             }
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            reject_child_node_handle(page, params)?;
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
-                .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-            {
-                nid
-            } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
-                let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects[{}]; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
-                    crate::util::object_id_literal(oid)
-                );
-                let result = page.evaluate(&code);
-                // JS returns -1 for an unresolvable object; `-1.0 as u64` would
-                // saturate to 0 (the document root), so check before casting.
-                let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
-                if nid < 0 {
-                    return Err(format!("objectId {oid} could not be resolved to a node"));
-                }
-                nid as u64
-            } else {
-                return Err("nodeId or objectId required".to_string());
-            };
-
-            let js_code = format!("globalThis._wrap({node_id})");
-
-            let info = if let Some(js) = &mut page.js {
-                match js.store_object_with_meta(&js_code) {
-                    Ok(info) => info,
-                    Err(_) => {
-                        return Ok(json!({
-                            "object": {
-                                "type": "object",
-                                "subtype": "node",
-                                "className": "HTMLElement",
-                                "objectId": format!("node-{}", node_id),
-                            }
-                        }));
-                    }
-                }
-            } else {
-                return Err("No JS runtime".to_string());
-            };
-
-            Ok(json!({
-                "object": {
-                    "type": "object",
-                    "subtype": "node",
-                    "className": if info.class_name.is_empty() { "HTMLElement".to_string() } else { info.class_name },
-                    "description": info.description,
-                    "objectId": info.object_id.unwrap_or_else(|| format!("node-{}", node_id)),
-                }
-            }))
+            let info = page.js.as_mut().ok_or("No JavaScript runtime")?.store_node_for_cdp(world, node_id)?;
+            let object_id = info.object_id.ok_or("Native node did not produce an object handle")?;
+            Ok(json!({"object":{
+                "type":"object", "subtype":"node", "className":info.class_name,
+                "description":info.description, "objectId":object_id,
+            }}))
         }
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
         "focus" => {
-            // No layout engine, but obscura's JS focus() sets document.activeElement,
-            // which Input.dispatchKeyEvent targets. CDP clients (browser-use) focus an
-            // input via DOM.focus before typing; without this their keystrokes land on
-            // nothing and the field stays empty.
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = resolve_node_id(page, params)?;
-            let code = format!(
-                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (el && typeof el.focus === 'function') {{ el.focus(); return true; }} return false; }})()",
-                node_id
-            );
-            let _ = page.evaluate(&code);
+            page.dispatch_native_input_in_frame(world.frame_id, &json!({
+                "kind": "focus", "nodeId": node_id,
+            }))?;
             Ok(json!({}))
         }
         "scrollIntoViewIfNeeded" => {
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = resolve_node_id(page, params)?;
             // Share the DOM shim's nested-scrollport handling. Fully visible
             // boxes stay put; clipped boxes are centered only where needed.
             let code = format!(
@@ -268,7 +211,7 @@ pub async fn handle(
                  el.scrollIntoViewIfNeeded(); return true; }})()",
                 node_id
             );
-            let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
+            let did_scroll = page.evaluate_in_execution_world(world, &code)?.as_bool().unwrap_or(false);
             if !did_scroll {
                 return Err(format!(
                     "node {node_id} could not be resolved to a scrollable element"
@@ -282,6 +225,7 @@ pub async fn handle(
             // each local file, then hand its bytes (base64) to the JS layer, which
             // builds real File objects and fires input+change like a real
             // selection so page code can read/upload them.
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             // setFileInputFiles reads local files and hands their bytes to page
             // JS. Anyone who can reach the CDP port (default localhost, but
@@ -291,7 +235,6 @@ pub async fn handle(
             if !page.context.allow_file_access {
                 return Err("DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.".to_string());
             }
-            let node_id = resolve_node_id(page, params)?;
             let paths: Vec<String> = params
                 .get("files")
                 .and_then(|v| v.as_array())
@@ -310,80 +253,36 @@ pub async fn handle(
                 specs.push(json!({ "name": name, "type": guess_mime(p), "b64": encode_base64(&bytes) }));
             }
 
-            let specs_json = serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_string());
-            let code = format!(
-                "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (el && globalThis.__obscura_setInputFiles) {{ globalThis.__obscura_setInputFiles(el, {1}); return true; }} return false; }})()",
-                node_id, specs_json
-            );
-            let _ = page.evaluate(&code);
+            page.dispatch_native_input_in_frame(world.frame_id, &json!({
+                "kind": "setFiles", "nodeId": node_id, "files": specs,
+            }))?;
             Ok(json!({}))
         }
         "getBoxModel" => {
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = match resolve_node_id(page, params) {
-                Ok(nid) => nid,
-                Err(_) => return Ok(json!(null)),
-            };
-            let code = format!(
-                "(function() {{\
-                    var el = globalThis._wrap && globalThis._wrap({0});\
-                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
-                    var r = el.getBoundingClientRect();\
-                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom,\
-                            r.width, r.height];\
-                }})()",
-                node_id
-            );
-            let val = page.evaluate(&code);
-            let (quad, w, h) = if let Some(arr) = val.as_array() {
-                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() >= 10 {
-                    let q: Vec<Value> = nums[..8].iter().map(|n| coord_value(*n)).collect();
-                    (q, nums[8], nums[9])
-                } else {
-                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
-                }
-            } else {
-                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
-            };
-            Ok(json!({
-                "model": {
-                    "content": quad.clone(),
-                    "padding": quad.clone(),
-                    "border": quad.clone(),
-                    "margin": quad,
-                    "width": coord_value(w), "height": coord_value(h),
-                }
-            }))
+            let model = page.native_node_box_model(world.frame_id, NodeId::new(node_id))?
+                .ok_or("Could not compute box model")?;
+            Ok(json!({"model": {
+                "content": quad_value(&model.content),
+                "padding": quad_value(&model.padding),
+                "border": quad_value(&model.border),
+                "margin": quad_value(&model.margin),
+                "width": coord_value(model.width), "height": coord_value(model.height),
+            }}))
         }
         "getContentQuads" => {
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = match resolve_node_id(page, params) {
-                Ok(nid) => nid,
-                Err(_) => return Ok(json!(null)),
-            };
-            let code = format!(
-                "(function() {{\
-                    var el = globalThis._wrap && globalThis._wrap({0});\
-                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
-                    var r = el.getBoundingClientRect();\
-                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];\
-                }})()",
-                node_id
-            );
-            let val = page.evaluate(&code);
-            let quad = if let Some(arr) = val.as_array() {
-                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| coord_value(*n)).collect::<Vec<_>>() }
-                else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
-            } else {
-                vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
-            };
-            Ok(json!({ "quads": [quad] }))
+            let model = page.native_node_box_model(world.frame_id, NodeId::new(node_id))?;
+            Ok(json!({"quads": model.map(|model| vec![quad_value(&model.content)]).unwrap_or_default()}))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
     }
+}
+
+fn quad_value(quad: &[(f64, f64); 4]) -> Vec<Value> {
+    quad.iter().flat_map(|&(x, y)| [coord_value(x), coord_value(y)]).collect()
 }
 
 /// Serialize a CDP box-model coordinate the way Chrome does: an integral double
@@ -834,10 +733,7 @@ mod tests {
         .await
         .expect_err("an unknown node should fail");
 
-        assert_eq!(
-            error,
-            "node 999999 could not be resolved to a scrollable element"
-        );
+        assert_eq!(error, "Cannot find node in the current document");
     }
 
     // A hostile or heavy page can nest nodes tens of thousands deep (trivially

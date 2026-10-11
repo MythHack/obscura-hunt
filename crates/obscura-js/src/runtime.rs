@@ -244,10 +244,29 @@ pub struct CdpObjectState {
     evaluation_recipes: HashMap<String, String>,
 }
 
+/// A CDP command selects an execution context, not a browsing context alias.
+/// `None` is the document's canonical author world; `Some` is a native isolated world.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CdpExecutionWorld {
+    pub frame_id: u32,
+    pub world_id: Option<u64>,
+}
+
+/// Exact box corners in the owning frame's viewport, in CDP corner order.
+#[derive(Clone, Debug)]
+pub struct NativeNodeBoxModel {
+    pub content: [(f64, f64); 4],
+    pub padding: [(f64, f64); 4],
+    pub border: [(f64, f64); 4],
+    pub margin: [(f64, f64); 4],
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Restores the command realm even when an awaited CDP command is cancelled.
 struct CdpRealmScope {
-    current: Rc<std::cell::Cell<u32>>,
-    previous: u32,
+    current: Rc<std::cell::Cell<CdpExecutionWorld>>,
+    previous: CdpExecutionWorld,
 }
 
 impl Drop for CdpRealmScope {
@@ -263,7 +282,7 @@ pub struct ObscuraJsRuntime {
     object_store: HashMap<String, String>,
     evaluation_recipes: HashMap<String, String>,
     object_counter: u64,
-    cdp_frame_id: Rc<std::cell::Cell<u32>>,
+    cdp_world: Rc<std::cell::Cell<CdpExecutionWorld>>,
     import_map: Rc<RefCell<ImportMap>>,
     /// Loader-owned signal for pending dynamic-import graph fetches. This is
     /// intentionally separate from page fetch/XHR activity so analytics does
@@ -562,7 +581,7 @@ impl ObscuraJsRuntime {
         Ok(Self { state: window.state.clone(), window_id: id, root_context: window.context.clone(),
             module_realm: window.module_realm.clone(), windows: self.windows.clone(),
             object_store: HashMap::new(), evaluation_recipes: HashMap::new(), object_counter: 0,
-            cdp_frame_id: Rc::new(std::cell::Cell::new(0)), import_map,
+            cdp_world: Rc::new(std::cell::Cell::new(CdpExecutionWorld::default())), import_map,
             module_load_activity: window.loader.activity(), isolate_handle: self.isolate_handle.clone(),
             heap_limit_state: self.heap_limit_state.clone(), module_evaluations: HashMap::new(),
             loaded_module_specifiers: window.loader.loaded_specifiers(), evaluated_module_specifiers: HashMap::new(),
@@ -592,10 +611,10 @@ impl ObscuraJsRuntime {
     /// native navigable, engine, transport and storage namespaces.
     pub fn refresh_window_realm(&mut self) -> Result<(), String> {
         self.sync_window_document();
-        let (previous, previous_realm, main_realm, proxy_url, realm_id) = {
+        let (previous_realm, main_realm, proxy_url, realm_id) = {
             let windows = self.windows.borrow();
             let window = windows.windows.get(&self.window_id).filter(|window| !window.closed).ok_or("Window is closed")?;
-            (window.context.clone(), window.module_realm.clone(), window.main_realm,
+            (window.module_realm.clone(), window.main_realm,
                 window.loader.proxy_url.clone(), window.realm_id)
         };
         let context = self.create_realm_context().ok_or("Window context creation failed")?;
@@ -634,7 +653,7 @@ impl ObscuraJsRuntime {
             deno_core::BrowserRealm::attach(scope, context, loader.clone())
         };
         let realms = self.realm_states();
-        realms.borrow_mut().forget(&previous);
+        realms.borrow_mut().forget_frame(realm_id);
         realms.borrow_mut().register(context.clone(), realm_id, self.state.clone());
         {
             let mut windows = self.windows.borrow_mut();
@@ -657,6 +676,7 @@ impl ObscuraJsRuntime {
     /// Every scope, isolate entry and RefMut ends before returning Pending.
     pub fn poll_windows(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), String>> {
         let windows = self.windows.clone();
+        self.retire_execution_world_modules();
         {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
@@ -762,9 +782,10 @@ impl ObscuraJsRuntime {
             {
                 let op_state = runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
-                op_state.put(state_clone);
+                op_state.put(state_clone.clone());
                 let mut realms = crate::ops::RealmStates::default();
                 realms.set_main_context(runtime.main_context());
+                realms.register(runtime.main_context(), 0, state_clone);
                 op_state.put(Rc::new(RefCell::new(realms)));
             }
 
@@ -800,7 +821,7 @@ impl ObscuraJsRuntime {
             object_store: HashMap::new(),
             evaluation_recipes: HashMap::new(),
             object_counter: 0,
-            cdp_frame_id: Rc::new(std::cell::Cell::new(0)),
+            cdp_world: Rc::new(std::cell::Cell::new(CdpExecutionWorld::default())),
             import_map,
             module_load_activity,
             isolate_handle,
@@ -928,47 +949,6 @@ impl ObscuraJsRuntime {
     /// ops table, and its bootstrap captured that exact object, so filling the
     /// `ops` table on it is enough to give every shim in that realm a working
     /// op surface. The functions are shared, not copied: same isolate.
-    /// deno_core's isolate-global promise-reject and dynamic-`import()`
-    /// callbacks read per-context state from V8's `ContextState` and
-    /// `ModuleMap` embedder-data slots in the *current* context. A
-    /// snapshot-created frame realm leaves those slots null, so a promise
-    /// rejection or dynamic import inside a frame null-dereferenced in
-    /// deno_core's `clone_rc_raw` and segfaulted the whole process (#850, #841).
-    /// Alias the main context's slot pointers into the frame context so those
-    /// callbacks resolve to the main realm's state instead of crashing.
-    ///
-    /// Safe: the frame context only *borrows* these pointers. The callbacks
-    /// `clone_rc_raw` (increment then drop) them — net-zero on the strong count
-    /// — and obscura never tears a frame context down through deno_core's
-    /// `Rc::from_raw` destroy path (only the main realm owns and frees the Rc),
-    /// so no double-free is possible.
-    pub(crate) fn share_deno_context_state_with_realm(
-        &mut self,
-        realm: &deno_core::v8::Global<deno_core::v8::Context>,
-    ) {
-        use deno_core::{CONTEXT_STATE_SLOT_INDEX, MODULE_MAP_SLOT_INDEX, v8};
-
-        let main = self.runtime().main_context();
-        let mut entered = self.runtime();
-        let isolate = entered.v8_isolate();
-        v8::scope!(let scope, isolate);
-        let main_ctx = v8::Local::new(scope, main);
-        let realm_ctx = v8::Local::new(scope, realm);
-        // SAFETY: these slots on the main context are `Rc::into_raw` pointers
-        // set by deno_core at runtime construction; they outlive every frame
-        // realm. We only copy (alias) them and never reconstruct the Rc from
-        // the frame.
-        unsafe {
-            let cs = main_ctx.get_aligned_pointer_from_embedder_data(CONTEXT_STATE_SLOT_INDEX);
-            let mm = main_ctx.get_aligned_pointer_from_embedder_data(MODULE_MAP_SLOT_INDEX);
-            realm_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
-            realm_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
-        }
-        // These borrowed native fields need no Rust slot annex. Leaving its
-        // weak finalizer alive until isolate disposal can access freed memory
-        // in rusty_v8; clearing it now preserves the native fields (#1161).
-        realm_ctx.clear_all_slots();
-    }
 
     pub(crate) fn share_ops_with_realm(
         &mut self,
@@ -1131,81 +1111,402 @@ impl ObscuraJsRuntime {
         frame.inherit_resources(&self.state.borrow());
     }
 
+    pub(crate) fn document_state_for_frame(&self, frame_id: u32) -> Result<crate::ops::SharedState, String> {
+        self.document_state_for_cdp(frame_id)
+    }
+
+    pub(crate) fn attach_document_module_realm(&mut self, context: &v8::Global<v8::Context>,
+        state: &crate::ops::SharedState) -> deno_core::BrowserRealm {
+        let (base, imports) = {
+            let state = state.borrow();
+            (crate::ops::document_base_url(&state).unwrap_or_else(|| state.url.clone()), state.import_map.clone())
+        };
+        let proxy = self.windows.borrow().windows.get(&self.window_id)
+            .and_then(|window| window.loader.proxy_url.clone());
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, state, imports));
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        v8::scope_with_context!(scope, entered.v8_isolate(), main);
+        let context = v8::Local::new(scope, context);
+        deno_core::BrowserRealm::attach(scope, context, loader)
+    }
+
     pub fn forget_frame_state(&mut self, frame_id: u32) {
         self.realm_states().borrow_mut().forget_frame(frame_id);
+        self.retire_execution_world_modules();
     }
 
     pub fn live_frame_owner(&self, frame_id: u32) -> Option<(u32, NodeId)> {
-        self.realm_states().borrow().live_frame_owner(frame_id)
+        let (parent, owner) = self.realm_states().borrow().live_frame_owner(frame_id)?;
+        Some((if parent == self.state.borrow().frame_id { 0 } else { parent }, owner))
+    }
+
+    fn document_state_for_cdp(&self, frame_id: u32) -> Result<crate::ops::SharedState, String> {
+        let world = CdpExecutionWorld { frame_id, world_id: None };
+        self.validate_cdp_world(world)?;
+        self.realm_states().borrow().by_frame_id(self.world_document_id(world))
+            .ok_or_else(|| "Cannot find live document".into())
+    }
+
+    pub fn cdp_document_generation(&self, frame_id: u32) -> Result<u64, String> {
+        Ok(self.document_state_for_cdp(frame_id)?.borrow().document_generation)
+    }
+
+    pub fn with_dom_in_frame<R>(&self, frame_id: u32, read: impl FnOnce(&DomTree) -> R) -> Result<R, String> {
+        let state = self.document_state_for_cdp(frame_id)?;
+        let state = state.borrow();
+        Ok(read(state.dom.as_ref().ok_or("Native document unavailable")?))
+    }
+
+    pub fn frame_owner_chain(&self, mut frame_id: u32) -> Option<Vec<(u32, u32, NodeId, u64)>> {
+        self.validate_cdp_world(CdpExecutionWorld { frame_id, world_id: None }).ok()?;
+        let mut chain = Vec::new();
+        let root = self.state.borrow().frame_id;
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        for _ in 0..=crate::ops::max_live_frames() {
+            if frame_id == 0 || frame_id == root { return Some(chain); }
+            let (parent, owner) = registry.live_frame_owner(frame_id)?;
+            let generation = registry.by_frame_id(parent)?.borrow().document_generation;
+            chain.push((frame_id, if parent == root { 0 } else { parent }, owner, generation));
+            frame_id = parent;
+        }
+        None
+    }
+
+    /// Restore a snapshot context bound to the existing document, without
+    /// reparsing, publishing an author contentWindow, or spending a frame slot.
+    pub fn ensure_isolated_world(&mut self, frame_id: u32, world_name: &str,
+        grant_universal_access: bool) -> Result<u64, String>
+    {
+        self.begin_javascript_task();
+        let state = self.document_state_for_cdp(frame_id)?;
+        let document_id = state.borrow().frame_id;
+        let registry = self.realm_states();
+        let existing = registry.borrow().named_world(document_id, world_name);
+        if let Some(id) = existing {
+            if grant_universal_access { registry.borrow_mut().upgrade_world_access(id); }
+            return Ok(id);
+        }
+        static NEXT_WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_WORLD.try_update(std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| "Execution world id space exhausted")?;
+        let context = self.create_realm_context().ok_or("Execution world context creation failed")?;
+        if !self.share_ops_with_realm(&context) { return Err("Execution world op binding failed".into()); }
+        self.copy_identity_to_realm(&context);
+        {
+            let canonical = registry.borrow().context(document_id).ok_or("Document context is unavailable")?;
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), main);
+            let canonical = v8::Local::new(scope, canonical);
+            let isolated = v8::Local::new(scope, &context);
+            isolated.set_security_token(canonical.get_security_token(scope));
+        }
+        let (base, imports) = { let state = state.borrow();
+            (crate::ops::document_base_url(&state).unwrap_or_else(|| state.url.clone()), state.import_map.clone()) };
+        let proxy = self.windows.borrow().windows.get(&self.window_id)
+            .ok_or("Window is closed")?.loader.proxy_url.clone();
+        let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base, proxy, &state, imports));
+        let modules = {
+            let main = self.runtime().main_context();
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), main);
+            let local = v8::Local::new(scope, &context);
+            deno_core::BrowserRealm::attach(scope, local, loader)
+        };
+        registry.borrow_mut().register_world(context.clone(), document_id, id,
+            world_name.to_string(), modules, grant_universal_access)?;
+        let parent = registry.borrow().live_frame_owner(document_id).map_or(0, |owner| owner.0);
+        let initialized = self.eval_in_realm(&context, &format!(
+            "globalThis.__obscura_objects = {{}}; globalThis.__obscura_frameId = {document_id};\
+             globalThis.__obscura_parentFrameId = {parent}; globalThis.__obscura_init({}, true);", self.window_id));
+        if let Err(error) = initialized {
+            registry.borrow_mut().forget(&context);
+            self.retire_execution_world_modules();
+            return Err(error);
+        }
+        Ok(id)
+    }
+
+    pub fn dispose_isolated_world(&mut self, world_id: u64) -> Result<(), String> {
+        let context = self.realm_states().borrow().isolated_context(world_id)
+            .ok_or("Cannot find live isolated execution context")?;
+        self.realm_states().borrow_mut().forget(&context);
+        self.retire_execution_world_modules();
+        Ok(())
+    }
+
+    fn retire_execution_world_modules(&mut self) {
+        let registry = self.realm_states();
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        v8::scope_with_context!(scope, entered.v8_isolate(), main);
+        registry.borrow_mut().retire_modules(scope);
+    }
+
+    pub fn dispatch_native_input_in_frame(&mut self, frame_id: u32, payload: &serde_json::Value)
+        -> Result<serde_json::Value, String>
+    {
+        let context = self.execution_context(CdpExecutionWorld { frame_id, world_id: None })?;
+        self.begin_javascript_task();
+        let result = (|| {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), &context);
+            v8::tc_scope!(let scope, scope);
+            let payload = deno_core::serde_v8::to_v8(scope, payload).map_err(|error| error.to_string())?;
+            let value = crate::window::world_native_input(scope, &context, payload)
+                .ok_or_else(|| exception_text(scope))?;
+            let result = deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string());
+            scope.perform_microtask_checkpoint();
+            result
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    fn validate_object_arguments(&self, object_id: Option<&str>, arguments: &[serde_json::Value]) -> Result<(), String> {
+        for id in object_id.into_iter().chain(arguments.iter().filter_map(|arg| arg["objectId"].as_str())) {
+            if self.object_world(id)? != self.cdp_world.get() {
+                return Err("Object belongs to a different execution context".into());
+            }
+        }
+        Ok(())
     }
 
     pub fn network_frame_registry(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
         self.realm_states()
     }
 
-    fn enter_cdp_frame(&self, frame_id: u32) -> Result<CdpRealmScope, String> {
-        if frame_id != 0 && self.realm_states().borrow().context(frame_id).is_none() {
-            return Err("Cannot find live child frame context".to_string());
+    fn enter_cdp_frame(&self, world: CdpExecutionWorld) -> Result<CdpRealmScope, String> {
+        self.validate_cdp_world(world)?;
+        let previous = self.cdp_world.replace(world);
+        Ok(CdpRealmScope { current: self.cdp_world.clone(), previous })
+    }
+
+    fn world_document_id(&self, world: CdpExecutionWorld) -> u32 {
+        if world.frame_id == 0 { self.state.borrow().frame_id } else { world.frame_id }
+    }
+
+    pub fn validate_cdp_world(&self, world: CdpExecutionWorld) -> Result<(), String> {
+        self.execution_context(world).map(|_| ())
+    }
+
+    fn execution_context(&self, world: CdpExecutionWorld) -> Result<v8::Global<v8::Context>, String> {
+        let root = self.windows.borrow().windows.get(&self.window_id)
+            .filter(|window| !window.closed).map(|window| window.realm_id)
+            .ok_or("Window is closed")?;
+        let document = if world.frame_id == 0 { root } else { world.frame_id };
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        if document != root {
+            let mut ancestor = document;
+            for _ in 0..=crate::ops::max_live_frames() {
+                ancestor = registry.frame_parent(ancestor).ok_or("Cannot find live child frame context")?;
+                if ancestor == root { break; }
+            }
+            if ancestor != root { return Err("Execution context belongs to a different page".into()); }
         }
-        let previous = self.cdp_frame_id.replace(frame_id);
-        Ok(CdpRealmScope { current: self.cdp_frame_id.clone(), previous })
+        registry.world_context(document, world.world_id)
+            .ok_or_else(|| "Cannot find live execution context".to_string())
     }
 
     fn cdp_context(&mut self) -> Result<v8::Global<v8::Context>, String> {
-        let frame_id = self.cdp_frame_id.get();
-        if frame_id == 0 {
-            return self.windows.borrow().windows.get(&self.window_id)
-                .filter(|window| !window.closed).map(|window| window.context.clone())
-                .ok_or_else(|| "Window is closed".to_string());
-        }
-        self.realm_states().borrow().context(frame_id)
-            .ok_or_else(|| "Cannot find live child frame context".to_string())
+        self.execution_context(self.cdp_world.get())
     }
 
     /// Resolves handles in this runtime only, never in another page or realm.
-    pub fn object_frame_id(&self, object_id: &str) -> Result<u32, String> {
+    pub fn object_world(&self, object_id: &str) -> Result<CdpExecutionWorld, String> {
         let root = object_id.split("::").next().unwrap_or(object_id);
-        if !self.object_store.contains_key(object_id)
-            && !self.object_store.contains_key(root)
-            && !self.evaluation_recipes.contains_key(object_id)
-        {
+        if !self.object_store.contains_key(object_id) && !self.object_store.contains_key(root)
+            && !self.evaluation_recipes.contains_key(object_id) {
             return Err("Cannot find object with specified id".to_string());
         }
-        let frame_id = root.strip_prefix("frame-").or_else(|| root.strip_prefix("console-"))
-            .and_then(|rest| rest.split_once('-'))
-            .and_then(|(id, _)| id.parse::<u32>().ok()).unwrap_or(0);
-        if frame_id != 0 && self.live_frame_owner(frame_id).is_none() {
-            return Err("Cannot find live child frame context".to_string());
+        let mut world = CdpExecutionWorld::default();
+        if let Some(rest) = root.strip_prefix("frame-") {
+            let (frame, rest) = rest.split_once('-').ok_or("Invalid object execution context")?;
+            world.frame_id = frame.parse().map_err(|_| "Invalid object frame")?;
+            let rest = rest.strip_prefix("world-").ok_or("Invalid object world")?;
+            let (id, rest) = rest.split_once('-').ok_or("Invalid object world")?;
+            let id: u64 = id.parse().map_err(|_| "Invalid object world")?;
+            world.world_id = (id != 0).then_some(id);
+            let rest = rest.strip_prefix("generation-").ok_or("Invalid object generation")?;
+            let (generation, _) = rest.split_once('-').ok_or("Invalid object generation")?;
+            let generation: u64 = generation.parse().map_err(|_| "Invalid object generation")?;
+            if self.cdp_document_generation(world.frame_id)? != generation {
+                return Err("Object belongs to a retired document".into());
+            }
+        } else if let Some(rest) = root.strip_prefix("console-") {
+            world.frame_id = rest.split_once('-').and_then(|(frame, _)| frame.parse().ok())
+                .ok_or("Invalid console object context")?;
         }
-        Ok(frame_id)
+        self.validate_cdp_world(world)?;
+        Ok(world)
     }
 
-    pub fn evaluate_in_cdp_frame(&mut self, frame_id: u32, expression: &str)
+    /// Resolves only privately branded nodes in the handle's live execution world.
+    pub fn object_node_id(&mut self, object_id: &str) -> Result<(CdpExecutionWorld, u32), String> {
+        let world = self.object_world(object_id)?;
+        let _realm = self.enter_cdp_frame(world)?;
+        self.begin_javascript_task();
+        let result = (|| {
+            let value = self.cdp_stored_value(object_id)?;
+            let context = self.cdp_context()?;
+            let node_id = {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), &context);
+                v8::tc_scope!(let scope, scope);
+                let value = v8::Local::new(scope, value);
+                let object = v8::Local::<v8::Object>::try_from(value)
+                    .map_err(|_| "Object is not a native node")?;
+                let creation = object.get_creation_context(scope).ok_or("Object has no execution context")?;
+                let creation = v8::Global::new(scope, creation);
+                if creation != context {
+                    return Err("Object belongs to a different or retired execution context".into());
+                }
+                crate::window::world_node_id(scope, &creation, value)
+                    .filter(|node| *node != u32::MAX).ok_or("Object is not a native node")?
+            };
+            if !self.with_dom_in_frame(world.frame_id, |dom| dom.get_node(NodeId::new(node_id)).is_some())? {
+                return Err("Cannot find node in the current document".into());
+            }
+            Ok((world, node_id))
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    /// Wraps a native node with the requested world's captured wrapper factory.
+    pub fn store_node_for_cdp(&mut self, world: CdpExecutionWorld, node_id: u32)
+        -> Result<RemoteObjectInfo, String>
+    {
+        let _realm = self.enter_cdp_frame(world)?;
+        self.begin_javascript_task();
+        let result = (|| {
+            if !self.with_dom_in_frame(world.frame_id, |dom| dom.get_node(NodeId::new(node_id)).is_some())? {
+                return Err("Cannot find node in the current document".into());
+            }
+            let context = self.cdp_context()?;
+            let value = {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), &context);
+                v8::tc_scope!(let scope, scope);
+                let value = crate::window::world_wrap_node(scope, &context, node_id)
+                    .ok_or_else(|| exception_text(scope))?;
+                let object = v8::Local::<v8::Object>::try_from(value)
+                    .map_err(|_| "Native node did not produce a wrapper")?;
+                if object.get_creation_context(scope) != Some(v8::Local::new(scope, &context))
+                    || crate::window::world_node_id(scope, &context, value) != Some(node_id) {
+                    return Err("Native node wrapper belongs to a different execution context".into());
+                }
+                v8::Global::new(scope, value)
+            };
+            self.store_cdp_value(value)
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    /// Reads own descriptors, without evaluating their accessors or object coercions.
+    pub fn get_properties_for_cdp(&mut self, object_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let world = self.object_world(object_id)?;
+        let _realm = self.enter_cdp_frame(world)?;
+        self.begin_javascript_task();
+        let result = (|| {
+            let value = self.cdp_stored_value(object_id)?;
+            let context = self.cdp_context()?;
+            let descriptors = {
+                let mut entered = self.runtime();
+                v8::scope_with_context!(scope, entered.v8_isolate(), context);
+                v8::tc_scope!(let scope, scope);
+                let value = v8::Local::new(scope, value);
+                let object = value.to_object(scope).ok_or("Object has no properties")?;
+                let names = object.get_own_property_names(scope, v8::GetPropertyNamesArgsBuilder::new()
+                    .property_filter(v8::PropertyFilter::ALL_PROPERTIES)
+                    .key_conversion(v8::KeyConversionMode::ConvertToString).build())
+                    .ok_or_else(|| exception_text(scope))?;
+                let mut descriptors = Vec::with_capacity(names.length() as usize);
+                let value_keys = ["value", "get", "set"].map(|name| v8::String::new(scope, name).unwrap());
+                let flag_keys = ["configurable", "enumerable", "writable"].map(|name| v8::String::new(scope, name).unwrap());
+                for index in 0..names.length() {
+                    let key = names.get_index(scope, index).ok_or_else(|| exception_text(scope))?;
+                    let name = v8::Local::<v8::Name>::try_from(key).map_err(|_| "Invalid property name")?;
+                    let descriptor = object.get_own_property_descriptor(scope, name)
+                        .ok_or_else(|| exception_text(scope))?;
+                    if descriptor.is_undefined() { continue; }
+                    let descriptor = v8::Local::<v8::Object>::try_from(descriptor)
+                        .map_err(|_| "Invalid property descriptor")?;
+                    let symbol = v8::Local::<v8::Symbol>::try_from(key).ok();
+                    let display_name = if let Some(symbol) = symbol {
+                        let description = symbol.description(scope);
+                        format!("Symbol({})", if description.is_undefined() { String::new() }
+                            else { description.to_rust_string_lossy(scope) })
+                    } else { key.to_rust_string_lossy(scope) };
+                    let mut output = serde_json::json!({"name":display_name,"isOwn":true});
+                    for (field, key) in ["configurable", "enumerable", "writable"].into_iter().zip(flag_keys) {
+                        if descriptor.has_own_property(scope, key.into()).ok_or_else(|| exception_text(scope))? {
+                            let flag = descriptor.get(scope, key.into()).ok_or_else(|| exception_text(scope))?;
+                            output[field] = serde_json::json!(flag.boolean_value(scope));
+                        }
+                    }
+                    let mut values = [None, None, None];
+                    for (slot, key) in values.iter_mut().zip(value_keys) {
+                        if descriptor.has_own_property(scope, key.into()).ok_or_else(|| exception_text(scope))? {
+                            let value = descriptor.get(scope, key.into()).ok_or_else(|| exception_text(scope))?;
+                            *slot = Some(v8::Global::new(scope, value));
+                        }
+                    }
+                    descriptors.push((output, values, symbol.map(|symbol| {
+                        v8::Global::new(scope, v8::Local::<v8::Value>::from(symbol))
+                    })));
+                }
+                descriptors
+            };
+            let mut result = Vec::with_capacity(descriptors.len());
+            for (mut descriptor, values, symbol) in descriptors {
+                for (field, value) in ["value", "get", "set"].into_iter().zip(values) {
+                    if let Some(value) = value {
+                        descriptor[field] = Self::cdp_remote_value(self.store_cdp_value(value)?);
+                    }
+                }
+                if let Some(symbol) = symbol {
+                    descriptor["symbol"] = Self::cdp_remote_value(self.store_cdp_value(symbol)?);
+                }
+                result.push(descriptor);
+            }
+            Ok(result)
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    pub fn evaluate_in_cdp_frame(&mut self, world: CdpExecutionWorld, expression: &str)
         -> Result<serde_json::Value, String>
     {
-        let _realm = self.enter_cdp_frame(frame_id)?;
+        let _realm = self.enter_cdp_frame(world)?;
         self.evaluate(expression)
     }
 
+    /// Execute a classic script in a live world without serializing its completion.
+    pub fn execute_script_in_cdp_frame(&mut self, world: CdpExecutionWorld, name: &str, source: &str)
+        -> Result<(), String>
+    {
+        let _realm = self.enter_cdp_frame(world)?;
+        self.execute_script(name, source)
+    }
+
     pub async fn evaluate_for_cdp_in_frame(
-        &mut self, frame_id: u32, expression: &str, return_by_value: bool,
+        &mut self, world: CdpExecutionWorld, expression: &str, return_by_value: bool,
         await_promise: bool, timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        let _realm = self.enter_cdp_frame(frame_id)?;
+        let _realm = self.enter_cdp_frame(world)?;
         self.evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, timeout_ms).await
     }
 
     pub async fn call_function_on_for_cdp_in_frame(
-        &mut self, frame_id: u32, declaration: &str, object_id: Option<&str>,
+        &mut self, world: CdpExecutionWorld, declaration: &str, object_id: Option<&str>,
         arguments: &[serde_json::Value], return_by_value: bool, await_promise: bool,
         timeout_ms: u64,
     ) -> Result<RemoteObjectInfo, String> {
-        let _realm = self.enter_cdp_frame(frame_id)?;
-        for id in object_id.into_iter().chain(arguments.iter().filter_map(|arg| arg["objectId"].as_str())) {
-            if self.object_frame_id(id)? != frame_id {
-                return Err("Object belongs to a different execution context".to_string());
-            }
-        }
+        let _realm = self.enter_cdp_frame(world)?;
+        self.validate_object_arguments(object_id, arguments)?;
         let this = self.resolve_this(object_id);
         let (setup, args) = self.build_args(arguments);
         let source = format!("(function() {{ {setup} return ({declaration}).call({this}, {args}); }})()");
@@ -1214,12 +1515,7 @@ impl ObscuraJsRuntime {
 
     #[cfg(feature = "render")]
     pub fn native_hit_test(&mut self, frame_id: u32, x: f64, y: f64) -> Result<Option<NodeId>, String> {
-        let shared = if frame_id == 0 { self.state.clone() } else {
-            let realms = self.realm_states();
-            let realms = realms.borrow();
-            realms.context(frame_id).ok_or("Cannot find live child frame context")?;
-            realms.by_frame_id(frame_id).ok_or("Cannot find child document")?
-        };
+        let shared = self.document_state_for_cdp(frame_id)?;
         let mut state = shared.borrow_mut();
         begin_animation_task(&mut state);
         ensure_resolved_scroll(&mut state).ok_or("Native hit test layout unavailable")?;
@@ -1229,31 +1525,108 @@ impl ObscuraJsRuntime {
         Ok(prepared.hit_test(dom, scroll, x as f32, y as f32))
     }
 
-    /// Uses the native content box and resolved ancestor/root scroll, not
-    /// author-overridable geometry or parent-visible child document objects.
+    /// Map a parent viewport point to the child's CSS viewport through the
+    /// retained owner plane. Insets and zoom are used layout units.
     #[cfg(feature = "render")]
     pub fn direct_child_point(&mut self, frame_id: u32, x: f64, y: f64)
         -> Result<Option<(f64, f64)>, String>
     {
+        self.document_state_for_cdp(frame_id)?;
         let (parent, owner) = self.live_frame_owner(frame_id).ok_or("No live frame owner")?;
-        if parent != 0 { return Err("Nested frame input is not supported".to_string()); }
-        let mut state = self.state.borrow_mut();
+        let shared = self.document_state_for_cdp(parent)?;
+        let mut state = shared.borrow_mut();
         begin_animation_task(&mut state);
         ensure_resolved_scroll(&mut state).ok_or("Native owner layout unavailable")?;
         let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
         let prepared = state.prepared_render.as_ref().ok_or("Native owner layout unavailable")?;
-        let layout = prepared.layout();
-        if layout.transforms.get(&owner).is_some_and(|transform| !transform.is_translation()) {
-            return Err("Transformed child frame input is not supported".to_string());
-        }
-        let rect = prepared.viewport_rect_with_scroll(owner, scroll).ok_or("Frame owner has no box")?;
-        let style = layout.styles.get(&owner).ok_or("Frame owner has no style")?;
-        let left = f64::from(rect.x + style.border.left + style.padding.left);
-        let top = f64::from(rect.y + style.border.top + style.padding.top);
-        let width = f64::from(rect.width - style.border.left - style.border.right - style.padding.left - style.padding.right);
-        let height = f64::from(rect.height - style.border.top - style.border.bottom - style.padding.top - style.padding.bottom);
-        let local = (x - left, y - top);
-        Ok((local.0 >= 0.0 && local.1 >= 0.0 && local.0 < width && local.1 < height).then_some(local))
+        let dom = state.dom.as_ref().ok_or("Native document unavailable")?;
+        if prepared.hit_test(dom, scroll, x as f32, y as f32) != Some(owner) { return Ok(None); }
+        let Some((x, y)) = prepared.viewport_to_local(dom, owner, scroll, x as f32, y as f32) else {
+            return Ok(None);
+        };
+        let rect = prepared.layout().rects.get(&owner).ok_or("Frame owner has no box")?;
+        let style = prepared.layout().styles.get(&owner).ok_or("Frame owner has no style")?;
+        let left = style.border.left + style.padding.left;
+        let top = style.border.top + style.padding.top;
+        let width = rect.width - left - style.border.right - style.padding.right;
+        let height = rect.height - top - style.border.bottom - style.padding.bottom;
+        let (x, y) = (x - left, y - top);
+        let zoom = style.used_zoom();
+        Ok((zoom.is_finite() && zoom > 0.0 && x >= 0.0 && y >= 0.0 && x < width && y < height)
+            .then_some((f64::from(x / zoom), f64::from(y / zoom))))
+    }
+
+    /// Project child CSS viewport coordinates into its immediate parent's
+    /// viewport. Off-viewport quad corners remain available to CDP.
+    #[cfg(feature = "render")]
+    pub fn direct_child_to_parent_point(&mut self, frame_id: u32, x: f64, y: f64)
+        -> Result<Option<(f64, f64)>, String>
+    {
+        self.document_state_for_cdp(frame_id)?;
+        let (parent, owner) = self.live_frame_owner(frame_id).ok_or("No live frame owner")?;
+        let shared = self.document_state_for_cdp(parent)?;
+        let mut state = shared.borrow_mut();
+        begin_animation_task(&mut state);
+        ensure_resolved_scroll(&mut state).ok_or("Native owner layout unavailable")?;
+        let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
+        let prepared = state.prepared_render.as_ref().ok_or("Native owner layout unavailable")?;
+        let dom = state.dom.as_ref().ok_or("Native document unavailable")?;
+        let style = prepared.layout().styles.get(&owner).ok_or("Frame owner has no style")?;
+        let zoom = style.used_zoom();
+        let (x, y) = (x as f32 * zoom + style.border.left + style.padding.left,
+            y as f32 * zoom + style.border.top + style.padding.top);
+        Ok(prepared.local_to_viewport(dom, owner, scroll, x, y)
+            .map(|(x, y)| (f64::from(x), f64::from(y))))
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_node_local_to_viewport(&mut self, frame_id: u32, node: NodeId, x: f64, y: f64)
+        -> Result<Option<(f64, f64)>, String>
+    {
+        let shared = self.document_state_for_cdp(frame_id)?;
+        let mut state = shared.borrow_mut();
+        begin_animation_task(&mut state);
+        ensure_resolved_scroll(&mut state).ok_or("Native node layout unavailable")?;
+        let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
+        let prepared = state.prepared_render.as_ref().ok_or("Native node layout unavailable")?;
+        let dom = state.dom.as_ref().ok_or("Native document unavailable")?;
+        Ok(prepared.local_to_viewport(dom, node, scroll, x as f32, y as f32)
+            .map(|(x, y)| (f64::from(x), f64::from(y))))
+    }
+
+    #[cfg(feature = "render")]
+    pub fn native_node_box_model(&mut self, frame_id: u32, node: NodeId)
+        -> Result<Option<NativeNodeBoxModel>, String>
+    {
+        let shared = self.document_state_for_cdp(frame_id)?;
+        let mut state = shared.borrow_mut();
+        begin_animation_task(&mut state);
+        ensure_resolved_scroll(&mut state).ok_or("Native node layout unavailable")?;
+        let (_, scroll) = state.resolved_scroll.as_ref().ok_or("Native scroll state unavailable")?;
+        let prepared = state.prepared_render.as_ref().ok_or("Native node layout unavailable")?;
+        let dom = state.dom.as_ref().ok_or("Native document unavailable")?;
+        if !dom.is_connected(node) { return Ok(None); }
+        let Some(rect) = prepared.layout().rects.get(&node) else { return Ok(None) };
+        let Some(style) = prepared.layout().styles.get(&node) else { return Ok(None) };
+        let quad = |left, top, right, bottom| -> Option<[(f64, f64); 4]> {
+            let mut points = [(0.0, 0.0); 4];
+            for (point, (x, y)) in points.iter_mut().zip([
+                (left, top), (right, top), (right, bottom), (left, bottom)]) {
+                let (x, y) = prepared.local_to_viewport(dom, node, scroll, x, y)?;
+                *point = (f64::from(x), f64::from(y));
+            }
+            Some(points)
+        };
+        let Some(border) = quad(0.0, 0.0, rect.width, rect.height) else { return Ok(None) };
+        let Some(padding) = quad(style.border.left, style.border.top,
+            rect.width - style.border.right, rect.height - style.border.bottom) else { return Ok(None) };
+        let Some(content) = quad(style.border.left + style.padding.left, style.border.top + style.padding.top,
+            rect.width - style.border.right - style.padding.right,
+            rect.height - style.border.bottom - style.padding.bottom) else { return Ok(None) };
+        let Some(margin) = quad(-style.margin.left, -style.margin.top,
+            rect.width + style.margin.right, rect.height + style.margin.bottom) else { return Ok(None) };
+        Ok(Some(NativeNodeBoxModel { content, padding, border, margin,
+            width: f64::from(rect.width), height: f64::from(rect.height) }))
     }
 
     /// The origin of the document this runtime is running, or `"null"` for a
@@ -1448,14 +1821,14 @@ impl ObscuraJsRuntime {
     fn execute_runtime_script(
         &mut self,
         name: &'static str,
-        source: String,
+        source: impl AsRef<str>,
     ) -> Result<deno_core::v8::Global<deno_core::v8::Value>, String> {
         let context = self.cdp_context()?;
         let result = {
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), context);
             v8::tc_scope!(let scope, scope);
-            let code = v8::String::new(scope, &source).ok_or("source too large")?;
+            let code = v8::String::new(scope, source.as_ref()).ok_or("source too large")?;
             let resource_name = v8::String::new(scope, name).ok_or("script name too large")?;
             let origin = v8::ScriptOrigin::new(scope, resource_name.into(), 0, 0, false, 0,
                 None, false, false, false, None);
@@ -1510,8 +1883,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
+        let replacing = gs.dom.is_some();
         gs.dom = Some(dom);
-        gs.document_generation = gs.document_generation.wrapping_add(1);
+        if replacing { gs.document_generation = gs.document_generation.wrapping_add(1); }
+        gs.focused_node = None;
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
@@ -2689,6 +3064,12 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        if self.execution_context(CdpExecutionWorld::default()).is_err() {
+            if let Err(error) = self.refresh_window_realm() {
+                tracing::error!(%error, "cannot initialize retired document context");
+                return;
+            }
+        }
         self.state.borrow_mut().navigation_timing.record("domLoading");
         let source = format!("globalThis.__obscura_frameId = {}; globalThis.__obscura_init({});",
             self.state.borrow().frame_id, self.window_id);
@@ -2720,13 +3101,13 @@ impl ObscuraJsRuntime {
         );
     }
 
+    /// Run a script in the selected live world and return its completion value.
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
         #[cfg(feature = "render")]
         self.service_render_resources();
         self.begin_javascript_task();
-        let wrapped = Self::wrap_expression(expression);
         let result = self
-            .execute_runtime_script("<eval>", wrapped)
+            .execute_runtime_script("<eval>", expression)
             .map_err(|e| format!("JS error: {}", e))?;
         self.v8_to_json(result)
     }
@@ -3153,12 +3534,11 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object(&mut self, object_id: &str) {
-        let frame_id = object_id.strip_prefix("frame-").or_else(|| object_id.strip_prefix("console-"))
-            .and_then(|rest| rest.split_once('-'))
-            .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok()).unwrap_or(0);
+        let world = self.object_world(object_id).ok();
         self.evaluation_recipes.remove(object_id);
         if self.object_store.remove(object_id).is_some() {
-            if let Ok(_realm) = self.enter_cdp_frame(frame_id) {
+            if let Some(world) = world.filter(|world| self.validate_cdp_world(*world).is_ok()) {
+                let _realm = self.enter_cdp_frame(world).expect("validated execution context");
                 let _ = self.execute_runtime_script("<release>", format!(
                     "delete globalThis.__obscura_objects[{}];", js_string_literal(object_id)));
             }
@@ -3166,19 +3546,12 @@ impl ObscuraJsRuntime {
     }
 
     pub fn release_object_group(&mut self) {
-        let mut frame_ids: Vec<u32> = self
-            .object_store
-            .keys()
-            .filter_map(|object_id| object_id.strip_prefix("frame-").or_else(|| object_id.strip_prefix("console-")))
-            .filter_map(|rest| rest.split_once('-'))
-            .filter_map(|(frame_id, _)| frame_id.parse().ok())
-            .filter(|frame_id| *frame_id != 0)
-            .collect();
-        frame_ids.sort_unstable();
-        frame_ids.dedup();
-        frame_ids.push(0);
-        for frame_id in frame_ids {
-            if let Ok(_realm) = self.enter_cdp_frame(frame_id) {
+        let mut worlds: Vec<CdpExecutionWorld> = self.object_store.keys()
+            .filter_map(|object_id| self.object_world(object_id).ok()).collect();
+        worlds.sort_unstable();
+        worlds.dedup();
+        for world in worlds {
+            if let Ok(_realm) = self.enter_cdp_frame(world) {
                 let _ = self.execute_runtime_script("<releaseGroup>", "globalThis.__obscura_objects = {};".to_string());
             }
         }
@@ -3745,7 +4118,8 @@ impl ObscuraJsRuntime {
         self.state.borrow().activity_generation
     }
 
-    fn has_pending_network_requests(&self) -> bool {
+    /// Whether this page still owns an in-flight network request.
+    pub fn has_pending_network_requests(&self) -> bool {
         let state = self.state.borrow();
         state
             .page_in_flight
@@ -4156,23 +4530,20 @@ impl ObscuraJsRuntime {
         if timeout.is_zero() {
             return self.evaluate(expression);
         }
-        self.begin_javascript_task();
-        let wrapped = Self::wrap_expression(expression);
         let token = self.arm_watchdog(timeout);
-        let result = self.runtime().execute_script("<eval>", wrapped);
+        let result = self.evaluate(expression);
         let fired = self.disarm_watchdog(token);
         if self.recover_heap_limit() {
             return Err("JavaScript heap limit exceeded; execution terminated".to_string());
         }
         match result {
-            Ok(v) if !fired => self.v8_to_json(v),
+            Ok(value) if !fired => Ok(value),
             Ok(_) => Err("eval timed out".to_string()),
-            Err(e) => {
-                let msg = e.to_string();
-                if fired || msg.contains("execution terminated") {
+            Err(error) => {
+                if fired || error.contains("execution terminated") {
                     Err("eval timed out".to_string())
                 } else {
-                    Err(format!("JS error: {}", msg))
+                    Err(error)
                 }
             }
         }
@@ -4367,48 +4738,135 @@ impl ObscuraJsRuntime {
     }
     fn make_oid(&self, _counter: u64) -> String {
         let id = NEXT_CDP_OBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let frame_id = self.cdp_frame_id.get();
-        if frame_id == 0 {
-            format!("{{\"injectedScriptId\":1,\"id\":{}}}", id)
-        } else {
-            format!("frame-{frame_id}-{{\"injectedScriptId\":1,\"id\":{id}}}")
-        }
+        let world = self.cdp_world.get();
+        let generation = self.cdp_document_generation(world.frame_id)
+            .expect("object creation requires a live execution context");
+        format!("frame-{}-world-{}-generation-{generation}-{{\"injectedScriptId\":1,\"id\":{id}}}",
+            world.frame_id, world.world_id.unwrap_or(0))
     }
 
-    fn wrap_expression(expression: &str) -> String {
-        let trimmed = expression.trim();
-
-        let is_multi_statement = trimmed.starts_with("var ")
-            || trimmed.starts_with("let ")
-            || trimmed.starts_with("const ")
-            || trimmed.starts_with("if ")
-            || trimmed.starts_with("for ")
-            || trimmed.starts_with("while ")
-            || trimmed.starts_with("return ");
-
-        if is_multi_statement {
-            format!(
-                "(function() {{ try {{\n{}\n}} catch(e) {{ return null; }} }})()",
-                expression
-            )
-        } else {
-            // Strip trailing semicolons + whitespace before wrapping in
-            // `return (...);`. Playwright's utility-script expression is
-            // an IIFE that ends with `})();` — leaving the `;` in place
-            // produces `return (...;);`, a SyntaxError. The script fails
-            // to parse, the catch never fires (parse errors are not
-            // catchable), and the function silently returns `undefined`.
-            // Stripping makes the wrapped expression syntactically valid.
-            //
-            // The newline before the trailing `)` also terminates any
-            // `//# sourceURL=...` line comment the caller may have appended
-            // (Puppeteer's evaluated bundles do).
-            let cleaned = trimmed.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-            format!(
-                "(function() {{ try {{ return (\n{}\n); }} catch(e) {{ return null; }} }})()",
-                cleaned
-            )
+    fn cdp_own_data_property<'s>(scope: &mut v8::PinScope<'s, '_>, object: v8::Local<v8::Object>,
+        key: v8::Local<v8::Name>) -> Result<Option<v8::Local<'s, v8::Value>>, String>
+    {
+        let descriptor = object.get_own_property_descriptor(scope, key)
+            .ok_or("Cannot read CDP object storage")?;
+        if descriptor.is_undefined() { return Ok(None); }
+        let descriptor = v8::Local::<v8::Object>::try_from(descriptor).map_err(|_| "Invalid storage descriptor")?;
+        let value_key = v8::String::new(scope, "value").ok_or("Cannot allocate property name")?;
+        if !descriptor.has_own_property(scope, value_key.into()).ok_or("Cannot read storage descriptor")? {
+            return Err("CDP object storage is not a data property".into());
         }
+        descriptor.get(scope, value_key.into()).map(Some).ok_or_else(|| "Cannot read stored value".into())
+    }
+
+    fn cdp_object_table<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Object>, String> {
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__obscura_objects").ok_or("Cannot allocate storage name")?;
+        let value = Self::cdp_own_data_property(scope, global, key.into())?.ok_or("CDP object storage unavailable")?;
+        if value.is_proxy() { return Err("Invalid CDP object storage".into()); }
+        v8::Local::<v8::Object>::try_from(value).map_err(|_| "Invalid CDP object storage".into())
+    }
+
+    fn cdp_stored_value(&mut self, object_id: &str) -> Result<v8::Global<v8::Value>, String> {
+        // Restore an existing evaluation recipe if needed, then read the same
+        // object table natively so storage accessors cannot execute author code.
+        if !self.object_store.contains_key(object_id) && self.evaluation_recipes.contains_key(object_id) {
+            self.resolve_remote_object(object_id).ok_or("Cannot find object with specified id")?;
+        }
+        let context = self.cdp_context()?;
+        let mut entered = self.runtime();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        v8::tc_scope!(let scope, scope);
+        let table = Self::cdp_object_table(scope)?;
+        let key = v8::String::new(scope, object_id).ok_or("Cannot allocate object id")?;
+        let value = Self::cdp_own_data_property(scope, table, key.into())?.ok_or("Cannot find object with specified id")?;
+        Ok(v8::Global::new(scope, value))
+    }
+
+    fn store_cdp_value(&mut self, value: v8::Global<v8::Value>) -> Result<RemoteObjectInfo, String> {
+        let context = self.cdp_context()?;
+        let registry = self.realm_states();
+        let info = {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), &context);
+            v8::tc_scope!(let scope, scope);
+            let value = v8::Local::new(scope, &value);
+            if !value.is_object() && !value.is_symbol() {
+                None
+            } else {
+                let js_type = value.type_of(scope).to_rust_string_lossy(scope);
+                let mut subtype = None;
+                let (mut class_name, mut description) = if let Ok(symbol) = v8::Local::<v8::Symbol>::try_from(value) {
+                    let description = symbol.description(scope);
+                    (String::new(), format!("Symbol({})", if description.is_undefined() { String::new() }
+                        else { description.to_rust_string_lossy(scope) }))
+                } else if let Ok(function) = v8::Local::<v8::Function>::try_from(value) {
+                    let name = function.get_name(scope).to_rust_string_lossy(scope);
+                    ("Function".to_string(), if name.is_empty() { "function()".into() }
+                        else { format!("function {name}()") })
+                } else {
+                    let object = v8::Local::<v8::Object>::try_from(value).map_err(|_| "Invalid CDP value")?;
+                    let name = object.get_constructor_name().to_rust_string_lossy(scope);
+                    (name.clone(), name)
+                };
+                if value.is_array() {
+                    let array = v8::Local::<v8::Array>::try_from(value).map_err(|_| "Invalid array value")?;
+                    subtype = Some("array".into());
+                    class_name = "Array".into();
+                    description = format!("Array({})", array.length());
+                } else if value.is_native_error() {
+                    subtype = Some("error".into());
+                } else if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
+                    if object.get_creation_context(scope) == Some(v8::Local::new(scope, &context)) {
+                        if let Some(node_id) = crate::window::world_node_id(scope, &context, value).filter(|node| *node != u32::MAX) {
+                            let document = registry.borrow().by_context(&context)
+                                .ok_or("Cannot find live execution context")?;
+                            let document = document.borrow();
+                            let node = document.dom.as_ref().and_then(|dom| dom.get_node(NodeId::new(node_id)))
+                                .ok_or("Cannot find node in the current document")?;
+                            subtype = Some("node".into());
+                            description = match &node.data {
+                                obscura_dom::NodeData::Document => { class_name = "HTMLDocument".into(); "#document".into() },
+                                obscura_dom::NodeData::Element { name, .. } => name.local.to_string(),
+                                obscura_dom::NodeData::Doctype { name, .. } => name.clone(),
+                                obscura_dom::NodeData::Text { .. } => "#text".into(),
+                                obscura_dom::NodeData::Comment { .. } => "#comment".into(),
+                                obscura_dom::NodeData::ProcessingInstruction { target, .. } => target.clone(),
+                            };
+                        }
+                    }
+                }
+                Some(RemoteObjectInfo { thrown:false, js_type, subtype, class_name, description,
+                    object_id:None, value:None, unserializable_value:None })
+            }
+        };
+        let Some(mut info) = info else { return self.v8_to_cdp_value(value); };
+        self.object_counter += 1;
+        let oid = self.make_oid(self.object_counter);
+        {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            v8::tc_scope!(let scope, scope);
+            let table = Self::cdp_object_table(scope)?;
+            let key = v8::String::new(scope, &oid).ok_or("Cannot allocate object id")?;
+            let value = v8::Local::new(scope, value);
+            if table.create_data_property(scope, key.into(), value) != Some(true) {
+                return Err("Cannot store CDP value".into());
+            }
+        }
+        self.object_store.insert(oid.clone(), format!("globalThis.__obscura_objects[{}]", js_string_literal(&oid)));
+        info.object_id = Some(oid);
+        Ok(info)
+    }
+
+    fn cdp_remote_value(info: RemoteObjectInfo) -> serde_json::Value {
+        let mut value = serde_json::json!({"type":info.js_type,"description":info.description});
+        if let Some(subtype) = info.subtype { value["subtype"] = serde_json::json!(subtype); }
+        if !info.class_name.is_empty() { value["className"] = serde_json::json!(info.class_name); }
+        if let Some(object_id) = info.object_id { value["objectId"] = serde_json::json!(object_id); }
+        if let Some(data) = info.value { value["value"] = data; }
+        if let Some(unserializable) = info.unserializable_value { value["unserializableValue"] = serde_json::json!(unserializable); }
+        value
     }
 
     fn meta_extract_js(var_name: &str) -> String {
@@ -4451,10 +4909,11 @@ impl ObscuraJsRuntime {
     }
 
     fn resolve_remote_object(&mut self, object_id: &str) -> Option<String> {
+        if self.object_world(object_id).ok()? != self.cdp_world.get() { return None; }
         if let Some(retrieval) = self.object_store.get(object_id) {
             return Some(retrieval.clone());
         }
-        if object_id.contains("::") && self.object_frame_id(object_id).ok() == Some(self.cdp_frame_id.get()) {
+        if object_id.contains("::") {
             return Some(format!("globalThis.__obscura_objects[{}]", js_string_literal(object_id)));
         }
         let expression = self.evaluation_recipes.get(object_id)?.clone();
@@ -10340,8 +10799,6 @@ mod tests {
                     ];
                     const deleted = document.fonts.delete(dynamic);
                     document.fonts.clear();
-                    const bytes = new Uint8Array([0, 1, 2, 253, 254, 255]);
-                    const binary = new FontFace("Binary", bytes, { weight: 600 });
                     return [
                         authored.length,
                         authored.map(face => face.family),
@@ -10349,8 +10806,6 @@ mod tests {
                         afterAdd,
                         deleted,
                         document.fonts.size,
-                        binary.status,
-                        binary.loaded === binary.load()
                     ];
                 })()"#,
             )
@@ -10375,55 +10830,10 @@ mod tests {
                 ],
                 true,
                 2,
-                "loaded",
-                true
             ])
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn font_face_load_updates_status_set_readiness_and_matching() {
-        let mut rt = setup_runtime("<html><body></body></html>");
-        rt.execute_script(
-            "font-face-lifecycle",
-            r#"
-                globalThis.__fontEvents = [];
-                const face = new FontFace("Lifecycle", "url('/lifecycle.woff2')", {
-                    weight: "700"
-                });
-                document.fonts.onloading = event => __fontEvents.push([event.type, event.fontfaces.length]);
-                document.fonts.onloadingdone = event => __fontEvents.push([event.type, event.fontfaces.length]);
-                document.fonts.add(face);
-                globalThis.__fontBefore = [
-                    face.status,
-                    document.fonts.status,
-                    document.fonts.check("700 16px Lifecycle")
-                ];
-                globalThis.__fontLoadResult = "pending";
-                document.fonts.load("700 16px Lifecycle").then(faces => {
-                    __fontLoadResult = [faces.length, faces[0] === face, face.status,
-                        document.fonts.check("700 16px Lifecycle")];
-                });
-                document.fonts.ready.then(set => {
-                    globalThis.__fontReady = set === document.fonts;
-                });
-            "#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
-        let result = rt
-            .evaluate("return [__fontBefore, __fontLoadResult, __fontReady, __fontEvents];")
-            .unwrap();
-        assert_eq!(
-            result,
-            serde_json::json!([
-                ["unloaded", "loaded", false],
-                [1, true, "loaded", true],
-                true,
-                [["loading", 1], ["loadingdone", 1]]
-            ])
-        );
-    }
 
     #[test]
     fn animation_frame_requires_a_callable_callback() {
@@ -12823,73 +13233,6 @@ mod tests {
         assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[cfg(feature = "render")]
-    #[test]
-    fn script_registered_url_font_reaches_render_resource_collection() {
-        let loads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let loader_loads = std::sync::Arc::clone(&loads);
-        let font = include_bytes!("../../obscura-render/assets/liberation-serif.ttf").to_vec();
-        let mut rt = parser_image_runtime(
-            r#"<html><body style="margin:0">
-                <span id="sample" style="display:inline-block;width:max-content;
-                    font-family:DynamicFixture;font-size:40px;white-space:nowrap">WWWWiiii</span>
-            </body></html>"#,
-            move |url: &str| {
-                loader_loads
-                    .lock()
-                    .expect("font loads")
-                    .push(url.to_string());
-                (url == "http://example.com/fonts/dynamic.ttf").then(|| font.clone())
-            },
-        );
-        rt.set_viewport(400.0, 100.0);
-        let before = rt
-            .evaluate("document.getElementById('sample').getBoundingClientRect().width")
-            .unwrap()
-            .as_f64()
-            .expect("fallback width");
-        assert!(loads.lock().expect("initial loads").is_empty());
-
-        let registered = rt
-            .evaluate(
-                r#"(() => {
-                    const face = new FontFace("DynamicFixture",
-                        "url('../fonts/dynamic.ttf') format('truetype')",
-                        { weight: "normal", style: "normal", unicodeRange: "U+20-7E" });
-                    return [document.fonts.add(face) === document.fonts,
-                        document.fonts.size, document.fonts.has(face)];
-                })()"#,
-            )
-            .unwrap();
-        assert_eq!(registered, serde_json::json!([true, 1, true]));
-        {
-            let state = rt.state.borrow();
-            assert_eq!(state.dynamic_fonts.len(), 1);
-            assert!(state.prepared_render.is_some());
-            assert_eq!(
-                state.pending_style_mutations,
-                vec![obscura_render::RetainedStyleMutation::Resource],
-                "font registry changes need reshaping and layout, not a fresh cascade"
-            );
-        }
-
-        let after = rt
-            .evaluate("document.getElementById('sample').getBoundingClientRect().width")
-            .unwrap()
-            .as_f64()
-            .expect("dynamic font width");
-        assert_ne!(
-            before, after,
-            "registered face must affect final text geometry"
-        );
-        assert_eq!(
-            *loads.lock().expect("dynamic font loads"),
-            vec!["http://example.com/fonts/dynamic.ttf".to_string()]
-        );
-        rt.screenshot_prepared((400.0, 100.0), Some("http://example.com/page/index.html"))
-            .expect("dynamic font screenshot");
-        assert_eq!(loads.lock().expect("repeated font loads").len(), 1);
-    }
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
@@ -21866,7 +22209,7 @@ mod tests {
     #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
     async fn stealth_same_origin_fetch_sends_origin_for_non_get_methods() {
-        let (mut rt, origin, requests) = raw_request_runtime(6);
+        let (rt, origin, requests) = raw_request_runtime(6);
         rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
             std::sync::Arc::new(obscura_net::CookieJar::new()),
         )));
@@ -23713,24 +24056,6 @@ mod tests {
     // conflicts when both this branch and an unrelated bootstrap.js change
     // add tests near the start of `mod tests`).
 
-    /// Playwright >= 1.25 calls `element.checkVisibility(...)` before every
-    /// input event. If the method isn't defined Playwright retries until its
-    /// action timeout fires. Without a layout engine we can't compute it
-    /// properly, so the stub always returns true — still strictly better
-    /// than the undefined path.
-    #[test]
-    fn element_check_visibility_is_callable() {
-        let mut rt = setup_runtime(r#"<div id="x">x</div>"#);
-        let result = rt
-            .evaluate("document.getElementById('x').checkVisibility({checkOpacity: true})")
-            .unwrap();
-        assert_eq!(result, serde_json::json!(true));
-
-        let typeof_method = rt
-            .evaluate("typeof document.getElementById('x').checkVisibility")
-            .unwrap();
-        assert_eq!(typeof_method, serde_json::json!("function"));
-    }
 
     /// Playwright's `getByRole` / `getByLabel` locators resolve via ARIA
     /// reflection properties. Without the getters those locators always
@@ -24081,45 +24406,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn media_text_tracks_expose_loaded_webvtt_cues() {
-        let mut rt = setup_runtime(
-            r#"<video><track id="captions" kind="captions" srclang="en" default
-                src="data:text/vtt,WEBVTT%0A%0A00%3A00%3A01.000%20--%3E%2000%3A00%3A03.000%0AHello"></video>"#,
-        );
-        let result = rt
-            .evaluate(
-                r#"
-                const element = document.getElementById("captions");
-                const video = document.querySelector("video");
-                const cue = element.track.cues[0];
-                const added = video.addTextTrack("metadata", "Data", "en");
-                cue.line = -2;
-                cue.size = 80;
-                return [
-                    element instanceof HTMLTrackElement,
-                    element.readyState === HTMLTrackElement.LOADED,
-                    element.track instanceof TextTrack,
-                    element.track.cues.length,
-                    cue.startTime,
-                    cue.endTime,
-                    cue.text,
-                    cue.line,
-                    cue.size,
-                    video.textTracks.length,
-                    video.textTracks.getTrackById("captions") === element.track,
-                    added.kind,
-                ];
-                "#,
-            )
-            .unwrap();
-        assert_eq!(
-            result,
-            serde_json::json!([
-                true, true, true, 1, 1, 3, "Hello", -2, 80, 1, true, "metadata"
-            ])
-        );
-    }
 
     #[test]
     fn unsupported_media_capabilities_and_readiness_are_honest() {

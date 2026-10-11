@@ -401,12 +401,12 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             },
             {
                 "name": "browser_press_key",
-                "description": "Dispatch a keyboard event on an element or the document",
+                "description": "Press a key on the focused element, or focus a selector first",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "key": { "type": "string", "description": "Key name (e.g. Enter, Tab, Escape)" },
-                        "selector": { "type": "string", "description": "CSS selector (optional, defaults to document)" }
+                        "selector": { "type": "string", "description": "CSS selector to focus (optional, defaults to the focused element)" }
                     },
                     "required": ["key"]
                 }
@@ -1031,107 +1031,83 @@ fn tool_snapshot(args: &Value, state: &mut BrowserState) -> Result<String, Strin
     Ok(format!("URL: {url}\nTitle: {title}\n\n{body}{refs_summary}"))
 }
 
+fn target_node(page: &Page, selector: &str) -> Result<NodeId, String> {
+    page.with_dom(|dom| dom.query_selector(selector))
+        .ok_or("No DOM loaded")?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Element not found: {selector}"))
+}
+
+fn native_click(page: &mut Page, node: NodeId) -> Result<(), String> {
+    // Selector-based clicks target the resolved node, not a coordinate hit test.
+    for (event_type, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+        page.dispatch_native_input(&json!({
+            "kind": "mouse", "type": event_type, "nodeId": node.index(),
+            "x": 0, "y": 0, "buttonCode": 0, "buttons": buttons, "clickCount": 1,
+        }))?;
+    }
+    Ok(())
+}
+
+fn native_form_input(page: &mut Page, payload: &Value) -> Result<(), String> {
+    let result = page.dispatch_native_input(payload)?;
+    match result.as_str() {
+        Some("ok") => Ok(()),
+        Some(error) => Err(error.to_string()),
+        None => Err("Native form input did not complete".to_string()),
+    }
+}
+
 async fn tool_click(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
-
-    let js = format!(
-        r#"(function(){{
-            var el = document.querySelector({sel});
-            if (!el) return "error:element not found";
-            el.click();
-            return "ok";
-        }})()"#,
-        sel = serde_json::to_string(&selector).unwrap()
-    );
-
-    let result = state.page_mut().evaluate(&js);
-    if result.as_str() == Some("error:element not found") {
-        Err(format!("Element not found: {selector}"))
-    } else {
-        // A click can navigate or rewrite the DOM; the old ref table may
-        // no longer match. Conservative: invalidate. Next snapshot rebuilds.
-        state.interactive_refs.clear();
-        state.settle_synthetic_navigation().await?;
-        Ok(format!("Clicked '{selector}'"))
-    }
+    let page = state.page_mut();
+    let node = target_node(page, &selector)?;
+    native_click(page, node)?;
+    // A click can navigate or rewrite the DOM; the old ref table may
+    // no longer match. Conservative: invalidate. Next snapshot rebuilds.
+    state.interactive_refs.clear();
+    state.settle_synthetic_navigation().await?;
+    Ok(format!("Clicked '{selector}'"))
 }
 
 async fn tool_fill(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let value = args.get("value").and_then(Value::as_str)
         .ok_or("Missing value parameter")?;
-
-    let js = format!(
-        r#"(function(){{
-            var el = document.querySelector({sel});
-            if (!el) return "error:element not found";
-            globalThis.__obscura_setFieldValue(el, "value", {val});
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", {{bubbles:true}})));
-            return "ok";
-        }})()"#,
-        sel = serde_json::to_string(&selector).unwrap(),
-        val = serde_json::to_string(value).unwrap()
-    );
-
-    let result = state.page_mut().evaluate(&js);
-    if result.as_str() == Some("error:element not found") {
-        Err(format!("Element not found: {selector}"))
-    } else {
-        state.settle_synthetic_navigation().await?;
-        Ok(format!("Filled '{selector}' with value"))
-    }
+    let page = state.page_mut();
+    let node = target_node(page, &selector)?;
+    native_form_input(page, &json!({
+        "kind": "fill", "nodeId": node.index(), "value": value,
+    }))?;
+    state.settle_synthetic_navigation().await?;
+    Ok(format!("Filled '{selector}' with value"))
 }
 
 async fn tool_type(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = resolve_target(args, state)?;
     let text = args.get("text").and_then(Value::as_str)
         .ok_or("Missing text parameter")?;
-
-    let js = format!(
-        r#"(function(){{
-            var el = document.querySelector({sel});
-            if (!el) return "error:element not found";
-            globalThis.__obscura_setFieldValue(el, "value", (el.value || "") + {txt});
-            el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", {{bubbles:true}})));
-            return "ok";
-        }})()"#,
-        sel = serde_json::to_string(&selector).unwrap(),
-        txt = serde_json::to_string(text).unwrap()
-    );
-
-    let result = state.page_mut().evaluate(&js);
-    if result.as_str() == Some("error:element not found") {
-        Err(format!("Element not found: {selector}"))
-    } else {
-        state.settle_synthetic_navigation().await?;
-        Ok(format!("Typed into '{selector}'"))
-    }
+    let page = state.page_mut();
+    let node = target_node(page, &selector)?;
+    native_form_input(page, &json!({
+        "kind": "fill", "nodeId": node.index(), "value": text,
+        "append": true, "change": false,
+    }))?;
+    state.settle_synthetic_navigation().await?;
+    Ok(format!("Typed into '{selector}'"))
 }
 
 async fn tool_press_key(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let key = args.get("key").and_then(Value::as_str)
         .ok_or("Missing key parameter")?;
-    let selector = args.get("selector").and_then(Value::as_str);
-
-    let target = match selector {
-        Some(sel) => format!("document.querySelector({})", serde_json::to_string(sel).unwrap()),
-        None => "document".to_string(),
-    };
-
-    let js = format!(
-        r#"(function(){{
-            var t = {target};
-            if (!t) return "error:element not found";
-            t.dispatchEvent(new KeyboardEvent("keydown", {{key:{key},bubbles:true}}));
-            t.dispatchEvent(new KeyboardEvent("keyup", {{key:{key},bubbles:true}}));
-            return "ok";
-        }})()"#,
-        target = target,
-        key = serde_json::to_string(key).unwrap()
-    );
-
-    state.page_mut().evaluate(&js);
+    let page = state.page_mut();
+    if let Some(selector) = args.get("selector").and_then(Value::as_str) {
+        let node = target_node(page, selector)?;
+        page.dispatch_native_input(&json!({ "kind": "focus", "nodeId": node.index() }))?;
+    }
+    for event_type in ["keyDown", "keyUp"] {
+        page.dispatch_native_input(&json!({ "kind": "key", "type": event_type, "key": key }))?;
+    }
     state.settle_synthetic_navigation().await?;
     Ok(format!("Pressed key '{key}'"))
 }
@@ -1141,28 +1117,12 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
         .ok_or("Missing selector parameter")?;
     let value = args.get("value").and_then(Value::as_str)
         .ok_or("Missing value parameter")?;
-
-    let js = format!(
-        r#"(function(){{
-            var el = document.querySelector({sel});
-            if (!el) return "error:element not found";
-            var opts = Array.from(el.options);
-            var opt = opts.find(function(o){{ return o.value === {val} || o.text === {val}; }});
-            if (!opt) return "error:option not found";
-            el.value = opt.value;
-            el.dispatchEvent(new Event("change", {{bubbles:true}}));
-            return "ok";
-        }})()"#,
-        sel = serde_json::to_string(selector).unwrap(),
-        val = serde_json::to_string(value).unwrap()
-    );
-
-    let result = state.page_mut().evaluate(&js);
-    match result.as_str() {
-        Some("error:element not found") => Err(format!("Element not found: {selector}")),
-        Some("error:option not found") => Err(format!("Option not found: {value}")),
-        _ => Ok(format!("Selected '{value}' in '{selector}'")),
-    }
+    let page = state.page_mut();
+    let node = target_node(page, selector)?;
+    native_form_input(page, &json!({
+        "kind": "selectOption", "nodeId": node.index(), "value": value,
+    }))?;
+    Ok(format!("Selected '{value}' in '{selector}'"))
 }
 
 /// Wrap an expression so a thenable it returns can be polled to settlement.
@@ -1736,66 +1696,33 @@ fn tool_detect_forms(state: &mut BrowserState) -> Result<String, String> {
 /// `submit_ref`/`submit_selector` clicks after filling.
 fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let fields = args.get("fields").and_then(Value::as_array)
-        .ok_or("Missing fields array")?
-        .clone();
+        .ok_or("Missing fields array")?;
     let mut filled = 0u32;
     let mut errors = Vec::new();
     for field in fields {
         let value = field.get("value").and_then(Value::as_str).unwrap_or("");
         let kind = field.get("type").and_then(Value::as_str).unwrap_or("text");
-        let selector = match resolve_target(&field, state) {
+        let selector = match resolve_target(field, state) {
             Ok(s) => s,
             Err(e) => { errors.push(e); continue; }
         };
-        let js = match kind {
-            "check" => format!(r#"(function(){{
-                var el = document.querySelector({sel});
-                if (!el) return "error:not found";
-                globalThis.__obscura_setFieldValue(el, 'checked', true);
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
-                return "ok";
-            }})()"#, sel = serde_json::to_string(&selector).unwrap()),
-            "uncheck" => format!(r#"(function(){{
-                var el = document.querySelector({sel});
-                if (!el) return "error:not found";
-                globalThis.__obscura_setFieldValue(el, 'checked', false);
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
-                return "ok";
-            }})()"#, sel = serde_json::to_string(&selector).unwrap()),
-            "select" => format!(r#"(function(){{
-                var el = document.querySelector({sel});
-                if (!el) return "error:not found";
-                var want = {val};
-                var matched = false;
-                for (var i = 0; i < el.options.length; i++) {{
-                    var o = el.options[i];
-                    if (o.value === want || (o.textContent || '').trim() === want) {{
-                        el.selectedIndex = i;
-                        matched = true;
-                        break;
-                    }}
-                }}
-                if (!matched) return "error:no matching option";
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
-                return "ok";
-            }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
-            _ => format!(r#"(function(){{
-                var el = document.querySelector({sel});
-                if (!el) return "error:not found";
-                globalThis.__obscura_setFieldValue(el, 'value', {val});
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));
-                el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}})));
-                return "ok";
-            }})()"#, sel = serde_json::to_string(&selector).unwrap(), val = serde_json::to_string(value).unwrap()),
+        let page = state.page_mut();
+        let node = match target_node(page, &selector) {
+            Ok(node) => node,
+            Err(error) => { errors.push(error); continue; }
         };
-        let res = state.page_mut().evaluate(&js);
-        match res.as_str() {
-            Some("ok") => filled += 1,
-            Some(e) => errors.push(format!("{selector}: {e}")),
-            None => errors.push(format!("{selector}: unknown error")),
+        let payload = match kind {
+            "check" | "uncheck" => json!({
+                "kind": "setChecked", "nodeId": node.index(), "checked": kind == "check",
+            }),
+            "select" => json!({
+                "kind": "selectOption", "nodeId": node.index(), "value": value,
+            }),
+            _ => json!({ "kind": "fill", "nodeId": node.index(), "value": value }),
+        };
+        match native_form_input(page, &payload) {
+            Ok(()) => filled += 1,
+            Err(error) => errors.push(format!("{selector}: {error}")),
         }
     }
 
@@ -1808,13 +1735,10 @@ fn tool_fill_form(args: &Value, state: &mut BrowserState) -> Result<String, Stri
         resolve_target(&pseudo, state).ok()
     } else { None };
     if let Some(sel) = submit_target {
-        let js = format!(r#"(function(){{
-            var el = document.querySelector({sel});
-            if (!el) return "error:not found";
-            el.click();
-            return "ok";
-        }})()"#, sel = serde_json::to_string(&sel).unwrap());
-        let _ = state.page_mut().evaluate(&js);
+        let page = state.page_mut();
+        if let Err(error) = target_node(page, &sel).and_then(|node| native_click(page, node)) {
+            errors.push(format!("{sel}: {error}"));
+        }
         state.interactive_refs.clear();
     }
 
@@ -2528,7 +2452,9 @@ mod tests {
     async fn console_tool_returns_page_messages() {
         const PAGE: &str = "data:text/html,<button id=log>Log</button><script>\
             console.error('mcp-console-inline');\
-            document.getElementById('log').onclick=()=>{\
+            document.getElementById('log').click=()=>{throw new Error('author click must not drive MCP input')};\
+            document.getElementById('log').onclick=(event)=>{\
+                window.nativeClickTrusted=event.isTrusted;\
                 console.error('mcp-console-click');\
                 setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
             }</script>";
@@ -2554,6 +2480,9 @@ mod tests {
         let later = tool_console_messages(&mut state).expect("console tool should succeed");
         assert!(later.contains("mcp-console-click"), "{later}");
         assert!(later.contains("mcp-console-async"), "{later}");
+        assert_eq!(state.page_mut().evaluate(
+            "[window.nativeClickTrusted, document.activeElement.id]"
+        ), json!([true, "log"]));
     }
 
     /// Records the method, path and body of every request it serves, so a test
@@ -2701,10 +2630,18 @@ mod tests {
                         descriptor.set.call(this, value);
                     }
                 });
+                input.focus = function () { throw new Error('author focus must not drive MCP input'); };
+                input.dispatchEvent = function () { throw new Error('author dispatch must not drive MCP input'); };
                 window.__controlledState = '';
                 window.__controlledUpdates = 0;
                 window.__lastInputTarget = '';
                 window.__lastInputTrusted = false;
+                window.__lastKeyTarget = '';
+                window.__lastKeyTrusted = false;
+                root.addEventListener('keydown', function (event) {
+                    window.__lastKeyTarget = event.target.id;
+                    window.__lastKeyTrusted = event.isTrusted;
+                });
                 root.addEventListener('input', function (event) {
                     window.__lastInputTarget = event.target.id;
                     window.__lastInputTrusted = event.isTrusted;
@@ -2724,12 +2661,18 @@ mod tests {
         )
         .await
         .expect("browser_fill should succeed");
+        state.page_mut().evaluate(
+            "document.getElementById('field').setSelectionRange(0, 0)"
+        );
         tool_type(
             &json!({ "selector": "#field", "text": "-typed" }),
             &mut state,
         )
         .await
         .expect("browser_type should succeed");
+        assert_eq!(state.page_mut().evaluate(
+            "document.getElementById('field').value"
+        ), json!("filled-typed"));
         tool_fill_form(
             &json!({
                 "fields": [{ "selector": "#field", "value": "form-filled" }]
@@ -2737,6 +2680,9 @@ mod tests {
             &mut state,
         )
         .expect("browser_fill_form should succeed");
+        tool_press_key(&json!({ "key": "Escape" }), &mut state)
+            .await
+            .expect("browser_press_key should use the focused field");
 
         let actual = state.page_mut().evaluate(
             r#"JSON.stringify({
@@ -2744,12 +2690,15 @@ mod tests {
                 controlledState: window.__controlledState,
                 controlledUpdates: window.__controlledUpdates,
                 lastInputTarget: window.__lastInputTarget,
-                lastInputTrusted: window.__lastInputTrusted
+                lastInputTrusted: window.__lastInputTrusted,
+                focused: document.activeElement.id,
+                lastKeyTarget: window.__lastKeyTarget,
+                lastKeyTrusted: window.__lastKeyTrusted
             })"#,
         );
         assert_eq!(
             actual,
-            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true}"#),
+            json!(r#"{"domValue":"form-filled","controlledState":"form-filled","controlledUpdates":3,"lastInputTarget":"field","lastInputTrusted":true,"focused":"field","lastKeyTarget":"field","lastKeyTrusted":true}"#),
         );
     }
 
@@ -2768,9 +2717,8 @@ mod tests {
         // Install a React-style tracker on the checkbox's `checked`, redefined on
         // the instance. A direct `el.checked = true` runs this wrapper in lockstep,
         // so a change handler comparing target.checked to the tracked value sees no
-        // change and never commits. Writing through the prototype setter (what
-        // __obscura_setFieldValue does) leaves the tracker stale so the edit
-        // registers. Also record whether the dispatched change is trusted.
+        // change and never commits. Native input bypasses the instance setter so
+        // the edit registers. Also record whether the dispatched change is trusted.
         state.page_mut().evaluate(
             r#"(function () {
                 var box = document.getElementById('box');
@@ -2823,5 +2771,15 @@ mod tests {
             actual,
             json!(r#"{"domChecked":true,"checkedCommitted":true,"checkTrusted":true,"selValue":"b","selectTrusted":true}"#),
         );
+        tool_fill_form(
+            &json!({ "fields": [{ "selector": "#box", "type": "uncheck" }] }),
+            &mut state,
+        ).expect("browser_fill_form should uncheck the field");
+        tool_select_option(
+            &json!({ "selector": "#sel", "value": "a" }), &mut state,
+        ).expect("browser_select_option should succeed");
+        assert_eq!(state.page_mut().evaluate(
+            "[document.getElementById('box').checked, document.getElementById('sel').value, window.__checkTrusted, window.__selectTrusted]"
+        ), json!([false, "a", true, true]));
     }
 }

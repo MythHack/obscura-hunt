@@ -1340,7 +1340,9 @@ async fn do_navigate(
         );
     }
 
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+    let preload_scripts = ctx.preload_scripts_for_page(
+        &ctx.get_session_page(session_id).ok_or("No page for session")?.id,
+    );
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
@@ -1481,54 +1483,25 @@ pub async fn handle(
             Ok(json!({ "frameTree": frame_tree(page, &loader_id) }))
         }
         "createIsolatedWorld" => {
-            let (frame_id_param, world_name, origin, page_id, persist_across_navigation) = {
-                let page = ctx
-                    .get_session_page(session_id)
-                    .ok_or("No page for session")?;
-                let frame_id = params
-                        .get("frameId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&page.frame_id)
-                        .to_string();
-                let (origin, persist) = if frame_id == page.frame_id {
-                    (page.url_string(), true)
-                } else if page.frames.iter().any(|frame| {
-                    child_frame_id(&page.frame_id, frame.frame_id()) == frame_id
-                        && page.live_frame_owner(frame.frame_id()).is_some()
-                }) {
-                    return Err("Child isolated execution worlds are not supported".to_string());
-                } else {
-                    return Err(format!("No frame with given id found: {frame_id}"));
+            let (frame_id, world_name, origin, page_id, persist) = {
+                let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+                let frame_id = params.get("frameId").and_then(Value::as_str).unwrap_or(&page.frame_id).to_string();
+                let native_id = native_frame_id(page, &frame_id)?;
+                let origin = if native_id == 0 { page.url_string() } else {
+                    page.frames.iter().find(|frame| frame.frame_id() == native_id)
+                        .ok_or("No live frame")?.origin().to_string()
                 };
-                (
-                    frame_id,
-                    params
-                        .get("worldName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    origin,
-                    page.id.clone(),
-                    persist,
-                )
+                (frame_id, params.get("worldName").and_then(Value::as_str).unwrap_or("").to_string(),
+                    origin, page.id.clone(), native_id == 0)
             };
-            ctx.ensure_default_context(&page_id)
-                .ok_or("No page for session")?;
-            let (context, created) = ctx.create_isolated_context(
-                &page_id,
-                &frame_id_param,
-                &origin,
-                &world_name,
-                persist_across_navigation,
-            );
+            let grant = params.get("grantUniveralAccess").and_then(Value::as_bool).unwrap_or(false);
+            ctx.ensure_default_context(&page_id).ok_or("No page for session")?;
+            let (context, created) = ctx.create_isolated_context(&page_id, &frame_id, &origin, &world_name, persist, grant)?;
             if created {
                 for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
-                    ctx.pending_events.push(super::runtime::execution_context_created_event(
-                        &context, Some(runtime_session),
-                    ));
+                    ctx.pending_events.push(super::runtime::execution_context_created_event(&context, Some(runtime_session)));
                 }
             }
-
             Ok(json!({ "executionContextId": context.id }))
         }
         "setLifecycleEventsEnabled" => {
@@ -1547,48 +1520,56 @@ pub async fn handle(
             Ok(json!({}))
         }
         "addScriptToEvaluateOnNewDocument" => {
-            let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let owner_session = session_id.as_ref().ok_or("No page for session")?;
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            let script = obscura_browser::page::PreloadScript {
+                source: params.get("source").and_then(Value::as_str).unwrap_or("").to_string(),
+                world_name: params.get("worldName").and_then(Value::as_str).unwrap_or("").to_string(),
+            };
             let run_immediately = params.get("runImmediately").and_then(Value::as_bool).unwrap_or(false);
-            if run_immediately && params.get("worldName").and_then(Value::as_str)
-                .is_some_and(|name| !name.is_empty())
-            {
-                return Err("Immediate scripts in isolated worlds are not supported".to_string());
-            }
             ctx.preload_counter += 1;
-            let identifier = format!("{}", ctx.preload_counter);
-            if !source.is_empty() {
-                if run_immediately {
-                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
-                    // Script exceptions do not reject the registration. Dispatch
-                    // supplies the V8 lock and watchdog for this command.
-                    if let Err(error) = page.execute_preload_script(source) {
-                        tracing::warn!("Immediate preload: {error}");
+            let identifier = ctx.preload_counter.to_string();
+            ctx.preload_scripts.push(crate::dispatch::RegisteredPreloadScript {
+                session_id: owner_session.clone(), identifier: identifier.clone(), script: script.clone(),
+            });
+            ctx.refresh_preload_scripts(&page_id);
+            if run_immediately {
+                ctx.ensure_default_context(&page_id).ok_or("No page for session")?;
+                let created = ctx.ensure_child_default_contexts(&page_id);
+                for context in created {
+                    for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
+                        ctx.pending_events.push(super::runtime::execution_context_created_event(&context, Some(runtime_session)));
                     }
-                    if let Some(js) = &mut page.js {
-                        for frame in &page.frames {
-                            if let Err(error) = frame.execute_script(js, source) {
-                                tracing::warn!("Immediate frame preload: {error}");
-                            }
-                        }
+                }
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                let mut frames = vec![0];
+                frames.extend(page.frames.iter().filter(|frame| page.live_frame_owner(frame.frame_id()).is_some())
+                    .map(|frame| frame.frame_id()));
+                for frame_id in frames {
+                    // JavaScript exceptions do not reject registration, but native
+                    // world creation and execution context ownership were established
+                    // above before the preload is made observable to CDP clients.
+                    if let Err(error) = page.execute_preload_script(frame_id, &script) {
+                        tracing::warn!("Immediate preload: {error}");
                     }
                 }
             }
-            // Store empty sources too: Chrome returns a removable id for them.
-            ctx.preload_scripts
-                .push((identifier.clone(), source.to_string()));
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
+            let owner_session = session_id.as_ref().ok_or("No page for session")?;
+            let page_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
             let identifier = params
                 .get("identifier")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             // Chrome reports an unknown or already removed id as an error.
             let before = ctx.preload_scripts.len();
-            ctx.preload_scripts.retain(|(id, _)| id != identifier);
+            ctx.preload_scripts.retain(|script| script.session_id != *owner_session || script.identifier != identifier);
             if ctx.preload_scripts.len() == before {
                 return Err("Script not found".to_string());
             }
+            ctx.refresh_preload_scripts(&page_id);
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
@@ -1704,8 +1685,9 @@ pub async fn handle(
                 (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                let preload_scripts: Vec<String> =
-                    ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+                let preload_scripts = ctx.preload_scripts_for_page(
+                    &ctx.get_session_page(session_id).ok_or("No page for session")?.id,
+                );
                 let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
@@ -2088,20 +2070,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn immediate_preload_runs_in_existing_frames_and_remains_removable() {
+    async fn immediate_preload_runs_in_current_document_and_remains_removable() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session = Some(format!("{page_id}-session"));
         ctx.sessions.insert(session.clone().unwrap(), page_id);
         handle("navigate", &json!({"url":"about:blank"}), &mut ctx, &session)
             .await.unwrap();
-        {
-            let page = ctx.get_session_page_mut(&session).unwrap();
-            let frame = obscura_js::frame::FrameRealm::new(
-                page.js.as_mut().unwrap(), 1, 0, "https://frame.example/", "<p>child</p>",
-            ).unwrap();
-            page.frames.push(frame);
-        }
         let deferred = handle("addScriptToEvaluateOnNewDocument", &json!({
             "source":"globalThis.deferred = (globalThis.deferred || 0) + 1",
         }), &mut ctx, &session).await.unwrap();
@@ -2114,7 +2089,6 @@ mod tests {
         {
             let page = ctx.get_session_page_mut(&session).unwrap();
             assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.immediate ?? 0").unwrap().as_f64(), Some(1.0));
-            assert_eq!(page.evaluate_in_frame(0, "globalThis.immediate ?? 0").unwrap().as_f64(), Some(1.0));
         }
         handle("navigate", &json!({"url":"data:text/html,<title>next</title>"}), &mut ctx, &session)
             .await.unwrap();
@@ -2132,12 +2106,16 @@ mod tests {
             .await.unwrap();
         assert_eq!(ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap()
             .evaluate("[globalThis.deferred ?? 0, globalThis.immediate ?? 0]").unwrap(), json!([0,0]));
-        // Named worlds currently share the main global. Do not silently inject
-        // an explicitly isolated immediate script into the page's own world.
         let isolated = handle("addScriptToEvaluateOnNewDocument", &json!({
             "source":"globalThis.leaked = true", "runImmediately":true, "worldName":"private",
-        }), &mut ctx, &session).await;
-        assert!(isolated.is_err());
+        }), &mut ctx, &session).await.unwrap();
+        let world = handle("createIsolatedWorld", &json!({"worldName":"private"}), &mut ctx, &session).await.unwrap();
+        let value = super::super::runtime::handle("evaluate", &json!({
+            "expression":"globalThis.leaked", "contextId":world["executionContextId"], "returnByValue":true,
+        }), &mut ctx, &session).await.unwrap();
+        assert_eq!(value["result"]["value"], true);
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate("typeof globalThis.leaked"), "undefined");
+        handle("removeScriptToEvaluateOnNewDocument", &isolated, &mut ctx, &session).await.unwrap();
         assert!(ctx.preload_scripts.is_empty());
     }
 
@@ -2432,6 +2410,7 @@ mod tests {
         .enumerate()
         .map(|(index, (url, kind))| obscura_browser::NetworkEvent {
             request_id: format!("finished-{index}"),
+            frame_id: 0,
             intercepted: false,
             url: url.into(),
             method: "GET".into(),

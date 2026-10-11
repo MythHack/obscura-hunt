@@ -96,9 +96,9 @@ One page cannot hang or crash the process. `obscura-js/runtime.rs` provides a V8
 
 `obscura-js/src/ops.rs` registers Rust ops that the bootstrap calls into:
 
-```js
-Deno.core.ops.op_dom('insert_before', parentNid, refNid, newNid);
-```
+The private DOM wrapper supplies the creating realm's native global. Rust
+authenticates its live creation context before selecting the document; numeric
+frame IDs alone do not select a document or grant access.
 
 Adding a Web API usually means:
 
@@ -125,6 +125,23 @@ Session IDs are `"{targetId}-session"`. The dispatcher routes by `sessionId` in 
 
 Targets are created by `Target.createTarget`. Closing the WebSocket detaches all sessions but leaves the pages running.
 
+`Page.addScriptToEvaluateOnNewDocument` registrations belong to the registering
+CDP session and target, not the browser globally, and are not inherited by popups.
+Only the owner session can remove a registration; detaching that session removes
+its entries. Preloads in named worlds remain isolated from the page global.
+
+Each document has one canonical native context. Isolated worlds use separate
+V8 contexts, globals, prototypes, and DOM wrappers without reparsing or resetting
+that document. The DOM, focus, form state, and event cancellation remain shared.
+Native topology, activity, and style epochs invalidate world-local caches.
+
+CDP and MCP input call captured native dispatch callbacks, not a page-visible
+trust-marking function. Event provenance belongs to the specific event;
+`isTrusted` is an unforgeable own accessor and author redispatch removes trust.
+Document generations retire stale worlds, callbacks, and remote handles. An
+explicit isolated-world access grant bypasses only related live DOM origin
+checks, never fetch origin, CORS, SSRF, or embedding-policy enforcement.
+
 ## Lifecycle
 
 Lifecycle events are emitted by `obscura-browser/lifecycle.rs` as the page transitions:
@@ -134,6 +151,15 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 ```
 
 `waitUntil` on `Page.navigate` blocks until the requested level is reached. The Puppeteer / Playwright `goto` resolves on the matching `Page.lifecycleEvent` client-side.
+
+An iframe can have a real initial `about:blank` document before its `src`
+navigation starts. The bootstrap retires that document and reserves the next
+child identity under the exact live native parent and embedding node. Frame
+binding passes the creating realm's native global to the DOM bridge, including
+the sandbox-principal lookup, before the Document request starts. Fetch requires
+the reserved URL and an unstarted load; commit requires a started load. Both
+retain exact reservation and live owner-generation checks; an unrelated frame
+registration does not authorize a request.
 
 ## Storage
 

@@ -1,5 +1,5 @@
 "use strict";
-(function () {
+(function (globalThis) {
 
 // deno_core installs its privileged bridge in the page's V8 context. Capture
 // it in this private bootstrap closure. The host removes the public global
@@ -21,7 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -139,21 +139,16 @@ globalThis.removeEventListener = function(type, fn, options) {
   _eventTargetRemove(globalThis, type, fn, options);
 };
 globalThis.dispatchEvent = function(event) {
-  return _eventTargetDispatch(globalThis, event);
+  return _realmRegistered ? _domEventDispatch(globalThis, event) : _eventTargetDispatch(globalThis, event);
 };
 
 let _domMutationEpoch = 0;
 let _treeMutationEpoch = 0;
 const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
-  "set_attribute", "remove_attribute",
+  "set_attribute", "remove_attribute", "set_attribute_ns", "remove_attribute_ns",
   "set_text_content", "set_inner_html", "set_inner_html_context",
   "set_fragment_html_executable", "document_write", "document_write_close",
-]);
-const _DOM_TREE_MUTATION_COMMANDS = new Set([
-  "append_child", "insert_before", "remove_child",
-  "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
-  "document_write", "document_write_close",
 ]);
 // Which realm this bootstrap closure belongs to. Every wrapper's methods come
 // from its own realm's prototypes, so a DOM call names the document it belongs
@@ -163,9 +158,14 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 let _realmFrameId = 0;
 let _realmParentFrameId = 0;
 let _realmRegistered = false;
+let _realmIsolated = false;
+let _worldCallbacksRegistered = false;
+function _treeGeneration() {
+  return _realmRegistered ? __obscuraCore.ops.op_world_dom_generation(globalThis, true) : _treeMutationEpoch;
+}
 
 const _dom = (cmd, a1, a2) => {
-  let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId, globalThis);
   if (result.startsWith('{"__obscuraFrameRetirements":')) {
     const mutation = JSON.parse(result);
     result = mutation.result;
@@ -174,8 +174,7 @@ const _dom = (cmd, a1, a2) => {
       if (element && element._frameId === id) _resetIframeElement(element);
     }
   }
-  if (_DOM_MUTATION_COMMANDS.has(cmd)) {
-    _domMutationEpoch++;
+  if (result === "true" && _DOM_MUTATION_COMMANDS.has(cmd)) {
     // Resize observation is tied to rendering-invalidating DOM work. The
     // hook is installed later in bootstrap, before page script can run.
     if (typeof globalThis.__obscura_recompute_resizes === "function") {
@@ -188,15 +187,9 @@ const _dom = (cmd, a1, a2) => {
       globalThis.__obscura_recompute_intersections();
     }
   }
-  // Native mutation ops report their verified postcondition. Only a real tree
-  // change invalidates ancestry caches; rejected cycles and invalid roots must
-  // not make JS believe a move happened.
-  if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
-    _treeMutationEpoch++;
-    // HTML removal steps reset the focused area to the viewport without
-    // dispatching blur/change events. Cover native replacement paths too.
-    const focused = globalThis.__obscura_focused;
-    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
+  // Epochs come from actual native topology, including other worlds' changes.
+  if (result === "true" && _DOM_MUTATION_COMMANDS.has(cmd)) {
+    _treeMutationEpoch = _treeGeneration();
   }
   return result;
 };
@@ -783,46 +776,22 @@ function _getFp() {
   return _fpCache;
 }
 function _fp(key) { return _getFp()[key]; }
-globalThis._eventRegistry = globalThis._eventRegistry || {};
-globalThis._formValues = globalThis._formValues || {};
-globalThis._formChecked = globalThis._formChecked || {};
-globalThis._formIndeterminate = globalThis._formIndeterminate || {};
-const _eventRegistry = globalThis._eventRegistry;
-const _formValues = globalThis._formValues;
-const _formChecked = globalThis._formChecked;
-const _formIndeterminate = globalThis._formIndeterminate;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
-const _formStateLoaded = new Set();
-function _loadFormState(nid) {
-  if (_formStateLoaded.has(nid)) return;
-  const state = _domParse("get_form_state", nid);
-  if (state) {
-    if (state.value !== null) _formValues[nid] = state.value;
-    if (state.checked !== null) _formChecked[nid] = state.checked;
-    if (state.indeterminate) _formIndeterminate[nid] = true;
-  }
-  _formStateLoaded.add(nid);
-}
 
 // Native activation changes checkedness without invoking author-defined IDL
 // accessors. Frameworks may wrap those accessors to track script assignments.
 function _inputChecked(el) {
-  if (_formChecked[el._nid] === undefined) _loadFormState(el._nid);
-  if (_formChecked[el._nid] !== undefined) return _formChecked[el._nid];
-  return el.hasAttribute("checked");
+  return _domParse("get_form_state", el._nid)?.checked ?? el.hasAttribute("checked");
 }
 function _setInputChecked(el, value) {
   const checked = !!value;
-  _formChecked[el._nid] = checked;
   _dom("set_form_checked", el._nid, String(checked));
 }
 function _inputIndeterminate(el) {
-  if (_formIndeterminate[el._nid] === undefined) _loadFormState(el._nid);
-  return _formIndeterminate[el._nid] === true;
+  return _domParse("get_form_state", el._nid)?.indeterminate === true;
 }
 function _setInputIndeterminate(el, value) {
   const indeterminate = !!value;
-  _formIndeterminate[el._nid] = indeterminate;
   _dom("set_form_indeterminate", el._nid, String(indeterminate));
 }
 globalThis.__obscura_inputChecked = _inputChecked;
@@ -1945,11 +1914,23 @@ function _shallowCloneNode(node) {
   return el;
 }
 
+// Private event and node state must never call author-replaceable collection
+// methods. Bound intrinsics keep both the registry and its values unreachable.
+const _weakMapGet = Function.prototype.call.bind(WeakMap.prototype.get);
+const _weakMapSet = Function.prototype.call.bind(WeakMap.prototype.set);
+const _weakMapHas = Function.prototype.call.bind(WeakMap.prototype.has);
+const _weakMapDelete = Function.prototype.call.bind(WeakMap.prototype.delete);
+const _weakSetAdd = Function.prototype.call.bind(WeakSet.prototype.add);
+const _weakSetHas = Function.prototype.call.bind(WeakSet.prototype.has);
+const _weakSetDelete = Function.prototype.call.bind(WeakSet.prototype.delete);
+const _defineEventProperty = Object.defineProperty;
+
 // EventTarget listener state belongs to the JS wrapper rather than the backing
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
 const _eventTargetListenerChanged = new WeakMap();
+const _nodeIdentity = new WeakMap();
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1961,10 +1942,10 @@ function _eventTargetAdd(target, type, callback, options) {
   const capture = _eventCapture(options);
   const signal = options && typeof options === "object" ? options.signal : null;
   if (signal && signal.aborted) return;
-  let byType = _eventTargetListeners.get(target);
+  let byType = _weakMapGet(_eventTargetListeners, target);
   if (!byType) {
     byType = new Map();
-    _eventTargetListeners.set(target, byType);
+    _weakMapSet(_eventTargetListeners, target, byType);
   }
   let listeners = byType.get(type);
   if (!listeners) {
@@ -1981,14 +1962,14 @@ function _eventTargetAdd(target, type, callback, options) {
     abortHandler: null,
   };
   listeners.push(entry);
-  _eventTargetListenerChanged.get(target)?.();
+  _weakMapGet(_eventTargetListenerChanged, target)?.();
   if (signal && typeof signal.addEventListener === "function") {
     entry.abortHandler = () => _eventTargetRemove(target, type, callback, capture);
     signal.addEventListener("abort", entry.abortHandler, { once: true });
   }
 }
 function _eventTargetRemove(target, type, callback, options) {
-  const byType = _eventTargetListeners.get(target);
+  const byType = _weakMapGet(_eventTargetListeners, target);
   if (!byType) return;
   type = String(type);
   const listeners = byType.get(type);
@@ -2004,22 +1985,26 @@ function _eventTargetRemove(target, type, callback, options) {
     break;
   }
   if (listeners.length === 0) byType.delete(type);
-  if (byType.size === 0) _eventTargetListeners.delete(target);
-  _eventTargetListenerChanged.get(target)?.();
+  if (byType.size === 0) _weakMapDelete(_eventTargetListeners, target);
+  _weakMapGet(_eventTargetListenerChanged, target)?.();
 }
 function _eventTargetDispatch(target, event) {
-  if (!event || typeof event.type === "undefined") {
+  if (!_weakMapHas(_eventState, event) || typeof event.type === "undefined") {
     throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   }
   if (String(event.type) === "") {
     throw new DOMException("The event's type was not specified.", "InvalidStateError");
   }
-  if (event._dispatching) {
+  if (_weakMapGet(_eventState, event).dispatching) {
     throw new DOMException("The event is already being dispatched.", "InvalidStateError");
   }
-  event._dispatching = true;
-  event._propagationStopped = false;
-  event._immediatePropagationStopped = false;
+  const state = _weakMapGet(_eventState, event);
+  if (!_weakSetDelete(_nativeInputEvents, event)) {
+    _weakSetDelete(_trustedEvents, event);
+    _weakSetDelete(_trustedMessageEvents, event);
+  }
+  state.dispatching = true;
+  state.flags &= 1;
   event.target = target;
   event.currentTarget = target;
   event.eventPhase = 2;
@@ -2033,25 +2018,29 @@ function _eventTargetDispatch(target, event) {
         console.error(error);
       }
     }
-    const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+    const listeners = (_weakMapGet(_eventTargetListeners, target)?.get(String(event.type)) || []).slice();
     for (const entry of listeners) {
-      const current = _eventTargetListeners.get(target)?.get(String(event.type));
+      const current = _weakMapGet(_eventTargetListeners, target)?.get(String(event.type));
       if (!current || !current.includes(entry)) continue;
       if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
       const callback = entry.callback;
+      state.passive = entry.passive;
       try {
         if (typeof callback === "function") callback.call(target, event);
         else callback.handleEvent.call(callback, event);
       } catch (error) {
         console.error(error);
+      } finally {
+        state.passive = false;
       }
-      if (event._immediatePropagationStopped) break;
+      if (_eventFlags(event) & 4) break;
     }
     return !event.defaultPrevented;
   } finally {
     event.currentTarget = null;
     event.eventPhase = 0;
-    event._dispatching = false;
+    state.dispatching = false;
+    state.flags &= 1;
   }
 }
 
@@ -2063,9 +2052,10 @@ function _domEventInvoke(target, event, capture, phase) {
   // listener group. Keep their existing position ahead of listeners installed
   // through addEventListener; changing that ordering here would be an unrelated
   // compatibility change.
-  if (!capture && typeof target._resolveInlineHandler === "function") {
+  if (!capture) {
     const handlerName = "on" + event.type;
-    const inlineFn = target[handlerName] || target._resolveInlineHandler(handlerName);
+    const inlineFn = target[handlerName] || (!_realmIsolated && typeof target._resolveInlineHandler === "function"
+      ? target._resolveInlineHandler(handlerName) : null);
     if (typeof inlineFn === "function") {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
@@ -2075,80 +2065,125 @@ function _domEventInvoke(target, event, capture, phase) {
     }
   }
 
-  const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
+  const listeners = (_weakMapGet(_eventTargetListeners, target)?.get(String(event.type)) || []).slice();
+  if (_eventFlags(event) & 4) return;
   for (const entry of listeners) {
     if (entry.capture !== capture) continue;
-    const current = _eventTargetListeners.get(target)?.get(String(event.type));
+    const current = _weakMapGet(_eventTargetListeners, target)?.get(String(event.type));
     if (!current || !current.includes(entry)) continue;
     if (entry.once) _eventTargetRemove(target, event.type, entry.callback, entry.capture);
+    _weakMapGet(_eventState, event).passive = entry.passive;
     try {
       if (typeof entry.callback === "function") entry.callback.call(target, event);
       else entry.callback.handleEvent.call(entry.callback, event);
     } catch (error) {
       console.error(error);
+    } finally {
+      _weakMapGet(_eventState, event).passive = false;
     }
-    if (event._immediatePropagationStopped) break;
+    if (_eventFlags(event) & 4) break;
   }
 }
 
-// DOM events have one propagation path. The old Element implementation
-// recursively called parent.dispatchEvent(), which discarded capture options
-// and left eventPhase at NONE. Delegated framework handlers depend on capture
-// running before target/bubble listeners, so build the path once and dispatch
-// each phase explicitly.
+// The native coordinator visits this document's path once, interleaving realm
+// listener groups at each phase. Activation remains in the initiating click.
 function _domEventDispatch(target, event) {
-  if (!event || typeof event.type === "undefined") {
-    throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+  const localState = _weakMapGet(_eventState, event);
+  if (localState) {
+    if (typeof event.type === "undefined") {
+      throw new TypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
+    }
+    if (String(event.type) === "" || localState.dispatching) {
+      throw new DOMException("The event is already being dispatched or has no type.", "InvalidStateError");
+    }
   }
-  if (String(event.type) === "") {
-    throw new DOMException("The event's type was not specified.", "InvalidStateError");
-  }
-  if (event._dispatching) {
-    throw new DOMException("The event is already being dispatched.", "InvalidStateError");
-  }
-
-  event._dispatching = true;
-  event._propagationStopped = false;
-  event._immediatePropagationStopped = false;
-  event.target = target;
-  const path = [];
-  let ancestor = target.parentNode || null;
-  while (ancestor) {
-    path.push(ancestor);
-    ancestor = ancestor.parentNode || null;
-  }
-  // Detached nodes have no event parent. Connected paths reach Window through
-  // Document, except for load, whose Document parent is null by specification.
-  const reachesDocument = target === document || path[path.length - 1] === document;
-  if (reachesDocument && event.type !== "load") {
-    path.push(globalThis);
-  }
-
   try {
-    for (let index = path.length - 1; index >= 0; index--) {
-      _domEventInvoke(path[index], event, true, 1);
-      if (event._propagationStopped) break;
-    }
-
-    if (!event._propagationStopped) {
-      _domEventInvoke(target, event, true, 2);
-      if (!event._immediatePropagationStopped) {
-        _domEventInvoke(target, event, false, 2);
-      }
-    }
-
-    if (event.bubbles && !event._propagationStopped) {
-      for (const currentTarget of path) {
-        _domEventInvoke(currentTarget, event, false, 3);
-        if (event._propagationStopped) break;
-      }
-    }
-    return !event.defaultPrevented;
+    return __obscuraCore.ops.op_world_event_dispatch(globalThis, target, event);
   } finally {
-    event.currentTarget = null;
-    event.eventPhase = 0;
-    event._dispatching = false;
+    if (localState) _worldEventFinish(event, _eventFlags(event));
   }
+}
+
+function _worldNodeId(value) {
+  return value === globalThis ? 0xFFFFFFFF : _weakMapGet(_nodeIdentity, value);
+}
+function _worldWrapNode(nid) {
+  return nid === 0xFFFFFFFF ? globalThis : _wrap(nid);
+}
+function _worldEventCreate(source, nid, original, trusted, shared, borrowedState = undefined) {
+  let event = source;
+  if (original) {
+    if (!_weakSetHas(_events, source)) throw new TypeError("Invalid event");
+    if (String(source.type) === "" || _weakMapGet(_eventState, source).dispatching) {
+      throw new DOMException("The event is already being dispatched or has no type.", "InvalidStateError");
+    }
+    if (!_weakSetDelete(_nativeInputEvents, event) && !trusted) {
+      _weakSetDelete(_trustedEvents, event);
+      _weakSetDelete(_trustedMessageEvents, event);
+    }
+    if (nid === undefined) return _weakMapGet(_eventState, source);
+  } else if (borrowedState) {
+    // Native authentication supplies the creating world's private state, not
+    // an author-controlled Event expando. A borrowed Event keeps its identity.
+    _weakMapSet(_eventState, event, borrowedState);
+    _weakSetAdd(_events, event);
+    _weakSetDelete(_trustedEvents, event);
+    _weakSetDelete(_trustedMessageEvents, event);
+  } else {
+    const options = { bubbles: !!source.bubbles, cancelable: !!source.cancelable, composed: !!source.composed };
+    for (const name of ['detail', 'screenX', 'screenY', 'clientX', 'clientY', 'ctrlKey', 'altKey', 'shiftKey',
+      'metaKey', 'button', 'buttons', 'movementX', 'movementY', 'key', 'code', 'location', 'repeat',
+      'keyCode', 'charCode', 'which', 'data', 'inputType', 'pointerId', 'width', 'height', 'pressure',
+      'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'pointerType', 'isPrimary', 'deltaX', 'deltaY',
+      'deltaZ', 'deltaMode']) {
+      if (name in source) options[name] = source[name];
+    }
+    if (source.view) options.view = globalThis;
+    if (source.relatedTarget) {
+      const related = __obscuraCore.ops.op_world_node_id(globalThis, source.relatedTarget);
+      options.relatedTarget = related === null ? null : _worldWrapNode(related);
+    }
+    if (source.submitter) {
+      const submitter = __obscuraCore.ops.op_world_node_id(globalThis, source.submitter);
+      options.submitter = submitter === null ? null : _worldWrapNode(submitter);
+    }
+    let Constructor = _worldEventConstructors.Event;
+    if ('pointerId' in source) Constructor = _worldEventConstructors.PointerEvent;
+    else if ('deltaMode' in source) Constructor = _worldEventConstructors.WheelEvent;
+    else if ('key' in source) Constructor = _worldEventConstructors.KeyboardEvent;
+    else if ('clientX' in source) Constructor = _worldEventConstructors.MouseEvent;
+    else if ('relatedTarget' in source) Constructor = _worldEventConstructors.FocusEvent;
+    else if ('inputType' in source) Constructor = _worldEventConstructors.InputEvent;
+    else if ('submitter' in source) Constructor = _worldEventConstructors.SubmitEvent;
+    else if ('detail' in source) Constructor = _worldEventConstructors.CustomEvent;
+    event = new Constructor(String(source.type), options);
+    event.timeStamp = source.timeStamp;
+    if (trusted) _weakSetAdd(_trustedEvents, event);
+  }
+  const state = _weakMapGet(_eventState, event);
+  if (original || borrowedState) shared[0] = state.flags & 1;
+  state.shared = shared;
+  state.dispatching = true;
+  event.target = _worldWrapNode(nid);
+  return event;
+}
+function _worldEventPhase(event, nid, capture, phase, status) {
+  if (phase === 0) {
+    return (_eventFlags(event) & 1) | (_weakSetHas(_trustedEvents, event) ? 8 : 0)
+      | (event.bubbles ? 16 : 0) | (event.type === 'load' ? 32 : 0);
+  }
+  _addEventFlags(event, status & 7);
+  _domEventInvoke(_worldWrapNode(nid), event, capture, phase);
+  return _eventFlags(event);
+}
+function _worldEventFinish(event, status) {
+  const state = _weakMapGet(_eventState, event);
+  state.flags = status & 1;
+  state.shared = null;
+  event.currentTarget = null;
+  event.eventPhase = 0;
+  state.dispatching = false;
+  state.passive = false;
 }
 
 // During custom-element upgrade, HTMLElement's constructor must return the
@@ -2324,7 +2359,7 @@ function __prepareInsertedSubtree(root) {
 }
 
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
+  _treeMutationEpoch = _treeGeneration();
   node._treeParent = null;
   node._treeParentEpoch = _treeMutationEpoch;
   node._treeConnected = false;
@@ -2332,7 +2367,7 @@ function _seedDetachedTreeState(node) {
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
+  _treeMutationEpoch = _treeGeneration();
   node._treeParent = parent;
   node._treeParentEpoch = _treeMutationEpoch;
   node._treeConnected = !!connected;
@@ -2340,6 +2375,7 @@ function _seedInsertedTreeState(node, parent, connected) {
 }
 
 function _seedUnchangedConnection(node, connected) {
+  _treeMutationEpoch = _treeGeneration();
   node._treeConnected = !!connected;
   node._treeConnectedEpoch = _treeMutationEpoch;
 }
@@ -2404,7 +2440,7 @@ class Node {
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
-    if (this._treeDetachedExact) return null;
+    _treeMutationEpoch = _treeGeneration();
     if (this._treeParentEpoch === _treeMutationEpoch) return this._treeParent;
     const parent = _wrap(+_dom("parent_node", this._nid));
     this._treeParent = parent;
@@ -2641,7 +2677,7 @@ class Node {
     return root;
   }
   get isConnected() {
-    if (this._treeDetachedExact) return false;
+    _treeMutationEpoch = _treeGeneration();
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
     const connected = _dom("is_connected", this._nid) === "true";
     this._treeConnected = connected;
@@ -3091,9 +3127,8 @@ function _labeledControl(label) {
 // of labels currently forwarding is closure-private, so a control that clicks
 // its own label from a click handler cannot recurse and page script can neither
 // read nor forge the state. Marking the label itself would leave an enumerable
-// property on a DOM node. The CDP click path shares this guard through the
-// non-enumerable __obscura_activateLabel helper, so both click paths apply the
-// same rule.
+// property on a DOM node. Author clicks and native input share this private
+// re-entrancy guard, not a public trust token.
 // Interactive content inside a label has its own activation behaviour and
 // swallows the label's, so only a click landing on ordinary content forwards.
 // This is the HTML interactive-content set, which is not the labelable set:
@@ -3103,13 +3138,6 @@ const _INTERACTIVE = 'a[href],audio[controls],button,details,embed,iframe,'
   + 'img[usemap],input:not([type=hidden]),select,textarea,video[controls]';
 
 const _forwardingLabels = new WeakSet();
-// Passed to click() only by label activation on behalf of a real input event,
-// so the forwarded control events keep the trustedness of the click that
-// caused them, as they do in a real browser. The symbol itself is
-// closure-private, so click() cannot be called with it directly, but
-// __obscura_activateLabel below will supply it on request, exactly as
-// __obscura_markTrusted already does for any event.
-const _TRUSTED_ACTIVATION = Symbol('obscura.trustedActivation');
 
 // Only these elements can be actually disabled. A `disabled` attribute on
 // anything else, which component libraries do put on plain <div>s, has no
@@ -3146,16 +3174,15 @@ function _isActuallyDisabled(el) {
   return false;
 }
 
-globalThis.__obscura_activateLabel = function(label, control, trusted) {
-  if (!label || !control || _forwardingLabels.has(label)) return false;
+globalThis.__obscura_activateLabel = function(label, control) {
+  if (!label || !control || _weakSetHas(_forwardingLabels, label)) return false;
   if (_isActuallyDisabled(control) || typeof control.click !== 'function') return false;
-  _forwardingLabels.add(label);
-  try { control.click(trusted ? _TRUSTED_ACTIVATION : undefined); }
-  finally { _forwardingLabels.delete(label); }
+  _weakSetAdd(_forwardingLabels, label);
+  try { control.click(); }
+  finally { _weakSetDelete(_forwardingLabels, label); }
   return true;
 };
-// The CDP click path runs its own JS snippet, so it reaches the same rules
-// through these helpers rather than restating the selectors.
+// These author-callable helpers share activation rules but confer no trust.
 globalThis.__obscura_isDisabled = function(el) { return _isActuallyDisabled(el); };
 globalThis.__obscura_labeledControl = function(label) { return _labeledControl(label); };
 globalThis.__obscura_interactiveHost = function(el) {
@@ -4080,6 +4107,7 @@ class Element extends Node {
     return _domEventDispatch(this, event);
   }
   _resolveInlineHandler(name) {
+    if (_realmIsolated) return null;
     // name = 'onclick' / 'onsubmit' / etc. Compile the content attribute
     // as a function body on first read and cache it on the instance.
     const cache = this.__inlineHandlerCache || (this.__inlineHandlerCache = {});
@@ -4094,15 +4122,11 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    // A label activating this control on behalf of a real input event passes a
-    // private token so the forwarded events stay trusted. Read from arguments
-    // to keep click.length at 0, as in a real browser.
-    const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
     // A borrowed method must activate in the receiver's realm: node ids and
     // private checkedness are local to each document.
     if (_cache.get(this._nid) !== this) {
       const activate = _documentRealmMember(this, 'activateElement');
-      if (activate) return activate.call(this, _trusted);
+      if (activate) return activate.call(this);
     }
     // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
     // click event dispatches, so listeners observe the new state, and the change
@@ -4146,7 +4170,6 @@ class Element extends Node {
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
-    if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
       if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
@@ -4156,7 +4179,6 @@ class Element extends Node {
     if (_checkable && _inputChecked(this) !== _oldChecked) {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
-        if (_trusted) globalThis.__obscura_markTrusted(_e);
         try { this.dispatchEvent(_e); } catch (e) {}
       }
       return;
@@ -4200,22 +4222,23 @@ class Element extends Node {
     }
   }
   focus() {
+    if (!this.isConnected) return;
     const previous = globalThis.__obscura_focused || null;
     if (previous === this) return;
     if (previous) {
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: this })));
-      previous.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this })));
+      _dispatchTrustedDomEvent(previous, _worldEventConstructors.FocusEvent, 'blur', { relatedTarget: this });
+      _dispatchTrustedDomEvent(previous, _worldEventConstructors.FocusEvent, 'focusout', { bubbles: true, composed: true, relatedTarget: this });
     }
     globalThis.__obscura_focused = this;
     globalThis.__obscura_click_target = this;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focus', { relatedTarget: previous })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })));
+    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'focus', { relatedTarget: previous });
+    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'focusin', { bubbles: true, composed: true, relatedTarget: previous });
   }
   blur() {
     if (globalThis.__obscura_focused !== this) return;
     globalThis.__obscura_focused = null;
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('blur', { relatedTarget: null })));
-    this.dispatchEvent(globalThis.__obscura_markTrusted(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: null })));
+    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'blur', { relatedTarget: null });
+    _dispatchTrustedDomEvent(this, _worldEventConstructors.FocusEvent, 'focusout', { bubbles: true, composed: true, relatedTarget: null });
   }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -4380,8 +4403,8 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
-    if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    const state = _domParse("get_form_state", this._nid);
+    if (state?.value != null) return state.value;
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4433,7 +4456,6 @@ class Element extends Node {
       return;
     }
     const value = String(v);
-    _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
       this.textContent = value;
@@ -4718,13 +4740,13 @@ class Element extends Node {
     ).then(raw => {
       // Numeric identity also distinguishes replaced owners with the same URL.
       if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
-      const response = JSON.parse(raw);
+      const response = _iframeResponseParse(raw);
       if (response.blocked || response.status <= 0 || response.status >= 400) {
         throw new Error('Iframe document request failed');
       }
       const html = response.body || '';
       const loadedUrl = response.url || fullUrl;
-      if (!_iframeEmbeddingAllowed(response, loadedUrl)) {
+      if (!_iframeEmbeddingAllowed(raw)) {
         throw new Error('Iframe embedding denied or unsupported by response policy');
       }
       __obscuraCore.ops.op_frame_document_ready(
@@ -5340,10 +5362,32 @@ class Element extends Node {
     }
     return new DOMRectList([this.getBoundingClientRect()]);
   }
-  // No layout engine: a stub that always returns true unblocks Playwright's
-  // actionability polling. With a real layout we'd check display, visibility,
-  // opacity and rect dimensions per spec.
-  checkVisibility(opts) { return true; }
+  checkVisibility(opts = {}) {
+    if (opts == null) opts = {};
+    else if (typeof opts !== 'object' && typeof opts !== 'function') throw new TypeError('Expected CheckVisibilityOptions');
+    const checkOpacity = Boolean(opts.checkOpacity), checkVisibilityCSS = Boolean(opts.checkVisibilityCSS);
+    Boolean(opts.contentVisibilityAuto);
+    const opacityProperty = Boolean(opts.opacityProperty), visibilityProperty = Boolean(opts.visibilityProperty);
+    const opacity = opacityProperty || checkOpacity, visibility = visibilityProperty || checkVisibilityCSS;
+    if (!this.isConnected) return false;
+    let node = this;
+    while (node) {
+      const style = globalThis.getComputedStyle(node);
+      if (style.display === 'none' || (node === this && style.display === 'contents')) return false;
+      // Hidden content suppresses descendants, not the owner's own box.
+      if (node !== this && style.getPropertyValue('content-visibility') === 'hidden') return false;
+      if (opacity && Number(style.opacity) === 0) return false;
+      // Visibility is inherited but may be overridden by a visible child.
+      if (node === this && visibility && (style.visibility === 'hidden' || style.visibility === 'collapse')) return false;
+      const parent = node.parentNode;
+      node = parent instanceof Element ? parent : parent instanceof ShadowRoot ? parent.host : null;
+    }
+    // Box existence, not positive area, is required. Without render we cannot
+    // assert a box from the synthetic compatibility getBoundingClientRect().
+    // contentVisibilityAuto has no extra effect until layout actually skips
+    // an auto subtree; being offscreen alone does not establish that state.
+    return this._renderBoxGeometry() != null;
+  }
   // ARIA reflection properties. Without an accessibility tree we expose the
   // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
   // at least find elements that author them explicitly.
@@ -6525,7 +6569,12 @@ class DocumentType extends Node {
   get ownerDocument() { return this._ownerDocument || globalThis.document; }
 }
 
-const _cache = new Map();
+const _cache = new class extends Map {
+  set(nid, node) {
+    _weakMapSet(_nodeIdentity, node, nid);
+    return super.set(nid, node);
+  }
+};
 
 class TextTrackCue {
   constructor(startTime, endTime, text) {
@@ -6559,69 +6608,189 @@ class TextTrackCueList extends Array {
   }
   item(index) { return this[index] || null; }
 }
+const _textTrackKinds = new Set(['subtitles','captions','descriptions','chapters','metadata']);
+const _cueTracks = new WeakMap();
+const _maxTrackBytes = 2 * 1024 * 1024;
+const _maxTrackCues = 10000;
+function _trackEvent(target, type, track) {
+  setTimeout(() => {
+    const event = new Event(type);
+    if (track) Object.defineProperty(event, 'track', {value:track,enumerable:true});
+    target.dispatchEvent(event);
+  }, 0);
+}
+function _trackHandler(prototype, name) {
+  const values = new WeakMap(), wrappers = new WeakMap();
+  Object.defineProperty(prototype, 'on' + name, {enumerable:true,configurable:true,
+    get() { return values.get(this) || null; },
+    set(callback) {
+      callback = typeof callback === 'function' ? callback : null;
+      values.set(this, callback);
+      if (callback && !wrappers.has(this)) {
+        const wrapper = event => values.get(this)?.call(this,event);
+        wrappers.set(this,wrapper); this.addEventListener(name,wrapper);
+      } else if (!callback && wrappers.has(this)) {
+        this.removeEventListener(name,wrappers.get(this)); wrappers.delete(this);
+      }
+    }});
+}
 class TextTrack extends Node {
   constructor(element, kind, label, language) {
     super();
     this._element = element || null;
-    this.kind = kind || "subtitles";
-    this.label = label || "";
-    this.language = language || "";
-    this.id = element?.id || "";
-    this.mode = element?.hasAttribute?.("default") ? "showing" : "disabled";
-    this.inBandMetadataTrackDispatchType = "";
-    this._parsedSrc = null;
-    this._cues = new TextTrackCueList();
-    this.activeCues = new TextTrackCueList();
-    this.oncuechange = null;
+    this._kind = kind || 'subtitles'; this._label = label || ''; this._language = language || '';
+    this._mode = element?.hasAttribute('default') ? 'showing' : element ? 'disabled' : 'hidden';
+    this._cues = new TextTrackCueList(); this._activeCues = new TextTrackCueList();
+    this._media = null;
   }
-  get cues() {
-    const src = this._element?.getAttribute?.("src") || "";
-    if (src !== this._parsedSrc) {
-      this._parsedSrc = src;
-      this._cues = _parseWebVttCues(src);
+  get kind() { return this._element?.kind || this._kind; }
+  get label() { return this._element?.label ?? this._label; }
+  get language() { return this._element?.srclang ?? this._language; }
+  get id() { return this._element?.id || ''; }
+  get inBandMetadataTrackDispatchType() { return ''; }
+  get mode() { return this._mode; }
+  set mode(value) {
+    value = `${value}`;
+    if (!['disabled','hidden','showing'].includes(value)) throw new TypeError('Invalid TextTrackMode');
+    if (value === this._mode) return;
+    this._mode = value;
+    if (value === 'disabled') this._activeCues.length = 0;
+    else this._element?._queueTrackLoad();
+    const media = this._element?.parentElement instanceof HTMLMediaElement ? this._element.parentElement : this._media;
+    if (media) _trackEvent(media.textTracks,'change');
+  }
+  get cues() { this._element?._queueTrackLoad(); return this.mode === 'disabled' ? null : this._cues; }
+  get activeCues() { return this.mode === 'disabled' ? null : this._activeCues; }
+  addCue(cue) {
+    if (!(cue instanceof TextTrackCue)) throw new TypeError('Expected TextTrackCue');
+    const previous = _cueTracks.get(cue);
+    if (previous && previous !== this) previous.removeCue(cue);
+    if (this._cues.includes(cue)) return;
+    _cueTracks.set(cue,this); this._cues.push(cue);
+    this._cues.sort((a,b) => a.startTime-b.startTime || b.endTime-a.endTime);
+  }
+  removeCue(cue) {
+    if (!(cue instanceof TextTrackCue)) throw new TypeError('Expected TextTrackCue');
+    const index = this._cues.indexOf(cue);
+    if (index < 0) throw new DOMException('The cue is not in this track.', 'NotFoundError');
+    this._cues.splice(index,1); _cueTracks.delete(cue);
+    const active = this._activeCues.indexOf(cue); if (active >= 0) this._activeCues.splice(active,1);
+  }
+}
+_trackHandler(TextTrack.prototype,'cuechange');
+class TextTrackList extends Node {
+  constructor(owner) {
+    super(); this._owner=owner; this._tracks=[]; this._syncing=false;
+    const list = new Proxy(this, {
+      get(target,name,receiver) {
+        if (typeof name === 'string' && /^(0|[1-9]\d*)$/.test(name)) {
+          target._sync(); return target._tracks[Number(name)];
+        }
+        return Reflect.get(target,name,receiver);
+      },
+      has(target,name) {
+        if (typeof name === 'string' && /^(0|[1-9]\d*)$/.test(name)) { target._sync(); return Number(name)<target._tracks.length; }
+        return Reflect.has(target,name);
+      },
+      set(target,name,value,receiver) {
+        if (name === 'length' || typeof name === 'string' && /^(0|[1-9]\d*)$/.test(name)) return false;
+        return Reflect.set(target,name,value,receiver);
+      },
+      ownKeys(target) { target._sync(); return [...Reflect.ownKeys(target),...target._tracks.map((_,i) => String(i))]; },
+      getOwnPropertyDescriptor(target,name) {
+        if (typeof name === 'string' && /^(0|[1-9]\d*)$/.test(name)) {
+          target._sync(); if (Number(name)<target._tracks.length) return {value:target._tracks[Number(name)],writable:false,enumerable:true,configurable:true};
+        }
+        return Reflect.getOwnPropertyDescriptor(target,name);
+      },
+    });
+    this._proxy=list;
+    if (owner && typeof MutationObserver === 'function') {
+      this._observer=new MutationObserver(() => list._sync());
+      this._observer.observe(owner,{childList:true});
     }
-    return this._cues;
+    return list;
   }
-}
-class TextTrackList extends Array {
-  item(index) { return this[index] || null; }
-  getTrackById(id) {
-    return this.find((track) => track && track.id === String(id)) || null;
+  _sync() {
+    if (!this._owner || this._syncing) return;
+    this._syncing=true;
+    try {
+      const tracks=Array.from(this._owner.children).filter(el => el instanceof HTMLTrackElement).map(el => el.track);
+      tracks.push(...this._owner._addedTextTracks);
+      const old=this._tracks;
+      this._tracks=tracks;
+      for (const track of old) if (!tracks.includes(track)) {
+        if (track._media === this._owner) track._media=null;
+        track._activeCues.length=0; _trackEvent(this._proxy,'removetrack',track);
+      }
+      for (const track of tracks) {
+        track._media=this._owner;
+        if (!old.includes(track)) _trackEvent(this._proxy,'addtrack',track);
+        track._element?._queueTrackLoad();
+      }
+    } finally { this._syncing=false; }
   }
+  get length() { this._sync(); return this._tracks.length; }
+  item(index) { this._sync(); return this._tracks[Number(index) >>> 0] || null; }
+  getTrackById(id) { this._sync(); return this._tracks.find(track => track.id === String(id)) || null; }
+  *[Symbol.iterator]() { for (let i=0;i<this.length;i++) yield this[i]; }
 }
+for (const name of ['addtrack','removetrack','change']) _trackHandler(TextTrackList.prototype,name);
 function _vttTime(value) {
-  const parts = String(value).trim().split(":").map(Number);
-  if (parts.some((part) => !Number.isFinite(part))) return 0;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
+  const match=/^(?:(\d{2,}):)?(\d{2}):(\d{2})\.(\d{3})$/.exec(String(value).trim());
+  if (!match || Number(match[2])>59 || Number(match[3])>59) return NaN;
+  return Number(match[1] || 0)*3600+Number(match[2])*60+Number(match[3])+Number(match[4])/1000;
 }
-function _parseWebVttCues(src) {
-  const cues = new TextTrackCueList();
-  if (!src || !src.startsWith("data:text/vtt")) return cues;
-  let text = "";
-  try {
-    const comma = src.indexOf(",");
-    if (comma < 0) return cues;
-    const meta = src.slice(0, comma);
-    const body = src.slice(comma + 1);
-    text = /;base64(?:;|$)/i.test(meta) ? atob(body) : decodeURIComponent(body);
-  } catch (_error) {
-    return cues;
-  }
-  const blocks = text.replace(/\r\n?/g, "\n").split(/\n{2,}/);
-  for (const block of blocks) {
-    const lines = block.split("\n").filter((line) => line.length > 0);
-    if (!lines.length || lines[0].trim() === "WEBVTT" || lines[0].trim().startsWith("NOTE")) continue;
-    let timingIndex = lines.findIndex((line) => line.includes("-->"));
-    if (timingIndex < 0) continue;
-    const timing = lines[timingIndex].split("-->");
-    const endToken = (timing[1] || "").trim().split(/\s+/)[0];
-    const cue = new VTTCue(_vttTime(timing[0]), _vttTime(endToken), lines.slice(timingIndex + 1).join("\n"));
-    if (timingIndex > 0) cue.id = lines[timingIndex - 1].trim();
+function _parseWebVttCues(text) {
+  text=text.replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
+  if (!/^WEBVTT(?:[ \t][^\n]*)?(?:\n|$)/.test(text)) throw new Error('Invalid WebVTT signature');
+  const cues=new TextTrackCueList();
+  for (const block of text.split(/\n{2,}/).slice(1)) {
+    const lines=block.split('\n');
+    if (!lines.length || /^(?:NOTE(?:[ \t]|$)|STYLE$|REGION$)/.test(lines[0])) continue;
+    const timingIndex=lines[0].includes('-->') ? 0 : 1;
+    const timing=/^\s*(\S+)\s+-->\s+(\S+)(?:[ \t]+(.*))?$/.exec(lines[timingIndex] || '');
+    if (!timing) continue;
+    const start=_vttTime(timing[1]), end=_vttTime(timing[2]);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end<start) continue;
+    const cue=new VTTCue(start,end,lines.slice(timingIndex+1).join('\n').replace(/\n+$/,''));
+    if (timingIndex === 1) cue.id=lines[0];
+    // Preserve author cue positioning for native poster/caption consumers.
+    for (const setting of (timing[3] || '').split(/\s+/)) {
+      const [name,value]=setting.split(':');
+      if (name === 'vertical' && ['rl','lr'].includes(value)) cue.vertical=value;
+      else if (name === 'align' && ['start','center','end','left','right'].includes(value)) cue.align=value;
+      else if (name === 'size' && /^\d+(?:\.\d+)?%$/.test(value) && parseFloat(value)<=100) cue.size=parseFloat(value);
+      else if (name === 'line') {
+        const [line,align]=value.split(',');
+        if (/^-?\d+$/.test(line)) cue.line=Number(line);
+        else if (/^\d+(?:\.\d+)?%$/.test(line) && parseFloat(line)<=100) { cue.line=parseFloat(line); cue.snapToLines=false; }
+        if (['start','center','end'].includes(align)) cue.lineAlign=align;
+      } else if (name === 'position') {
+        const [position,align]=value.split(',');
+        if (/^\d+(?:\.\d+)?%$/.test(position) && parseFloat(position)<=100) cue.position=parseFloat(position);
+        if (['line-left','center','line-right'].includes(align)) cue.positionAlign=align;
+      }
+    }
+    if (cues.length >= _maxTrackCues) throw new Error('WebVTT cue limit exceeded');
     cues.push(cue);
   }
   return cues;
+}
+async function _loadWebVttSource(url,media,signal) {
+  if (!url) throw new Error('A track source is required');
+  if (/^data:/i.test(url) && url.length>_maxTrackBytes*4) throw new Error('Track byte limit exceeded');
+  const cors=media?.crossOrigin ?? null;
+  // The shared fetch path enforces origin/CSP gates before every send,
+  // including interception rewrites and redirects, and decodes data URLs.
+  const response=await _fetch(url,{mode:cors === null ? 'same-origin' : 'cors',
+    credentials:cors === 'use-credentials' ? 'include' : 'same-origin',signal},'Track');
+  if (!response.ok) { await response.body?.cancel(); throw new Error('Track HTTP request failed'); }
+  const length=Number(response.headers.get('content-length'));
+  if (length>_maxTrackBytes) { await response.body?.cancel(); throw new Error('Track byte limit exceeded'); }
+  const bytes=new Uint8Array(await response.arrayBuffer());
+  if (signal.aborted || bytes.length>_maxTrackBytes) throw new Error('Track load cancelled or too large');
+  return _parseWebVttCues(new TextDecoder('utf-8').decode(bytes));
 }
 
 function _imageEncodingError() {
@@ -6954,6 +7123,29 @@ _markNative(HTMLImageElement.prototype.decode);
 
 // Report only capabilities backed by a real decoder. Poster rendering is an
 // image operation and does not make any audio/video container playable.
+function _mediaDouble(value) {
+  value=+value;
+  if (!Number.isFinite(value)) throw new TypeError('The provided double value is non-finite.');
+  return value;
+}
+class MediaError {
+  static MEDIA_ERR_ABORTED=1;
+  static MEDIA_ERR_NETWORK=2;
+  static MEDIA_ERR_DECODE=3;
+  static MEDIA_ERR_SRC_NOT_SUPPORTED=4;
+  constructor(code,message) { this._code=code; this._message=message; }
+  get code() { return this._code; }
+  get message() { return this._message; }
+  get MEDIA_ERR_ABORTED() { return 1; }
+  get MEDIA_ERR_NETWORK() { return 2; }
+  get MEDIA_ERR_DECODE() { return 3; }
+  get MEDIA_ERR_SRC_NOT_SUPPORTED() { return 4; }
+}
+globalThis.MediaError=MediaError;
+const _emptyMediaRanges=Object.freeze({length:0,
+  start() { throw new DOMException('The index is not in the allowed range.','IndexSizeError'); },
+  end() { throw new DOMException('The index is not in the allowed range.','IndexSizeError'); },
+});
 class HTMLMediaElement extends Element {
   static NETWORK_EMPTY = 0;
   static NETWORK_IDLE = 1;
@@ -6964,9 +7156,39 @@ class HTMLMediaElement extends Element {
   static HAVE_CURRENT_DATA = 2;
   static HAVE_FUTURE_DATA = 3;
   static HAVE_ENOUGH_DATA = 4;
+  constructor(nid) {
+    super(nid);
+    this._mediaVolume=1; this._mediaMuted=this.hasAttribute('muted'); this._mediaTime=0;
+    this._mediaRate=1; this._mediaDefaultRate=1; this._mediaPreservesPitch=true;
+    this._mediaNetwork=0; this._mediaError=null; this._mediaLoadGeneration=0;
+    this._addedTextTracks=[]; this._textTrackList=null;
+    if (this.getAttribute('src')) this._queueMediaLoad();
+  }
   canPlayType(_type) { return ''; }
-  load() {}
+  load() {
+    const previousTime=this._mediaTime;
+    this._mediaTime=0; this.playbackRate=this._mediaDefaultRate;
+    this._mediaError=null; this._mediaNetwork=HTMLMediaElement.NETWORK_EMPTY;
+    if (previousTime !== 0) _trackEvent(this,'timeupdate');
+    this._queueMediaLoad();
+    this.textTracks._sync();
+  }
+  _queueMediaLoad() {
+    const generation=++this._mediaLoadGeneration;
+    setTimeout(() => {
+      if (generation !== this._mediaLoadGeneration) return;
+      const hasSource=this.hasAttribute('src') || Array.from(this.children).some(el => el.localName === 'source' && el.hasAttribute('src'));
+      if (!hasSource) { this._mediaNetwork=HTMLMediaElement.NETWORK_EMPTY; return; }
+      this._mediaNetwork=HTMLMediaElement.NETWORK_LOADING;
+      this.dispatchEvent(new Event('loadstart'));
+      if (generation !== this._mediaLoadGeneration) return;
+      this._mediaNetwork=HTMLMediaElement.NETWORK_NO_SOURCE;
+      this._mediaError=new MediaError(MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED,'No installed audio/video decoder supports this source.');
+      this.dispatchEvent(new Event('error'));
+    },0);
+  }
   play() {
+    if (this._mediaNetwork === HTMLMediaElement.NETWORK_EMPTY) this._queueMediaLoad();
     return Promise.reject(new DOMException(
       "The element has no supported sources.",
       "NotSupportedError",
@@ -6984,17 +7206,67 @@ class HTMLMediaElement extends Element {
   get HAVE_ENOUGH_DATA() { return HTMLMediaElement.HAVE_ENOUGH_DATA; }
   get paused() { return true; }
   get ended() { return false; }
-  get networkState() { return HTMLMediaElement.NETWORK_EMPTY; }
+  get networkState() { return this._mediaNetwork; }
   get readyState() { return HTMLMediaElement.HAVE_NOTHING; }
-  get error() { return null; }
+  get error() { return this._mediaError; }
   get seeking() { return false; }
-  get currentTime() { return 0; }
-  set currentTime(v) {}
+  get currentTime() { return this._mediaTime; }
+  set currentTime(v) { this._mediaTime=_mediaDouble(v); }
   get duration() { return NaN; }
-  get volume() { return 1; }
-  set volume(v) {}
-  get muted() { return false; }
-  set muted(v) {}
+  get volume() { return this._mediaVolume; }
+  set volume(v) {
+    v=_mediaDouble(v);
+    if (v<0 || v>1) throw new DOMException('Volume must be between 0 and 1.','IndexSizeError');
+    if (v === this._mediaVolume) return;
+    this._mediaVolume=v; _trackEvent(this,'volumechange');
+  }
+  get muted() { return this._mediaMuted; }
+  set muted(v) {
+    v=Boolean(v); if (v === this._mediaMuted) return;
+    this._mediaMuted=v; _trackEvent(this,'volumechange');
+  }
+  get playbackRate() { return this._mediaRate; }
+  set playbackRate(v) {
+    v=_mediaDouble(v); if (v === this._mediaRate) return;
+    this._mediaRate=v; _trackEvent(this,'ratechange');
+  }
+  get defaultPlaybackRate() { return this._mediaDefaultRate; }
+  set defaultPlaybackRate(v) {
+    v=_mediaDouble(v);
+    if (v === this._mediaDefaultRate) return;
+    this._mediaDefaultRate=v; _trackEvent(this,'ratechange');
+  }
+  get preservesPitch() { return this._mediaPreservesPitch; }
+  set preservesPitch(v) { this._mediaPreservesPitch=Boolean(v); }
+  get defaultMuted() { return this.hasAttribute('muted'); }
+  set defaultMuted(v) { v ? this.setAttribute('muted','') : this.removeAttribute('muted'); }
+  get autoplay() { return this.hasAttribute('autoplay'); }
+  set autoplay(v) { v ? this.setAttribute('autoplay','') : this.removeAttribute('autoplay'); }
+  get controls() { return this.hasAttribute('controls'); }
+  set controls(v) { v ? this.setAttribute('controls','') : this.removeAttribute('controls'); }
+  get loop() { return this.hasAttribute('loop'); }
+  set loop(v) { v ? this.setAttribute('loop','') : this.removeAttribute('loop'); }
+  get preload() {
+    const value=(this.getAttribute('preload') || '').toLowerCase();
+    return ['none','metadata'].includes(value) ? value : 'auto';
+  }
+  set preload(v) { this.setAttribute('preload',v); }
+  get crossOrigin() {
+    const value=this.getAttribute('crossorigin');
+    return value === null ? null : value.toLowerCase() === 'use-credentials' ? 'use-credentials' : 'anonymous';
+  }
+  set crossOrigin(v) { v === null ? this.removeAttribute('crossorigin') : this.setAttribute('crossorigin',v); }
+  get buffered() { return _emptyMediaRanges; }
+  get played() { return _emptyMediaRanges; }
+  get seekable() { return _emptyMediaRanges; }
+  setAttribute(name,value) {
+    super.setAttribute(name,value);
+    if (String(name).toLowerCase() === 'src' && this._addedTextTracks) this.load();
+  }
+  removeAttribute(name) {
+    super.removeAttribute(name);
+    if (String(name).toLowerCase() === 'src' && this._addedTextTracks) this.load();
+  }
   get src() {
     const raw = this.getAttribute("src");
     if (!raw) return "";
@@ -7004,12 +7276,16 @@ class HTMLMediaElement extends Element {
   set src(v) { this.setAttribute('src', v); }
   get currentSrc() { return ""; }
   get textTracks() {
-    return TextTrackList.from(
-      Array.from(this.querySelectorAll("track")).map((element) => element.track)
-    );
+    if (!this._textTrackList) this._textTrackList=new TextTrackList(this);
+    this._textTrackList._sync(); return this._textTrackList;
   }
-  addTextTrack(kind, label = "", language = "") {
-    return new TextTrack(null, String(kind), String(label), String(language));
+  addTextTrack(kind, label = '', language = '') {
+    if (arguments.length === 0) throw new TypeError('A TextTrackKind is required');
+    kind=`${kind}`;
+    if (!_textTrackKinds.has(kind)) throw new TypeError('Invalid TextTrackKind');
+    label=`${label}`; language=`${language}`;
+    const track=new TextTrack(null,kind,label,language);
+    track._media=this; this._addedTextTracks.push(track); this.textTracks._sync(); return track;
   }
 }
 _markNative(HTMLMediaElement.prototype.canPlayType);
@@ -7026,6 +7302,8 @@ class HTMLVideoElement extends HTMLMediaElement {
   set poster(value) { this.setAttribute("poster", value); }
   get videoWidth() { return 0; }
   get videoHeight() { return 0; }
+  get playsInline() { return this.hasAttribute('playsinline'); }
+  set playsInline(value) { value ? this.setAttribute('playsinline','') : this.removeAttribute('playsinline'); }
 }
 class HTMLAudioElement extends HTMLMediaElement {}
 class HTMLTrackElement extends Element {
@@ -7033,9 +7311,26 @@ class HTMLTrackElement extends Element {
   static LOADING = 1;
   static LOADED = 2;
   static ERROR = 3;
-  get kind() { return this.getAttribute("kind") || "subtitles"; }
+  constructor(nid) {
+    super(nid);
+    this._trackReadyState=HTMLTrackElement.NONE;
+    this._trackGeneration=0; this._trackQueued=false; this._trackSource=null; this._trackAbort=null;
+  }
+  get NONE() { return HTMLTrackElement.NONE; }
+  get LOADING() { return HTMLTrackElement.LOADING; }
+  get LOADED() { return HTMLTrackElement.LOADED; }
+  get ERROR() { return HTMLTrackElement.ERROR; }
+  get kind() {
+    const value=this.getAttribute('kind');
+    if (value === null) return 'subtitles';
+    const kind=value.toLowerCase(); return _textTrackKinds.has(kind) ? kind : 'metadata';
+  }
   set kind(value) { this.setAttribute("kind", value); }
-  get src() { return this.getAttribute("src") || ""; }
+  get src() {
+    const raw=this.getAttribute('src'); if (!raw) return '';
+    try { return new URL(raw,this.baseURI || globalThis.location?.href || 'about:blank').href; }
+    catch (_error) { return raw; }
+  }
   set src(value) { this.setAttribute("src", value); }
   get srclang() { return this.getAttribute("srclang") || ""; }
   set srclang(value) { this.setAttribute("srclang", value); }
@@ -7043,12 +7338,73 @@ class HTMLTrackElement extends Element {
   set label(value) { this.setAttribute("label", value); }
   get default() { return this.hasAttribute("default"); }
   set default(value) { value ? this.setAttribute("default", "") : this.removeAttribute("default"); }
-  get readyState() { return HTMLTrackElement.LOADED; }
+  get readyState() { this._queueTrackLoad(); return this._trackReadyState; }
   get track() {
-    if (!this._textTrack) {
-      this._textTrack = new TextTrack(this, this.kind, this.label, this.srclang);
+    if (!this._textTrack) this._textTrack=new TextTrack(this,this.kind,this.label,this.srclang);
+    this._queueTrackLoad(); return this._textTrack;
+  }
+  setAttribute(name,value) {
+    const normalized=String(name).toLowerCase();
+    super.setAttribute(name,value);
+    if (normalized === 'src' && this._trackGeneration !== undefined) {
+      this._clearTrackCues(); this._queueTrackLoad();
     }
-    return this._textTrack;
+  }
+  removeAttribute(name) {
+    const normalized=String(name).toLowerCase();
+    super.removeAttribute(name);
+    if (normalized === 'src' && this._trackGeneration !== undefined) {
+      this._clearTrackCues(); this._queueTrackLoad();
+    }
+  }
+  _clearTrackCues() {
+    if (this._textTrack) {
+      for (const cue of this._textTrack._cues) _cueTracks.delete(cue);
+      this._textTrack._cues.length=0; this._textTrack._activeCues.length=0;
+    }
+  }
+  _queueTrackLoad() {
+    const parent=this.parentElement;
+    if (!(parent instanceof HTMLMediaElement) && this._trackSource === null) return;
+    if (!this._textTrack) this._textTrack=new TextTrack(this,this.kind,this.label,this.srclang);
+    if (this._textTrack.mode === 'disabled' || this._trackQueued || this._trackSource === this.src) return;
+    const interrupted=this._trackAbort !== null;
+    if (interrupted) { this._trackAbort.abort(); this._trackAbort=null; }
+    const generation=++this._trackGeneration;
+    this._trackQueued=true;
+    setTimeout(() => {
+      if (generation !== this._trackGeneration) return;
+      // Source replacement while loading has an observable error transition.
+      // Keep this task queued through its handler, so reentrant source writes
+      // select the latest URL without creating overlapping loads.
+      if (interrupted) { this._trackReadyState=HTMLTrackElement.ERROR; this.dispatchEvent(new Event('error')); }
+      this._trackQueued=false;
+      const media=this.parentElement instanceof HTMLMediaElement ? this.parentElement : null;
+      if ((!media && this._trackSource === null) || this._textTrack.mode === 'disabled') return;
+      const source=this.src;
+      if (!interrupted && this._trackSource === source) return;
+      this._trackSource=source; this._trackReadyState=HTMLTrackElement.LOADING;
+      const abort=new AbortController(); this._trackAbort=abort;
+      _loadWebVttSource(source,media,abort.signal).then(
+        cues => this._finishTrackLoad(generation,abort,source,cues),
+        () => this._finishTrackLoad(generation,abort,source,null));
+    },0);
+  }
+  _finishTrackLoad(generation,abort,source,cues) {
+    setTimeout(() => {
+      if (generation !== this._trackGeneration || abort.signal.aborted) return;
+      // Removing a track from its media list does not cancel its resource or
+      // discard loaded cues. A changed URL, however, must never install old cues.
+      if (this.src !== source) cues=null;
+      if (cues !== null) {
+        this._clearTrackCues();
+        for (const cue of cues) { this._textTrack._cues.push(cue); _cueTracks.set(cue,this._textTrack); }
+      }
+      this._trackReadyState=cues === null ? HTMLTrackElement.ERROR : HTMLTrackElement.LOADED;
+      this._trackAbort=null;
+      this.dispatchEvent(new Event(cues === null ? 'error' : 'load'));
+      this._queueTrackLoad();
+    },0);
   }
 }
 globalThis.HTMLMediaElement = HTMLMediaElement;
@@ -7900,16 +8256,14 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
       signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType, globalThis);
   } catch (error) {
     cleanup();
-    throw signalState && signalState.aborted ? signalState.reason : error;
+    throw signalState && signalState.aborted ? signalState.reason
+      : new TypeError('Failed to fetch: ' + (error?.message || String(error)));
   }
   if (signalState && signalState.aborted) { cleanup(); throw signalState.reason; }
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     cleanup();
-    const err = new TypeError('net::ERR_FAILED');
-    err.name = 'AbortError';
-    err.__aborted = true;
-    throw err;
+    throw new TypeError('Failed to fetch: ' + (parsed.error || 'net::ERR_FAILED'));
   }
   if (parsed.corsBlocked) {
     cleanup();
@@ -7922,10 +8276,10 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
   const response = _createInternalResponse(responseBody, {
     status: parsed.status,
-    statusText: "",
+    statusText: parsed.statusText || "",
     headers: parsed.headers || {},
     type: respType,
-    url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
+    url: respType === "opaque" ? "" : (parsed.url || url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   _attachResponseAbort(response, signal);
@@ -7933,7 +8287,8 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
     // stream backpressure rather than eagerly queuing every network chunk.
     const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid)
-      .catch(error => { throw signalState && signalState.aborted ? signalState.reason : error; })
+      .catch(error => { throw signalState && signalState.aborted ? signalState.reason
+        : new TypeError('Failed to fetch: ' + (error?.message || String(error))); })
       .finally(cleanup);
     promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
     response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
@@ -9181,13 +9536,15 @@ globalThis.getComputedStyle = (el, pseudo = '') => {
   }
   const refreshRendered = (property = '') => {
     const viewportWidth = globalThis.innerWidth, viewportHeight = globalThis.innerHeight;
+    const epoch = _domMutationEpoch + (_realmRegistered
+      ? __obscuraCore.ops.op_world_dom_generation(globalThis, false) : 0);
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
-    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation
+    if (snapshot.epoch === epoch && !hasRunningAnimation
         && snapshot.viewportWidth === viewportWidth && snapshot.viewportHeight === viewportHeight
         && (snapshot.complete || (property && snapshot.rendered
             && Object.prototype.hasOwnProperty.call(snapshot.rendered, property)))) return;
-    snapshot.epoch = _domMutationEpoch;
+    snapshot.epoch = epoch;
     snapshot.viewportWidth = viewportWidth;
     snapshot.viewportHeight = viewportHeight;
     snapshot.rendered = null;
@@ -10684,12 +11041,38 @@ globalThis.DOMException = (function () {
 // `new Event(...)` must report isTrusted === false (issue #303). Returning true
 // for everything is a trivial bot-detection tell. Trusted events are tracked in
 // a closure-private WeakSet so page JS can neither read nor forge the flag.
-// obscura's CDP input pipeline marks its synthetic events via the
-// non-enumerable __obscura_markTrusted helper.
+// Native input uses one-shot provenance consumed by the dispatch coordinator;
+// author dispatch never gains an ambient privilege.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+const _nativeInputEvents = new WeakSet();
+const _events = new WeakSet();
+const _eventState = new WeakMap();
+function _eventFlags(event) {
+  const state = _weakMapGet(_eventState, event);
+  return state.shared ? state.shared[0] : state.flags;
+}
+function _addEventFlags(event, flags) {
+  const state = _weakMapGet(_eventState, event);
+  if (state.shared) state.shared[0] |= flags;
+  else state.flags |= flags;
+}
 const _messageEvents = new WeakSet();
 const _trustedMessageEvents = new WeakSet();
+function _eventIsTrusted() {
+  if (!_weakSetHas(_events, this)) throw new TypeError('Illegal invocation');
+  return _weakSetHas(_messageEvents, this)
+    ? _weakSetHas(_trustedMessageEvents, this) : _weakSetHas(_trustedEvents, this);
+}
+_markNativeAs(_eventIsTrusted, 'function get isTrusted() { [native code] }');
+const _eventTrustedDescriptor = {
+  __proto__: null, get: _eventIsTrusted, enumerable: true, configurable: false,
+};
+function _dispatchTrustedDomEvent(target, Constructor, type, options) {
+  const event = new Constructor(type, options);
+  _weakSetAdd(_trustedEvents, event);
+  _weakSetAdd(_nativeInputEvents, event);
+  return _domEventDispatch(target, event);
+}
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -10728,12 +11111,8 @@ function _makeFileList(files) {
 }
 function _emptyFileList() { return _makeFileList([]); }
 
-// Populate an <input type=file>'s FileList from the CDP DOM.setFileInputFiles
-// call (Puppeteer uploadFile / Playwright setInputFiles). `specs` is an array of
-// { name, type, b64 } where b64 is the base64-encoded file bytes read on the
-// Rust side. Real File objects (backed by the bytes) are created so page code can
-// read them via FileReader or upload them via fetch/FormData, then input+change
-// fire as a genuine selection would (issue #359).
+// Author-callable file population stays untrusted. CDP file selection uses the
+// captured native input callback instead (issue #359).
 globalThis.__obscura_setInputFiles = function(el, specs) {
   const files = (specs || []).map((s) => {
     let bytes;
@@ -10745,19 +11124,16 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
     return new File([bytes], s.name || "", { type: s.type || "" });
   });
   el._files = _makeFileList(files);
-  // Mark the events trusted (isTrusted === true), like the Input domain does
-  // for synthesized clicks/keys. A real <input type=file> selection fires
-  // trusted events; upload flows that gate their change handler on
-  // event.isTrusted (common in frameworks and anti-bot code) ignore untrusted
-  // ones, which would silently break the exact case this feature targets.
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("input", { bubbles: true }))); } catch (_e) {}
-  try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
+  try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (_e) {}
+  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (_e) {}
 };
 globalThis.Event = class Event {
-  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now();this._dispatching=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return _messageEvents.has(this) ? _trustedMessageEvents.has(this) : _trustedEvents.has(this); }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); _weakSetAdd(_events, this); _weakMapSet(_eventState, this, { flags: 0, shared: null, dispatching: false, passive: false }); _defineEventProperty(this, 'isTrusted', _eventTrustedDescriptor); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=performance.now(); }
+  get defaultPrevented() { return !!(_eventFlags(this) & 1); }
+  preventDefault() { if (this.cancelable && !_weakMapGet(_eventState, this).passive) _addEventFlags(this, 1); }
+  stopPropagation() { _addEventFlags(this, 2); }
+  stopImmediatePropagation() { _addEventFlags(this, 6); }
+  initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); const state = _weakMapGet(_eventState, this); if (state.dispatching) return; this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;state.flags=0; _weakSetDelete(_trustedEvents, this); _weakSetDelete(_trustedMessageEvents, this); _weakSetDelete(_nativeInputEvents, this); }
   composedPath() {
     if (!this.target) return [];
     const path = [];
@@ -10918,7 +11294,7 @@ globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event {
   constructor(t,o={}) {
     super(t,o);
-    _messageEvents.add(this);
+    _weakSetAdd(_messageEvents, this);
     this.data = Object.prototype.hasOwnProperty.call(o, "data") ? o.data : null;
     this.origin = o.origin == null ? "" : String(o.origin);
     this.lastEventId = o.lastEventId == null ? "" : String(o.lastEventId);
@@ -11097,8 +11473,8 @@ let _createDependentAbortSignal;
     state.sources.clear();
     dependentsFinalizer.unregister(state.ref);
     state.dependents.clear();
-    const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
-    _trustedEvents.add(evt);
+    const evt = new _worldEventConstructors.Event("abort");
+    _weakSetAdd(_trustedEvents, evt);
     try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
     emit(signal, evt);
   }
@@ -14206,38 +14582,15 @@ function _iframeRealmGlobal(target, name) {
   return value;
 }
 
-function _iframeEmbeddingAllowed(response, url) {
-  const headers = Object.entries(response.headers || {});
-  const values = name => headers.filter(([key]) => key.toLowerCase() === name)
-    .map(([, value]) => String(value));
-  const policies = values('content-security-policy');
-  const xfo = values('x-frame-options');
-  if (!policies.length && !xfo.length) return true;
-  const ancestors = _domParse('frame_ancestor_origins');
-  if (!Array.isArray(ancestors) || !ancestors.length) return false;
-  const documentOrigin = _urlParseOp(url)?.origin;
-  let hasAncestors = false;
-  for (const policy of policies.flatMap(value => value.split(','))) {
-    const directive = policy.split(';').map(value => value.trim().split(/\s+/))
-      .find(parts => parts[0].toLowerCase() === 'frame-ancestors');
-    if (!directive) continue;
-    hasAncestors = true;
-    const sources = directive.slice(1);
-    if (!ancestors.every(origin => sources.some(source => {
-      if (origin === 'null') return false;
-      if (source === '*') return true;
-      if (source.toLowerCase() === "'self'") return origin === documentOrigin;
-      const parsed = _urlParseOp(source);
-      // Unsupported source patterns fail closed, not as a successful embedding.
-      return parsed && parsed.origin !== 'null' && parsed.pathname === '/'
-        && !parsed.search && !parsed.hash && origin === parsed.origin;
-    }))) return false;
-  }
-  // An enforced frame-ancestors directive supersedes X-Frame-Options.
-  if (hasAncestors) return true;
-  return xfo.flatMap(value => value.split(',')).every(value =>
-    value.trim().toUpperCase() === 'SAMEORIGIN'
-    && ancestors.every(origin => origin !== 'null' && origin === documentOrigin));
+// Captured before author scripts; the gate and native document materialization
+// must both retain the actual protected response URL, headers and body.
+const _iframeResponseParse = JSON.parse;
+const _iframePolicyGlobal = globalThis;
+
+function _iframeEmbeddingAllowed(rawResponse) {
+  // Parse the original private native response, not author-mutable URL/JSON
+  // APIs or collection prototypes. Native live ancestors remain authoritative.
+  return __obscuraCore.ops.op_dom('frame_embedding_allowed', rawResponse, '', _realmFrameId, _iframePolicyGlobal) === 'true';
 }
 
 const _iframeWindowState = new WeakMap();
@@ -14285,6 +14638,12 @@ function _iframeNavigate(state, value) {
   if (_iframeWindowIsLive(state)) state.element.src = String(value);
 }
 
+function _iframeWindowRelation(name) {
+  return name === 'parent'
+    ? __obscuraCore.ops.op_window_realm_proxy(_nativeWindowId, _realmFrameId, _windowProxy)
+    : _windowRelated(_nativeWindowId, 'top', _realmFrameId);
+}
+
 function _iframeCrossOriginValue(target, key, state) {
   if (_iframeCrossOriginSpecialKey(key)) return undefined;
   if (!_iframeCrossOriginKeySet.has(key)) return _iframeAccessDenied();
@@ -14293,6 +14652,7 @@ function _iframeCrossOriginValue(target, key, state) {
   if (key === 'location') return state.crossOriginLocation;
   if (key === 'closed') return target.closed || !_iframeWindowIsLive(state);
   if (key === 'opener') return null;
+  if (key === 'parent' || key === 'top') return _iframeWindowRelation(key);
   if (key === 'close' || key === 'focus' || key === 'blur') return state.operations[key];
   return Reflect.get(target, key, target);
 }
@@ -14302,7 +14662,7 @@ function _bindIframeWindowFrame(win, frameId) {
   if (state) {
     state.frameId = frameId >>> 0;
     state.opaque = __obscuraCore.ops.op_dom(
-      'frame_is_sandboxed_opaque', String(state.frameId), '', _realmFrameId) !== 'false';
+      'frame_is_sandboxed_opaque', String(state.frameId), '', _realmFrameId, _iframePolicyGlobal) !== 'false';
   }
 }
 
@@ -14313,6 +14673,7 @@ const _iframeWindowProxyHandler = {
     if (key === 'document') return _frameObjectsFor(state.element)?.document || state.document;
     if (key === 'localStorage' || key === 'sessionStorage') return globalThis[key];
     if (key === 'postMessage') return state.postMessage;
+    if (key === 'parent' || key === 'top') return _iframeWindowRelation(key);
     if (key === 'window' || key === 'self' || key === 'frames') return receiver;
     if (key === 'globalThis') return receiver;
     const real = _frameObjectsFor(state.element)?.window;
@@ -14538,27 +14899,27 @@ function _ensureInitialFrameRealm(element) {
   if (element._frameId || !element.isConnected) return;
   // An opaque sandbox must never receive the creator's security token.
   if (_iframeSandboxIsOpaque(element) || _iframeWindowState.get(element._iframeWin)?.opaque) return;
-  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
-    const core = child.__obscura_core_handoff;
-    for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
-    delete child.__obscura_core_handoff;
-    delete child.Deno;
-    for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
-                       '__obscura_ua_platform_version', '__obscura_stealth',
-                       '__obscura_geo_lat', '__obscura_geo_lon']) {
-      if (globalThis[name] !== undefined) child[name] = globalThis[name];
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id, reused) => {
+    if (!reused) {
+      const core = child.__obscura_core_handoff;
+      for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
+      delete child.__obscura_core_handoff;
+      delete child.Deno;
+      for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
+                         '__obscura_ua_platform_version', '__obscura_stealth',
+                         '__obscura_geo_lat', '__obscura_geo_lon']) {
+        if (globalThis[name] !== undefined) child[name] = globalThis[name];
+      }
+      child.__obscura_frameId = id;
+      child.__obscura_parentFrameId = _realmFrameId;
+      child.__obscura_init();
+      Object.defineProperty(child, 'frameElement', { value: element, configurable: true });
+      child.innerWidth = 300;
+      child.innerHeight = 150;
     }
-    child.__obscura_frameId = id;
-    child.__obscura_parentFrameId = _realmFrameId;
-    child.__obscura_init();
-    Object.defineProperties(child, {
-      parent: { value: globalThis, configurable: true },
-      top: { value: globalThis.top, configurable: true },
-      frameElement: { value: element, configurable: true },
-    });
-    child.innerWidth = 300;
-    child.innerHeight = 150;
-    _frameObjects[id] = { window: child, document: child.document };
+    let document;
+    try { document = child.document; } catch (_) {}
+    _frameObjects[id] = { window: child, document };
   }, element._nid);
   if (frameId) {
     element._frameId = frameId;
@@ -14604,13 +14965,12 @@ function _deliverRealmMessage(dataJson, origin, sourceFrameId, targetOrigin) {
 function _dispatchRealmMessage(data, origin, source) {
   try {
     const event = new _NativeMessageEvent('message', { data, origin, source });
-    // Do not route trusted delivery through page-replaceable constructors,
-    // dispatchEvent or __obscura_markTrusted hooks.
-    _trustedMessageEvents.add(event);
+    // Captured constructors and lexical dispatch bypass author hooks.
+    _weakSetAdd(_trustedMessageEvents, event);
+    _weakSetAdd(_nativeInputEvents, event);
     _defineFrameMessageProperties(event, {
       origin: { value: origin, writable: false, configurable: false },
       source: { value: source, writable: false, configurable: false },
-      isTrusted: { value: true, writable: false, configurable: false },
     });
     _eventTargetDispatch(globalThis, event);
   } catch (error) {
@@ -14618,57 +14978,22 @@ function _dispatchRealmMessage(data, origin, source) {
   }
 }
 
-// A window in another browsing context, as seen from this one.
-//
-// Only the cross-origin surface is exposed: reaching synchronously into another
-// realm's DOM is not something this engine does, and a browser forbids it
-// across origins anyway. Widgets use postMessage regardless, which is what it
-// is for.
-class _RemoteWindow {
-  constructor(frameId) {
-    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
-  }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
-  get self() { return this; }
-  get window() { return this; }
-  get frames() { return this; }
-  get parent() { return this; }
-  get top() { return this; }
-  get opener() { return null; }
-  get closed() { return false; }
-  get length() { return 0; }
-  focus() {}
-  blur() {}
-  close() {}
-}
-_markNative(_RemoteWindow.prototype.postMessage);
-
-const _remoteWindows = new Map();
-function _remoteWindow(frameId) {
-  let win = _remoteWindows.get(frameId);
-  if (!win) {
-    win = new _RemoteWindow(frameId);
-    _remoteWindows.set(frameId, win);
-  }
-  return win;
-}
-
-// Installs `parent` and `top` for a framed document. Called from
-// __obscura_init, before any of the document's own scripts run: `parent ===
-// window` is how a document decides it is top-level, and one script taking
-// that branch wrongly is enough to change everything after it.
+// Installs real parent and top browsing-context proxies before a framed
+// document can run author code. The native registry resolves the caller's
+// document, so an isolated execution world follows its canonical frame rather
+// than constructing a private remote placeholder.
 function _installFramingRelationships() {
-  if (!globalThis.__obscura_frameId) return; // the page really is the top
-  for (const [name, frameId] of [
-    ['parent', globalThis.__obscura_parentFrameId],
-    ['top', 0], // the top browsing context is always the page's realm
-  ]) {
+  if (!_realmFrameId) return;
+  for (const name of ['parent', 'top']) {
     try {
+      const relation = JSON.parse(__obscuraCore.ops.op_window_relation(
+        __obscuraCore.ops.op_window_current(), name, _realmFrameId));
+      const value = relation.windowId
+        ? __obscuraCore.ops.op_window_realm_proxy(relation.windowId, relation.realmId, _windowProxy)
+        : null;
+      if (!value) continue;
       Object.defineProperty(globalThis, name, {
-        value: _remoteWindow(frameId),
-        writable: false,
-        enumerable: true,
-        configurable: true,
+        value, writable: false, enumerable: true, configurable: true,
       });
     } catch (_) {}
   }
@@ -15326,8 +15651,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     throw new DOMException('Failed to execute attachShadow on Element: this element does not support attachShadow', 'NotSupportedError');
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
-  _treeMutationEpoch++;
-  shadow._treeDetachedExact = false;
+  _treeMutationEpoch = _treeGeneration();
   shadow._treeParent = null;
   shadow._treeParentEpoch = _treeMutationEpoch;
   shadow._treeConnected = this.isConnected;
@@ -16464,26 +16788,323 @@ if (typeof DOMRectList === 'undefined') {
     }
   };
 }
-if (typeof DOMPoint === 'undefined') {
-  globalThis.DOMPoint = class DOMPoint {
-    constructor(x=0,y=0,z=0,w=1) { this.x=x;this.y=y;this.z=z;this.w=w; }
-    static fromPoint(p={}) { return new DOMPoint(p.x,p.y,p.z,p.w); }
-  };
-}
-if (typeof DOMMatrix === 'undefined') {
-  globalThis.DOMMatrix = class DOMMatrix {
-    constructor() { this.a=1;this.b=0;this.c=0;this.d=1;this.e=0;this.f=0;this.is2D=true;this.isIdentity=true; }
-    static fromMatrix() { return new DOMMatrix(); }
-    static fromFloat32Array() { return new DOMMatrix(); }
-    static fromFloat64Array() { return new DOMMatrix(); }
-    multiply() { return new DOMMatrix(); }
-    inverse() { return new DOMMatrix(); }
-    translate() { return new DOMMatrix(); }
-    scale() { return new DOMMatrix(); }
-    rotate() { return new DOMMatrix(); }
-    transformPoint(p) { return new DOMPoint(p?.x||0,p?.y||0); }
-  };
-}
+// Geometry Interfaces use CSS column-major storage and homogeneous points.
+// These operations are independent of the presence of a layout engine.
+(() => {
+  const matrices = new WeakMap(), points = new WeakMap();
+  const names = ['m11','m12','m13','m14','m21','m22','m23','m24',
+    'm31','m32','m33','m34','m41','m42','m43','m44'];
+  const aliases = {a:0,b:1,c:4,d:5,e:12,f:13};
+  const identity = () => [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
+  const number = (v, fallback = 0) => v === undefined ? fallback : +v;
+  const string = v => { if (typeof v === 'symbol') throw new TypeError('Cannot convert a Symbol to DOMString'); return String(v); };
+  function object(input) {
+    if (input == null) return {};
+    if (typeof input !== 'object' && typeof input !== 'function') throw new TypeError('Expected a dictionary');
+    return input;
+  }
+  function pointDictionary(input) {
+    const p = object(input);
+    // WebIDL reads dictionary members once, in lexicographical order.
+    const w=number(p.w,1), x=number(p.x), y=number(p.y), z=number(p.z);
+    return [x,y,z,w];
+  }
+  const isPlanar = m => m[2] === 0 && m[3] === 0 && m[6] === 0 && m[7] === 0
+    && m[8] === 0 && m[9] === 0 && m[10] === 1 && m[11] === 0 && m[14] === 0 && m[15] === 1;
+  function state(value) {
+    const result = matrices.get(value);
+    if (!result) throw new TypeError('Illegal invocation');
+    return result;
+  }
+  function clone(value) {
+    const current=state(value), matrix=new DOMMatrix();
+    matrices.set(matrix,{m:current.m.slice(),is2D:current.is2D}); return matrix;
+  }
+  function transformedPoint(v,m) {
+    return new DOMPoint(m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3],
+      m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3],
+      m[2]*v[0]+m[6]*v[1]+m[10]*v[2]+m[14]*v[3],
+      m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3]);
+  }
+  function product(a, b) {
+    const out = new Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1]
+        + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+    return out;
+  }
+  function dictionary(input = {}) {
+    input = object(input);
+    const values = {};
+    for (const name of ['a','b','c','d','e','f','m11','m12','m21','m22','m41','m42',
+      'is2D','m13','m14','m23','m24','m31','m32','m33','m34','m43','m44']) {
+      const value=input[name];
+      if (value !== undefined) values[name]=name === 'is2D' ? Boolean(value) : +value;
+    }
+    const m = identity();
+    for (let i = 0; i < 16; i++) if (values[names[i]] !== undefined) m[i] = values[names[i]];
+    for (const [name, i] of Object.entries(aliases)) {
+      if (values[name] === undefined) continue;
+      const v = values[name];
+      if (values[names[i]] !== undefined && !(v === m[i] || (Number.isNaN(v) && Number.isNaN(m[i])))) {
+        throw new TypeError('Conflicting DOMMatrix components');
+      }
+      m[i] = v;
+    }
+    const planar = isPlanar(m);
+    if (values.is2D && !planar) throw new TypeError('A 2D matrix cannot contain 3D components');
+    return {m, is2D: values.is2D === undefined ? planar : values.is2D};
+  }
+  function sequenceValues(values) {
+    if (values.length === 6) {
+      const m = identity(), indices = [0,1,4,5,12,13];
+      for (let i = 0; i < 6; i++) m[indices[i]] = values[i];
+      return {m, is2D:true};
+    }
+    if (values.length !== 16) throw new TypeError('A matrix requires 6 or 16 values');
+    return {m:values, is2D:false};
+  }
+  function initialMatrix(input) {
+    if (input === undefined) return {m:identity(),is2D:true};
+    if (input !== null && (typeof input === 'object' || typeof input === 'function')) {
+      const iterator=input[Symbol.iterator];
+      if (iterator != null) {
+        if (typeof iterator !== 'function') throw new TypeError('Expected an iterator');
+        return sequenceValues(Array.from({[Symbol.iterator]:() => iterator.call(input)},v => +v));
+      }
+    }
+    return css(string(input));
+  }
+  const typedArrayPrototype=Object.getPrototypeOf(Float32Array.prototype);
+  const typedArrayTag=Object.getOwnPropertyDescriptor(typedArrayPrototype,Symbol.toStringTag).get;
+  const typedArrayLength=Object.getOwnPropertyDescriptor(typedArrayPrototype,'length').get;
+  const typedArrayBuffer=Object.getOwnPropertyDescriptor(typedArrayPrototype,'buffer').get;
+  function matrixFromArray(Type,input,tag) {
+    if (typedArrayTag.call(input) !== tag) throw new TypeError('Expected ' + tag);
+    const buffer=typedArrayBuffer.call(input);
+    if (typeof SharedArrayBuffer === 'function' && buffer instanceof SharedArrayBuffer) throw new TypeError('Shared arrays are not allowed');
+    const values=Array.from({length:typedArrayLength.call(input)},(_,i) => input[i]);
+    const value=sequenceValues(values), matrix=new Type();
+    matrices.set(matrix,value); return matrix;
+  }
+  const syntax = () => new DOMException('Invalid CSS transform.', 'SyntaxError');
+  function cssNumber(token, kind = '') {
+    const match = /^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-z]*)$/i.exec(token);
+    if (!match) throw syntax();
+    let value = Number(match[1]), unit = match[2].toLowerCase();
+    if (!Number.isFinite(value)) throw syntax();
+    if (kind === 'angle') {
+      if (unit === 'rad') value *= 180 / Math.PI;
+      else if (unit === 'grad') value *= .9;
+      else if (unit === 'turn') value *= 360;
+      else if (unit !== 'deg' && !(unit === '' && value === 0)) throw syntax();
+    } else if (kind === 'length') {
+      const units = {px:1,in:96,cm:96/2.54,mm:96/25.4,q:96/101.6,pt:96/72,pc:16};
+      if (unit in units) value *= units[unit];
+      else if (!(unit === '' && value === 0)) throw syntax();
+    } else if (unit) throw syntax();
+    return value;
+  }
+  function css(text) {
+    if (text === '') return {m:identity(),is2D:true};
+    text = text.replace(/\/\*[\s\S]*?\*\//g,'').trim();
+    if (text.toLowerCase() === 'none') return {m:identity(),is2D:true};
+    let matrix = new DOMMatrix(), offset = 0;
+    const functions = /([a-z][a-z0-9]*)\(([^()]*)\)/ig;
+    let match;
+    while ((match = functions.exec(text))) {
+      if (text.slice(offset, match.index).trim()) throw syntax();
+      offset = functions.lastIndex;
+      const name = match[1].toLowerCase(), tokens = match[2].trim().split(/\s*,\s*/);
+      const count = (...allowed) => { if (!allowed.includes(tokens.length)) throw syntax(); };
+      const nums = kind => tokens.map(t => cssNumber(t, kind));
+      let op;
+      if (name === 'matrix' || name === 'matrix3d') {
+        count(name === 'matrix' ? 6 : 16); op = new DOMMatrix(nums());
+      } else if (name === 'translate' || name === 'translate3d' || /^translate[xyz]$/.test(name)) {
+        count(...(name === 'translate' ? [1,2] : name === 'translate3d' ? [3] : [1]));
+        const v = nums('length');
+        op = new DOMMatrix().translate(name === 'translatey' || name === 'translatez' ? 0 : v[0],
+          name === 'translatey' ? v[0] : name === 'translate' || name === 'translate3d' ? v[1] || 0 : 0,
+          name === 'translatez' ? v[0] : name === 'translate3d' ? v[2] : 0);
+      } else if (name === 'scale' || name === 'scale3d' || /^scale[xyz]$/.test(name)) {
+        count(...(name === 'scale' ? [1,2] : name === 'scale3d' ? [3] : [1]));
+        const v = nums();
+        op = new DOMMatrix().scale(name === 'scaley' || name === 'scalez' ? 1 : v[0],
+          name === 'scaley' ? v[0] : name === 'scale' ? number(v[1], v[0]) : name === 'scale3d' ? v[1] : 1,
+          name === 'scalez' ? v[0] : name === 'scale3d' ? v[2] : 1);
+      } else if (name === 'rotate3d') {
+        count(4); op = new DOMMatrix().rotateAxisAngle(cssNumber(tokens[0]), cssNumber(tokens[1]),
+          cssNumber(tokens[2]), cssNumber(tokens[3], 'angle'));
+      } else if (name === 'rotate' || /^rotate[xyz]$/.test(name)) {
+        count(1); const angle = cssNumber(tokens[0], 'angle');
+        op = name === 'rotatex' ? new DOMMatrix().rotate(angle,0,0)
+          : name === 'rotatey' ? new DOMMatrix().rotate(0,angle,0) : new DOMMatrix().rotate(angle);
+      } else if (name === 'skewx' || name === 'skewy' || name === 'skew') {
+        count(...(name === 'skew' ? [1,2] : [1])); const v = nums('angle');
+        op = new DOMMatrix();
+        if (name !== 'skewy') op.c = Math.tan(v[0] * Math.PI / 180);
+        if (name !== 'skewx') op.b = Math.tan((name === 'skewy' ? v[0] : v[1] || 0) * Math.PI / 180);
+      } else if (name === 'perspective') {
+        count(1); const d = cssNumber(tokens[0], 'length'); if (d < 0) throw syntax();
+        op = new DOMMatrix(); op.m34 = -1 / Math.max(1, d);
+      } else throw syntax();
+      if (name.endsWith('3d') || /[xyz]$/.test(name) && !name.endsWith('x') && !name.endsWith('y')
+          || name === 'rotatex' || name === 'rotatey' || name === 'perspective') state(op).is2D = false;
+      matrix.multiplySelf(op);
+    }
+    if (!offset || text.slice(offset).trim()) throw syntax();
+    return state(matrix);
+  }
+  class DOMPointReadOnly {
+    constructor(x=0,y=0,z=0,w=1) { points.set(this,[+x,+y,+z,+w]); }
+    static fromPoint(p={}) { return new DOMPointReadOnly(...pointDictionary(p)); }
+    matrixTransform(matrix={}) {
+      const v=points.get(this); if (!v) throw new TypeError('Illegal invocation');
+      return transformedPoint(v,dictionary(matrix).m);
+    }
+    toJSON() {
+      const v=points.get(this); if (!v) throw new TypeError('Illegal invocation');
+      return {x:v[0],y:v[1],z:v[2],w:v[3]};
+    }
+    get [Symbol.toStringTag]() { return 'DOMPointReadOnly'; }
+  }
+  class DOMPoint extends DOMPointReadOnly {
+    static fromPoint(p={}) { return new DOMPoint(...pointDictionary(p)); }
+    get [Symbol.toStringTag]() { return 'DOMPoint'; }
+  }
+  for (const [i,name] of ['x','y','z','w'].entries()) {
+    Object.defineProperty(DOMPointReadOnly.prototype,name,{enumerable:true,configurable:true,
+      get() { if (!points.has(this)) throw new TypeError('Illegal invocation'); return points.get(this)[i]; }});
+    Object.defineProperty(DOMPoint.prototype,name,{enumerable:true,configurable:true,
+      get() { if (!points.has(this)) throw new TypeError('Illegal invocation'); return points.get(this)[i]; },
+      set(v) { if (!points.has(this)) throw new TypeError('Illegal invocation'); points.get(this)[i] = +v; }});
+  }
+  class DOMMatrixReadOnly {
+    constructor(init) {
+      matrices.set(this, initialMatrix(init));
+    }
+    static fromMatrix(input={}) { const value=dictionary(input), matrix=new DOMMatrixReadOnly(); matrices.set(matrix,value); return matrix; }
+    static fromFloat32Array(input) { return matrixFromArray(DOMMatrixReadOnly,input,'Float32Array'); }
+    static fromFloat64Array(input) { return matrixFromArray(DOMMatrixReadOnly,input,'Float64Array'); }
+    get is2D() { return state(this).is2D; }
+    get isIdentity() { return state(this).m.every((v,i) => v === (i % 5 === 0 ? 1 : 0)); }
+    multiply(other={}) {
+      state(this); const b=dictionary(other), matrix=clone(this), a=state(matrix);
+      a.m=product(a.m,b.m); a.is2D=a.is2D && b.is2D; return matrix;
+    }
+    inverse() { return clone(this).invertSelf(); }
+    translate(x=0,y=0,z=0) { state(this); x=+x; y=+y; z=+z; return clone(this).translateSelf(x,y,z); }
+    scale(x=1,y,z=1,ox=0,oy=0,oz=0) {
+      state(this); x=+x; y=y === undefined ? x : +y; z=+z; ox=+ox; oy=+oy; oz=+oz;
+      return clone(this).scaleSelf(x,y,z,ox,oy,oz);
+    }
+    scale3d(scale=1,ox=0,oy=0,oz=0) { state(this); scale=+scale; ox=+ox; oy=+oy; oz=+oz; return clone(this).scale3dSelf(scale,ox,oy,oz); }
+    scaleNonUniform(x=1,y=1) { state(this); x=+x; y=+y; return clone(this).scaleSelf(x,y); }
+    rotate(x=0,y,z) { state(this); x=+x; if (y !== undefined) y=+y; if (z !== undefined) z=+z; return clone(this).rotateSelf(x,y,z); }
+    rotateFromVector(x=0,y=0) { state(this); x=+x; y=+y; return clone(this).rotateFromVectorSelf(x,y); }
+    rotateAxisAngle(x=0,y=0,z=0,angle=0) { state(this); x=+x; y=+y; z=+z; angle=+angle; return clone(this).rotateAxisAngleSelf(x,y,z,angle); }
+    skewX(angle=0) { state(this); angle=+angle; return clone(this).skewXSelf(angle); }
+    skewY(angle=0) { state(this); angle=+angle; return clone(this).skewYSelf(angle); }
+    flipX() { return clone(this).scaleSelf(-1,1); }
+    flipY() { return clone(this).scaleSelf(1,-1); }
+    transformPoint(p={}) {
+      state(this); const point=pointDictionary(p); return transformedPoint(point,state(this).m);
+    }
+    toFloat32Array() { return new Float32Array(state(this).m); }
+    toFloat64Array() { return new Float64Array(state(this).m); }
+    toJSON() {
+      const {m,is2D}=state(this), out = {};
+      for (const [name,i] of Object.entries(aliases)) out[name]=m[i];
+      for (let i=0;i<16;i++) out[names[i]]=m[i];
+      out.is2D=is2D; out.isIdentity=m.every((v,i) => v === (i%5 === 0 ? 1 : 0)); return out;
+    }
+    toString() {
+      const {m,is2D} = state(this);
+      if (m.some(v => !Number.isFinite(v))) throw new DOMException('Cannot serialize a non-finite matrix.', 'InvalidStateError');
+      return is2D ? 'matrix(' + [m[0],m[1],m[4],m[5],m[12],m[13]].join(', ') + ')'
+        : 'matrix3d(' + m.join(', ') + ')';
+    }
+    get [Symbol.toStringTag]() { return 'DOMMatrixReadOnly'; }
+  }
+  class DOMMatrix extends DOMMatrixReadOnly {
+    static fromMatrix(input={}) { const value=dictionary(input), matrix=new DOMMatrix(); matrices.set(matrix,value); return matrix; }
+    static fromFloat32Array(input) { return matrixFromArray(DOMMatrix,input,'Float32Array'); }
+    static fromFloat64Array(input) { return matrixFromArray(DOMMatrix,input,'Float64Array'); }
+    multiplySelf(other={}) {
+      state(this); const b=dictionary(other), a=state(this);
+      a.m = product(a.m,b.m); a.is2D = a.is2D && b.is2D; return this;
+    }
+    preMultiplySelf(other={}) {
+      state(this); const b=dictionary(other), a=state(this);
+      a.m = product(b.m,a.m); a.is2D = a.is2D && b.is2D; return this;
+    }
+    translateSelf(x=0,y=0,z=0) {
+      state(this); x=+x; y=+y; z=+z;
+      const m=identity(); m[12]=x; m[13]=y; m[14]=z;
+      const s=state(this); s.m=product(s.m,m); if (z !== 0) s.is2D=false; return this;
+    }
+    scaleSelf(x=1,y,z=1,ox=0,oy=0,oz=0) {
+      state(this); x=+x; y=y === undefined ? x : +y; z=+z; ox=+ox; oy=+oy; oz=+oz;
+      DOMMatrix.prototype.translateSelf.call(this,ox,oy,oz);
+      const m=identity(); m[0]=x; m[5]=y; m[10]=z;
+      const s=state(this); s.m=product(s.m,m); if (z !== 1) s.is2D=false;
+      return DOMMatrix.prototype.translateSelf.call(this,-ox,-oy,-oz);
+    }
+    scale3dSelf(scale=1,ox=0,oy=0,oz=0) { state(this); scale=+scale; return DOMMatrix.prototype.scaleSelf.call(this,scale,scale,scale,ox,oy,oz); }
+    rotateSelf(x=0,y,z) {
+      state(this); x=+x;
+      if (y === undefined && z === undefined) { z=x; x=0; y=0; }
+      else { y=number(y); z=number(z); }
+      if (x !== 0 || y !== 0) state(this).is2D=false;
+      DOMMatrix.prototype.rotateAxisAngleSelf.call(this,0,0,1,z);
+      if (y !== 0) DOMMatrix.prototype.rotateAxisAngleSelf.call(this,0,1,0,y);
+      if (x !== 0) DOMMatrix.prototype.rotateAxisAngleSelf.call(this,1,0,0,x);
+      return this;
+    }
+    rotateFromVectorSelf(x=0,y=0) { state(this); x=+x; y=+y; return DOMMatrix.prototype.rotateSelf.call(this,x === 0 && y === 0 ? 0 : Math.atan2(y,x)*180/Math.PI); }
+    rotateAxisAngleSelf(x=0,y=0,z=0,angle=0) {
+      state(this); x=+x; y=+y; z=+z; angle=+angle*Math.PI/180;
+      const value=state(this);
+      const length=Math.hypot(x,y,z); if (length === 0) return this;
+      x/=length; y/=length; z/=length;
+      const c=Math.cos(angle), s=Math.sin(angle), t=1-c;
+      const m=[t*x*x+c,t*x*y+s*z,t*x*z-s*y,0,t*x*y-s*z,t*y*y+c,t*y*z+s*x,0,
+        t*x*z+s*y,t*y*z-s*x,t*z*z+c,0,0,0,0,1];
+      value.m=product(value.m,m); if (x !== 0 || y !== 0) value.is2D=false; return this;
+    }
+    skewXSelf(angle=0) { state(this); const m=identity(); m[4]=Math.tan(+angle*Math.PI/180); const value=state(this); value.m=product(value.m,m); return this; }
+    skewYSelf(angle=0) { state(this); const m=identity(); m[1]=Math.tan(+angle*Math.PI/180); const value=state(this); value.m=product(value.m,m); return this; }
+    invertSelf() {
+      const value=state(this), m=value.m;
+      const rows=[0,1,2,3].map(r => [m[r],m[4+r],m[8+r],m[12+r],...identity().slice(r*4,r*4+4)]);
+      for (let c=0;c<4;c++) {
+        let pivot=c; for (let r=c+1;r<4;r++) if (Math.abs(rows[r][c]) > Math.abs(rows[pivot][c])) pivot=r;
+        if (rows[pivot][c] === 0 || !Number.isFinite(rows[pivot][c])) {
+          value.m=new Array(16).fill(NaN); value.is2D=false; return this;
+        }
+        [rows[c],rows[pivot]]=[rows[pivot],rows[c]];
+        const divisor=rows[c][c]; for (let i=0;i<8;i++) rows[c][i]/=divisor;
+        for (let r=0;r<4;r++) if (r !== c) {
+          const factor=rows[r][c]; for (let i=0;i<8;i++) rows[r][i]-=factor*rows[c][i];
+        }
+      }
+      value.m=names.map((_,i) => rows[i%4][4+Math.floor(i/4)]); return this;
+    }
+    setMatrixValue(text) { state(this); if (!arguments.length) throw new TypeError('A transform string is required'); matrices.set(this,css(string(text))); return this; }
+    get [Symbol.toStringTag]() { return 'DOMMatrix'; }
+  }
+  for (const [name,i] of [...names.map((n,i) => [n,i]),...Object.entries(aliases)]) {
+    Object.defineProperty(DOMMatrixReadOnly.prototype,name,{enumerable:true,configurable:true,get() { return state(this).m[i]; }});
+    Object.defineProperty(DOMMatrix.prototype,name,{enumerable:true,configurable:true,
+      get() { return state(this).m[i]; }, set(v) {
+        state(this); v=+v; const s=state(this); s.m[i]=v;
+        if (!(i in {0:1,1:1,4:1,5:1,12:1,13:1}) && s.m[i] !== (i%5 === 0 ? 1 : 0)) s.is2D=false;
+      }});
+  }
+  Object.assign(globalThis,{DOMPointReadOnly,DOMPoint,DOMMatrixReadOnly,DOMMatrix});
+})();
 
 if (typeof Image === 'undefined') {
   // In a real browser `new Image()` is `document.createElement('img')`, i.e. a
@@ -16520,11 +17141,13 @@ if (typeof Option === 'undefined') {
 }
 
 if (typeof Audio === 'undefined') {
-  globalThis.Audio = class Audio {
-    constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
-    play() { return Promise.resolve(); } pause() { this.paused = true; } load() {}
-    addEventListener() {} removeEventListener() {}
+  globalThis.Audio = function Audio(src) {
+    const audio=document.createElement('audio');
+    audio.preload='auto';
+    if (src !== undefined) audio.src=String(src);
+    return audio;
   };
+  globalThis.Audio.prototype=HTMLAudioElement.prototype;
 }
 
 if (typeof FileReader === 'undefined') {
@@ -16810,8 +17433,8 @@ globalThis.MediaQueryList = class MediaQueryList {
     if (token !== _mediaQueryToken) throw new TypeError('Illegal constructor');
     _mediaQueryState.set(this, { media, matches: _evaluateMediaQueryList(media), onchange: null });
     _mediaQueries.add(new WeakRef(this));
-    _eventTargetListenerChanged.set(this, () => {
-      if (_eventTargetListeners.get(this)?.get('change')?.length) _activeMediaQueries.add(this);
+    _weakMapSet(_eventTargetListenerChanged, this, () => {
+      if (_weakMapGet(_eventTargetListeners, this)?.get('change')?.length) _activeMediaQueries.add(this);
       else _activeMediaQueries.delete(this);
     });
   }
@@ -16903,35 +17526,25 @@ if (typeof Range === 'undefined') {
 
 if (typeof FontFace === 'undefined') {
   const _fontFaceString = value => String(value ?? '');
-  const _fontFaceBytesBase64 = bytes => {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let out = '';
-    for (let i = 0; i < bytes.length; i += 3) {
-      const a = bytes[i], b = bytes[i + 1] || 0, c = bytes[i + 2] || 0;
-      out += alphabet[a >> 2];
-      out += alphabet[((a & 3) << 4) | (b >> 4)];
-      out += i + 1 < bytes.length ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
-      out += i + 2 < bytes.length ? alphabet[c & 63] : '=';
-    }
-    return out;
-  };
   const _fontFaceSource = source => {
     if (typeof source === 'string') {
       if (!source.trim()) throw new DOMException('The font source is empty', 'SyntaxError');
-      return { css: source, binary: false };
+      // Relative sources belong to the creating document, not a later base
+      // element mutation or whichever document happens to load the face.
+      const base = globalThis.document?.baseURI || globalThis.location?.href || 'about:blank';
+      const css = source.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)/gi,
+        (match, doubleQuoted, singleQuoted, bare) => {
+          const value = (doubleQuoted ?? singleQuoted ?? bare ?? '').trim();
+          try { return 'url(' + JSON.stringify(new URL(value, base).href) + ')'; }
+          catch (_) { return match; }
+        });
+      return { css, binary: null };
     }
-    let bytes;
-    if (source instanceof ArrayBuffer) {
-      bytes = new Uint8Array(source.slice(0));
-    } else if (ArrayBuffer.isView(source)) {
-      bytes = new Uint8Array(source.buffer.slice(source.byteOffset, source.byteOffset + source.byteLength));
-    } else {
-      throw new TypeError('FontFace source must be a CSS source string or BufferSource');
-    }
-    return {
-      css: 'url("data:font/ttf;base64,' + _fontFaceBytesBase64(bytes) + '")',
-      binary: true
+    if (source instanceof ArrayBuffer) return { css: '', binary: new Uint8Array(source) };
+    if (ArrayBuffer.isView(source)) return {
+      css: '', binary: new Uint8Array(source.buffer, source.byteOffset, source.byteLength)
     };
+    throw new TypeError('FontFace source must be a CSS source string or BufferSource');
   };
   const _fontFaceDescriptor = (descriptors, name, fallback) =>
     descriptors && descriptors[name] !== undefined ? String(descriptors[name]) : fallback;
@@ -17011,8 +17624,22 @@ if (typeof FontFace === 'undefined') {
       this._ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
       this._descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
       this._lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
-      this._status = normalizedSource.binary ? 'loaded' : 'unloaded';
-      this._loadedPromise = normalizedSource.binary ? Promise.resolve(this) : null;
+      this._status = 'unloaded';
+      this._loadedPromise = new Promise((resolve, reject) => {
+        this._resolveLoaded = resolve;
+        this._rejectLoaded = reject;
+      });
+      // Internal loading must not create an unhandled rejection before an
+      // author has had a chance to observe the public, stable loaded promise.
+      this._loadedPromise.catch(() => {});
+      if (normalizedSource.binary !== null) {
+        const op = __obscuraCore.ops.op_decode_font_face;
+        try {
+          this._settle(typeof op === 'function'
+            ? JSON.parse(op(normalizedSource.binary, globalThis))
+            : { ok: false, name: 'NotSupportedError', message: 'Font decoding is unavailable' });
+        } catch (error) { this._fail(error, 'SyntaxError'); }
+      }
     }
     _changed() { for (const set of this._sets) set._faceChanged(this); }
     _setDescriptor(slot, value) {
@@ -17044,28 +17671,38 @@ if (typeof FontFace === 'undefined') {
     get lineGapOverride() { return this._lineGapOverride; }
     set lineGapOverride(value) { this._setDescriptor('_lineGapOverride', value); }
     get status() { return this._status; }
-    get loaded() {
-      if (!this._loadedPromise) {
-        this._loadedPromise = new Promise((resolve, reject) => {
-          this._resolveLoaded = resolve;
-          this._rejectLoaded = reject;
-        });
+    get loaded() { return this._loadedPromise; }
+    _fail(error, fallback='NetworkError') {
+      const name = /^(?:AbortError|SecurityError|SyntaxError|NetworkError|NotSupportedError)$/.test(error?.name)
+        ? error.name : fallback;
+      this._settle({ ok: false, name, message: String(error?.message || error) });
+    }
+    _settle(outcome) {
+      if (outcome.ok) {
+        this._resolvedSource = 'url(' + JSON.stringify(outcome.source) + ')';
+        this._status = 'loaded';
+        this._resolveLoaded(this);
+      } else {
+        this._status = 'error';
+        this._retired = outcome.name === 'AbortError' || outcome.name === 'SecurityError';
+        this._rejectLoaded(new DOMException(outcome.message || 'Font loading failed', outcome.name || 'NetworkError'));
       }
-      return this._loadedPromise;
+      this._changed();
     }
     load() {
-      if (this._status === 'loaded') return this.loaded;
-      if (this._status === 'loading') return this.loaded;
+      if (this._status !== 'unloaded') return this.loaded;
       this._status = 'loading';
       this._changed();
-      const loaded = this.loaded;
-      Promise.resolve().then(() => {
-        if (this._status !== 'loading') return;
-        this._status = 'loaded';
-        this._resolveLoaded?.(this);
-        this._changed();
-      });
-      return loaded;
+      const op = __obscuraCore.ops.op_load_font_face;
+      try {
+        if (typeof op !== 'function') {
+          this._settle({ ok: false, name: 'NotSupportedError', message: 'Font loading is unavailable' });
+        } else {
+          Promise.resolve(op(this._source, globalThis)).then(
+            raw => this._settle(JSON.parse(raw)), error => this._fail(error));
+        }
+      } catch (error) { this._fail(error); }
+      return this.loaded;
     }
   };
 
@@ -17087,6 +17724,21 @@ if (typeof FontFace === 'undefined') {
     return Math.abs(faceWeight - selection.weight) < 350 && italic === (selection.style !== 'normal');
   };
 
+  const _fontFaceCoversText = (face, text) => {
+    const ranges = face.unicodeRange.split(',').map(part => {
+      const token = part.trim().replace(/^u\+/i, '');
+      if (!/^[0-9a-f?]{1,6}(?:-[0-9a-f]{1,6})?$/i.test(token)) return null;
+      if (token.includes('?')) return [parseInt(token.replace(/\?/g, '0'), 16), parseInt(token.replace(/\?/g, 'f'), 16)];
+      const ends = token.split('-');
+      return [parseInt(ends[0], 16), parseInt(ends[1] || ends[0], 16)];
+    }).filter(Boolean);
+    for (const ch of String(text)) {
+      const point = ch.codePointAt(0);
+      if (ranges.some(([start, end]) => start <= point && point <= end)) return true;
+    }
+    return false;
+  };
+
   globalThis.FontFaceSet = class FontFaceSet extends EventTarget {
     constructor(initialFaces=[], ownerDocument=null) {
       super();
@@ -17095,13 +17747,17 @@ if (typeof FontFace === 'undefined') {
       this._cssFaces = new Map();
       this._status = 'loaded';
       this._readyPromise = Promise.resolve(this);
+      this._pending = new Set();
+      this._batchLoaded = new Set();
+      this._batchFailed = new Set();
+      this._finishQueued = false;
       this.onloading = null;
       this.onloadingdone = null;
       this.onloadingerror = null;
       if (initialFaces != null) for (const face of initialFaces) this.add(face);
     }
-    get status() { return this._status; }
-    get ready() { return this._readyPromise; }
+    get status() { this._discoverCssFaces(); this._loadUsedFaces(); return this._status; }
+    get ready() { this._discoverCssFaces(); this._loadUsedFaces(); return this._readyPromise; }
     get size() { this._discoverCssFaces(); return this._faces.size; }
     _discoverCssFaces() {
       if (!this._ownerDocument) return;
@@ -17122,8 +17778,10 @@ if (typeof FontFace === 'undefined') {
         if (retained.has(key)) continue;
         face._sets.delete(this);
         this._faces.delete(face);
+        this._pending.delete(face);
         this._cssFaces.delete(key);
       }
+      this._queueFinish();
     }
     _dispatch(type, faces) {
       const event = new Event(type);
@@ -17135,30 +17793,93 @@ if (typeof FontFace === 'undefined') {
       }
     }
     _syncNative() {
-      if (!this._ownerDocument || typeof __obscuraCore.ops.op_set_dynamic_fonts !== 'function') return;
+      if (this._retired || !this._ownerDocument || typeof __obscuraCore.ops.op_set_dynamic_fonts !== 'function') return;
       const registrations = [];
-      for (const face of this._faces) registrations.push({
-        ...(face._cssConnected ? { skip: true } : {}),
-        family: face.family,
-        source: face._source,
-        style: face.style,
-        weight: face.weight,
-        unicodeRange: face.unicodeRange
-      });
-      __obscuraCore.ops.op_set_dynamic_fonts(JSON.stringify(registrations.filter(face => !face.skip)));
+      for (const face of this._faces) {
+        if (face._cssConnected || face.status !== 'loaded' || face._retired) continue;
+        registrations.push({ family: face.family, source: face._resolvedSource,
+          style: face.style, weight: face.weight, unicodeRange: face.unicodeRange });
+      }
+      try {
+        __obscuraCore.ops.op_set_dynamic_fonts(JSON.stringify(registrations), globalThis);
+      } catch (error) {
+        if (error?.name !== 'SecurityError' && error?.name !== 'AbortError') throw error;
+        this._retired = true;
+        this._pending.clear();
+        this._queueFinish();
+        return;
+      }
       _scheduleResizeRenderCheckpoint();
     }
+    _loadUsedFaces() {
+      if (!this._ownerDocument || this._scanningUsed) return;
+      this._scanningUsed = true;
+      try {
+        for (const element of this._ownerDocument.querySelectorAll('*')) {
+          if (/^(?:STYLE|SCRIPT|TEMPLATE|NOSCRIPT)$/.test(element.tagName)) continue;
+          let text = '';
+          for (const child of element.childNodes) if (child.nodeType === 3) text += child.textContent;
+          if (!text) continue;
+          const style = getComputedStyle(element);
+          if (style.display === 'none') continue;
+          const families = String(style.fontFamily).split(',').map(family =>
+            family.trim().replace(/^(['"])(.*)\1$/, '$2').toLowerCase());
+          const selection = { weight: style.fontWeight === 'bold' ? 700 : +style.fontWeight || 400,
+            style: style.fontStyle || 'normal' };
+          for (const face of this._faces) {
+            if (face.status !== 'unloaded' || !_fontFaceCoversText(face, text)) continue;
+            if (families.some(family => _fontFaceMatches(face, { ...selection, family }))) face.load();
+          }
+        }
+      } finally { this._scanningUsed = false; }
+    }
+    _queueFinish() {
+      if (this._status !== 'loading' || this._pending.size || this._finishQueued) return;
+      this._finishQueued = true;
+      Promise.resolve().then(() => {
+        this._finishQueued = false;
+        if (this._pending.size || this._status !== 'loading') return;
+        // Text/style mutations during the batch can require another subset.
+        // ready belongs to the complete current document font workload.
+        if (!this._retired) {
+          try { this._discoverCssFaces(); this._loadUsedFaces(); }
+          catch (error) {
+            if (error?.name !== 'SecurityError' && error?.name !== 'AbortError') throw error;
+            this._retired = true;
+          }
+          if (this._pending.size) return;
+        }
+        const loaded = Array.from(this._batchLoaded), failed = Array.from(this._batchFailed);
+        this._batchLoaded.clear();
+        this._batchFailed.clear();
+        this._status = 'loaded';
+        this._resolveReady?.(this);
+        this._resolveReady = null;
+        if (!this._retired) {
+          this._dispatch('loadingdone', loaded);
+          if (failed.length) this._dispatch('loadingerror', failed);
+        }
+      });
+    }
     _faceChanged(face) {
+      if (!this._faces.has(face)) return;
+      if (face._retired) {
+        this._retired = true;
+        this._pending.delete(face);
+        this._queueFinish();
+        return;
+      }
       this._syncNative();
-      if (face.status === 'loading' && this._status !== 'loading') {
-        this._status = 'loading';
-        const pending = Array.from(this._faces).filter(candidate => candidate.status === 'loading');
-        this._readyPromise = Promise.all(pending.map(candidate => candidate.loaded)).then(() => {
-          this._status = 'loaded';
-          this._dispatch('loadingdone', Array.from(this._faces));
-          return this;
-        });
-        this._dispatch('loading', [face]);
+      if (face.status === 'loading') {
+        this._pending.add(face);
+        if (this._status !== 'loading') {
+          this._status = 'loading';
+          this._readyPromise = new Promise(resolve => { this._resolveReady = resolve; });
+          Promise.resolve().then(() => { if (!this._retired) this._dispatch('loading', []); });
+        }
+      } else if (this._pending.delete(face)) {
+        (face.status === 'loaded' ? this._batchLoaded : this._batchFailed).add(face);
+        this._queueFinish();
       }
     }
     add(face) {
@@ -17167,15 +17888,15 @@ if (typeof FontFace === 'undefined') {
       if (!this._faces.has(face)) {
         this._faces.add(face);
         face._sets.add(this);
-        this._syncNative();
+        this._faceChanged(face);
       }
       return this;
     }
     check(font, text=' ') {
-      void String(text);
+      text = String(text);
       this._discoverCssFaces();
       const selection = _fontFaceSelection(font);
-      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
+      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection) && _fontFaceCoversText(face, text));
       return matches.length === 0 || matches.every(face => face.status === 'loaded');
     }
     clear() {
@@ -17183,21 +17904,25 @@ if (typeof FontFace === 'undefined') {
         if (face._cssConnected) continue;
         face._sets.delete(this);
         this._faces.delete(face);
+        this._pending.delete(face);
       }
       this._syncNative();
+      this._queueFinish();
     }
     delete(face) {
       this._discoverCssFaces();
       if (!(face instanceof FontFace) || face._cssConnected || !this._faces.delete(face)) return false;
       face._sets.delete(this);
+      this._pending.delete(face);
       this._syncNative();
+      this._queueFinish();
       return true;
     }
     load(font, text=' ') {
-      void String(text);
+      text = String(text);
       this._discoverCssFaces();
       const selection = _fontFaceSelection(font);
-      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection));
+      const matches = Array.from(this._faces).filter(face => _fontFaceMatches(face, selection) && _fontFaceCoversText(face, text));
       return Promise.all(matches.map(face => face.load())).then(() => matches);
     }
     forEach(callback, thisArg=undefined) {
@@ -17480,18 +18205,320 @@ const _documentMembers = Object.freeze(Object.fromEntries([
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
-  ['activateElement', function(trusted) {
-    return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
+  ['activateElement', function() {
+    return _nativeElementClick.call(this);
   }],
 ]));
+const _worldEventConstructors = Object.freeze({ Event, MouseEvent, PointerEvent, KeyboardEvent,
+  FocusEvent, InputEvent, CustomEvent, SubmitEvent, WheelEvent });
 
-globalThis.__obscura_init = function(windowId = 0) {
+// Only the native context slot retains this closure. Its events carry one-shot
+// private provenance, never an ambient privilege that author code can inherit.
+const _worldNativeInput = (() => {
+  const apply = Reflect.apply;
+  const descriptors = Object.getOwnPropertyDescriptors(Element.prototype);
+  const navigateSubmit = Element.prototype._navigateSubmit;
+  const computedStyle = globalThis.getComputedStyle;
+  const FileConstructor = globalThis.File, decodeBase64 = globalThis.atob;
+  let mouseDown = null, mouseOver = null;
+  const nid = element => _weakMapGet(_nodeIdentity, element);
+  const tag = element => element ? _domParse('tag_name', nid(element)) : '';
+  const attr = (element, name) => _domParse('get_attribute', nid(element), name);
+  const matches = (element, selector) => element && _dom('matches_selector', nid(element), selector) === 'true';
+  const parent = element => element ? _worldWrapNode(+_dom('parent_node', nid(element))) : null;
+  const connected = element => element && _dom('is_connected', nid(element)) === 'true';
+  const closest = (element, selector) => {
+    for (let node=element;node;node=parent(node)) if (matches(node,selector)) return node;
+    return null;
+  };
+  const contains = (ancestor, element) => {
+    for (let node=element;node;node=parent(node)) if (node===ancestor) return true;
+    return false;
+  };
+  const disabled = element => {
+    if (!matches(element,_DISABLEABLE)) return false;
+    if (attr(element,'disabled')!==null) return true;
+    if (!matches(element,_FIELDSET_DISABLEABLE)) return false;
+    let child=element;
+    for (let owner=parent(element);owner;child=owner,owner=parent(owner)) {
+      if (tag(owner)!=='FIELDSET' || attr(owner,'disabled')===null) continue;
+      const children=_domParse('element_children',nid(owner)) || [];
+      const legend=children.map(_worldWrapNode).find(node=>tag(node)==='LEGEND');
+      if (child!==legend) return true;
+    }
+    return false;
+  };
+  const read = (element,name) => name==='selectionStart' ? (_ns_selectionStart.get(element) ?? null)
+    : name==='selectionEnd' ? (_ns_selectionEnd.get(element) ?? null) : apply(descriptors[name].get,element,[]);
+  const value = element => _domParse('get_form_state',nid(element))?.value
+    ?? (tag(element)==='TEXTAREA' ? _domParse('text_content',nid(element)) : attr(element,'value')) ?? '';
+  const setValue = (element,text) => apply(descriptors.value.set,element,[text]);
+  const body = () => _worldWrapNode(+_dom('query_selector','body'));
+  const active = () => {
+    const id=__obscuraCore.ops.op_world_focus(globalThis,null,false);
+    return id===0xFFFFFFFF ? body() : _worldWrapNode(id);
+  };
+  const dispatch = _dispatchTrustedDomEvent;
+  const focus = element => {
+    const previousId=__obscuraCore.ops.op_world_focus(globalThis,null,false);
+    const previous=previousId===0xFFFFFFFF ? null : _worldWrapNode(previousId);
+    if (previous===element || (element && !connected(element))) return;
+    if (previous) {
+      dispatch(previous,_worldEventConstructors.FocusEvent,'blur',{relatedTarget:element});
+      dispatch(previous,_worldEventConstructors.FocusEvent,'focusout',{bubbles:true,composed:true,relatedTarget:element});
+    }
+    __obscuraCore.ops.op_world_focus(globalThis,element,true);
+    if (element) {
+      dispatch(element,_worldEventConstructors.FocusEvent,'focus',{relatedTarget:previous});
+      dispatch(element,_worldEventConstructors.FocusEvent,'focusin',{bubbles:true,composed:true,relatedTarget:previous});
+    }
+  };
+  const submit = (form,submitter) => {
+    if (form && dispatch(form,_worldEventConstructors.SubmitEvent,'submit',{bubbles:true,cancelable:true,submitter:submitter || null})) apply(navigateSubmit,form,[submitter]);
+  };
+  const insert = (text,imeCommit,inputType='insertText') => {
+    const target=active();
+    if (!matches(target,'input,textarea') || disabled(target) || (!imeCommit && attr(target,'readonly')!==null)) return;
+    const commitStart=imeCommit ? (read(target,'selectionStart') ?? value(target).length) : null;
+    if (!dispatch(target,_worldEventConstructors.InputEvent,'beforeinput',{bubbles:true,composed:true,cancelable:true,data:text,inputType})) return;
+    if (attr(target,'readonly')!==null || disabled(target) || !connected(target)) return;
+    const old=value(target),start=read(target,'selectionStart'),end=read(target,'selectionEnd');
+    if (start===null) setValue(target,old+text);
+    else {
+      const s=Math.max(0,Math.min(start,old.length)),e=Math.max(0,Math.min(end ?? s,old.length));
+      const lower=Math.min(s,e),upper=Math.max(s,e);
+      setValue(target,old.slice(0,lower)+text+old.slice(upper));
+      const caret=Math.max(0,Math.min((commitStart ?? lower)+text.length,value(target).length));
+      _ns_selectionStart.set(target,caret); _ns_selectionEnd.set(target,caret);
+    }
+    dispatch(target,_worldEventConstructors.InputEvent,'input',{bubbles:true,composed:true,data:text,inputType});
+  };
+  const erase = backward => {
+    const target=active();
+    if (!matches(target,'input,textarea') || disabled(target) || attr(target,'readonly')!==null) return;
+    const old=value(target),start=read(target,'selectionStart'),end=read(target,'selectionEnd');
+    let lower=start===null ? old.length : Math.max(0,Math.min(start,old.length));
+    let upper=end===null ? lower : Math.max(0,Math.min(end,old.length));
+    [lower,upper]=[Math.min(lower,upper),Math.max(lower,upper)];
+    if (lower===upper) {
+      if (backward && lower>0) {
+        const low=old.charCodeAt(lower-1),high=old.charCodeAt(lower-2);
+        lower-=low>=0xDC00 && low<=0xDFFF && high>=0xD800 && high<=0xDBFF ? 2 : 1;
+      } else if (!backward && start!==null && upper<old.length) upper++;
+      else return;
+    }
+    const inputType=backward ? 'deleteContentBackward' : 'deleteContentForward';
+    if (!dispatch(target,_worldEventConstructors.InputEvent,'beforeinput',{bubbles:true,composed:true,cancelable:true,data:null,inputType})) return;
+    setValue(target,old.slice(0,lower)+old.slice(upper));
+    if (start!==null) { _ns_selectionStart.set(target,lower); _ns_selectionEnd.set(target,lower); }
+    dispatch(target,_worldEventConstructors.InputEvent,'input',{bubbles:true,composed:true,data:null,inputType});
+  };
+  const activate = (target,init,count) => {
+    if (disabled(target)) return;
+    const type=(attr(target,'type') || '').toLowerCase();
+    const checkable=tag(target)==='INPUT' && (type==='checkbox' || type==='radio');
+    const oldChecked=checkable && _inputChecked(target),oldIndeterminate=checkable && _inputIndeterminate(target);
+    let radios=null;
+    if (checkable && type==='radio') {
+      const name=attr(target,'name') || '';
+      if (name) {
+        radios=(_domParse('query_selector_all','input') || []).map(_worldWrapNode)
+          .filter(node=>(attr(node,'type') || '').toLowerCase()==='radio' && attr(node,'name')===name && closest(node,'form')===closest(target,'form'))
+          .map(node=>[node,_inputChecked(node)]);
+        for (const [node] of radios) if (node!==target) _setInputChecked(node,false);
+      }
+      _setInputChecked(target,true);
+    } else if (checkable) { _setInputChecked(target,!oldChecked); _setInputIndeterminate(target,false); }
+    if (!dispatch(target,_worldEventConstructors.MouseEvent,'click',{...init,button:0,buttons:0,detail:count})) {
+      if (radios) for (const [node,checked] of radios) _setInputChecked(node,checked);
+      else if (checkable) { _setInputChecked(target,oldChecked); _setInputIndeterminate(target,oldIndeterminate); }
+      return;
+    }
+    if (count===2) dispatch(target,_worldEventConstructors.MouseEvent,'dblclick',{...init,button:0,buttons:0,detail:2});
+    if (checkable && _inputChecked(target)!==oldChecked) {
+      dispatch(target,_worldEventConstructors.Event,'input',{bubbles:true});
+      dispatch(target,_worldEventConstructors.Event,'change',{bubbles:true});
+      return;
+    }
+    const label=closest(target,'label'),interactive=closest(target,_INTERACTIVE);
+    if (label && !(interactive && contains(label,interactive)) && !_weakSetHas(_forwardingLabels, label)) {
+      const forId=attr(label,'for');
+      const control=forId!==null ? _worldWrapNode(+_dom('get_element_by_id',forId)) : _worldWrapNode(+_dom('query_selector_scoped',nid(label),_LABELABLE));
+      if (control && control!==target && matches(control,_LABELABLE) && !disabled(control)) {
+        _weakSetAdd(_forwardingLabels, label);
+        try { activate(control,init,1); } finally { _weakSetDelete(_forwardingLabels, label); }
+        return;
+      }
+    }
+    const link=closest(target,'a[href]'),button=closest(target,'button,input[type=submit],input[type=image]');
+    if (link) {
+      const href=attr(link,'href');
+      if (href && !href.startsWith('javascript:')) {
+        if (href.startsWith('#')) history.pushState(null,'',href);
+        else location.assign(href);
+      }
+    } else if (button && !disabled(button) && !['button','reset'].includes((attr(button,'type') || '').toLowerCase())) submit(closest(button,'form'),button);
+    else if (count>=3 && matches(target,'input,textarea')) {
+      _ns_selectionStart.set(target,0); _ns_selectionEnd.set(target,value(target).length);
+    }
+  };
+  return payload => {
+    const kind=payload.kind;
+    if (kind==='cancelMouse') { mouseDown=null; return true; }
+    if (kind==='focus') { focus(_worldWrapNode(payload.nodeId)); return true; }
+    if (kind==='fill') {
+      const target=_worldWrapNode(payload.nodeId);
+      if (!matches(target,'input,textarea') || !connected(target)) return 'error:not an editable field';
+      if (disabled(target) || attr(target,'readonly')!==null) return 'error:field is not editable';
+      focus(target);
+      if (payload.append) {
+        const end=value(target).length;
+        _ns_selectionStart.set(target,end); _ns_selectionEnd.set(target,end);
+        insert(payload.value,false);
+      } else {
+        setValue(target,payload.value);
+        const end=value(target).length;
+        _ns_selectionStart.set(target,end); _ns_selectionEnd.set(target,end);
+        dispatch(target,_worldEventConstructors.InputEvent,'input',{bubbles:true,composed:true,data:payload.value,inputType:'insertText'});
+      }
+      if (payload.change!==false) dispatch(target,_worldEventConstructors.Event,'change',{bubbles:true});
+      return 'ok';
+    }
+    if (kind==='setChecked') {
+      const target=_worldWrapNode(payload.nodeId);
+      if (!matches(target,'input[type=checkbox],input[type=radio]') || !connected(target)) return 'error:not a checkable field';
+      if (disabled(target)) return 'error:field is disabled';
+      focus(target);
+      if (_inputChecked(target)!==payload.checked) activate(target,{bubbles:true,cancelable:true,composed:true,view:globalThis},1);
+      return _inputChecked(target)===payload.checked ? 'ok' : 'error:checked state was not changed';
+    }
+    if (kind==='selectOption') {
+      const target=_worldWrapNode(payload.nodeId);
+      if (tag(target)!=='SELECT' || !connected(target)) return 'error:not a select field';
+      if (disabled(target)) return 'error:field is disabled';
+      const options=read(target,'options');
+      let index=-1;
+      for (let i=0;i<options.length;i++) {
+        const text=_domParse('text_content',nid(options[i])) || '';
+        if (read(options[i],'value')===payload.value || text.trim()===payload.value) { index=i; break; }
+      }
+      if (index<0) return 'error:no matching option';
+      focus(target);
+      apply(descriptors.selectedIndex.set,target,[index]);
+      dispatch(target,_worldEventConstructors.Event,'input',{bubbles:true});
+      dispatch(target,_worldEventConstructors.Event,'change',{bubbles:true});
+      return 'ok';
+    }
+    if (kind==='setFiles') {
+      const target=_worldWrapNode(payload.nodeId);
+      const files=payload.files.map(spec=> {
+        const binary=decodeBase64(spec.b64),bytes=new Uint8Array(binary.length);
+        for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+        return new FileConstructor([bytes],spec.name,{type:spec.type});
+      });
+      target._files=_makeFileList(files);
+      dispatch(target,_worldEventConstructors.Event,'input',{bubbles:true});
+      dispatch(target,_worldEventConstructors.Event,'change',{bubbles:true});
+      return true;
+    }
+    if (kind==='insertText') { insert(payload.text,true); return true; }
+    const modifiers=payload.modifiers || 0;
+    const init={bubbles:true,cancelable:true,composed:true,view:globalThis,altKey:!!(modifiers&1),ctrlKey:!!(modifiers&2),metaKey:!!(modifiers&4),shiftKey:!!(modifiers&8)};
+    if (kind==='key') {
+      const target=active(),type=payload.type,key=payload.key || '',text=payload.text || '';
+      const keyInit={...init,key,code:payload.code || '',keyCode:payload.windowsVirtualKeyCode || 0,which:payload.windowsVirtualKeyCode || 0};
+      if (type==='keyUp') dispatch(target,_worldEventConstructors.KeyboardEvent,'keyup',{...keyInit,cancelable:false});
+      else if (type==='char') { if (text) insert(text,false); }
+      else if (type==='keyDown' || type==='rawKeyDown') {
+        if (!dispatch(target,_worldEventConstructors.KeyboardEvent,'keydown',keyInit)) return false;
+        if (text && text!=='\r' && text!=='\n') insert(text,false);
+        if (key==='Enter') {
+          if (!dispatch(active(),_worldEventConstructors.KeyboardEvent,'keypress',{...keyInit,charCode:keyInit.keyCode})) return false;
+          if (tag(active())==='TEXTAREA') insert('\n',false,'insertLineBreak');
+          else submit(closest(active(),'form'),null);
+        } else if (key==='Backspace') erase(true);
+        else if (key==='Delete') erase(false);
+      }
+      return true;
+    }
+    if (kind!=='mouse') throw new TypeError('Unknown native input kind');
+    const target=payload.nodeId==null ? body() : _worldWrapNode(payload.nodeId);
+    if (!target) { mouseDown=null; return false; }
+    const count=payload.clickCount ?? 1;
+    Object.assign(init,{clientX:payload.x,clientY:payload.y,button:payload.buttonCode || 0,buttons:payload.buttons || 0,detail:count});
+    const pointer={...init,detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:init.buttons ? 0.5 : 0};
+    if (payload.type==='mouseMoved' || payload.type==='mousePressed') {
+      __obscuraCore.ops.op_set_hovered(nid(target),0);
+      if (mouseOver!==target) {
+        const ancestry=node=> { const path=[]; for (;node;node=parent(node)) path.push(node); return path; };
+        const oldPath=connected(mouseOver) ? ancestry(mouseOver) : [],newPath=ancestry(target);
+        const common=newPath.find(node=>oldPath.includes(node));
+        const exited=common ? oldPath.slice(0,oldPath.indexOf(common)) : oldPath,entered=common ? newPath.slice(0,newPath.indexOf(common)) : newPath;
+        for (const [Constructor,prefix,options] of [[_worldEventConstructors.PointerEvent,'pointer',pointer],[_worldEventConstructors.MouseEvent,'mouse',init]]) {
+          if (oldPath.length) dispatch(mouseOver,Constructor,prefix+'out',{...options,detail:0,relatedTarget:target});
+          for (const node of exited) dispatch(node,Constructor,prefix+'leave',{...options,bubbles:false,cancelable:false,composed:false,detail:0,relatedTarget:target});
+          dispatch(target,Constructor,prefix+'over',{...options,detail:0,relatedTarget:mouseOver});
+          for (let i=entered.length-1;i>=0;i--) dispatch(entered[i],Constructor,prefix+'enter',{...options,bubbles:false,cancelable:false,composed:false,detail:0,relatedTarget:mouseOver});
+        }
+        mouseOver=target;
+      }
+    }
+    if (payload.type==='mouseMoved') {
+      dispatch(target,_worldEventConstructors.PointerEvent,'pointermove',pointer);
+      dispatch(target,_worldEventConstructors.MouseEvent,'mousemove',{...init,detail:0});
+    } else if (payload.type==='mousePressed') {
+      mouseDown={target,button:init.button};
+      dispatch(target,_worldEventConstructors.PointerEvent,'pointerdown',pointer);
+      if (dispatch(target,_worldEventConstructors.MouseEvent,'mousedown',init)) {
+        const focusTarget=closest(target,_INTERACTIVE) || closest(target,'[tabindex]');
+        focus(focusTarget && !disabled(focusTarget) ? focusTarget : null);
+      }
+    } else if (payload.type==='mouseReleased') {
+      const down=mouseDown; mouseDown=null;
+      dispatch(target,_worldEventConstructors.PointerEvent,'pointerup',{...pointer,buttons:0,pressure:0});
+      dispatch(target,_worldEventConstructors.MouseEvent,'mouseup',{...init,buttons:0});
+      if (down && down.button===init.button && init.button===0 && connected(down.target)) {
+        let clickTarget=down.target;
+        while (clickTarget && !contains(clickTarget,target)) clickTarget=parent(clickTarget);
+        if (clickTarget) activate(clickTarget,{...init,buttons:0},count);
+      }
+    } else if (payload.type==='mouseWheel') {
+      const dx=payload.deltaX || 0,dy=payload.deltaY || 0;
+      if (!dispatch(target,_worldEventConstructors.WheelEvent,'wheel',{...init,deltaX:dx,deltaY:dy,deltaMode:0})) return false;
+      const root=_worldWrapNode(+_dom('query_selector','html')) || body();
+      let scrollTarget=root;
+      for (let element=target;element && element!==root && element!==body();element=parent(element)) {
+        if (tag(element)==='') continue;
+        const style=computedStyle(element),ox=style.overflowX || style.overflow,oy=style.overflowY || style.overflow;
+        const x=read(element,'scrollLeft'),y=read(element,'scrollTop');
+        const maxX=Math.max(0,read(element,'scrollWidth')-read(element,'clientWidth')),maxY=Math.max(0,read(element,'scrollHeight')-read(element,'clientHeight'));
+        if ((['auto','scroll','overlay'].includes(ox) && ((dx>0 && x<maxX)||(dx<0 && x>0))) || (['auto','scroll','overlay'].includes(oy) && ((dy>0 && y<maxY)||(dy<0 && y>0)))) { scrollTarget=element; break; }
+      }
+      if (scrollTarget) apply(descriptors.scrollTo.value,scrollTarget,[read(scrollTarget,'scrollLeft')+dx,read(scrollTarget,'scrollTop')+dy]);
+    }
+    return true;
+  };
+})();
+
+function _installWorldFocus() {
+  Object.defineProperty(globalThis, '__obscura_focused', {
+    get() {
+      const nid = __obscuraCore.ops.op_world_focus(globalThis, null, false);
+      return nid === 0xFFFFFFFF ? null : _wrapEl(nid);
+    },
+    set(element) { __obscuraCore.ops.op_world_focus(globalThis, element ?? null, true); },
+    enumerable: false, configurable: false,
+  });
+}
+
+globalThis.__obscura_init = function(windowId = 0, isolated = false) {
   // Capture realm identity once, before author code can replace public hints.
   if (!_realmRegistered) {
     _realmFrameId = globalThis.__obscura_frameId >>> 0;
     _realmParentFrameId = globalThis.__obscura_parentFrameId >>> 0;
+    _realmIsolated = !!isolated;
     _realmRegistered = true;
-    _registerNativeWindow(windowId);
+    _registerNativeWindow(windowId, !_realmIsolated);
     // Bind window listeners to the restored realm, not the snapshot's global
     // proxy: the listener WeakMap must not carry a snapshot-era window key.
     _eventTargetAdd(globalThis, 'resize', _viewportRenderingUpdate);
@@ -17516,6 +18543,12 @@ globalThis.__obscura_init = function(windowId = 0) {
   // canonical so getRootNode(), isConnected, and identity comparisons return
   // the same Document object exposed as globalThis.document.
   _cache.set(documentNid, globalThis.document);
+  if (!_worldCallbacksRegistered) {
+    __obscuraCore.ops.op_world_register(globalThis, _worldNodeId, _worldWrapNode,
+      _worldEventCreate, _worldEventPhase, _worldEventFinish, _worldNativeInput);
+    _installWorldFocus();
+    _worldCallbacksRegistered = true;
+  }
   const previousWindowNames = new Set(_windowNamedPropertyNames);
   _registerWindowNamedTree(globalThis.document.documentElement);
   _reconcileWindowNamedProperties(previousWindowNames);
@@ -17581,9 +18614,11 @@ globalThis.__obscura_init = function(windowId = 0) {
   // This also runs inside a frame realm, so a frame nested in a frame loads
   // by the same path, with op_frame_document_ready recording the caller as
   // its parent.
-  for (const frame of globalThis.document.querySelectorAll('iframe')) {
-    const src = frame.getAttribute('src');
-    if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+  if (!_realmIsolated) {
+    for (const frame of globalThis.document.querySelectorAll('iframe')) {
+      const src = frame.getAttribute('src');
+      if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    }
   }
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
@@ -18204,4 +19239,4 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
   }
 })();
 
-})();
+})(globalThis);

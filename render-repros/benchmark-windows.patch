@@ -1,0 +1,726 @@
+diff --git a/compare/head-to-head.py b/compare/head-to-head.py
+index 2f2400f..7ae9db3 100755
+--- a/compare/head-to-head.py
++++ b/compare/head-to-head.py
+@@ -7,13 +7,16 @@ let its JavaScript settle, and serialize the resulting DOM to stdout:
+   obscura:  obscura fetch <url> --dump html --wait <W>
+   chrome:   google-chrome --headless --dump-dom --virtual-time-budget=<W>ms <url>
+ 
+-We measure wall-clock latency (Python timer) and peak memory (GNU `time -v`
+-Maximum resident set size) for each run, take the minimum over N runs (least
+-noisy), and report obscura vs Chrome side by side.
++We measure wall-clock latency (Python perf_counter) and take the median over
++valid timed runs. POSIX retains GNU `time -v` maximum process RSS; Windows
++samples the sum of root and descendant RSS every 30 ms, which can miss spikes.
++Missing memory is null, never an invented zero. These metrics are not interchangeable.
+ 
+-This is the scraping/automation path: fetch + run scripts + read the DOM. obscura
+-has no rendering/layout/paint pipeline, so this is not a full-browser comparison;
+-it is the comparison that matters for headless scraping and agent automation.
++This is cold-process scraping (load + scripts + DOM serialization), not a
++paint/pixel or general browser benchmark. Chrome uses an isolated temporary
++profile per process, preserving the original headless incognito default, rather
++than production tab reuse. Chrome's virtual-time
++budget and obscura's wall-clock --wait are not equivalent settling policies.
+ 
+ Usage:
+   OBSCURA_BIN=/path/to/obscura python3 head-to-head.py [--runs N] [--wait S]
+@@ -21,6 +24,7 @@ Usage:
+ """
+ import argparse, json, os, re, socket, statistics, subprocess, threading, time
+ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
++from scale import PROCESS_TIMEOUT, RSS_INTERVAL, _start_process, _cleanup_process, psutil
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ OC = os.path.join(os.path.dirname(HERE), "obstacle-course")
+@@ -35,18 +39,94 @@ def free_port():
+     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+ 
+ 
+-def timed(cmd):
+-    """Run `cmd` under GNU time -v; return (wall_ms, peak_rss_mb, stdout_len)."""
+-    full = [GNU_TIME, "-v"] + cmd
+-    t0 = time.time()
++def timed(cmd, details=None):
++    """Return wall_ms, platform-specific peak RSS in MiB, and stdout length."""
++    details = details if details is not None else {}
++    details.update({"returncode": None, "timeout": False, "rss_error": None,
++                    "wall_ms": None, "rss_mb": None, "stdout_length": -1})
++    full = cmd if os.name == "nt" else [GNU_TIME, "-v"] + cmd
++    peak = [None]
++    rss_errors = []
++    stop = threading.Event()
++    sampler_thread = None
++    t0 = time.perf_counter()
++    process = _start_process(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, errors="replace")
++
++    def sampler(root):
++        while not stop.is_set():
++            total, observed = 0, False
++            processes = [root]
++            try:
++                processes += root.children(recursive=True)
++            except psutil.NoSuchProcess:
++                pass
++            except psutil.Error as exc:
++                rss_errors.append(f"{type(exc).__name__}: {exc}")
++            for child in processes:
++                try:
++                    total += child.memory_info().rss
++                    observed = True
++                except psutil.NoSuchProcess:
++                    pass
++                except psutil.Error as exc:
++                    rss_errors.append(f"{type(exc).__name__}: {exc}")
++            if observed:
++                peak[0] = total if peak[0] is None else max(peak[0], total)
++            stop.wait(RSS_INTERVAL)
++
+     try:
+-        p = subprocess.run(full, capture_output=True, text=True, timeout=60)
+-    except subprocess.TimeoutExpired:
+-        return None, None, -1
+-    wall = (time.time() - t0) * 1000.0
+-    m = _RSS_RE.search(p.stderr)
+-    rss_mb = (int(m.group(1)) / 1024.0) if m else None
+-    return wall, rss_mb, len(p.stdout)
++        if os.name == "nt":
++            if psutil is None:
++                rss_errors.append("psutil is unavailable")
++            else:
++                try:
++                    root = psutil.Process(process.pid)
++                    sampler_thread = threading.Thread(target=sampler, args=(root,), daemon=True)
++                    sampler_thread.start()
++                except psutil.NoSuchProcess:
++                    pass
++                except psutil.Error as exc:
++                    rss_errors.append(f"{type(exc).__name__}: {exc}")
++        try:
++            stdout, stderr = process.communicate(timeout=PROCESS_TIMEOUT)
++        except subprocess.TimeoutExpired:
++            details["timeout"] = True
++            return None, None, -1
++        wall = (time.perf_counter() - t0) * 1000.0
++        stop.set()
++        if sampler_thread is not None:
++            sampler_thread.join()
++        if os.name == "nt":
++            if peak[0] is None and not rss_errors:
++                rss_errors.append("no live process RSS sample was obtained")
++            rss_mb = peak[0] / (1024 * 1024) if peak[0] is not None and not rss_errors else None
++            details["rss_error"] = "; ".join(sorted(set(rss_errors))) if rss_errors else None
++        else:
++            match = _RSS_RE.search(stderr)
++            rss_mb = int(match.group(1)) / 1024.0 if match else None
++            if match is None:
++                details["rss_error"] = "GNU time maximum RSS was not reported"
++        details.update({"wall_ms": wall, "rss_mb": rss_mb, "stdout_length": len(stdout)})
++        if process.returncode != 0:
++            details["stderr"] = stderr
++        return wall, rss_mb, len(stdout)
++    finally:
++        stop.set()
++        if sampler_thread is not None:
++            sampler_thread.join()
++        try:
++            _cleanup_process(process)
++        finally:
++            try:
++                details["returncode"] = process.returncode
++                if details["timeout"]:
++                    details["rss_error"] = "process exceeded the 60-second timeout"
++                    _, stderr = process.communicate(timeout=5)
++                    details["stderr"] = stderr
++            finally:
++                for stream in (process.stdout, process.stderr):
++                    stream.close()
+ 
+ 
+ def obscura_cmd(url, wait):
+@@ -57,24 +137,28 @@ def obscura_cmd(url, wait):
+ 
+ def chrome_cmd(url, wait):
+     return [CHROME, "--headless", "--no-sandbox", "--disable-gpu",
+-            "--disable-dev-shm-usage", f"--virtual-time-budget={int(wait * 1000)}",
++            "--disable-dev-shm-usage", "--window-size=1280,720", "--force-device-scale-factor=1",
++            f"--virtual-time-budget={int(wait * 1000)}",
+             "--dump-dom", url]
+ 
+ 
+-def bench(cmd, warmup, runs):
+-    """Median wall/RSS over runs that actually produced a fully rendered DOM.
++def bench(cmd, warmup, runs, attempts=None):
++    """Median wall/RSS over the original non-empty/output-length guard.
+ 
+-    The local fixture server can occasionally drop a sub-resource under rapid
+-    repeated requests, leaving a run un-rendered (tiny output). Those runs are
+-    discarded so we never report a fast-but-empty result; the comparison only
+-    counts runs where both the page loaded and its JS settled.
++    This is a size heuristic, not a semantic DOM assertion. Keep the original
++    sample selection, warmups, and 100-ms inter-run sleeps unchanged.
+     """
+-    for _ in range(warmup):
+-        timed(cmd)
++    attempts = attempts if attempts is not None else []
++    for run in range(warmup):
++        detail = {"phase": "warmup", "run": run + 1}
++        attempts.append(detail)
++        timed(cmd, detail)
+         time.sleep(0.1)
+     samples = []
+-    for _ in range(runs):
+-        w, r, n = timed(cmd)
++    for run in range(runs):
++        detail = {"phase": "timed", "run": run + 1}
++        attempts.append(detail)
++        w, r, n = timed(cmd, detail)
+         if w is not None:
+             samples.append((w, r, n))
+         time.sleep(0.1)
+@@ -92,6 +176,10 @@ def bench(cmd, warmup, runs):
+             statistics.median(rsss) if rsss else None, maxlen, len(valid))
+ 
+ 
++def metric(value, decimals=0, suffix=""):
++    return f"{value:.{decimals}f}{suffix}" if value is not None else "n/a"
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--runs", type=int, default=3)
+@@ -99,6 +187,8 @@ def main():
+     ap.add_argument("--wait", type=float, default=3.0)
+     ap.add_argument("--filter", help="only fixtures whose name/category contains this")
+     ap.add_argument("--json", action="store_true")
++    ap.add_argument("--label", help="optional run label recorded in JSON")
++    ap.add_argument("--output", help="write JSON to this path as well as the normal CLI output")
+     args = ap.parse_args()
+ 
+     manifest = json.load(open(os.path.join(OC, "manifest.json")))
+@@ -115,30 +205,61 @@ def main():
+     base = f"http://127.0.0.1:{port}"
+ 
+     rows = []
++    memory_metric = "sampled_process_tree_rss_mb" if os.name == "nt" else "process_peak_rss_mb"
++    methodology = {
++        "workload": "cold-process scraping: load + scripts + DOM serialization, not paint/pixel correctness",
++        "aggregation": "median of valid timed samples; memory uses available RSS samples",
++        "wall_clock": "time.perf_counter; includes process startup and DOM output",
++        "runs": args.runs, "warmup": args.warmup, "inter_run_sleep_seconds": 0.1,
++        "timeout_seconds": PROCESS_TIMEOUT,
++        "obscura_wait_seconds": int(round(args.wait)), "chrome_virtual_time_ms": int(args.wait * 1000),
++        "settling_limit": "Obscura wall-clock wait and Chrome virtual-time budget are not equivalent wall waits",
++        "output_guard": "original non-empty/output-length heuristic, not manifest assertions or an exit-code gate",
++        "chrome_profile": "isolated temporary profile per cold process; --incognito preserves original headless default; no browser/tab reuse",
++        "chrome_geometry_flags": ["--window-size=1280,720", "--force-device-scale-factor=1"],
++        "viewport_limit": "CLI geometry matches the requested Obscura default; actual CSS viewport is not inspected",
++        "memory_metric": memory_metric, "memory_unit": "MiB",
++        "rss_sample_interval_ms": 30 if os.name == "nt" else None,
++        "memory_limit": "Windows sampled tree RSS may miss sub-30-ms spikes; not comparable to GNU process peak RSS",
++    }
+     if not args.json:
+         print(f"obscura vs headless Chrome  |  cold `fetch --dump html` vs `--headless --dump-dom`")
+-        print(f"min of {args.runs} runs (warmup {args.warmup}), wait/virtual-time {args.wait}s")
++        print(f"median of {args.runs} runs (warmup {args.warmup}), wait/virtual-time {args.wait}s")
++        print(f"memory: {memory_metric} (MiB)" + (", sampled every 30 ms" if os.name == "nt" else ", GNU time -v"))
++        print("Chrome viewport flags: 1280x720, device scale 1; CSS viewport not inspected")
+         print(f"  obscura: {OBSCURA}\n  chrome:  {CHROME}\n")
+         print(f"{'page':<20}{'o-ms':>7}{'chr-ms':>8}{'spdup':>7}   {'o-MB':>7}{'chr-MB':>8}{'mem x':>7}")
+         print("-" * 72)
+-    for st in stages:
+-        url = f"{base}/{st['file']}"
+-        o_ms, o_mb, _, _ = bench(obscura_cmd(url, args.wait), args.warmup, args.runs)
+-        c_ms, c_mb, _, _ = bench(chrome_cmd(url, args.wait), args.warmup, args.runs)
+-        speedup = (c_ms / o_ms) if (o_ms and c_ms) else None
+-        memx = (c_mb / o_mb) if (o_mb and c_mb) else None
+-        rows.append({"page": st["name"], "obscura_ms": o_ms, "chrome_ms": c_ms,
+-                     "speedup": speedup, "obscura_mb": o_mb, "chrome_mb": c_mb, "mem_ratio": memx})
+-        if not args.json:
+-            print(f"{st['name']:<20}{o_ms or 0:>7.0f}{c_ms or 0:>8.0f}{(speedup or 0):>6.1f}x"
+-                  f"   {o_mb or 0:>7.0f}{c_mb or 0:>8.0f}{(memx or 0):>6.1f}x")
+-
+-    srv.shutdown()
+-    sp = [r["speedup"] for r in rows if r["speedup"]]
+-    mx = [r["mem_ratio"] for r in rows if r["mem_ratio"]]
+-    omb = [r["obscura_mb"] for r in rows if r["obscura_mb"]]
+-    cmb = [r["chrome_mb"] for r in rows if r["chrome_mb"]]
++    try:
++        for st in stages:
++            url = f"{base}/{st['file']}"
++            o_attempts, c_attempts = [], []
++            o_ms, o_mb, o_maxlen, o_valid = bench(obscura_cmd(url, args.wait), args.warmup, args.runs, o_attempts)
++            c_ms, c_mb, c_maxlen, c_valid = bench(chrome_cmd(url, args.wait), args.warmup, args.runs, c_attempts)
++            speedup = (c_ms / o_ms) if (o_ms is not None and o_ms > 0 and c_ms is not None) else None
++            memx = (c_mb / o_mb) if (o_mb is not None and o_mb > 0 and c_mb is not None) else None
++            rows.append({"page": st["name"], "obscura_ms": o_ms, "chrome_ms": c_ms,
++                         "speedup": speedup, "obscura_mb": o_mb, "chrome_mb": c_mb, "mem_ratio": memx,
++                         "obscura_valid_runs": o_valid, "chrome_valid_runs": c_valid,
++                         "obscura_max_stdout_length": o_maxlen, "chrome_max_stdout_length": c_maxlen,
++                         "obscura_attempts": o_attempts, "chrome_attempts": c_attempts})
++            if not args.json:
++                print(f"{st['name']:<20}{metric(o_ms):>7}{metric(c_ms):>8}{metric(speedup, 1, 'x'):>7}"
++                      f"   {metric(o_mb):>7}{metric(c_mb):>8}{metric(memx, 1, 'x'):>7}")
++                for engine, attempts in (("obscura", o_attempts), ("chrome", c_attempts)):
++                    for detail in attempts:
++                        if detail["timeout"] or detail["returncode"] != 0 or detail["rss_error"]:
++                            print(f"  {engine} {detail['phase']} {detail['run']}: {detail}")
++    finally:
++        srv.shutdown()
++        srv.server_close()
++    sp = [r["speedup"] for r in rows if r["speedup"] is not None]
++    mx = [r["mem_ratio"] for r in rows if r["mem_ratio"] is not None]
++    omb = [r["obscura_mb"] for r in rows if r["obscura_mb"] is not None]
++    cmb = [r["chrome_mb"] for r in rows if r["chrome_mb"] is not None]
+     summary = {
++        "label": args.label, "obscura_bin": OBSCURA, "chrome_bin": CHROME,
++        "methodology": methodology,
+         "pages": len(rows),
+         "median_speedup_vs_chrome": round(statistics.median(sp), 2) if sp else None,
+         "median_memory_ratio_vs_chrome": round(statistics.median(mx), 2) if mx else None,
+@@ -146,14 +267,20 @@ def main():
+         "median_chrome_mb": round(statistics.median(cmb), 1) if cmb else None,
+         "results": rows,
+     }
++    if args.output:
++        with open(args.output, "w", encoding="utf-8") as output:
++            json.dump(summary, output, indent=2)
++            output.write("\n")
+     if args.json:
+         print(json.dumps(summary, indent=2))
+     else:
+         print("-" * 72)
+-        print(f"median: obscura is {summary['median_speedup_vs_chrome']}x faster and uses "
+-              f"{summary['median_memory_ratio_vs_chrome']}x less memory than headless Chrome")
+-        print(f"median peak RSS: obscura {summary['median_obscura_mb']} MB vs Chrome {summary['median_chrome_mb']} MB")
+-        print("note: scraping path only (load + JS + DOM serialize); obscura has no render/paint pipeline")
++        print(f"median: Chrome/Obscura latency {metric(summary['median_speedup_vs_chrome'], 2, 'x')}, "
++              f"memory {metric(summary['median_memory_ratio_vs_chrome'], 2, 'x')}")
++        print(f"median {memory_metric}: obscura {metric(summary['median_obscura_mb'], 1)} MiB "
++              f"vs Chrome {metric(summary['median_chrome_mb'], 1)} MiB")
++        print("note: cold-process scraping only; size guard is not a semantic assertion; no paint/pixel comparison")
++        print("note: Chrome virtual time and Obscura wall-clock settling are not equivalent")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/compare/scale.py b/compare/scale.py
+index 56b78d6..8b441a7 100755
+--- a/compare/scale.py
++++ b/compare/scale.py
+@@ -3,27 +3,216 @@
+ 
+ Loads the same page N times through each engine at increasing concurrency
+ (a pool of C cold processes at a time) and reports sustained throughput
+-(pages/sec) and peak total resident memory (sum of the live engine processes,
+-sampled by psutil). This is the "scrape at scale" view: how many pages/sec a
+-worker box sustains and how much RAM that costs.
++(pages/sec) and peak total resident memory (sum of the live engine processes
++and their descendants, sampled by psutil every 30 ms). Sampling can miss short
++spikes; unavailable memory is reported as null, not zero.
+ 
+-Both engines run a fresh process per page, which is obscura's normal model and
+-the worst case for Chrome (production Chrome usually reuses one browser across
+-tabs). The point is that obscura's per-page process is cheap enough to fan out
+-cold, where Chrome's is not.
++Both engines run a fresh process per page; Chrome also gets an isolated temporary
++profile so it cannot delegate to an existing browser outside the measured tree.
++The original headless incognito default is preserved explicitly for that profile.
++This cold-process scraping workload does not represent production Chrome tab
++reuse, paint/pixel correctness, or equivalent wall-clock settling: Chrome advances
++virtual time while obscura's --wait is a wall-clock wait.
+ 
+ Usage:
+   OBSCURA_BIN=/path/to/obscura python3 scale.py [--pages N] [--levels 1,4,8]
+                                                 [--wait S] [--page fixtures/x.html] [--json]
+ """
+-import argparse, json, os, socket, statistics, subprocess, threading, time
++import argparse, json, os, signal, socket, statistics, subprocess, tempfile, threading, time
+ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+-import psutil
++try:
++    import psutil
++except ImportError:
++    psutil = None
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ OC = os.path.join(os.path.dirname(HERE), "obstacle-course")
+ OBSCURA = os.environ.get("OBSCURA_BIN", "obscura")
+ CHROME = os.environ.get("CHROME_BIN", "google-chrome")
++RSS_INTERVAL = 0.03
++PROCESS_TIMEOUT = 60
++
++
++if os.name == "nt":
++    import ctypes
++    from ctypes import wintypes
++
++    class _BasicLimits(ctypes.Structure):
++        _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
++                    ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
++                    ("max_working_set", ctypes.c_size_t), ("active_limit", wintypes.DWORD),
++                    ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
++                    ("scheduling", wintypes.DWORD)]
++
++    class _IoCounters(ctypes.Structure):
++        _fields_ = [(name, ctypes.c_uint64) for name in
++                    ("reads", "writes", "other", "read_bytes", "write_bytes", "other_bytes")]
++
++    class _ExtendedLimits(ctypes.Structure):
++        _fields_ = [("basic", _BasicLimits), ("io", _IoCounters),
++                    ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
++                    ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
++
++    class _JobAccounting(ctypes.Structure):
++        _fields_ = [(name, ctypes.c_int64) for name in
++                    ("user_time", "kernel_time", "period_user_time", "period_kernel_time")] + [
++                    (name, wintypes.DWORD) for name in
++                    ("page_faults", "total_processes", "active_processes", "terminated_processes")]
++
++    class _ThreadEntry(ctypes.Structure):
++        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD),
++                    ("thread_id", wintypes.DWORD), ("process_id", wintypes.DWORD),
++                    ("base_priority", wintypes.LONG), ("delta_priority", wintypes.LONG),
++                    ("flags", wintypes.DWORD)]
++
++    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
++    _kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
++    _kernel.CreateJobObjectW.restype = wintypes.HANDLE
++    _kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
++    _kernel.SetInformationJobObject.restype = wintypes.BOOL
++    _kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
++    _kernel.AssignProcessToJobObject.restype = wintypes.BOOL
++    _kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
++    _kernel.TerminateJobObject.restype = wintypes.BOOL
++    _kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
++                                                 wintypes.DWORD, ctypes.c_void_p]
++    _kernel.QueryInformationJobObject.restype = wintypes.BOOL
++    _kernel.CloseHandle.argtypes = [wintypes.HANDLE]
++    _kernel.CloseHandle.restype = wintypes.BOOL
++    _kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
++    _kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
++    _kernel.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)]
++    _kernel.Thread32First.restype = wintypes.BOOL
++    _kernel.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry)]
++    _kernel.Thread32Next.restype = wintypes.BOOL
++    _kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
++    _kernel.OpenThread.restype = wintypes.HANDLE
++    _kernel.ResumeThread.argtypes = [wintypes.HANDLE]
++    _kernel.ResumeThread.restype = wintypes.DWORD
++
++    class _WindowsJob:
++        """Contain every child before it can spawn, including after launcher exit."""
++        def __init__(self):
++            self.handle = _kernel.CreateJobObjectW(None, None)
++            if not self.handle:
++                raise ctypes.WinError(ctypes.get_last_error())
++            limits = _ExtendedLimits()
++            limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
++            if not _kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
++                error = ctypes.get_last_error()
++                _kernel.CloseHandle(self.handle)
++                self.handle = None
++                raise ctypes.WinError(error)
++
++        def resume(self, process):
++            if not _kernel.AssignProcessToJobObject(self.handle, int(process._handle)):
++                raise ctypes.WinError(ctypes.get_last_error())
++            # Popen closes CreateProcess's primary-thread handle. Obtain the
++            # suspended process's threads through documented Toolhelp/Win32 APIs.
++            snapshot = _kernel.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
++            if snapshot == ctypes.c_void_p(-1).value:
++                raise ctypes.WinError(ctypes.get_last_error())
++            try:
++                entry = _ThreadEntry()
++                entry.size = ctypes.sizeof(entry)
++                found = _kernel.Thread32First(snapshot, ctypes.byref(entry))
++                thread_ids = []
++                while found:
++                    if entry.process_id == process.pid:
++                        thread_ids.append(entry.thread_id)
++                    entry.size = ctypes.sizeof(entry)
++                    found = _kernel.Thread32Next(snapshot, ctypes.byref(entry))
++                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
++                    raise ctypes.WinError(ctypes.get_last_error())
++                if not thread_ids:
++                    raise OSError("No thread found for the suspended benchmark child")
++                for thread_id in thread_ids:
++                    thread = _kernel.OpenThread(0x0002, False, thread_id)  # THREAD_SUSPEND_RESUME
++                    if not thread:
++                        raise ctypes.WinError(ctypes.get_last_error())
++                    try:
++                        if _kernel.ResumeThread(thread) == 0xffffffff:
++                            raise ctypes.WinError(ctypes.get_last_error())
++                    finally:
++                        _kernel.CloseHandle(thread)
++            finally:
++                _kernel.CloseHandle(snapshot)
++
++        def close(self):
++            if not self.handle:
++                return
++            try:
++                if not _kernel.TerminateJobObject(self.handle, 1):
++                    raise ctypes.WinError(ctypes.get_last_error())
++                accounting = _JobAccounting()
++                deadline = time.monotonic() + 5
++                while True:
++                    if not _kernel.QueryInformationJobObject(self.handle, 1, ctypes.byref(accounting),
++                                                            ctypes.sizeof(accounting), None):
++                        raise ctypes.WinError(ctypes.get_last_error())
++                    if not accounting.active_processes:
++                        break
++                    if time.monotonic() >= deadline:
++                        raise TimeoutError("Windows child job did not finish terminating")
++                    time.sleep(0.01)
++            finally:
++                _kernel.CloseHandle(self.handle)
++                self.handle = None
++
++
++def _start_process(cmd, **kwargs):
++    """Shared by the two comparison paths; never attach to a user's Chrome."""
++    profile = None
++    job = None
++    process = None
++    try:
++        if CHROME in cmd:
++            profile = tempfile.TemporaryDirectory(prefix="obscura-compare-chrome-")
++            cmd = list(cmd)
++            cmd.insert(cmd.index(CHROME) + 1, f"--user-data-dir={profile.name}")
++            # Headless Chrome defaults to incognito only without user-data-dir.
++            # Preserve that upstream policy when providing our cleanup profile.
++            if "--incognito" not in cmd:
++                cmd.insert(cmd.index(CHROME) + 1, "--incognito")
++        if os.name == "nt":
++            job = _WindowsJob()
++            # Keep the primary thread suspended until job assignment, then
++            # resume through documented Toolhelp/Win32 thread APIs.
++            process = subprocess.Popen(cmd, creationflags=0x00000004, **kwargs)  # CREATE_SUSPENDED
++            job.resume(process)
++        else:
++            process = subprocess.Popen(cmd, start_new_session=True, **kwargs)
++        process._benchmark_job = job
++        process._benchmark_profile = profile
++        return process
++    except BaseException:
++        try:
++            if process is not None:
++                process.kill()
++                process.wait()
++        finally:
++            try:
++                if job is not None:
++                    job.close()
++            finally:
++                if profile is not None:
++                    profile.cleanup()
++        raise
++
++
++def _cleanup_process(process):
++    try:
++        if os.name == "nt":
++            process._benchmark_job.close()
++        else:
++            try:
++                os.killpg(process.pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++        process.wait(timeout=5)
++    finally:
++        if process._benchmark_profile is not None:
++            process._benchmark_profile.cleanup()
+ 
+ 
+ def free_port():
+@@ -37,48 +226,94 @@ def obscura_cmd(url, wait):
+ 
+ def chrome_cmd(url, wait):
+     return [CHROME, "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
++            "--window-size=1280,720", "--force-device-scale-factor=1",
+             f"--virtual-time-budget={int(wait * 1000)}", "--dump-dom", url]
+ 
+ 
+ def run_pool(cmd_for, url, wait, n_pages, concurrency):
+-    """Run n_pages cold processes, `concurrency` at a time. Returns (pages_per_sec,
+-    peak_total_rss_mb). Peak RSS is the max over time of the summed RSS of the
+-    live worker processes (+ their children), sampled in a background thread."""
++    """Cold attempts/sec and sampled live process-tree RSS, not a render assertion."""
+     procs = {}            # pid -> psutil.Process
+-    peak = [0.0]
++    procs_lock = threading.Lock()
++    peak = [None]
++    rss_errors = [] if psutil is not None else ["psutil is unavailable"]
++    failures = []
+     stop = threading.Event()
+ 
+     def sampler():
+         while not stop.is_set():
+-            total = 0
+-            for p in list(procs.values()):
++            total, observed = 0, False
++            with procs_lock:
++                roots = list(procs.values())
++            for root in roots:
++                processes = [root]
+                 try:
+-                    total += p.memory_info().rss
+-                    for c in p.children(recursive=True):
+-                        total += c.memory_info().rss
+-                except (psutil.NoSuchProcess, psutil.AccessDenied):
++                    processes += root.children(recursive=True)
++                except psutil.NoSuchProcess:
+                     pass
+-            peak[0] = max(peak[0], total)
+-            time.sleep(0.03)
++                except psutil.Error as exc:
++                    rss_errors.append(f"{type(exc).__name__}: {exc}")
++                for process in processes:
++                    try:
++                        total += process.memory_info().rss
++                        observed = True
++                    except psutil.NoSuchProcess:
++                        pass
++                    except psutil.Error as exc:
++                        rss_errors.append(f"{type(exc).__name__}: {exc}")
++            if observed:
++                peak[0] = total if peak[0] is None else max(peak[0], total)
++            stop.wait(RSS_INTERVAL)
+ 
+-    st = threading.Thread(target=sampler, daemon=True); st.start()
+-    t0 = time.time()
++    st = threading.Thread(target=sampler, daemon=True) if psutil is not None else None
++    if st is not None:
++        st.start()
++    t0 = time.perf_counter()
+     running, launched, done = [], 0, 0
+-    while done < n_pages:
+-        while len(running) < concurrency and launched < n_pages:
+-            p = subprocess.Popen(cmd_for(url, wait), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+-            try:
+-                procs[p.pid] = psutil.Process(p.pid)
+-            except psutil.NoSuchProcess:
+-                pass
+-            running.append(p); launched += 1
+-        for p in running[:]:
+-            if p.poll() is not None:
+-                running.remove(p); procs.pop(p.pid, None); done += 1
+-        time.sleep(0.01)
+-    elapsed = time.time() - t0
+-    stop.set(); st.join(timeout=1)
+-    return n_pages / elapsed, peak[0] / (1024 * 1024)
++    try:
++        while done < n_pages:
++            while len(running) < concurrency and launched < n_pages:
++                process = _start_process(cmd_for(url, wait), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++                launched += 1
++                running.append((process, time.perf_counter(), launched))
++                if psutil is not None:
++                    try:
++                        with procs_lock:
++                            procs[process.pid] = psutil.Process(process.pid)
++                    except psutil.NoSuchProcess:
++                        pass
++                    except psutil.Error as exc:
++                        rss_errors.append(f"{type(exc).__name__}: {exc}")
++            for process, started, attempt in running[:]:
++                code = process.poll()
++                timed_out = code is None and time.perf_counter() - started >= PROCESS_TIMEOUT
++                if code is not None or timed_out:
++                    _cleanup_process(process)
++                    running.remove((process, started, attempt))
++                    with procs_lock:
++                        procs.pop(process.pid, None)
++                    if timed_out or code != 0:
++                        failures.append({"attempt": attempt, "returncode": process.returncode, "timeout": timed_out})
++                    done += 1
++            time.sleep(0.01)
++        elapsed = time.perf_counter() - t0
++    finally:
++        cleanup_errors = []
++        try:
++            for process, _, _ in running:
++                try:
++                    _cleanup_process(process)
++                except BaseException as exc:
++                    cleanup_errors.append(exc)
++        finally:
++            stop.set()
++            if st is not None:
++                st.join()
++        if cleanup_errors:
++            raise cleanup_errors[0]
++    if peak[0] is None and not rss_errors:
++        rss_errors.append("no live process RSS sample was obtained")
++    rss = peak[0] / (1024 * 1024) if peak[0] is not None and not rss_errors else None
++    return n_pages / elapsed, rss, failures, sorted(set(rss_errors))
+ 
+ 
+ def main():
+@@ -88,6 +323,8 @@ def main():
+     ap.add_argument("--wait", type=float, default=3.0)
+     ap.add_argument("--page", default=None, help="fixture path (default: a React app)")
+     ap.add_argument("--json", action="store_true")
++    ap.add_argument("--label", help="optional run label recorded in JSON")
++    ap.add_argument("--output", help="write JSON to this path as well as the normal CLI output")
+     args = ap.parse_args()
+     levels = [int(x) for x in args.levels.split(",")]
+ 
+@@ -106,20 +343,48 @@ def main():
+ 
+     engines = [("obscura", obscura_cmd), ("chrome", chrome_cmd)]
+     rows = []
++    methodology = {
++        "workload": "cold-process scraping attempts; Chrome does not reuse a browser or tabs",
++        "validity_limit": "original completion counting regardless of exit code; no DOM assertions; output discarded",
++        "wall_clock": "time.perf_counter; includes cold launches and child/profile cleanup",
++        "timeout_seconds": PROCESS_TIMEOUT,
++        "obscura_wait_seconds": int(round(args.wait)), "chrome_virtual_time_ms": int(args.wait * 1000),
++        "settling_limit": "Obscura wall-clock wait and Chrome virtual-time budget are not equivalent wall waits",
++        "chrome_profile": "isolated temporary profile per cold process; --incognito preserves original headless default",
++        "chrome_geometry_flags": ["--window-size=1280,720", "--force-device-scale-factor=1"],
++        "viewport_limit": "actual CSS viewport is not inspected; not a paint/pixel comparison",
++        "memory_metric": "sampled_process_tree_rss_mb", "memory_unit": "MiB", "rss_sample_interval_ms": 30,
++        "memory_limit": "maximum sampled sum across live worker trees; may miss sub-30-ms spikes; not GNU peak RSS",
++    }
+     if not args.json:
+         print(f"throughput + concurrency scaling  |  {args.pages} loads of {page} per level")
+         print(f"  obscura: {OBSCURA}\n  chrome:  {CHROME}\n")
++        print("memory: sampled_process_tree_rss_mb (MiB), sampled every 30 ms; unavailable = n/a")
+         print(f"{'engine':<10}{'workers':>8}{'pages/sec':>11}{'peak RSS MB':>13}")
+         print("-" * 44)
+-    for name, cmd_for in engines:
+-        for c in levels:
+-            pps, rss = run_pool(cmd_for, url, args.wait, args.pages, c)
+-            rows.append({"engine": name, "workers": c, "pages_per_sec": round(pps, 2), "peak_rss_mb": round(rss, 1)})
+-            if not args.json:
+-                print(f"{name:<10}{c:>8}{pps:>11.2f}{rss:>13.1f}")
+-    srv.shutdown()
++    try:
++        for name, cmd_for in engines:
++            for c in levels:
++                pps, rss, failures, rss_errors = run_pool(cmd_for, url, args.wait, args.pages, c)
++                rows.append({"engine": name, "workers": c, "pages_per_sec": round(pps, 2),
++                             "peak_rss_mb": round(rss, 1) if rss is not None else None,
++                             "failures": failures, "rss_errors": rss_errors})
++                if not args.json:
++                    memory = f"{rss:.1f}" if rss is not None else "n/a"
++                    print(f"{name:<10}{c:>8}{pps:>11.2f}{memory:>13}")
++                    if failures or rss_errors:
++                        print(f"  failures: {failures}; RSS errors: {rss_errors}")
++    finally:
++        srv.shutdown()
++        srv.server_close()
++    summary = {"label": args.label, "obscura_bin": OBSCURA, "chrome_bin": CHROME,
++               "pages": args.pages, "page": page, "methodology": methodology, "results": rows}
++    if args.output:
++        with open(args.output, "w", encoding="utf-8") as output:
++            json.dump(summary, output, indent=2)
++            output.write("\n")
+     if args.json:
+-        print(json.dumps({"pages": args.pages, "page": page, "results": rows}, indent=2))
++        print(json.dumps(summary, indent=2))
+ 
+ 
+ if __name__ == "__main__":

@@ -37,6 +37,10 @@ async fn serve_fixture() -> String {
                             width: 120px; height: 60px; }
             #deep-target { width: 120px; height: 60px; }
             #deep-child { display: block; width: 100%; height: 100%; }
+            #check, #radio-form, #hash-link { position: absolute; top: 220px; }
+            #check { left: 240px; }
+            #radio-form { left: 300px; }
+            #hash-link { left: 400px; }
             #hover-host { position: absolute; left: 400px; top: 100px; width: 120px; height: 60px; }
             #hover-host button { opacity: 0; }
             #hover-host:hover button { opacity: 1; }
@@ -95,6 +99,20 @@ async fn evaluate(ctx: &mut CdpContext, id: u64, expression: &str, session_id: &
         session_id,
     )
     .await
+}
+
+async fn target_center(ctx: &mut CdpContext, id: u64, sid: &str, target_id: &str) -> (f64, f64) {
+    let result = evaluate(
+        ctx,
+        id,
+        &format!(
+            "(() => {{ const rect = document.getElementById({}).getBoundingClientRect(); return {{x: rect.left + rect.width / 2, y: rect.top + rect.height / 2}}; }})()",
+            json!(target_id),
+        ),
+        sid,
+    ).await;
+    let point = &result["result"]["value"];
+    (point["x"].as_f64().unwrap(), point["y"].as_f64().unwrap())
 }
 
 async fn setup() -> (CdpContext, String) {
@@ -462,7 +480,6 @@ async fn press_release_orders_events_and_defers_click_activation() {
         2,
         r#"(() => {
             const target = document.getElementById('check');
-            document.elementFromPoint = () => target;
             globalThis.mouseLog = [];
             for (const type of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter',
                                 'pointerdown', 'mousedown', 'focus', 'focusin',
@@ -480,13 +497,14 @@ async fn press_release_orders_events_and_defers_click_activation() {
         &sid,
     )
     .await;
+    let (x, y) = target_center(&mut ctx, 20, &sid, "check").await;
 
     cdp(
         &mut ctx,
         3,
         "Input.dispatchMouseEvent",
         json!({
-            "type": "mousePressed", "x": 31.0, "y": 42.0,
+            "type": "mousePressed", "x": x, "y": y,
             "button": "left", "clickCount": 1, "modifiers": 10
         }),
         &sid,
@@ -534,7 +552,7 @@ async fn press_release_orders_events_and_defers_click_activation() {
         5,
         "Input.dispatchMouseEvent",
         json!({
-            "type": "mouseReleased", "x": 31.0, "y": 42.0,
+            "type": "mouseReleased", "x": x, "y": y,
             "button": "left", "clickCount": 1, "modifiers": 10
         }),
         &sid,
@@ -574,10 +592,130 @@ async fn press_release_orders_events_and_defers_click_activation() {
     );
     assert_eq!(released["checked"], true);
     assert_eq!(released["log"][10]["checked"], true, "click sees checkbox pre-activation");
-    assert_eq!(released["log"][10]["x"], 31.0);
+    assert_eq!(released["log"][10]["x"].as_f64(), Some(x));
     assert_eq!(released["log"][10]["ctrl"], true);
     assert_eq!(released["log"][10]["shift"], true);
     assert_eq!(released["log"][10]["trusted"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_input_trust_and_target_identity_survive_author_tampering() {
+    let (mut ctx, sid) = setup().await;
+    let setup_result = evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const target = document.getElementById('hit-target');
+            const decoy = document.getElementById('deep-target');
+            const NativeEvent = Event;
+            const NativeMessageEvent = MessageEvent;
+            const dispatch = Element.prototype.dispatchEvent;
+            const define = Object.defineProperty;
+            const mapGet = WeakMap.prototype.get;
+            const mapSet = WeakMap.prototype.set;
+            const setAdd = WeakSet.prototype.add;
+            const setHas = WeakSet.prototype.has;
+            globalThis.trustProbe = {
+                events: [], nested: [], decoy: [], constructorCalls: 0,
+                helperCalls: 0, propertyHooks: 0, leakedEvents: 0, leakedState: 0,
+                nativeOverwriteBlocked: 0
+            };
+            for (const type of ['mousedown', 'click']) {
+                target.addEventListener(type, event => {
+                    trustProbe.events.push([event.type, event.target === target, event.isTrusted]);
+                    try { define(event, 'isTrusted', {value: false}); }
+                    catch (_) { trustProbe.nativeOverwriteBlocked++; }
+                    const authored = new NativeEvent('author-probe');
+                    dispatch.call(target, authored);
+                    if (event.type === 'click' && event.isTrusted) globalThis.replayEvent = event;
+                });
+                decoy.addEventListener(type, event => trustProbe.decoy.push(event.type));
+            }
+            target.addEventListener('author-probe', event => trustProbe.nested.push(event.isTrusted));
+            document.elementFromPoint = () => target;
+            for (const name of ['Event', 'MouseEvent', 'PointerEvent', 'FocusEvent', 'MessageEvent']) {
+                const Constructor = globalThis[name];
+                globalThis[name] = function(...args) {
+                    trustProbe.constructorCalls++;
+                    return new Constructor(...args);
+                };
+            }
+            globalThis.__obscura_markTrusted = event => { trustProbe.helperCalls++; return event; };
+            Element.prototype.dispatchEvent = event => { trustProbe.helperCalls++; return true; };
+            WeakSet.prototype.add = function(event) {
+                if (event instanceof NativeEvent) trustProbe.leakedEvents++;
+                return setAdd.call(this, event);
+            };
+            WeakSet.prototype.has = function(event) {
+                return event instanceof NativeEvent ? true : setHas.call(this, event);
+            };
+            WeakSet.prototype.delete = () => false;
+            WeakMap.prototype.get = function(key) {
+                const value = mapGet.call(this, key);
+                if (key instanceof NativeEvent) trustProbe.leakedState++;
+                return key === target && typeof value === 'number' ? decoy._nid : value;
+            };
+            WeakMap.prototype.set = function(key, value) {
+                if (key instanceof NativeEvent) trustProbe.leakedState++;
+                return mapSet.call(this, key, value);
+            };
+            WeakMap.prototype.has = () => true;
+            WeakMap.prototype.delete = () => false;
+            globalThis.WeakSet = globalThis.WeakMap = function() { throw new Error('author constructor'); };
+            Object.defineProperty = function(object, name, descriptor) {
+                if (name === 'isTrusted') { trustProbe.propertyHooks++; return object; }
+                return define(object, name, descriptor);
+            };
+            const authored = new NativeEvent('author-probe');
+            const message = new NativeMessageEvent('message');
+            const getter = Object.getOwnPropertyDescriptor(authored, 'isTrusted')?.get;
+            let ownOverwriteBlocked = false, brandBlocked = false, fakeDispatchBlocked = false;
+            try { define(authored, 'isTrusted', {value: true}); } catch (_) { ownOverwriteBlocked = true; }
+            const reflectedOverwrite = Reflect.defineProperty(authored, 'isTrusted', {value: true});
+            try { getter.call(Object.create(NativeEvent.prototype)); } catch (_) { brandBlocked = true; }
+            try { dispatch.call(target, {type: 'click', isTrusted: true}); }
+            catch (_) { fakeDispatchBlocked = true; }
+            Object.setPrototypeOf(authored, {isTrusted: true});
+            globalThis.replayNativeEvent = () => dispatch.call(target, replayEvent);
+            return JSON.stringify({
+                authored: authored.isTrusted, message: message.isTrusted,
+                ownOverwriteBlocked, reflectedOverwrite, brandBlocked, fakeDispatchBlocked,
+                ownAccessor: typeof getter === 'function',
+                sharedGetter: getter === Object.getOwnPropertyDescriptor(message, 'isTrusted')?.get
+            });
+        })()"#,
+        &sid,
+    ).await;
+    let authored: Value =
+        serde_json::from_str(setup_result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(authored, json!({
+        "authored": false, "message": false, "ownOverwriteBlocked": true,
+        "reflectedOverwrite": false, "brandBlocked": true, "fakeDispatchBlocked": true,
+        "ownAccessor": true, "sharedGetter": true
+    }));
+
+    for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchMouseEvent",
+            json!({"type": event_type, "x": 510, "y": 30, "button": "left"}),
+            &sid,
+        ).await;
+    }
+    let result = evaluate(
+        &mut ctx,
+        5,
+        "(() => { replayNativeEvent(); return JSON.stringify(trustProbe); })()",
+        &sid,
+    ).await;
+    let probe: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(probe, json!({
+        "events": [["mousedown", true, true], ["click", true, true], ["click", true, false]],
+        "nested": [false, false, false], "decoy": [], "constructorCalls": 0,
+        "helperCalls": 0, "propertyHooks": 0, "leakedEvents": 0, "leakedState": 0,
+        "nativeOverwriteBlocked": 3
+    }));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -594,18 +732,18 @@ async fn checkbox_activation_bypasses_framework_checked_setter() {
                 get() { return native.get.call(this); },
                 set(value) { tracked = !!value; native.set.call(this, value); }
             });
-            document.elementFromPoint = () => target;
             globalThis.frameworkSawChange = false;
             target.addEventListener('change', () => { frameworkSawChange = tracked !== target.checked; });
         })()"#,
         &sid,
     ).await;
+    let (x, y) = target_center(&mut ctx, 20, &sid, "check").await;
     for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
         cdp(
             &mut ctx,
             id,
             "Input.dispatchMouseEvent",
-            json!({"type": event_type, "x": 10, "y": 10, "button": "left"}),
+            json!({"type": event_type, "x": x, "y": y, "button": "left"}),
             &sid,
         ).await;
     }
@@ -688,19 +826,18 @@ async fn clicking_a_hash_link_performs_same_document_navigation() {
         &mut ctx,
         2,
         r#"(() => {
-            const link = document.getElementById('hash-link');
-            document.elementFromPoint = () => link;
             globalThis.hashChanges = 0;
             onhashchange = () => hashChanges++;
         })()"#,
         &sid,
     ).await;
+    let (x, y) = target_center(&mut ctx, 20, &sid, "hash-link").await;
     for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
         cdp(
             &mut ctx,
             id,
             "Input.dispatchMouseEvent",
-            json!({"type": event_type, "x": 10, "y": 10, "button": "left"}),
+            json!({"type": event_type, "x": x, "y": y, "button": "left"}),
             &sid,
         ).await;
     }
@@ -722,7 +859,6 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         r#"(() => {
             const a = document.getElementById('radio-a');
             const b = document.getElementById('radio-b');
-            document.elementFromPoint = () => b;
             globalThis.radioEvents = [];
             for (const radio of [a, b]) {
                 for (const type of ['mousedown', 'mouseup', 'click', 'input', 'change']) {
@@ -733,11 +869,12 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         &sid,
     )
     .await;
+    let (x, y) = target_center(&mut ctx, 20, &sid, "radio-b").await;
     cdp(
         &mut ctx,
         3,
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 10.0, "y": 10.0, "button": "left"}),
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left"}),
         &sid,
     )
     .await;
@@ -745,7 +882,7 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         &mut ctx,
         4,
         "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 10.0, "y": 10.0, "button": "left"}),
+        json!({"type": "mouseReleased", "x": x, "y": y, "button": "left"}),
         &sid,
     )
     .await;

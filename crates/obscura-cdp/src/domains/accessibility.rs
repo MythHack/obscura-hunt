@@ -46,9 +46,15 @@ pub async fn handle(
                 .unwrap_or_default();
             #[cfg(not(feature = "render"))]
             let styles = HashMap::new();
-            let nodes = page
+            let mut nodes = page
                 .with_dom(|dom| build_ax_nodes_with_styles(dom, &styles))
                 .unwrap_or_default();
+            for node in &mut nodes {
+                if let Some(native) = node.get("backendDOMNodeId").and_then(Value::as_u64) {
+                    node["backendDOMNodeId"] = json!(super::dom::backend_node_id(ctx, session_id, 0,
+                        u32::try_from(native).map_err(|_| "Invalid native node id")?)?);
+                }
+            }
             Ok(json!({ "nodes": nodes }))
         }
         _ => Ok(json!({})),

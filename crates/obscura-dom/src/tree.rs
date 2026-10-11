@@ -278,6 +278,8 @@ pub(crate) struct DomTreeInner {
     form_controls: HashMap<NodeId, FormControlState>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
+    /// Successful native topology changes, including detached subtrees.
+    topology_generation: u64,
     hovered: Option<NodeId>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
@@ -313,6 +315,7 @@ impl DomTree {
                 form_controls: HashMap::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
+                topology_generation: 0,
                 hovered: None,
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
@@ -324,6 +327,10 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn topology_generation(&self) -> u64 {
+        self.inner.borrow().topology_generation
     }
 
     pub fn replace_external_stylesheet(
@@ -628,6 +635,7 @@ impl DomTree {
             .and_then(|node| node.as_ref())
             .is_some_and(|node| node.connected);
         Self::set_subtree_connected(&mut inner, root, connected);
+        inner.topology_generation = inner.topology_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -939,6 +947,7 @@ impl DomTree {
         if parent_connected && !child_connected {
             Self::set_subtree_connected(&mut inner, child_id, true);
         }
+        inner.topology_generation = inner.topology_generation.wrapping_add(1);
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
@@ -1023,6 +1032,7 @@ impl DomTree {
         if parent_connected && !child_connected {
             Self::set_subtree_connected(&mut inner, new_sibling_id, true);
         }
+        inner.topology_generation = inner.topology_generation.wrapping_add(1);
     }
 
     pub fn detach(&self, node_id: NodeId) {
@@ -1076,6 +1086,9 @@ impl DomTree {
             node.parent = None;
             node.prev_sibling = None;
             node.next_sibling = None;
+        }
+        if parent_id.is_some() {
+            inner.topology_generation = inner.topology_generation.wrapping_add(1);
         }
     }
 
@@ -1158,6 +1171,7 @@ impl DomTree {
                 inner.free_list.push(id.0);
             }
         }
+        inner.topology_generation = inner.topology_generation.wrapping_add(1);
     }
 
     /// Collect an ordinary subtree plus every shadow tree owned by a host in

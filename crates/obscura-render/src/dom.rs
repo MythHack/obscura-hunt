@@ -334,7 +334,7 @@ pub struct DomLayout {
     /// Accumulated authored transforms in immutable document coordinates.
     /// Entries exist only inside a non-identity transformed subtree, keeping
     /// ordinary documents on the allocation-free identity path.
-    pub transforms: HashMap<NodeId, crate::Affine2>,
+    pub transforms: HashMap<NodeId, crate::VisualTransform>,
     /// Per-word geometry for text nodes: a text DOM node lays out as one
     /// taffy leaf per word (see `build_text_words`), each wrapping
     /// independently within its container, so its rendered content is a list
@@ -1091,7 +1091,7 @@ impl DomLayout {
                 &self.styles,
                 &mut self.clip_rects,
                 &mut self.translates,
-                crate::Affine2::IDENTITY,
+                crate::VisualTransform::IDENTITY,
                 &mut self.transforms,
                 root_font_size,
                 viewport,
@@ -1749,7 +1749,7 @@ fn accumulate_scrolling_overflow(
     rects: &HashMap<NodeId, Rect>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     translates: &HashMap<NodeId, (f32, f32)>,
-    transforms: &HashMap<NodeId, crate::Affine2>,
+    transforms: &HashMap<NodeId, crate::VisualTransform>,
     right: &mut f32,
     bottom: &mut f32,
 ) {
@@ -2212,8 +2212,8 @@ fn resolve_clip_rects(
     styles: &HashMap<NodeId, crate::LayoutStyle>,
     clip_rects: &mut HashMap<NodeId, Option<OverflowClip>>,
     translates: &mut HashMap<NodeId, (f32, f32)>,
-    parent_transform: crate::Affine2,
-    transforms: &mut HashMap<NodeId, crate::Affine2>,
+    parent_transform: crate::VisualTransform,
+    transforms: &mut HashMap<NodeId, crate::VisualTransform>,
     root_font_size: f32,
     viewport: (f32, f32),
 ) {
@@ -2232,9 +2232,9 @@ fn resolve_clip_rects(
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
     }
-    let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
+    let own_transform = styles.get(&id).map_or(crate::VisualTransform::IDENTITY, |style| {
         if style.ignores_used_box_sizes() {
-            crate::Affine2::IDENTITY
+            crate::VisualTransform::IDENTITY
         } else {
             let rect = rects.get(&id).copied().unwrap_or_default();
             resolved_transform_matrix(style, &rect, root_font_size, viewport)
@@ -2244,6 +2244,17 @@ fn resolve_clip_rects(
     if !transform.is_identity() {
         transforms.insert(id, transform);
     }
+    let child_transform = styles.get(&id).map_or(transform, |style| {
+        if style.ignores_used_box_sizes() { return transform; }
+        let parent_preserves_depth = rendered_parent(tree, id)
+            .and_then(|parent| styles.get(&parent)).is_some_and(preserves_3d);
+        let transform = if !preserves_3d(style)
+            && (transform.affine().is_none() || parent_preserves_depth) {
+            transform.flatten_children()
+        } else { transform };
+        let rect = rects.get(&id).copied().unwrap_or_default();
+        transform.then(resolved_perspective_matrix(style, &rect))
+    });
     // Overflow propagated from html/body establishes the root scrolling
     // viewport. It is anchored to the capture surface, not to document
     // coordinates, and the pixmap already supplies that viewport clip.
@@ -2272,7 +2283,7 @@ fn resolve_clip_rects(
             styles,
             clip_rects,
             translates,
-            transform,
+            child_transform,
             transforms,
             root_font_size,
             viewport,
@@ -2286,12 +2297,9 @@ fn resolved_own_translate(
     root_font_size: f32,
     viewport: (f32, f32),
 ) -> (f32, f32) {
-    let transform = resolved_transform_matrix(style, rect, root_font_size, viewport);
-    if transform.is_translation() {
-        (transform.e, transform.f)
-    } else {
-        (0.0, 0.0)
-    }
+    resolved_transform_matrix(style, rect, root_font_size, viewport)
+        .affine().filter(|matrix| matrix.is_translation())
+        .map_or((0.0, 0.0), |matrix| (matrix.e, matrix.f))
 }
 
 fn resolve_transform_length(
@@ -2319,7 +2327,13 @@ fn resolve_transform_length(
             )
         })
         .map(|pixels| pixels * zoom)
-        .unwrap_or_else(|| resolve_translate(length.value, basis))
+        .unwrap_or_else(|| match length.value {
+            crate::Dimension::Em(_) | crate::Dimension::Ex(_) | crate::Dimension::Rem(_)
+                | crate::Dimension::Vw(_) | crate::Dimension::Vh(_) | crate::Dimension::Vmin(_)
+                | crate::Dimension::Vmax(_) => resolve_translate(
+                    length.value.resolve(em, root_font_size, viewport.0 / 100., viewport.1 / 100.), basis) * zoom,
+            value => resolve_translate(value, basis),
+        })
 }
 
 pub(crate) fn resolved_transform_matrix(
@@ -2327,47 +2341,35 @@ pub(crate) fn resolved_transform_matrix(
     rect: &Rect,
     root_font_size: f32,
     viewport: (f32, f32),
-) -> crate::Affine2 {
-    let mut matrix = crate::Affine2::IDENTITY;
+) -> crate::VisualTransform {
+    let mut matrix = crate::VisualTransform::IDENTITY;
     if let Some((x, y)) = style.individual_translate {
-        let lengths = [
-            crate::TransformLength {
-                value: x,
-                expression: style.individual_translate_expressions[0].clone(),
-            },
-            crate::TransformLength {
-                value: y,
-                expression: style.individual_translate_expressions[1].clone(),
-            },
-        ];
-        matrix = matrix.then(crate::Affine2::translate(
-            resolve_transform_length(&lengths[0], 0, style, rect, root_font_size, viewport),
-            resolve_transform_length(&lengths[1], 1, style, rect, root_font_size, viewport),
-        ));
+        let lengths = [crate::TransformLength { value:x, expression:None },
+            crate::TransformLength { value:y, expression:None }];
+        let resolve = |axis:usize| {
+            style.individual_translate_expressions[axis].as_deref()
+                .and_then(|expression| crate::style::resolve_contextual_length(expression,
+                    style.font_size.unwrap_or(16.) / style.used_zoom(), root_font_size,
+                    viewport.0 / 100., viewport.1 / 100.,
+                    if axis == 0 { rect.width / style.used_zoom() } else { rect.height / style.used_zoom() }))
+                .map(|v| v * style.used_zoom())
+                .unwrap_or_else(|| resolve_transform_length(&lengths[axis],axis,style,rect,root_font_size,viewport))
+        };
+        matrix = matrix.then(crate::VisualTransform::translate(resolve(0),resolve(1)));
     }
     if let Some(angle) = style.individual_rotate {
-        matrix = matrix.then(crate::Affine2::rotate(angle));
+        matrix = matrix.then(crate::VisualTransform::Affine(crate::Affine2::rotate(angle)));
     }
     if let Some((x, y)) = style.individual_scale {
-        matrix = matrix.then(crate::Affine2::scale(x, y));
+        matrix = matrix.then(crate::VisualTransform::Affine(crate::Affine2::scale(x,y)));
     }
-    matrix = matrix.then(resolved_transform_property_matrix(
-        style,
-        rect,
-        root_font_size,
-        viewport,
-    ));
-    if matrix.is_identity() {
-        return matrix;
-    }
-    let (origin_x, origin_y) = style.transform_origin.unwrap_or((
-        crate::Dimension::Percent(0.5),
-        crate::Dimension::Percent(0.5),
-    ));
-    matrix.around((
-        rect.x + resolve_translate(origin_x, rect.width),
-        rect.y + resolve_translate(origin_y, rect.height),
-    ))
+    matrix = matrix.then(resolved_transform_property_matrix(style,rect,root_font_size,viewport));
+    if matrix.is_identity() { return matrix; }
+    let (x,y) = style.transform_origin.unwrap_or((crate::Dimension::Percent(0.5),crate::Dimension::Percent(0.5)));
+    let origin = |value,axis| resolve_transform_length(&crate::TransformLength { value,expression:None },
+        axis,style,rect,root_font_size,viewport);
+    matrix.around((rect.x+origin(x,0),rect.y+origin(y,1),
+        origin(style.transform_origin_z.unwrap_or(crate::Dimension::Px(0.)),2)))
 }
 
 /// Resolved value of the `transform` property alone. Individual transform
@@ -2378,22 +2380,75 @@ pub(crate) fn resolved_transform_property_matrix(
     rect: &Rect,
     root_font_size: f32,
     viewport: (f32, f32),
-) -> crate::Affine2 {
-    let mut matrix = crate::Affine2::IDENTITY;
+) -> crate::VisualTransform {
+    use crate::{Affine2, Matrix4, TransformOp, VisualTransform};
+    let mut matrix = VisualTransform::IDENTITY;
+    let length = |value,axis| resolve_transform_length(value,axis,style,rect,root_font_size,viewport);
     for operation in &style.transform_ops {
         let operation = match operation {
-            crate::TransformOp::Translate(x, y) => crate::Affine2::translate(
-                resolve_transform_length(x, 0, style, rect, root_font_size, viewport),
-                resolve_transform_length(y, 1, style, rect, root_font_size, viewport),
-            ),
-            crate::TransformOp::Scale(x, y) => crate::Affine2::scale(*x, *y),
-            crate::TransformOp::Rotate(angle) => crate::Affine2::rotate(*angle),
-            crate::TransformOp::Skew(x, y) => crate::Affine2::skew(*x, *y),
-            crate::TransformOp::Matrix(matrix) => *matrix,
+            TransformOp::Translate(x,y) => VisualTransform::translate(length(x,0),length(y,1)),
+            TransformOp::Translate3d(x,y,z) => VisualTransform::from_matrix(Matrix4::translate(length(x,0),length(y,1),length(z,2))),
+            TransformOp::Scale(x,y) => VisualTransform::Affine(Affine2::scale(*x,*y)),
+            TransformOp::Scale3d(x,y,z) => VisualTransform::from_matrix(Matrix4::scale(*x,*y,*z)),
+            TransformOp::Rotate(a) => VisualTransform::Affine(Affine2::rotate(*a)),
+            TransformOp::Rotate3d(x,y,z,a) => VisualTransform::from_matrix(Matrix4::rotate(*x,*y,*z,*a)),
+            TransformOp::Skew(x,y) => VisualTransform::Affine(Affine2::skew(*x,*y)),
+            TransformOp::Matrix(a) => VisualTransform::Affine(*a),
+            TransformOp::Matrix3d(m) => VisualTransform::from_matrix(*m),
+            TransformOp::Perspective(p) => VisualTransform::from_matrix(Matrix4::perspective(length(p,2))),
         };
         matrix = matrix.then(operation);
     }
     matrix
+}
+
+pub(crate) fn resolved_perspective_matrix(style: &crate::LayoutStyle, rect: &Rect) -> crate::VisualTransform {
+    let Some(crate::Dimension::Px(distance)) = style.perspective else { return crate::VisualTransform::IDENTITY; };
+    let (x,y) = style.perspective_origin.unwrap_or((crate::Dimension::Percent(0.5),crate::Dimension::Percent(0.5)));
+    crate::VisualTransform::from_matrix(crate::Matrix4::perspective(distance))
+        .around((rect.x+resolve_translate(x,rect.width),rect.y+resolve_translate(y,rect.height),0.))
+}
+
+/// Grouping properties force a preserve-3d element's used value to flat.
+pub(crate) fn preserves_3d(style: &crate::LayoutStyle) -> bool {
+    style.preserve_3d && !style.overflow_hidden && style.opacity.is_none_or(|o| o >= 1.)
+        && style.clip_path.is_none() && style.mask_image.is_none()
+        && style.containing_block_triggers & crate::CB_TRIGGER_FILTER == 0
+}
+
+pub(crate) fn local_visual_transform(tree: &DomTree, laid: &DomLayout, id: NodeId,
+    root_font_size: f32, viewport: (f32,f32)) -> crate::VisualTransform {
+    let own = laid.styles.get(&id).zip(laid.rects.get(&id))
+        .filter(|(style, _)| !style.ignores_used_box_sizes())
+        .map_or(crate::VisualTransform::IDENTITY, |(style,rect)|
+            resolved_transform_matrix(style,rect,root_font_size,viewport));
+    let camera = rendered_parent(tree,id).and_then(|p| laid.styles.get(&p).zip(laid.rects.get(&p)))
+        .map_or(crate::VisualTransform::IDENTITY, |(style,rect)| resolved_perspective_matrix(style,rect));
+    camera.then(own)
+}
+
+pub(crate) fn backface_culled(tree: &DomTree, laid: &DomLayout, id: NodeId,
+    root_font_size: f32, viewport: (f32,f32)) -> bool {
+    let mut node = Some(id);
+    while let Some(owner) = node {
+        let Some(style) = laid.styles.get(&owner) else { break; };
+        if !style.ignores_used_box_sizes() {
+            let matrix = local_visual_transform(tree, laid, owner, root_font_size, viewport);
+            if !matrix.is_identity() && !matrix.matrix().is_invertible() { return true; }
+        }
+        if !style.ignores_used_box_sizes() && style.backface_hidden && (owner == id || !preserves_3d(style)) {
+            let mut matrix = local_visual_transform(tree,laid,owner,root_font_size,viewport);
+            let mut parent = rendered_parent(tree,owner);
+            while let Some(p) = parent {
+                if !laid.styles.get(&p).is_some_and(preserves_3d) { break; }
+                matrix = local_visual_transform(tree,laid,p,root_font_size,viewport).then(matrix);
+                parent = rendered_parent(tree,p);
+            }
+            if matrix.matrix().back_facing() { return true; }
+        }
+        node = rendered_parent(tree,owner);
+    }
+    false
 }
 
 /// The CSS overflow clip is the padding box, not the outer border box. This is
@@ -4574,6 +4629,7 @@ pub fn computed_style_without_layout(
     let mut dark = false;
     let mut color = None;
     let mut pointer_events = false;
+    let mut visibility_hidden = false;
     let shadow_sheets = HashMap::new();
     let mut timeline = crate::AnimationTimelineState::default();
     let mut ancestor_display_none = false;
@@ -4605,6 +4661,8 @@ pub fn computed_style_without_layout(
         style.color = color;
         pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
         style.pointer_events_none = Some(pointer_events);
+        visibility_hidden = style.visibility_hidden.unwrap_or(visibility_hidden);
+        style.visibility_hidden = Some(visibility_hidden);
     }
     // Use the same outer-display fixup as layout, including transparent
     // display:contents ancestors and flex/grid items.
@@ -5675,6 +5733,13 @@ fn layout_dom_once(
                 // OWN computed font-size; resolve every relative length now.
                 let em_px = style.font_size.unwrap_or(parent_fs);
                 crate::style::set_grid_calc_context(style, em_px, root_fs, vw, vh);
+                for origin in [&mut style.transform_origin, &mut style.perspective_origin] {
+                    if let Some((x, y)) = origin {
+                        *x = x.resolve(em_px, root_fs, vw, vh);
+                        *y = y.resolve(em_px, root_fs, vw, vh);
+                    }
+                }
+                if let Some(z) = &mut style.transform_origin_z { *z = z.resolve(em_px, root_fs, vw, vh); }
                 if style.perspective_inherit {
                     style.perspective = inh.perspective;
                     style.perspective_expression = None;
@@ -5973,6 +6038,7 @@ fn layout_dom_once(
                     None => style.text_indent = Some(inh.text_indent),
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
+                style.visibility_hidden = Some(inh.visibility_hidden);
                 match style.pointer_events_none {
                     Some(value) => inh.pointer_events_none = value,
                     None => style.pointer_events_none = Some(inh.pointer_events_none),
@@ -7663,7 +7729,7 @@ fn layout_dom_once(
             &styles,
             &mut clip_rects,
             &mut translates,
-            crate::Affine2::IDENTITY,
+            crate::VisualTransform::IDENTITY,
             &mut transforms,
             root_font_size,
             viewport,
@@ -7797,7 +7863,7 @@ fn layout_dom_once(
                     &styles,
                     &mut clip_rects,
                     &mut translates,
-                    crate::Affine2::IDENTITY,
+                    crate::VisualTransform::IDENTITY,
                     &mut transforms,
                     root_font_size,
                     viewport,

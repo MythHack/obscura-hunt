@@ -100,6 +100,7 @@ pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
 pub use paint::{
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    decode_font_bytes, font_face_source_urls, font_data_url_bytes,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
@@ -583,6 +584,274 @@ impl Affine2 {
     }
 }
 
+/// CSS column-major homogeneous transform. The affine representation remains
+/// the common path; this value is used only when authored depth is present.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Matrix4(pub [f32; 16]);
+
+impl Matrix4 {
+    pub const IDENTITY: Self = Self([1.,0.,0.,0., 0.,1.,0.,0., 0.,0.,1.,0., 0.,0.,0.,1.]);
+
+    pub fn then(self, other: Self) -> Self {
+        let mut out = [0.; 16];
+        for column in 0..4 {
+            for row in 0..4 {
+                out[column * 4 + row] = (0..4)
+                    .map(|k| self.0[k * 4 + row] * other.0[column * 4 + k]).sum();
+            }
+        }
+        Self(out)
+    }
+
+    pub fn translate(x: f32, y: f32, z: f32) -> Self {
+        let mut out = Self::IDENTITY;
+        out.0[12] = x; out.0[13] = y; out.0[14] = z;
+        out
+    }
+
+    pub fn scale(x: f32, y: f32, z: f32) -> Self {
+        let mut out = Self::IDENTITY;
+        out.0[0] = x; out.0[5] = y; out.0[10] = z;
+        out
+    }
+
+    pub fn rotate(x: f32, y: f32, z: f32, angle: f32) -> Self {
+        let length = (f64::from(x).powi(2) + f64::from(y).powi(2) + f64::from(z).powi(2)).sqrt();
+        if length == 0. { return Self::IDENTITY; }
+        let (x, y, z) = ((f64::from(x) / length) as f32,
+            (f64::from(y) / length) as f32, (f64::from(z) / length) as f32);
+        let (s, c) = angle.to_radians().sin_cos();
+        let t = 1. - c;
+        Self([t*x*x+c, t*x*y+s*z, t*x*z-s*y, 0.,
+            t*x*y-s*z, t*y*y+c, t*y*z+s*x, 0.,
+            t*x*z+s*y, t*y*z-s*x, t*z*z+c, 0., 0.,0.,0.,1.])
+    }
+
+    pub fn perspective(distance: f32) -> Self {
+        let mut out = Self::IDENTITY;
+        out.0[11] = -1. / distance.max(1.);
+        out
+    }
+
+    pub fn from_affine(a: Affine2) -> Self {
+        Self([a.a,a.b,0.,0., a.c,a.d,0.,0., 0.,0.,1.,0., a.e,a.f,0.,1.])
+    }
+
+    pub fn affine(self) -> Option<Affine2> {
+        let m = self.0;
+        (m[2] == 0. && m[3] == 0. && m[6] == 0. && m[7] == 0.
+            && m[8] == 0. && m[9] == 0. && m[10] == 1. && m[11] == 0.
+            && m[14] == 0. && m[15] == 1.).then_some(Affine2 {
+                a:m[0], b:m[1], c:m[4], d:m[5], e:m[12], f:m[13],
+            })
+    }
+
+    pub(crate) fn homogeneous(self, x: f32, y: f32) -> [f64; 4] {
+        std::array::from_fn(|r| f64::from(self.0[r]) * f64::from(x)
+            + f64::from(self.0[4+r]) * f64::from(y) + f64::from(self.0[12+r]))
+    }
+
+    /// Authored singular 3D matrices suppress the entire element subtree even
+    /// when their z=0 homography alone could still be inverted. Internal CSS
+    /// flattening matrices are intentionally checked at a different boundary.
+    pub(crate) fn is_invertible(self) -> bool {
+        if let Some(matrix) = self.affine() { return matrix.inverse().is_some(); }
+        let mut rows = [[0_f64; 4]; 4];
+        for (r, row) in rows.iter_mut().enumerate() {
+            for (c, value) in row.iter_mut().enumerate() { *value = f64::from(self.0[c * 4 + r]); }
+        }
+        for c in 0..4 {
+            let pivot = (c..4).max_by(|a, b| rows[*a][c].abs().total_cmp(&rows[*b][c].abs())).unwrap();
+            if !rows[pivot][c].is_finite() || rows[pivot][c].abs() < 1.0e-12 { return false; }
+            rows.swap(c, pivot);
+            for r in c + 1..4 {
+                let scale = rows[r][c] / rows[c][c];
+                for k in c + 1..4 { rows[r][k] -= rows[c][k] * scale; }
+            }
+        }
+        true
+    }
+
+    /// CSS backface test: the inverse matrix's m33, not polygon winding.
+    /// A reflected 2D plane is not thereby a back face.
+    pub(crate) fn back_facing(self) -> bool {
+        let mut rows = [[0_f64; 8]; 4];
+        for r in 0..4 {
+            for c in 0..4 { rows[r][c] = f64::from(self.0[c*4+r]); }
+            rows[r][r+4] = 1.;
+        }
+        for c in 0..4 {
+            let pivot = (c..4).max_by(|a,b| rows[*a][c].abs().total_cmp(&rows[*b][c].abs())).unwrap();
+            if !rows[pivot][c].is_finite() || rows[pivot][c].abs() < 1.0e-12 { return false; }
+            rows.swap(c, pivot);
+            let scale = rows[c][c];
+            for k in 0..8 { rows[c][k] /= scale; }
+            for r in 0..4 {
+                if r == c { continue; }
+                let scale = rows[r][c];
+                for k in 0..8 { rows[r][k] -= rows[c][k] * scale; }
+            }
+        }
+        rows[2][6] < 0.
+    }
+}
+
+/// One visual source shared by CSSOM, pointer/caret geometry and composition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VisualTransform {
+    Affine(Affine2),
+    Projective(Matrix4),
+}
+
+impl Default for VisualTransform {
+    fn default() -> Self { Self::IDENTITY }
+}
+
+impl VisualTransform {
+    pub const IDENTITY: Self = Self::Affine(Affine2::IDENTITY);
+    pub fn from_matrix(matrix: Matrix4) -> Self {
+        matrix.affine().map_or(Self::Projective(matrix), Self::Affine)
+    }
+    pub fn matrix(self) -> Matrix4 {
+        match self { Self::Affine(a) => Matrix4::from_affine(a), Self::Projective(m) => m }
+    }
+    pub fn affine(self) -> Option<Affine2> {
+        match self { Self::Affine(a) => Some(a), Self::Projective(_) => None }
+    }
+    pub fn then(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Affine(a), Self::Affine(b)) => Self::Affine(a.then(b)),
+            _ => Self::from_matrix(self.matrix().then(other.matrix())),
+        }
+    }
+    pub fn translate(x: f32, y: f32) -> Self { Self::Affine(Affine2::translate(x,y)) }
+    pub fn is_identity(self) -> bool { self.affine().is_some_and(Affine2::is_identity) }
+    pub fn is_translation(self) -> bool { self.affine().is_some_and(Affine2::is_translation) }
+    pub fn around(self, origin: (f32,f32,f32)) -> Self {
+        Self::from_matrix(Matrix4::translate(origin.0,origin.1,origin.2))
+            .then(self).then(Self::from_matrix(Matrix4::translate(-origin.0,-origin.1,-origin.2)))
+    }
+    /// Flatten children in the element's local plane, before its own transform.
+    pub(crate) fn flatten_children(self) -> Self {
+        let mut flatten = Matrix4::IDENTITY;
+        flatten.0[10] = 0.;
+        self.then(Self::Projective(flatten))
+    }
+    pub fn inverse(self) -> Option<PlaneInverse> {
+        match self {
+            Self::Affine(a) => a.inverse().map(PlaneInverse::Affine),
+            Self::Projective(m) => {
+                let m = m.0;
+                let h = [f64::from(m[0]),f64::from(m[4]),f64::from(m[12]),
+                    f64::from(m[1]),f64::from(m[5]),f64::from(m[13]),
+                    f64::from(m[3]),f64::from(m[7]),f64::from(m[15])];
+                let adj = [h[4]*h[8]-h[5]*h[7],h[2]*h[7]-h[1]*h[8],h[1]*h[5]-h[2]*h[4],
+                    h[5]*h[6]-h[3]*h[8],h[0]*h[8]-h[2]*h[6],h[2]*h[3]-h[0]*h[5],
+                    h[3]*h[7]-h[4]*h[6],h[1]*h[6]-h[0]*h[7],h[0]*h[4]-h[1]*h[3]];
+                let determinant = h[0]*adj[0]+h[1]*adj[3]+h[2]*adj[6];
+                if !determinant.is_finite() || determinant.abs() < 1.0e-12 { return None; }
+                Some(PlaneInverse::Projective(adj.map(|v| v / determinant)))
+            }
+        }
+    }
+    pub fn project_rect(self, rect: Rect, clip: Option<Rect>) -> Option<ProjectedPolygon> {
+        if ![rect.x,rect.y,rect.width,rect.height].iter().all(|v| v.is_finite()) { return None; }
+        let corners = [(rect.x,rect.y),(rect.x+rect.width,rect.y),
+            (rect.x+rect.width,rect.y+rect.height),(rect.x,rect.y+rect.height)];
+        let mut points = [[0_f64;4]; 12];
+        let mut count = 4;
+        let m = self.matrix();
+        for (i,(x,y)) in corners.into_iter().enumerate() { points[i] = m.homogeneous(x,y); }
+        if points[..count].iter().flatten().any(|v| !v.is_finite()) { return None; }
+        // Clip in homogeneous coordinates before dividing at the camera plane.
+        // Optional destination clipping also precedes divide, bounding work
+        // without allocating an enormous near-camera intermediate surface.
+        let mut planes = [[0_f64;5];5];
+        planes[0] = [0.,0.,0.,1.,-1.0e-5];
+        let n = if let Some(c) = clip {
+            planes[1] = [1.,0.,0.,-f64::from(c.x),0.];
+            planes[2] = [-1.,0.,0.,f64::from(c.x+c.width),0.];
+            planes[3] = [0.,1.,0.,-f64::from(c.y),0.];
+            planes[4] = [0.,-1.,0.,f64::from(c.y+c.height),0.];
+            5
+        } else { 1 };
+        for plane in &planes[..n] {
+            if count == 0 { return None; }
+            let mut next = [[0_f64;4];12];
+            let mut size = 0;
+            let distance = |p: [f64;4]| (0..4).map(|i| p[i]*plane[i]).sum::<f64>() + plane[4];
+            for i in 0..count {
+                let a = points[i]; let b = points[(i+1)%count];
+                let da = distance(a); let db = distance(b);
+                if da >= 0. { next[size] = a; size += 1; }
+                if (da >= 0.) != (db >= 0.) {
+                    let t = da/(da-db);
+                    next[size] = std::array::from_fn(|k| a[k]+(b[k]-a[k])*t);
+                    size += 1;
+                }
+            }
+            points = next; count = size;
+        }
+        let mut polygon = ProjectedPolygon { points:[(0.,0.);12], len:count };
+        for (out,p) in polygon.points[..count].iter_mut().zip(&points[..count]) {
+            *out = ((p[0]/p[3]) as f32,(p[1]/p[3]) as f32);
+            if !out.0.is_finite() || !out.1.is_finite() { return None; }
+        }
+        Some(polygon)
+    }
+    pub fn map_rect(self, rect: Rect) -> Rect {
+        match self {
+            Self::Affine(a) => {
+                let out = a.map_rect(rect);
+                if [out.x,out.y,out.width,out.height].iter().all(|v| v.is_finite()) { out } else { Rect::default() }
+            }
+            Self::Projective(_) => self.project_rect(rect,None).map_or_else(Rect::default, |p| p.bounds()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PlaneInverse { Affine(Affine2), Projective([f64;9]) }
+impl PlaneInverse {
+    pub fn map_point(self, x: f32, y: f32) -> Option<(f32,f32)> {
+        let point = match self {
+            Self::Affine(a) => a.map_point(x,y),
+            Self::Projective(h) => {
+                let (x,y) = (f64::from(x),f64::from(y));
+                let w = h[6]*x+h[7]*y+h[8];
+                if !w.is_finite() || w.abs() < 1.0e-12 { return None; }
+                (((h[0]*x+h[1]*y+h[2])/w) as f32,((h[3]*x+h[4]*y+h[5])/w) as f32)
+            }
+        };
+        (point.0.is_finite() && point.1.is_finite()).then_some(point)
+    }
+}
+
+/// Convex visible border-plane polygon, with no heap allocation. A quad cut
+/// by the camera and viewport can have more than four vertices.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectedPolygon { points: [(f32,f32);12], len: usize }
+impl ProjectedPolygon {
+    pub fn points(&self) -> &[(f32,f32)] { &self.points[..self.len] }
+    pub fn bounds(&self) -> Rect {
+        let mut x = f32::INFINITY; let mut y = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY; let mut bottom = f32::NEG_INFINITY;
+        for &(px,py) in self.points() { x=x.min(px); y=y.min(py); right=right.max(px); bottom=bottom.max(py); }
+        Rect { x,y,width:(right-x).max(0.),height:(bottom-y).max(0.) }
+    }
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        if self.len < 3 { return false; }
+        let mut positive = false; let mut negative = false; let mut area = 0_f64;
+        for i in 0..self.len {
+            let a=self.points[i]; let b=self.points[(i+1)%self.len];
+            let cross = f64::from(b.0-a.0)*f64::from(y-a.1)-f64::from(b.1-a.1)*f64::from(x-a.0);
+            positive |= cross > 1.0e-5; negative |= cross < -1.0e-5;
+            area += f64::from(a.0)*f64::from(b.1)-f64::from(a.1)*f64::from(b.0);
+        }
+        !(positive && negative) && area.abs() > 1.0e-8
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TransformLength {
     pub value: Dimension,
@@ -604,10 +873,15 @@ impl TransformLength {
 #[derive(Clone, Debug)]
 pub enum TransformOp {
     Translate(TransformLength, TransformLength),
+    Translate3d(TransformLength, TransformLength, TransformLength),
     Scale(f32, f32),
+    Scale3d(f32, f32, f32),
     Rotate(f32),
+    Rotate3d(f32, f32, f32, f32),
     Skew(f32, f32),
     Matrix(Affine2),
+    Matrix3d(Matrix4),
+    Perspective(TransformLength),
 }
 
 impl Rect {
@@ -1627,12 +1901,13 @@ pub struct LayoutStyle {
     /// CSSOM computed lengths and unscaled box metrics divide by this value.
     pub(crate) effective_zoom: f32,
     pub(crate) zoom_lengths_scaled: bool,
-    /// Non-inherited computed `perspective`; `None` is the initial `none`.
-    /// The top-down pass resolves contextual lengths before containing blocks
-    /// are built. Perspective projection is not yet painted by the 2D renderer.
+    /// Non-inherited computed perspective camera for descendant planes.
     pub perspective: Option<Dimension>,
     pub(crate) perspective_expression: Option<String>,
     pub(crate) perspective_inherit: bool,
+    pub perspective_origin: Option<(Dimension, Dimension)>,
+    pub preserve_3d: bool,
+    pub backface_hidden: bool,
     /// Ordered operations in the non-inherited `transform` property. Length
     /// percentages remain unresolved until the final border box is known.
     pub transform_ops: Vec<TransformOp>,
@@ -1660,6 +1935,7 @@ pub struct LayoutStyle {
     /// Authored `transform-origin`, unresolved so percentages use the final
     /// border-box dimensions. `None` is the CSS initial value, 50% 50%.
     pub transform_origin: Option<(Dimension, Dimension)>,
+    pub transform_origin_z: Option<Dimension>,
     /// `box-shadow` (first layer only). Painted behind the element's own
     /// background/border box: cards, buttons, menus, and modals across the
     /// modern web rely on it for depth, and without it those elements paint
@@ -1777,7 +2053,9 @@ pub(crate) const CB_TRIGGER_ROTATE: u16 = 1 << 8;
 pub(crate) const CB_TRIGGER_SCALE: u16 = 1 << 9;
 
 impl LayoutStyle {
-    pub(crate) fn used_zoom(&self) -> f32 {
+    /// Scale converting computed CSS lengths into the retained used box units.
+    /// Border/padding and local projection coordinates already include it.
+    pub fn used_zoom(&self) -> f32 {
         if self.zoom_lengths_scaled { self.effective_zoom } else { 1.0 }
     }
 
@@ -1849,10 +2127,19 @@ impl LayoutStyle {
             for (x, y) in &mut clip.points { dimension(x); dimension(y); }
         }
         if let Some((x, y)) = &mut self.transform_origin { dimension(x); dimension(y); }
+        if let Some((x, y)) = &mut self.perspective_origin { dimension(x); dimension(y); }
+        if let Some(z) = &mut self.transform_origin_z { dimension(z); }
+        if let Some(p) = &mut self.perspective { dimension(p); }
         if let Some((x, y)) = &mut self.individual_translate { dimension(x); dimension(y); }
         for operation in &mut self.transform_ops {
             match operation {
                 TransformOp::Translate(x, y) => { dimension(&mut x.value); dimension(&mut y.value); }
+                TransformOp::Translate3d(x, y, z) => { dimension(&mut x.value); dimension(&mut y.value); dimension(&mut z.value); }
+                TransformOp::Perspective(p) => dimension(&mut p.value),
+                TransformOp::Matrix3d(matrix) => {
+                    matrix.0[12] *= factor; matrix.0[13] *= factor; matrix.0[14] *= factor;
+                    matrix.0[3] /= factor; matrix.0[7] /= factor; matrix.0[11] /= factor;
+                }
                 TransformOp::Matrix(matrix) => { matrix.e *= factor; matrix.f *= factor; }
                 _ => {}
             }

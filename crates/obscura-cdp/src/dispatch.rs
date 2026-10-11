@@ -4,6 +4,7 @@ use std::sync::Arc;
 use obscura_browser::{BrowserContext, Page};
 use obscura_browser::window::{WindowEvent, WindowInfo};
 use obscura_js::ops::InterceptedRequest;
+use obscura_js::runtime::CdpExecutionWorld;
 use serde_json::json;
 
 use crate::domains;
@@ -47,6 +48,23 @@ pub(crate) struct ExecutionContextRecord {
     pub origin: String,
     pub world_name: String,
     pub is_default: bool,
+    pub world: CdpExecutionWorld,
+    pub document_generation: u64,
+    pub grant_universal_access: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct NodeRecord {
+    pub page_id: String,
+    pub frame_id: u32,
+    pub document_generation: u64,
+    pub node_id: u32,
+}
+
+pub(crate) struct RegisteredPreloadScript {
+    pub session_id: String,
+    pub identifier: String,
+    pub script: obscura_browser::page::PreloadScript,
 }
 
 pub struct CdpContext {
@@ -80,7 +98,7 @@ pub struct CdpContext {
     native_windows: HashMap<String, WindowInfo>,
     native_navigation_generations: HashMap<String, u64>,
     pending_native_navigations: HashSet<String>,
-    pub preload_scripts: Vec<(String, String)>, // (identifier, source)
+    pub(crate) preload_scripts: Vec<RegisteredPreloadScript>,
     pub preload_counter: u32,
     // Which sessions asked for each `Runtime.addBinding` name. A binding is a
     // session-scoped subscription in CDP, and a client discards any event whose
@@ -93,29 +111,15 @@ pub struct CdpContext {
     pub runtime_enabled_sessions: HashSet<String>,
     /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
     pub(crate) lifecycle_enabled_sessions: HashSet<String>,
-    // Legacy direct-embedder configuration. Protocol-created worlds live only
-    // in `page_isolated_worlds`, so this vector does not grow with page churn.
-    pub isolated_worlds: Vec<String>,
-    // Set of allocated executionContextIds. An id is routable for an attached
-    // session only when `execution_contexts` also records the owning page.
-    //
-    // Runtime.evaluate / Runtime.callFunctionOn consult this set to reject
-    // requests targeting an unknown context — matching real Chrome's
-    // "Cannot find context with specified id" CDP error and unblocking the
-    // Playwright locator path described in issue #51.
+    // Context ids are monotonic and valid only with an owning native document.
     pub valid_context_ids: HashSet<i64>,
-    // Monotonic counter for isolated-world execution context ids. Issue #192:
-    // both `Page.createIsolatedWorld` and `do_navigate` used to hardcode id
-    // 100, so re-creating a context (e.g. Playwright opening a second page or
-    // re-navigating) silently emitted the same id twice and the client's
-    // bookkeeping diverged from the server's. Each fresh isolated context now
-    // claims and increments from this counter so the ids real Chrome would
-    // emit (incrementing, never reused) are mirrored.
-    pub next_isolated_context_id: i64,
     next_default_context_id: i64,
     execution_contexts: HashMap<i64, ExecutionContextRecord>,
     page_contexts: HashMap<String, Vec<i64>>,
-    page_isolated_worlds: HashMap<String, Vec<String>>,
+    page_isolated_worlds: HashMap<String, Vec<(String, bool)>>,
+    pub(crate) backend_nodes: HashMap<u64, NodeRecord>,
+    pub(crate) backend_node_ids: HashMap<NodeRecord, u64>,
+    pub(crate) next_backend_node_id: u64,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
@@ -207,13 +211,14 @@ impl CdpContext {
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
-            isolated_worlds: Vec::new(),
             valid_context_ids,
-            next_isolated_context_id: 100,
             next_default_context_id: 1,
             execution_contexts: HashMap::new(),
             page_contexts: HashMap::new(),
             page_isolated_worlds: HashMap::new(),
+            backend_nodes: HashMap::new(),
+            backend_node_ids: HashMap::new(),
+            next_backend_node_id: 1u64 << 32,
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -239,21 +244,6 @@ impl CdpContext {
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
-    /// Claim the next isolated-world execution context id and register it as
-    /// valid for `Runtime.evaluate`/`callFunctionOn`. Issue #192.
-    pub fn next_isolated_context(&mut self) -> i64 {
-        while self.valid_context_ids.contains(&self.next_isolated_context_id)
-            || self.execution_contexts.contains_key(&self.next_isolated_context_id)
-        {
-            self.next_isolated_context_id = self.next_isolated_context_id.checked_add(1)
-                .expect("execution context id space exhausted");
-        }
-        let id = self.next_isolated_context_id;
-        self.next_isolated_context_id = id.checked_add(1)
-            .expect("execution context id space exhausted");
-        self.valid_context_ids.insert(id);
-        id
-    }
 
     pub fn create_page(&mut self) -> String {
         self.create_page_in_context(None)
@@ -596,6 +586,7 @@ impl CdpContext {
         self.current_loader_ids.remove(id);
         self.nav_events_emitted.remove(id);
         self.announced_frames.borrow_mut().remove(id);
+        self.preload_scripts.retain(|script| !removed_sessions.contains(&script.session_id));
         self.binding_sessions.retain(|_, owners| {
             owners.retain(|owner| !removed_sessions.contains(owner));
             !owners.is_empty()
@@ -620,7 +611,22 @@ impl CdpContext {
             }
         }
         self.page_isolated_worlds.remove(id);
+        self.backend_nodes.retain(|_, node| node.page_id != id);
+        self.backend_node_ids.retain(|node, _| node.page_id != id);
         self.sessions.retain(|_, v| v != id);
+    }
+
+    pub(crate) fn preload_scripts_for_page(&self, page_id: &str) -> Vec<obscura_browser::page::PreloadScript> {
+        self.preload_scripts.iter().filter(|script| {
+            self.sessions.get(&script.session_id).is_some_and(|owner| owner == page_id)
+        }).map(|script| script.script.clone()).collect()
+    }
+
+    pub(crate) fn refresh_preload_scripts(&mut self, page_id: &str) {
+        let scripts = self.preload_scripts_for_page(page_id);
+        if let Some(page) = self.get_page_mut(page_id) {
+            page.set_preload_scripts(scripts);
+        }
     }
 
     fn allocate_context(
@@ -630,6 +636,9 @@ impl CdpContext {
         origin: &str,
         world_name: &str,
         is_default: bool,
+        world: CdpExecutionWorld,
+        document_generation: u64,
+        grant_universal_access: bool,
     ) -> ExecutionContextRecord {
         while self.valid_context_ids.contains(&self.next_default_context_id)
             || self.execution_contexts.contains_key(&self.next_default_context_id)
@@ -648,6 +657,9 @@ impl CdpContext {
             origin: origin.to_string(),
             world_name: world_name.to_string(),
             is_default,
+            world,
+            document_generation,
+            grant_universal_access,
         };
         self.valid_context_ids.insert(id);
         self.execution_contexts.insert(id, context.clone());
@@ -656,26 +668,61 @@ impl CdpContext {
     }
 
     pub(crate) fn ensure_default_context(&mut self, page_id: &str) -> Option<ExecutionContextRecord> {
-        let frame_id = self.get_page(page_id)?.frame_id.clone();
+        let page = self.get_page_mut(page_id)?;
+        let initialized = !page.has_js();
+        if initialized { page.resume_js(); }
+        let js = page.js.as_ref()?;
+        let generation = js.cdp_document_generation(0).ok()?;
+        let frame_id = page.frame_id.clone();
+        if initialized {
+            // Materializing the current blank document is not a navigation.
+            // Its native install receipt must not retire the context returned
+            // by createIsolatedWorld at the end of this same CDP command.
+            self.record_native_navigation(page_id);
+        }
         if let Some(context) = self.contexts_for_page(page_id).find(|context| context.is_default && context.frame_id == frame_id) {
             return Some(context.clone());
         }
         let page = self.get_page(page_id)?;
         let frame_id = page.frame_id.clone();
         let origin = page.url_string();
-        Some(self.allocate_context(page_id, &frame_id, &origin, "", true))
+        Some(self.allocate_context(page_id, &frame_id, &origin, "", true, CdpExecutionWorld::default(), generation, false))
     }
 
     pub(crate) fn ensure_child_default_contexts(&mut self, page_id: &str) -> Vec<ExecutionContextRecord> {
         let Some(page) = self.get_page(page_id) else { return Vec::new() };
         let children = page.frames.iter()
             .filter(|frame| page.live_frame_owner(frame.frame_id()).is_some())
-            .map(|frame| (domains::page::child_frame_id(&page.frame_id, frame.frame_id()), frame.origin().to_string()))
+            .map(|frame| (domains::page::child_frame_id(&page.frame_id, frame.frame_id()), frame.origin().to_string(), frame.frame_id()))
             .collect::<Vec<_>>();
         let mut created = Vec::new();
-        for (frame_id, origin) in children {
+        for (frame_id, origin, native_id) in children {
             if !self.contexts_for_page(page_id).any(|context| context.is_default && context.frame_id == frame_id) {
-                created.push(self.allocate_context(page_id, &frame_id, &origin, "", true));
+                let generation = self.get_page(page_id).and_then(|page| page.js.as_ref())
+                    .and_then(|js| js.cdp_document_generation(native_id).ok());
+                if let Some(generation) = generation {
+                    created.push(self.allocate_context(page_id, &frame_id, &origin, "", true,
+                        CdpExecutionWorld { frame_id: native_id, world_id: None }, generation, false));
+                }
+            }
+        }
+        let names = self.preload_scripts.iter().filter(|script| {
+            self.sessions.get(&script.session_id).is_some_and(|owner| owner == page_id)
+        }).map(|script| script.script.world_name.clone())
+            .filter(|name| !name.is_empty()).collect::<HashSet<_>>();
+        let documents = self.get_page(page_id).map(|page| {
+            let mut documents = vec![(page.frame_id.clone(), page.url_string(), true)];
+            documents.extend(page.frames.iter().filter(|frame| page.live_frame_owner(frame.frame_id()).is_some())
+                .map(|frame| (domains::page::child_frame_id(&page.frame_id, frame.frame_id()), frame.origin().to_string(), false)));
+            documents
+        }).unwrap_or_default();
+        for (frame_id, origin, persist) in documents {
+            for name in &names {
+                match self.create_isolated_context(page_id, &frame_id, &origin, name, persist, false) {
+                    Ok((context, true)) => created.push(context),
+                    Ok(_) => {},
+                    Err(error) => tracing::warn!("Named preload context: {error}"),
+                }
             }
         }
         created
@@ -694,20 +741,22 @@ impl CdpContext {
                 self.valid_context_ids.remove(&id);
             }
         }
-        let mut contexts = vec![self.allocate_context(page_id, frame_id, origin, "", true)];
-        let mut worlds = self.isolated_worlds.clone();
-        if let Some(page_worlds) = self.page_isolated_worlds.get(page_id) {
-            for world in page_worlds {
-                if !worlds.contains(world) {
-                    worlds.push(world.clone());
-                }
+        self.backend_nodes.retain(|_, node| node.page_id != page_id);
+        self.backend_node_ids.retain(|node, _| node.page_id != page_id);
+        let Some(page) = self.get_page_mut(page_id) else { return Vec::new() };
+        if !page.has_js() { page.resume_js(); }
+        let Some(generation) = page.js.as_ref().and_then(|js| js.cdp_document_generation(0).ok()) else {
+            return Vec::new();
+        };
+        let mut contexts = vec![self.allocate_context(page_id, frame_id, origin, "", true,
+            CdpExecutionWorld::default(), generation, false)];
+        let worlds = self.page_isolated_worlds.get(page_id).cloned().unwrap_or_default();
+        for (world, grant) in worlds {
+            match self.create_isolated_context(page_id, frame_id, origin, &world, true, grant) {
+                Ok((context, true)) => contexts.push(context),
+                Ok(_) => {},
+                Err(error) => tracing::warn!("Isolated context after navigation: {error}"),
             }
-        }
-        if worlds.is_empty() {
-            worlds.push("__puppeteer_utility_world__24.40.0".to_string());
-        }
-        for world in worlds {
-            contexts.push(self.allocate_context(page_id, frame_id, origin, &world, false));
         }
         contexts
     }
@@ -735,21 +784,34 @@ impl CdpContext {
         origin: &str,
         world_name: &str,
         persist_across_navigation: bool,
-    ) -> (ExecutionContextRecord, bool) {
+        grant_universal_access: bool,
+    ) -> Result<(ExecutionContextRecord, bool), String> {
+        let (world, generation) = {
+            let page = self.get_page_mut(page_id).ok_or("No page")?;
+            let native_id = domains::page::native_frame_id(page, frame_id)?;
+            let world_id = page.ensure_isolated_world(native_id, world_name, grant_universal_access)?;
+            let generation = page.js.as_ref().ok_or("No JavaScript runtime")?.cdp_document_generation(native_id)?;
+            (CdpExecutionWorld { frame_id: native_id, world_id: Some(world_id) }, generation)
+        };
         if !world_name.is_empty() {
-            if let Some(existing) = self.contexts_for_page(page_id).find(|context| {
-                !context.is_default && context.frame_id == frame_id && context.world_name == world_name
-            }) {
-                return (existing.clone(), false);
-            }
             if persist_across_navigation {
                 let worlds = self.page_isolated_worlds.entry(page_id.to_string()).or_default();
-                if !worlds.iter().any(|world| world == world_name) {
-                    worlds.push(world_name.to_string());
+                if let Some((_, grant)) = worlds.iter_mut().find(|(world, _)| world == world_name) {
+                    *grant |= grant_universal_access;
+                } else {
+                    worlds.push((world_name.to_string(), grant_universal_access));
                 }
             }
+            let existing_id = self.contexts_for_page(page_id).find(|context| {
+                !context.is_default && context.world == world && context.document_generation == generation
+            }).map(|context| context.id);
+            if let Some(id) = existing_id {
+                let existing = self.execution_contexts.get_mut(&id).ok_or("Cannot find live context")?;
+                existing.grant_universal_access |= grant_universal_access;
+                return Ok((existing.clone(), false));
+            }
         }
-        (self.allocate_context(page_id, frame_id, origin, world_name, false), true)
+        Ok((self.allocate_context(page_id, frame_id, origin, world_name, false, world, generation, grant_universal_access), true))
     }
 
     pub(crate) fn default_context_id(&self, page_id: &str) -> Option<i64> {
@@ -768,6 +830,10 @@ impl CdpContext {
             .filter(|id| self.execution_contexts.get(id)
                 .is_some_and(|context| context.frame_id == frame_id))
             .collect::<Vec<_>>();
+        let native_frames = removed.iter().filter_map(|id| self.execution_contexts.get(id))
+            .map(|context| context.world.frame_id).collect::<HashSet<_>>();
+        self.backend_nodes.retain(|_, node| node.page_id != page_id || !native_frames.contains(&node.frame_id));
+        self.backend_node_ids.retain(|node, _| node.page_id != page_id || !native_frames.contains(&node.frame_id));
         if let Some(contexts) = self.page_contexts.get_mut(page_id) {
             contexts.retain(|id| !removed.contains(id));
         }
@@ -837,7 +903,8 @@ mod context_ownership_tests {
                 "about:blank",
                 &format!("world-{cycle}"),
                 true,
-            );
+                false,
+            ).unwrap();
             ctx.remove_page(&page_id);
 
             assert!(ctx.execution_contexts.is_empty());
@@ -849,25 +916,14 @@ mod context_ownership_tests {
         }
     }
 
-    #[test]
-    fn isolated_compatibility_ids_are_not_claimed_as_default_realm_routes() {
-        let mut ctx = CdpContext::new();
-        let isolated = ctx.next_isolated_context();
-
-        assert!(ctx.valid_context_ids.contains(&isolated));
-        assert!(ctx.context_by_id(isolated).is_none());
-    }
 
     #[test]
-    fn default_and_isolated_allocators_do_not_collide_past_one_thousand_ids() {
+    fn context_allocator_does_not_reuse_ids_past_one_thousand_contexts() {
         let mut ctx = CdpContext::new();
         let mut ids = HashSet::new();
         for index in 0..1_200 {
-            let id = if index % 2 == 0 {
-                ctx.allocate_context("page", "frame", "about:blank", "", true).id
-            } else {
-                ctx.next_isolated_context()
-            };
+            let id = ctx.allocate_context("page", "frame", "about:blank", "", index % 2 == 0,
+                CdpExecutionWorld::default(), 0, false).id;
             assert!(ids.insert(id), "duplicate execution context id {id}");
         }
         assert_eq!(ids.len(), 1_200);
@@ -887,9 +943,9 @@ mod context_ownership_tests {
                 &first,
                 &format!("https://example.test/{generation}"),
             );
-            assert_eq!(contexts.len(), 2);
-            assert_eq!(ctx.page_contexts[&first].len(), 2);
-            assert_eq!(ctx.execution_contexts.len(), 3);
+            assert_eq!(contexts.len(), 1);
+            assert_eq!(ctx.page_contexts[&first].len(), 1);
+            assert_eq!(ctx.execution_contexts.len(), 2);
             assert_eq!(ctx.default_context_id(&second), Some(sibling_id));
         }
     }
@@ -899,20 +955,10 @@ mod context_ownership_tests {
         let mut ctx = CdpContext::new();
         let page = ctx.create_page();
         let main = ctx.ensure_default_context(&page).unwrap();
-        let child = ctx.create_isolated_context(
-            &page,
-            "child-frame",
-            "https://example.test/child",
-            "utility",
-            false,
-        ).0;
-        let sibling = ctx.create_isolated_context(
-            &page,
-            "sibling-frame",
-            "https://example.test/sibling",
-            "utility",
-            false,
-        ).0;
+        let child = ctx.allocate_context(&page, "child-frame", "https://example.test/child", "utility", false,
+            CdpExecutionWorld { frame_id: 1, world_id: Some(1) }, 0, false);
+        let sibling = ctx.allocate_context(&page, "sibling-frame", "https://example.test/sibling", "utility", false,
+            CdpExecutionWorld { frame_id: 2, world_id: Some(2) }, 0, false);
 
         let removed = ctx.remove_frame_contexts(&page, "child-frame");
 

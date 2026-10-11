@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
 use obscura_js::ops::{max_live_frames, NavigationTiming};
-use obscura_js::runtime::ObscuraJsRuntime;
+use obscura_js::runtime::{CdpExecutionWorld, ObscuraJsRuntime};
 use obscura_js::window::{WindowEvent, WindowId, WindowInfo, WindowNavigation};
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -15,6 +15,13 @@ use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+
+/// A document-start script and the native world in which it must execute.
+#[derive(Clone, Debug)]
+pub struct PreloadScript {
+    pub source: String,
+    pub world_name: String,
+}
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
@@ -322,7 +329,7 @@ pub struct Page {
     response_bodies: std::collections::HashMap<String, StoredResponseBody>,
     response_body_order: std::collections::VecDeque<String>,
     network_event_counter: u32,
-    mouse_gesture_frame: Option<u32>,
+    mouse_gesture_frame: Option<(u32, u64, u64, Vec<(u32, u32, obscura_dom::NodeId, u64)>)>,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
@@ -331,7 +338,7 @@ pub struct Page {
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
     // `exposeFunction` bindings exist before inline `<script>` tags execute.
-    preload_scripts: Vec<String>,
+    preload_scripts: Vec<PreloadScript>,
     /// Whether at least one attached CDP session enabled the Runtime domain.
     /// Page-owned so the subscription survives replacement of the JS runtime
     /// during navigation.
@@ -388,7 +395,7 @@ struct PageWindowSettings {
     intercept_block_patterns: Vec<String>,
     blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
-    preload_scripts: Vec<String>,
+    preload_scripts: Vec<PreloadScript>,
     runtime_events_enabled: bool,
     console_messages_enabled: bool,
     callbacks: Arc<CallbackRegistry>,
@@ -1313,6 +1320,7 @@ impl Page {
             let info = runtime.window_info();
             let mut settings = info.opener_id.and_then(|opener| group.settings.get(&opener))
                 .cloned().unwrap_or_else(|| own_settings.clone());
+            settings.preload_scripts.clear();
             settings.history.clear();
             settings.history.push("about:blank".to_string());
             settings.history_index = 0;
@@ -1333,7 +1341,11 @@ impl Page {
             self.window_settings()
         } else {
             self.window_group.as_ref().and_then(|group| group.borrow().settings.get(&id).cloned())
-                .unwrap_or_else(|| self.window_settings())
+                .unwrap_or_else(|| {
+                    let mut settings = self.window_settings();
+                    settings.preload_scripts.clear();
+                    settings
+                })
         };
         let mut page = Self::with_native_window(info.target_id, self.context.clone(), id, None, Some(self));
         page.apply_window_settings(settings);
@@ -1702,8 +1714,16 @@ impl Page {
                 // New-document scripts must be installed before the published
                 // child context can be observed, including while its external
                 // scripts are still loading.
-                for source in &self.preload_scripts {
-                    if let Err(error) = realm.execute_script(js, source) {
+                for script in &self.preload_scripts {
+                    let result = if script.world_name.is_empty() {
+                        realm.execute_script(js, &script.source)
+                    } else {
+                        js.ensure_isolated_world(frame.frame_id, &script.world_name, false)
+                            .and_then(|world_id| js.execute_script_in_cdp_frame(CdpExecutionWorld {
+                                frame_id: frame.frame_id, world_id: Some(world_id),
+                            }, "<preload>", &script.source))
+                    };
+                    if let Err(error) = result {
                         tracing::debug!("frame {} preload failed: {error}", frame.url);
                     }
                 }
@@ -2070,92 +2090,189 @@ impl Page {
         self.js.as_ref().map(|js| js.network_frame_registry())
     }
 
+    /// Retained box-model quads in the top page viewport, including every
+    /// live embedding owner's content offset, zoom, transform and scroll.
+    pub fn native_node_box_model(&mut self, frame_id: u32, node: obscura_dom::NodeId)
+        -> Result<Option<obscura_js::runtime::NativeNodeBoxModel>, String>
+    {
+        #[cfg(feature = "render")]
+        {
+            let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
+            let chain = js.frame_owner_chain(frame_id).ok_or("Node frame owner is stale")?;
+            let Some(mut model) = js.native_node_box_model(frame_id, node)? else { return Ok(None) };
+            let mut current = frame_id;
+            for &(child, parent, _, _) in &chain {
+                if child != current { return Err("Node frame owner chain is invalid".to_string()); }
+                for quad in [&mut model.content, &mut model.padding, &mut model.border, &mut model.margin] {
+                    for point in quad {
+                        let Some(mapped) = js.direct_child_to_parent_point(child, point.0, point.1)? else { return Ok(None) };
+                        *point = mapped;
+                    }
+                }
+                current = parent;
+            }
+            if current != 0 || js.frame_owner_chain(frame_id).as_ref() != Some(&chain) {
+                return Err("Node frame owner is stale".to_string());
+            }
+            Ok(Some(model))
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = (frame_id, node);
+            Err("Native node geometry requires rendering support".to_string())
+        }
+    }
+
+    fn cancel_mouse_gesture(&mut self) {
+        if let Some((frame, _, _, _)) = self.mouse_gesture_frame.take() {
+            let _ = self.dispatch_native_input_in_frame(frame, &serde_json::json!({ "kind": "cancelMouse" }));
+        }
+    }
+
     pub fn mouse_event_frame(&mut self, event_type: &str, x: f64, y: f64)
         -> Result<(u32, f64, f64, Option<u32>), String>
     {
-        if self.mouse_gesture_frame.is_some_and(|id| id != 0 && self.live_frame_owner(id).is_none()) {
-            self.mouse_gesture_frame = None;
-            return Err("Mouse gesture frame owner is stale".to_string());
+        if !x.is_finite() || !y.is_finite() {
+            self.cancel_mouse_gesture();
+            return Err("Mouse coordinates must be finite".to_string());
+        }
+        if let Some((pressed_frame, root_generation, leaf_generation, chain)) = &self.mouse_gesture_frame {
+            let js = self.js.as_ref().ok_or("JavaScript runtime unavailable")?;
+            if js.window_document_generation() != *root_generation
+                || js.cdp_document_generation(*pressed_frame).ok() != Some(*leaf_generation)
+                || js.frame_owner_chain(*pressed_frame).as_ref() != Some(chain)
+            {
+                self.cancel_mouse_gesture();
+                return Err("Mouse gesture frame owner is stale".to_string());
+            }
         }
         #[cfg(feature = "render")]
-        let hit = {
+        let hit: Result<(u32, f64, f64, Option<u32>), String> = {
             let js = self.js.as_mut().ok_or("JavaScript runtime unavailable")?;
-            let node = js.native_hit_test(0, x, y)?;
-            let child = js.network_frame_registry().borrow().live_frame_owners().into_iter()
-                .find_map(|(id, parent, owner)| (parent == 0 && Some(owner) == node).then_some(id));
-            if let Some(frame_id) = child {
-                if !self.frames.iter().any(|frame| frame.frame_id() == frame_id) {
-                    return Err("Child frame context is not ready for input".to_string());
+            let mut frame_id = 0;
+            let (mut local_x, mut local_y) = (x, y);
+            let mut depth = 0;
+            loop {
+                let node = js.native_hit_test(frame_id, local_x, local_y)?;
+                let child = self.frames.iter().find_map(|frame| {
+                    let child_id = frame.frame_id();
+                    js.live_frame_owner(child_id)
+                        .filter(|(parent, owner)| *parent == frame_id && Some(*owner) == node)
+                        .map(|_| child_id)
+                });
+                let Some(child_id) = child else {
+                    break Ok((frame_id, local_x, local_y, node.map(|id| id.index() as u32)));
+                };
+                if !self.frames.iter().any(|frame| frame.frame_id() == child_id) {
+                    break Err("Child frame context is not ready for input".to_string());
                 }
-                if let Some((local_x, local_y)) = js.direct_child_point(frame_id, x, y)? {
-                    let child_node = js.native_hit_test(frame_id, local_x, local_y)?
-                        .ok_or("Child frame has no native hit target")?;
-                    (frame_id, local_x, local_y, Some(child_node.index() as u32))
-                } else { (0, x, y, node.map(|id| id.index() as u32)) }
-            } else { (0, x, y, node.map(|id| id.index() as u32)) }
+                let Some(point) = js.direct_child_point(child_id, local_x, local_y)? else {
+                    break Ok((frame_id, local_x, local_y, node.map(|id| id.index() as u32)));
+                };
+                depth += 1;
+                if depth > max_live_frames() {
+                    break Err("Mouse frame owner chain is invalid".to_string());
+                }
+                frame_id = child_id;
+                (local_x, local_y) = point;
+            }
         };
         #[cfg(not(feature = "render"))]
-        let hit = {
+        let hit: Result<(u32, f64, f64, Option<u32>), String> = {
             if !self.frames.is_empty() {
-                return Err("Native child frame input requires rendering support".to_string());
+                Err("Native child frame input requires rendering support".to_string())
+            } else {
+                Ok((0, x, y, None))
             }
-            (0, x, y, None)
         };
-        if let Some(pressed_frame) = self.mouse_gesture_frame {
-            if pressed_frame != hit.0
-                || (pressed_frame != 0 && self.live_frame_owner(pressed_frame).is_none())
-            {
-                self.mouse_gesture_frame = None;
-                let _ = self.evaluate_in_native_frame(pressed_frame, "globalThis.__obscura_mouse_down = null");
+        let hit = match hit {
+            Ok(hit) => hit,
+            Err(error) => {
+                self.cancel_mouse_gesture();
+                return Err(error);
+            }
+        };
+        if let Some((pressed_frame, _, _, _)) = &self.mouse_gesture_frame {
+            if *pressed_frame != hit.0 {
+                self.cancel_mouse_gesture();
                 return Err("Mouse gesture frame owner changed or is obscured".to_string());
             }
         }
-        if event_type == "mousePressed" { self.mouse_gesture_frame = Some(hit.0); }
+        if event_type == "mousePressed" {
+            let chain = self.js.as_ref().and_then(|js| js.frame_owner_chain(hit.0))
+                .ok_or("Mouse gesture frame owner is stale")?;
+            let js = self.js.as_ref().ok_or("JavaScript runtime unavailable")?;
+            self.mouse_gesture_frame = Some((hit.0, js.window_document_generation(), js.cdp_document_generation(hit.0)?, chain));
+        }
         if event_type == "mouseReleased" { self.mouse_gesture_frame = None; }
         Ok(hit)
     }
 
-    pub fn object_frame_id(&self, object_id: &str) -> Result<u32, String> {
-        self.js.as_ref().ok_or("JavaScript runtime unavailable")?.object_frame_id(object_id)
+    pub fn object_world(&self, object_id: &str) -> Result<CdpExecutionWorld, String> {
+        self.js.as_ref().ok_or("JavaScript runtime unavailable")?.object_world(object_id)
     }
 
-    pub fn evaluate_in_native_frame(&mut self, frame_id: u32, expression: &str)
+    pub fn ensure_isolated_world(&mut self, frame_id: u32, name: &str, grant_universal_access: bool)
+        -> Result<u64, String>
+    {
+        if frame_id != 0 {
+            self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
+        }
+        if self.js.is_none() { self.init_js().map_err(|error| error.to_string())?; }
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
+            .ensure_isolated_world(frame_id, name, grant_universal_access)
+    }
+
+    pub fn dispatch_native_input(&mut self, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.dispatch_native_input_in_frame(0, payload)
+    }
+
+    pub fn dispatch_native_input_in_frame(&mut self, frame_id: u32, payload: &serde_json::Value)
         -> Result<serde_json::Value, String>
     {
         if frame_id != 0 && self.live_frame_owner(frame_id).is_none() {
             return Err("Cannot find live child frame context".to_string());
         }
         self.js.as_mut().ok_or("JavaScript runtime unavailable")?
-            .evaluate_in_cdp_frame(frame_id, expression)
+            .dispatch_native_input_in_frame(frame_id, payload)
+    }
+
+    pub fn evaluate_in_execution_world(&mut self, world: CdpExecutionWorld, expression: &str)
+        -> Result<serde_json::Value, String>
+    {
+        if world.frame_id != 0 && self.live_frame_owner(world.frame_id).is_none() {
+            return Err("Cannot find live child frame context".to_string());
+        }
+        self.js.as_mut().ok_or("JavaScript runtime unavailable")?
+            .evaluate_in_cdp_frame(world, expression)
     }
 
     pub async fn evaluate_for_cdp_in_frame(
-        &mut self, frame_id: u32, expression: &str, return_by_value: bool,
+        &mut self, world: CdpExecutionWorld, expression: &str, return_by_value: bool,
         await_promise: bool, timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        if frame_id == 0 {
-            return self.evaluate_for_cdp_with_timeout(expression, return_by_value, await_promise, timeout_ms).await;
+        if world.frame_id != 0 {
+            self.live_frame_owner(world.frame_id).ok_or("Cannot find live child frame context")?;
         }
-        self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
         let (mut js, generation) = self.take_evaluation_runtime()?;
         let result = self.await_with_window_work(js.evaluate_for_cdp_in_frame(
-            frame_id, expression, return_by_value, await_promise, timeout_ms,
+            world, expression, return_by_value, await_promise, timeout_ms,
         )).await;
         self.restore_evaluation_runtime(js, generation);
         result
     }
 
     pub async fn call_function_on_for_cdp_in_frame(
-        &mut self, frame_id: u32, declaration: &str, object_id: Option<&str>,
+        &mut self, world: CdpExecutionWorld, declaration: &str, object_id: Option<&str>,
         arguments: &[serde_json::Value], return_by_value: bool, await_promise: bool,
         timeout_ms: u64,
     ) -> Result<obscura_js::runtime::RemoteObjectInfo, String> {
-        if frame_id != 0 {
-            self.live_frame_owner(frame_id).ok_or("Cannot find live child frame context")?;
+        if world.frame_id != 0 {
+            self.live_frame_owner(world.frame_id).ok_or("Cannot find live child frame context")?;
         }
         let (mut js, generation) = self.take_evaluation_runtime()?;
         let result = self.await_with_window_work(js.call_function_on_for_cdp_in_frame(
-            frame_id, declaration, object_id, arguments, return_by_value, await_promise, timeout_ms,
+            world, declaration, object_id, arguments, return_by_value, await_promise, timeout_ms,
         )).await;
         self.restore_evaluation_runtime(js, generation);
         result
@@ -3078,8 +3195,8 @@ impl Page {
         // hits an undefined function and silently no-ops.
         let preload_sources = self.preload_scripts.clone();
         if let Some(js) = &mut self.js {
-            for source in &preload_sources {
-                if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
+            for script in &preload_sources {
+                if let Err(e) = Self::run_document_preload(js, 0, script) {
                     tracing::debug!("Preload script error: {}", e);
                 }
             }
@@ -3987,18 +4104,6 @@ impl Page {
         if url.scheme() == "about" {
             self.navigate_blank_document()?;
             if self.js.is_none() { self.init_js()?; }
-            // Preloads (Page.addScriptToEvaluateOnNewDocument, the
-            // Runtime.addBinding shim) must run on about:blank too —
-            // puppeteer's `browser.newPage()` lands on about:blank and
-            // a follow-up `exposeFunction` is unusable otherwise.
-            let preload_sources = self.preload_scripts.clone();
-            if let Some(js) = &mut self.js {
-                for source in &preload_sources {
-                    if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
-                        tracing::debug!("Preload script error on about:blank: {}", e);
-                    }
-                }
-            }
             return Ok(());
         }
 
@@ -4300,9 +4405,8 @@ impl Page {
     /// without an iframe skip the pumping entirely and pay one native selector
     /// query.
     async fn build_document_frames(&mut self) {
-        // How many rounds of "attach a frame, let it start its own" to follow.
-        // A frame can add a frame, so this needs a bound rather than a loop
-        // until quiet: a page that adds one on every turn would never finish.
+        // Bound actual frame-expansion rounds, not network polling turns.
+        // The existing navigation timeout also bounds callers without an outer deadline.
         const ROUNDS: usize = 8;
         const ROUND_MS: u64 = 50;
 
@@ -4313,13 +4417,17 @@ impl Page {
             return;
         }
 
-        for _ in 0..ROUNDS {
+        let deadline = tokio::time::Instant::now() + self.navigation_timeout();
+        let mut rounds = 0;
+        while rounds < ROUNDS && tokio::time::Instant::now() < deadline {
             if let Some(js) = &mut self.js {
                 // A Tokio timeout cannot interrupt synchronous microtasks.
                 // Use the same cooperative, watchdog-bounded pump as settling.
                 let _ = js.run_event_loop_bounded(ROUND_MS).await;
             }
-            if !self.advance_frames().await {
+            if self.advance_frames().await {
+                rounds += 1;
+            } else if !self.js.as_ref().is_some_and(|js| js.has_pending_network_requests()) {
                 break;
             }
         }
@@ -4345,7 +4453,14 @@ impl Page {
         self.content_type.clear();
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
-        if self.js.is_some() { self.init_js()?; }
+        if self.js.is_some() || !self.preload_scripts.is_empty() { self.init_js()?; }
+        if let Some(js) = &mut self.js {
+            for script in &self.preload_scripts {
+                if let Err(error) = Self::run_document_preload(js, 0, script) {
+                    tracing::debug!("Preload script error on about:blank: {error}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5268,12 +5383,18 @@ impl Page {
         }
     }
 
-    pub fn execute_preload_script(&mut self, source: &str) -> Result<(), String> {
-        if let Some(js) = &mut self.js {
-            js.execute_script("<preload>", source)
-        } else {
-            Err("No JS runtime".to_string())
-        }
+    fn run_document_preload(js: &mut ObscuraJsRuntime, frame_id: u32, script: &PreloadScript)
+        -> Result<(), String>
+    {
+        let world_id = if script.world_name.is_empty() { None } else {
+            Some(js.ensure_isolated_world(frame_id, &script.world_name, false)?)
+        };
+        js.execute_script_in_cdp_frame(CdpExecutionWorld { frame_id, world_id }, "<preload>", &script.source)
+    }
+
+    pub fn execute_preload_script(&mut self, frame_id: u32, script: &PreloadScript) -> Result<(), String> {
+        let js = self.js.as_mut().ok_or("No JS runtime")?;
+        Self::run_document_preload(js, frame_id, script)
     }
 
     pub fn suspend_js(&mut self) {
@@ -5398,7 +5519,7 @@ impl Page {
         self.remember_window_settings();
     }
 
-    pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
+    pub fn set_preload_scripts(&mut self, scripts: Vec<PreloadScript>) {
         self.preload_scripts = scripts;
         self.remember_window_settings();
     }
@@ -5407,7 +5528,7 @@ impl Page {
     /// `<script>` tags, matching CDP `Page.addScriptToEvaluateOnNewDocument`.
     /// Takes effect on the next navigation (`goto` / `navigate*`).
     pub fn add_preload_script(&mut self, script: &str) {
-        self.preload_scripts.push(script.to_string());
+        self.preload_scripts.push(PreloadScript { source: script.to_string(), world_name: String::new() });
         self.remember_window_settings();
     }
 

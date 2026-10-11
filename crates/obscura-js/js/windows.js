@@ -13,12 +13,12 @@ function _windowAccessDenied() {
   throw new DOMException('Blocked access to a cross-origin window.', 'SecurityError');
 }
 
-function _windowRelation(id, name) {
-  return _nativeWindowParse(__obscuraCore.ops.op_window_relation(id, name));
+function _windowRelation(id, name, realmId = undefined) {
+  return _nativeWindowParse(__obscuraCore.ops.op_window_relation(id, name, realmId));
 }
 
-function _windowTarget(id) {
-  const target = __obscuraCore.ops.op_window_target(id);
+function _windowTarget(id, realmId) {
+  const target = __obscuraCore.ops.op_window_target(id, realmId);
   if (!target) return _windowAccessDenied();
   return target;
 }
@@ -26,20 +26,13 @@ function _windowTarget(id) {
 function _windowSource(sourceRealmId) {
   const id = __obscuraCore.ops.op_window_source(sourceRealmId);
   if (!id) return null;
-  return _windowProxy(id);
+  return __obscuraCore.ops.op_window_realm_proxy(id, sourceRealmId, _windowProxy);
 }
 
-function _windowRelated(id, name) {
-  const relation = _windowRelation(id, name);
+function _windowRelated(id, name, realmId = undefined) {
+  const relation = _windowRelation(id, name, realmId);
   if (!relation.windowId) return null;
-  const root = _windowRelation(relation.windowId, 'self');
-  if (relation.realmId !== root.realmId) {
-    if (relation.realmId === _realmFrameId) return globalThis;
-    if (_realmFrameId && relation.realmId === _realmParentFrameId) return globalThis.parent;
-    return _frameWindowFor(relation.realmId)
-      || __obscuraCore.ops.op_window_realm_proxy(relation.windowId, relation.realmId);
-  }
-  return _windowProxy(relation.windowId);
+  return __obscuraCore.ops.op_window_realm_proxy(relation.windowId, relation.realmId, _windowProxy);
 }
 
 function _windowPostMessage(id, data, targetOrigin, transfer) {
@@ -50,9 +43,9 @@ function _windowPostMessage(id, data, targetOrigin, transfer) {
   __obscuraCore.ops.op_window_post_message(id, origin, data, transfer);
 }
 
-function _windowCrossOriginLocation(id) {
+function _windowCrossOriginLocation(id, realmId) {
   const replace = _markNative(function replace(url) {
-    __obscuraCore.ops.op_window_navigate(id, String(url), true);
+    __obscuraCore.ops.op_window_navigate(id, String(url), true, realmId);
   });
   return new Proxy(Object.create(null), {
     get(_target, key) {
@@ -62,7 +55,7 @@ function _windowCrossOriginLocation(id) {
     },
     set(_target, key, value) {
       if (key !== 'href') return _windowAccessDenied();
-      __obscuraCore.ops.op_window_navigate(id, String(value), false);
+      __obscuraCore.ops.op_window_navigate(id, String(value), false, realmId);
       return true;
     },
     has(_target, key) {
@@ -77,7 +70,7 @@ function _windowCrossOriginLocation(id) {
       if (key === 'replace') return { value: replace, writable: false, enumerable: true, configurable: true };
       if (key === 'href') return {
         get: _windowAccessDenied,
-        set(value) { __obscuraCore.ops.op_window_navigate(id, String(value), false); },
+        set(value) { __obscuraCore.ops.op_window_navigate(id, String(value), false, realmId); },
         enumerable: true, configurable: true,
       };
       return _windowAccessDenied();
@@ -90,24 +83,40 @@ function _windowCrossOriginLocation(id) {
   });
 }
 
-function _windowProxy(id, realmId = undefined) {
-  if (realmId !== undefined) {
-    if (realmId === _realmFrameId) return globalThis;
-    const frame = _frameWindowFor(realmId);
-    if (frame) return frame;
-    if (_windowRelation(id, 'self').realmId !== realmId) return null;
-  }
+function _windowProxy(id, realmId = undefined, backing = false) {
   if (!id) return null;
-  if (_nativeWindowRoot && id === _nativeWindowId) return globalThis;
-  let proxy = _nativeWindowProxies.get(id);
+  if (realmId === undefined && _nativeWindowRoot && id === _nativeWindowId) return globalThis;
+  const rootRealm = _windowRelation(id, 'self').realmId;
+  const targetRealm = realmId === undefined ? rootRealm : realmId;
+  const isRoot = targetRealm === rootRealm;
+  // Public facades belong to the caller's world. A native-authorized property
+  // access can request a private backing in the exact target's own world.
+  if (!backing && realmId !== undefined && targetRealm !== _realmFrameId) {
+    const frame = _frameWindowFor(targetRealm);
+    if (frame) return frame;
+  }
+  let entry = _nativeWindowProxies.get(targetRealm);
+  let proxy = entry && entry[backing ? 'backing' : 'proxy'];
   if (proxy) return proxy;
+  const target = () => backing ? globalThis : _windowTarget(id, targetRealm);
+  const sameOrigin = () => isRoot
+    ? __obscuraCore.ops.op_window_same_origin(id)
+    : __obscuraCore.ops.op_window_realm_same_origin(targetRealm);
+  const closed = () => isRoot
+    ? __obscuraCore.ops.op_window_closed(id)
+    : _windowRelation(id, 'self', targetRealm).realmId !== targetRealm;
   const postMessage = _markNative(function postMessage(data, targetOrigin, transfer) {
-    _windowPostMessage(id, data, targetOrigin, transfer);
+    if (isRoot && id !== __obscuraCore.ops.op_window_current()) {
+      _windowPostMessage(id, data, targetOrigin, transfer);
+    }
+    else _sendRealmMessage(targetRealm, data, targetOrigin);
   });
-  const close = _markNative(function close() { __obscuraCore.ops.op_window_close(id); });
+  const close = _markNative(function close() {
+    if (isRoot) __obscuraCore.ops.op_window_close(id);
+  });
   const focus = _markNative(function focus() {});
   const blur = _markNative(function blur() {});
-  const crossOriginLocation = _windowCrossOriginLocation(id);
+  const crossOriginLocation = _windowCrossOriginLocation(id, targetRealm);
   let nativeEval;
   function crossOriginValue(key) {
     if (_iframeCrossOriginSpecialKey(key)) return undefined;
@@ -118,23 +127,26 @@ function _windowProxy(id, realmId = undefined) {
       case 'close': return close;
       case 'focus': return focus;
       case 'blur': return blur;
-      case 'closed': return __obscuraCore.ops.op_window_closed(id);
+      case 'closed': return closed();
       case 'location': return crossOriginLocation;
-      case 'parent': case 'top': case 'opener': return _windowRelated(id, key);
-      case 'length': return _windowRelation(id, 'length').length;
+      case 'parent': case 'top': case 'opener':
+        return key === 'opener' && !isRoot ? null : _windowRelated(id, key, targetRealm);
+      case 'length': return _windowRelation(id, 'length', targetRealm).length;
     }
   }
   function get(key) {
-    if (key === 'closed') return __obscuraCore.ops.op_window_closed(id);
+    if (key === 'closed') return closed();
     if (key === 'postMessage') return postMessage;
     if (key === 'close') return close;
-    if (!__obscuraCore.ops.op_window_same_origin(id)) return crossOriginValue(key);
+    if (!sameOrigin()) return crossOriginValue(key);
     if (key === 'window' || key === 'self' || key === 'frames' || key === 'globalThis') return proxy;
-    if (key === 'parent' || key === 'top' || key === 'opener') return _windowRelated(id, key);
-    const real = _windowTarget(id);
+    if (key === 'parent' || key === 'top' || key === 'opener') {
+      return key === 'opener' && !isRoot ? null : _windowRelated(id, key, targetRealm);
+    }
+    const real = target();
     if (key === 'eval') {
       return nativeEval ||= _markNative(function(source) {
-        const current = _windowTarget(id);
+        const current = target();
         const value = Reflect.apply(current.eval, current, [source]);
         return value === current ? proxy : value;
       });
@@ -146,29 +158,29 @@ function _windowProxy(id, realmId = undefined) {
     get(_target, key) { return get(key); },
     set(_target, key, value) {
       if (key === 'location') {
-        __obscuraCore.ops.op_window_navigate(id, String(value), false);
+        __obscuraCore.ops.op_window_navigate(id, String(value), false, targetRealm);
         return true;
       }
-      const real = _windowTarget(id);
+      const real = target();
       return Reflect.set(real, key, value, real);
     },
     has(_target, key) {
-      if (!__obscuraCore.ops.op_window_same_origin(id)) {
+      if (!sameOrigin()) {
         if (_iframeCrossOriginKeySet.has(key) || _iframeCrossOriginSpecialKey(key)) return true;
         return _windowAccessDenied();
       }
-      return Reflect.has(_windowTarget(id), key);
+      return Reflect.has(target(), key);
     },
     ownKeys() {
-      return __obscuraCore.ops.op_window_same_origin(id)
-        ? Reflect.ownKeys(_windowTarget(id))
+      return sameOrigin()
+        ? Reflect.ownKeys(target())
         : _iframeCrossOriginKeys.concat('then', Symbol.toStringTag, Symbol.hasInstance, Symbol.isConcatSpreadable);
     },
     getOwnPropertyDescriptor(_target, key) {
-      if (!__obscuraCore.ops.op_window_same_origin(id)) {
+      if (!sameOrigin()) {
         return { value: crossOriginValue(key), writable: false, enumerable: true, configurable: true };
       }
-      const descriptor = Reflect.getOwnPropertyDescriptor(_windowTarget(id), key);
+      const descriptor = Reflect.getOwnPropertyDescriptor(target(), key);
       if (!descriptor) return undefined;
       if ('value' in descriptor) return { ...descriptor, value: get(key), configurable: true };
       return {
@@ -178,19 +190,20 @@ function _windowProxy(id, realmId = undefined) {
       };
     },
     defineProperty(_target, key, descriptor) {
-      const real = _windowTarget(id);
+      const real = target();
       // The backing target stays extensible so navigation can replace its realm.
       if (descriptor.configurable !== true) return false;
       return Reflect.defineProperty(real, key, descriptor);
     },
-    deleteProperty(_target, key) { return Reflect.deleteProperty(_windowTarget(id), key); },
+    deleteProperty(_target, key) { return Reflect.deleteProperty(target(), key); },
     getPrototypeOf() {
-      return __obscuraCore.ops.op_window_same_origin(id) ? Reflect.getPrototypeOf(_windowTarget(id)) : null;
+      return sameOrigin() ? Reflect.getPrototypeOf(target()) : null;
     },
-    setPrototypeOf(_target, prototype) { return Reflect.setPrototypeOf(_windowTarget(id), prototype); },
+    setPrototypeOf(_target, prototype) { return Reflect.setPrototypeOf(target(), prototype); },
     preventExtensions() { return false; },
   });
-  _nativeWindowProxies.set(id, proxy);
+  if (!entry) _nativeWindowProxies.set(targetRealm, entry = {});
+  entry[backing ? 'backing' : 'proxy'] = proxy;
   return proxy;
 }
 
@@ -219,17 +232,19 @@ function _deliverWindowMessage(data, origin, sourceWindowId, sourceRealmId) {
   const source = (!_nativeWindowRoot && sourceRealmId === _realmParentFrameId)
     ? globalThis.parent
     : (_frameWindowFor(sourceRealmId) || _windowSource(sourceRealmId)
-      || __obscuraCore.ops.op_window_realm_proxy(sourceWindowId, sourceRealmId));
+      || __obscuraCore.ops.op_window_realm_proxy(sourceWindowId, sourceRealmId, _windowProxy));
   _dispatchRealmMessage(data, origin, source);
 }
 
-function _registerNativeWindow(windowId) {
+function _registerNativeWindow(windowId, canonical) {
   if (_nativeWindowRegistered) return;
   _nativeWindowId = windowId || __obscuraCore.ops.op_window_current();
   const root = _windowRelation(_nativeWindowId, 'self');
   _nativeWindowRoot = root.realmId === _realmFrameId;
-  _nativeWindowMainRealm = __obscuraCore.ops.op_window_register(
-    _initializeNativeWindow, _windowProxy, _deliverWindowMessage);
+  if (canonical) {
+    _nativeWindowMainRealm = __obscuraCore.ops.op_window_register(
+      _initializeNativeWindow, _windowProxy, _deliverWindowMessage);
+  }
   _nativeWindowRegistered = true;
 }
 

@@ -116,6 +116,13 @@ impl Response {
     }
 }
 
+/// Fetch/HTTP ByteString values map each byte to the same Unicode code point.
+/// This is not UTF-8 decoding or the WHATWG windows-1252 `latin1` label.
+/// The existing decoder borrows ASCII and allocates once for obs-text.
+pub fn decode_response_header_value(bytes: &[u8]) -> String {
+    encoding_rs::mem::decode_latin1(bytes).into_owned()
+}
+
 /// Fold one response header line into the collected header map.
 ///
 /// A plain `HashMap` insert keeps only the *last* value when a response repeats
@@ -1600,7 +1607,7 @@ impl ObscuraHttpClient {
                 merge_response_header(
                     &mut response_headers,
                     k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_string(),
+                    decode_response_header_value(v.as_bytes()),
                 );
             }
 

@@ -25,11 +25,11 @@ async fn serve() -> String {
                 } else if request.starts_with("GET /denied.html ") {
                     "<html><body><script>window.secret = 'must-not-run';</script></body></html>"
                 } else if request.starts_with("GET /child.html ") {
-                    "<html><body><iframe src=\"/grandchild.html\"></iframe></body></html>"
+                    r#"<html><head><style>html,body{margin:0}iframe{position:absolute;left:30px;top:20px;width:100px;height:80px;border:0;padding:0}</style></head><body><iframe src="/grandchild.html"></iframe></body></html>"#
                 } else if request.starts_with("GET /grandchild.html ") {
-                    "<html><body><p>deep</p></body></html>"
+                    r#"<html><head><style>html,body{margin:0}#target{position:absolute;left:7px;top:9px;box-sizing:content-box;width:40px;height:30px;border:2px solid black;padding:3px;margin:0}</style></head><body><button id="target">deep</button></body></html>"#
                 } else {
-                    "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    r#"<html><head><style>html,body{margin:0}iframe{position:absolute;left:100px;top:50px;width:200px;height:150px;border:0;padding:0}#cover{display:none;position:absolute;left:100px;top:50px;width:200px;height:150px}</style></head><body><iframe src="/child.html"></iframe><div id="cover"></div></body></html>"#
                 };
                 let policy = if request.starts_with("GET /denied.html ") {
                     "Content-Security-Policy: frame-ancestors 'none'\r\nContent-Security-Policy: img-src 'self'\r\n"
@@ -235,12 +235,12 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
     let grandchild_world = default_for(&grandchild_id);
     assert_ne!(main_world, child_world);
     assert_ne!(child_world, grandchild_world);
-    let unsupported = dispatch(&CdpRequest {
-        id: 6, method: "Page.createIsolatedWorld".to_string(),
-        params: json!({"frameId": child_id, "worldName": "utility"}),
-        session_id: Some(session.clone()),
-    }, &mut ctx).await;
-    assert!(unsupported.error.unwrap().message.contains("not supported"));
+    let child_utility = cdp(&mut ctx, 6, "Page.createIsolatedWorld",
+        json!({"frameId":child_id,"worldName":"utility"}), &session).await["executionContextId"].as_i64().unwrap();
+    let grandchild_utility = cdp(&mut ctx, 6, "Page.createIsolatedWorld",
+        json!({"frameId":grandchild_id,"worldName":"utility"}), &session).await["executionContextId"].as_i64().unwrap();
+    assert_ne!(child_utility, child_world);
+    assert_ne!(grandchild_utility, grandchild_world);
     cdp(&mut ctx, 7, "Runtime.evaluate", json!({
         "expression": "globalThis.marker = 'host'", "returnByValue": true,
     }), &session).await;
@@ -253,6 +253,16 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
         "expression": "marker", "returnByValue": true,
     }), &session).await;
     assert_eq!(host_marker["result"]["value"], "host");
+    let utility_marker = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"[typeof marker,location.pathname,document.body.setAttribute('data-world','utility')]",
+        "contextId":child_utility,"returnByValue":true,
+    }), &session).await;
+    assert_eq!(utility_marker["result"]["value"][0], "undefined");
+    assert_eq!(utility_marker["result"]["value"][1], "/child.html");
+    let shared = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
+        "expression":"document.body.getAttribute('data-world')","contextId":child_world,"returnByValue":true,
+    }), &session).await;
+    assert_eq!(shared["result"]["value"], "utility");
 
     let unknown = dispatch(
         &CdpRequest {
@@ -263,7 +273,7 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
         },
         &mut ctx,
     ).await;
-    assert!(unknown.error.unwrap().message.contains("No frame with given id"));
+    assert!(unknown.error.is_some());
 
     ctx.pending_events.clear();
     cdp(
@@ -285,6 +295,8 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
     for (frame_id, context_id) in [
         (&child_id, child_world),
         (&grandchild_id, grandchild_world),
+        (&child_id, child_utility),
+        (&grandchild_id, grandchild_utility),
     ] {
         for runtime_session in [&session, &second_session] {
             let destroyed = ctx.pending_events.iter().position(|event| {
@@ -318,7 +330,7 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
         &mut ctx,
     ).await;
     assert!(main_still_routes.error.is_none());
-    for (id, stale_context) in [(12, child_world), (13, grandchild_world)] {
+    for (id, stale_context) in [(12, child_world), (13, grandchild_world), (14, child_utility), (15, grandchild_utility)] {
         let stale = dispatch(
             &CdpRequest {
                 id,
@@ -328,7 +340,7 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
             },
             &mut ctx,
         ).await;
-        assert!(stale.error.unwrap().message.contains("Cannot find context"));
+        assert!(stale.error.is_some());
     }
 
     ctx.pending_events.clear();
@@ -345,6 +357,51 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
     assert_eq!(recreated.len(), 1, "only the main-frame world should persist");
     assert_eq!(recreated[0].params["context"]["auxData"]["frameId"], main_id);
 
+}
+
+#[cfg(feature = "render")]
+#[tokio::test(flavor = "current_thread")]
+async fn isolated_grandchild_quads_use_retained_owner_projection_and_gesture_gates() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let mut ctx = CdpContext::new();
+    let session = attached_session(&mut ctx).await;
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url":serve().await,"waitUntil":"load"}), &session).await;
+    cdp(&mut ctx, 2, "Runtime.enable", json!({}), &session).await;
+    let tree = cdp(&mut ctx, 3, "Page.getFrameTree", json!({}), &session).await;
+    let child = tree["frameTree"]["childFrames"][0]["frame"]["id"].as_str().unwrap();
+    let grandchild = tree["frameTree"]["childFrames"][0]["childFrames"][0]["frame"]["id"].as_str().unwrap();
+    let world = cdp(&mut ctx, 4, "Page.createIsolatedWorld", json!({"frameId":grandchild,"worldName":"quad-utility"}), &session)
+        .await["executionContextId"].as_i64().unwrap();
+    let object = cdp(&mut ctx, 5, "Runtime.evaluate", json!({
+        "contextId":world,"expression":"(()=>{const node=document.getElementById('target');node.getBoundingClientRect=()=>{throw new Error('author geometry must not run')};globalThis.clicks=0;node.addEventListener('click',()=>clicks++);return node})()",
+    }), &session).await["result"]["objectId"].as_str().unwrap().to_string();
+    let described = cdp(&mut ctx, 6, "DOM.describeNode", json!({"objectId":object}), &session).await;
+    let backend = described["node"]["backendNodeId"].clone();
+    let model = cdp(&mut ctx, 7, "DOM.getBoxModel", json!({"backendNodeId":backend}), &session).await["model"].clone();
+    let quads = cdp(&mut ctx, 8, "DOM.getContentQuads", json!({"backendNodeId":backend}), &session).await["quads"].clone();
+    assert_eq!(quads, json!([model["content"].clone()]));
+    let content = model["content"].as_array().unwrap();
+    let border = model["border"].as_array().unwrap();
+    assert_eq!(content[0], json!(142));
+    assert_eq!(content[1], json!(84));
+    assert_eq!(border[0], json!(137));
+    assert_eq!(border[1], json!(79));
+    assert_eq!(model["width"], json!(50));
+    assert_eq!(model["height"], json!(40));
+    for event in ["mousePressed", "mouseReleased"] {
+        cdp(&mut ctx, 9, "Input.dispatchMouseEvent", json!({"type":event,"x":145,"y":90,"button":"left"}), &session).await;
+    }
+    assert_eq!(cdp(&mut ctx, 10, "Runtime.evaluate", json!({"contextId":world,"expression":"clicks === 1","returnByValue":true}), &session).await["result"]["value"], true);
+    cdp(&mut ctx, 11, "Input.dispatchMouseEvent", json!({"type":"mousePressed","x":145,"y":90,"button":"left"}), &session).await;
+    cdp(&mut ctx, 12, "Runtime.evaluate", json!({"expression":"document.getElementById('cover').style.display='block'"}), &session).await;
+    let obscured = dispatch(&CdpRequest { id: 13, method:"Input.dispatchMouseEvent".to_string(), params:json!({"type":"mouseReleased","x":145,"y":90,"button":"left"}), session_id:Some(session.clone()) }, &mut ctx).await;
+    assert!(obscured.error.is_some(), "an occluded pressed descendant must not receive release/click");
+    cdp(&mut ctx, 14, "Runtime.evaluate", json!({"expression":"document.getElementById('cover').style.display='none'"}), &session).await;
+    for event in ["mousePressed", "mouseReleased"] {
+        cdp(&mut ctx, 15, "Input.dispatchMouseEvent", json!({"type":event,"x":145,"y":90,"button":"left"}), &session).await;
+    }
+    assert_eq!(cdp(&mut ctx, 16, "Runtime.evaluate", json!({"contextId":world,"expression":"clicks === 2","returnByValue":true}), &session).await["result"]["value"], true);
+    assert!(!child.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

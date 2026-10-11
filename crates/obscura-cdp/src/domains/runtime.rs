@@ -1,6 +1,6 @@
 use obscura_browser::lifecycle::WaitUntil;
 use obscura_browser::page::PendingNavigationOutcome;
-use obscura_js::runtime::RemoteObjectInfo;
+use obscura_js::runtime::{CdpExecutionWorld, RemoteObjectInfo};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
@@ -168,7 +168,7 @@ pub async fn handle(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let frame_id = validate_context(params, "contextId", ctx, session_id, "evaluate")?.unwrap_or(0);
+            let world = validate_context(params, "contextId", ctx, session_id, "evaluate")?.unwrap_or_default();
 
             let await_promise = params
                 .get("awaitPromise")
@@ -190,7 +190,7 @@ pub async fn handle(
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
                 page.evaluate_for_cdp_in_frame(
-                    frame_id,
+                    world,
                     expression,
                     return_by_value,
                     await_promise,
@@ -231,14 +231,22 @@ pub async fn handle(
                 .map(|a| a.to_vec())
                 .unwrap_or_default();
 
-            let requested_frame = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
-            let object_frame = object_id.map(|id| {
-                ctx.get_session_page(session_id).ok_or_else(|| "No page".to_string())?.object_frame_id(id)
-            }).transpose()?;
-            if requested_frame.zip(object_frame).is_some_and(|(requested, object)| requested != object) {
+            let requested_world = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let object_world = object_id.map(|id| page.object_world(id)).transpose()?;
+            let mut argument_world = None;
+            for argument in &arguments {
+                let Some(id) = argument.get("objectId").and_then(Value::as_str) else { continue };
+                let candidate = page.object_world(id)?;
+                if argument_world.is_some_and(|world| world != candidate) {
+                    return Err("Object belongs to a different execution context".to_string());
+                }
+                argument_world = Some(candidate);
+            }
+            let world = requested_world.or(object_world).or(argument_world).unwrap_or_default();
+            if [requested_world, object_world, argument_world].into_iter().flatten().any(|candidate| candidate != world) {
                 return Err("Object belongs to a different execution context".to_string());
             }
-            let frame_id = requested_frame.or(object_frame).unwrap_or(0);
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -255,7 +263,7 @@ pub async fn handle(
             let info = match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
                 page.call_function_on_for_cdp_in_frame(
-                    frame_id,
+                    world,
                     function_declaration,
                     object_id,
                     &arguments,
@@ -279,129 +287,10 @@ pub async fn handle(
             Ok(evaluation_reply(&info))
         }
         "getProperties" => {
-            // Puppeteer's $$() flow:
-            //   1. evaluate querySelectorAll → handle for the NodeList
-            //   2. getProperties on that handle → indexed items
-            //   3. For each item, JSHandle.asElement() checks subtype === 'node';
-            //      if true, wraps as ElementHandle (with click/type/etc).
-            //
-            // Older impl returned the raw value via JSON, dropping the node
-            // identity. Items came back as `{type:'object'}` with no objectId
-            // and no subtype, so asElement returned null and the caller got
-            // plain JSHandles back from page.$$ -- breaking checkboxes[0].click().
-            //
-            // We now:
-            //   1. Walk the underlying object in JS, allocating a stable child
-            //      oid per (parent_oid + index) and stashing each value in
-            //      __obscura_objects so later callFunctionOn can resolve it.
-            //   2. Annotate each item with subtype:'node' + className when the
-            //      value has a numeric nodeType, so Puppeteer wraps it as
-            //      ElementHandle.
-            let object_id = params.get("objectId").and_then(|v| v.as_str());
-            if let Some(oid) = object_id {
-                let page = ctx
-                    .get_session_page_mut(session_id)
-                    .ok_or("No page")?;
-                let frame_id = page.object_frame_id(oid)?;
-                // The child ids minted below are `<parent>::<key>` and the key
-                // is a property name off a page object, so the page decides
-                // what ends up inside this literal. A JSON literal covers the
-                // C0 controls a manual quote/backslash pair leaves alone; see
-                // `util::object_id_literal`.
-                let oid_literal = crate::util::object_id_literal(oid);
-                let code = format!(
-                    "(function() {{\
-                        var obj = globalThis.__obscura_objects[{oid}];\
-                        if (!obj || typeof obj !== 'object') return [];\
-                        var keys = Object.keys(obj);\
-                        return keys.map(function(k) {{\
-                            var v = obj[k];\
-                            var t = typeof v;\
-                            var item = {{ name: k, type: t }};\
-                            if (v === null) {{ item.value = null; return item; }}\
-                            if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
-                            var childOid = {oid} + '::' + k;\
-                            globalThis.__obscura_objects[childOid] = v;\
-                            item.childOid = childOid;\
-                            if (typeof v.nodeType === 'number') {{\
-                                item.subtype = 'node';\
-                                item.className = v.constructor && v.constructor.name ? v.constructor.name : (v.tagName ? 'HTML' + v.tagName.charAt(0) + v.tagName.slice(1).toLowerCase() + 'Element' : 'Node');\
-                                item.description = v.tagName ? v.tagName.toLowerCase() : (v.nodeName || 'node');\
-                            }} else if (Array.isArray(v)) {{\
-                                item.subtype = 'array';\
-                                item.className = 'Array';\
-                                item.description = 'Array(' + v.length + ')';\
-                            }} else {{\
-                                item.className = (v.constructor && v.constructor.name) || 'Object';\
-                                item.description = item.className;\
-                            }}\
-                            return item;\
-                        }});\
-                    }})()",
-                    oid = oid_literal,
-                );
-                let result = page.evaluate_in_native_frame(frame_id, &code)?;
-                if let serde_json::Value::Array(props) = result {
-                    let descriptors: Vec<Value> = props
-                        .iter()
-                        .map(|p| {
-                            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let prop_type =
-                                p.get("type").and_then(|v| v.as_str()).unwrap_or("undefined");
-                            let mut remote = json!({ "type": prop_type });
-                            if let Some(child_oid) = p.get("childOid").and_then(|v| v.as_str()) {
-                                remote["type"] = json!("object");
-                                if let Some(sub) = p.get("subtype").and_then(|v| v.as_str()) {
-                                    remote["subtype"] = json!(sub);
-                                }
-                                if let Some(cls) = p.get("className").and_then(|v| v.as_str()) {
-                                    remote["className"] = json!(cls);
-                                }
-                                if let Some(desc) = p.get("description").and_then(|v| v.as_str()) {
-                                    remote["description"] = json!(desc);
-                                }
-                                remote["objectId"] = json!(child_oid);
-                            } else if let Some(val) = p.get("value") {
-                                match val {
-                                    Value::Null => {
-                                        remote["type"] = json!("object");
-                                        remote["subtype"] = json!("null");
-                                        remote["value"] = json!(null);
-                                    }
-                                    Value::String(s) => {
-                                        remote["type"] = json!("string");
-                                        remote["value"] = json!(s);
-                                    }
-                                    Value::Number(n) => {
-                                        remote["type"] = json!("number");
-                                        remote["value"] = json!(n);
-                                    }
-                                    Value::Bool(b) => {
-                                        remote["type"] = json!("boolean");
-                                        remote["value"] = json!(b);
-                                    }
-                                    _ => {
-                                        remote["value"] = val.clone();
-                                    }
-                                }
-                            }
-                            json!({
-                                "name": name,
-                                "value": remote,
-                                "configurable": true,
-                                "enumerable": true,
-                                "writable": true,
-                                "isOwn": true,
-                            })
-                        })
-                        .collect();
-                    Ok(json!({ "result": descriptors, "internalProperties": [] }))
-                } else {
-                    Ok(json!({ "result": [], "internalProperties": [] }))
-                }
-            } else {
-                Ok(json!({ "result": [], "internalProperties": [] }))
-            }
+            let object_id = params.get("objectId").and_then(Value::as_str).ok_or("objectId required")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let descriptors = page.js.as_mut().ok_or("No JavaScript runtime")?.get_properties_for_cdp(object_id)?;
+            Ok(json!({"result": descriptors, "internalProperties": []}))
         }
         "releaseObject" => {
             if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
@@ -441,9 +330,19 @@ pub async fn handle(
                 // Re-install on every navigation: globalThis is wiped on
                 // each new document, and puppeteer registers bindings
                 // once-per-page rather than once-per-document.
-                let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
-                ctx.preload_scripts.push((key, shim.clone()));
+                if let (Some(owner_session), Some(page_id)) = (
+                    session_id.as_ref(), ctx.get_session_page(session_id).map(|page| page.id.clone()),
+                ) {
+                    let key = format!("__obscura_binding__{}", name);
+                    ctx.preload_scripts.retain(|script| script.session_id != *owner_session || script.identifier != key);
+                    ctx.preload_scripts.push(crate::dispatch::RegisteredPreloadScript {
+                        session_id: owner_session.clone(), identifier: key,
+                        script: obscura_browser::page::PreloadScript {
+                            source: shim.clone(), world_name: String::new(),
+                        },
+                    });
+                    ctx.refresh_preload_scripts(&page_id);
+                }
                 // Remember who subscribed, so the call goes back to this
                 // session rather than to whichever session of the page a
                 // HashMap happens to yield first. A client discards an event
@@ -467,8 +366,13 @@ pub async fn handle(
         "removeBinding" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             if is_valid_binding_name(name) {
-                let key = format!("__obscura_binding__{}", name);
-                ctx.preload_scripts.retain(|(k, _)| k != &key);
+                if let (Some(owner_session), Some(page_id)) = (
+                    session_id.as_ref(), ctx.get_session_page(session_id).map(|page| page.id.clone()),
+                ) {
+                    let key = format!("__obscura_binding__{}", name);
+                    ctx.preload_scripts.retain(|script| script.session_id != *owner_session || script.identifier != key);
+                    ctx.refresh_preload_scripts(&page_id);
+                }
                 if let Some(session_id) = session_id {
                     if let Some(owners) = ctx.binding_sessions.get_mut(name) {
                         owners.retain(|owner| owner != session_id);
@@ -495,56 +399,38 @@ pub async fn handle(
     }
 }
 
-/// Reject `Runtime.{evaluate,callFunctionOn}` calls that target an execution
-/// context Obscura has not advertised for the attached page. An absent identity
-/// uses the page's default context. Direct embedders retain the compatibility
-/// path for ids reserved through `next_isolated_context`.
+/// Resolve a page-owned identity to its exact live native execution world.
 pub(crate) fn validate_context(
     params: &Value,
     field: &str,
     ctx: &crate::dispatch::CdpContext,
     session_id: &Option<String>,
     method: &str,
-) -> Result<Option<u32>, String> {
+) -> Result<Option<CdpExecutionWorld>, String> {
     let id = params.get(field).and_then(|value| value.as_i64());
     let unique_id = params.get("uniqueContextId").and_then(|value| value.as_str());
     if id.is_some() && unique_id.is_some() {
-        return Err(format!(
-            "Runtime.{method} cannot specify both {field} and uniqueContextId"
-        ));
+        return Err(format!("Runtime.{method} cannot specify both {field} and uniqueContextId"));
     }
-    if id.is_none() && unique_id.is_none() {
-        return Ok(None);
-    }
+    if id.is_none() && unique_id.is_none() { return Ok(None); }
     let record = id.and_then(|id| ctx.context_by_id(id))
         .or_else(|| unique_id.and_then(|id| ctx.context_by_unique_id(id)));
     if let Some(record) = record {
         let owner = session_id.as_ref().and_then(|session| ctx.sessions.get(session));
         if owner == Some(&record.page_id) {
-            let page = ctx.get_page(&record.page_id).ok_or("No page")?;
-            if record.frame_id == page.frame_id { return Ok(Some(0)); }
-            if !record.is_default {
-                return Err("Child isolated execution worlds are not supported".to_string());
+            if let Some(page) = ctx.get_page(&record.page_id) {
+                if let Some(js) = &page.js {
+                    if js.cdp_document_generation(record.world.frame_id).ok() == Some(record.document_generation)
+                        && js.validate_cdp_world(record.world).is_ok()
+                    {
+                        return Ok(Some(record.world));
+                    }
+                }
             }
-            return super::page::native_frame_id(page, &record.frame_id).map(Some);
         }
-    } else if session_id.is_none() && unique_id.is_none()
-        && id.is_some_and(|id| ctx.valid_context_ids.contains(&id))
-    {
-        // Direct embedders can still reserve an id through the existing public
-        // next_isolated_context API. Attached sessions require page ownership.
-        return Ok(Some(0));
     }
-    let identity = id.map(|id| id.to_string())
-        .or_else(|| unique_id.map(str::to_string))
-        .unwrap_or_default();
-    if record.is_none() || session_id.is_some() {
-        return Err(format!(
-            "Cannot find context with specified id: {}",
-            identity
-        ));
-    }
-    Err("Cannot route execution context without its owning page".to_string())
+    let identity = id.map(|id| id.to_string()).or_else(|| unique_id.map(str::to_string)).unwrap_or_default();
+    Err(format!("Cannot find context with specified id: {identity}"))
 }
 
 /// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
@@ -640,10 +526,6 @@ mod tests {
     // locator (which targets the utility world created by
     // Page.createIsolatedWorld) ran in the wrong context and timed out.
     //
-    // Phase 5.5 (RED-then-GREEN) verification:
-    //   - Without the prod fix, `valid_context_ids` does not exist on
-    //     CdpContext → these tests fail to compile.
-    //   - With the prod fix, all four tests pass.
 
     #[tokio::test]
     async fn evaluate_rejects_unknown_context_id() {
@@ -819,29 +701,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_isolated_world_registers_id_for_evaluate() {
-        // Round-trip: Page.createIsolatedWorld returns contextId N, and a
-        // subsequent Runtime.evaluate targeting that contextId must NOT be
-        // rejected.
+    async fn create_isolated_world_registers_native_world_for_evaluate() {
         let mut ctx = CdpContext::new();
-        // Bypass the page-attached path of createIsolatedWorld by direct
-        // insert — mirrors the same effect as calling the page handler with
-        // a real session.
-        ctx.valid_context_ids.insert(100);
-
-        let result = handle(
-            "evaluate",
-            &json!({ "expression": "1 + 1", "contextId": 100 }),
-            &mut ctx,
-            &None,
-        )
-        .await;
-        if let Err(e) = result {
-            assert!(
-                !e.contains("Cannot find context"),
-                "registered isolated-world contextId=100 must be accepted, got: {e}"
-            );
-        }
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        super::super::page::handle("navigate", &json!({"url":"about:blank"}), &mut ctx, &session).await.unwrap();
+        let created = super::super::page::handle("createIsolatedWorld", &json!({"worldName":"utility"}), &mut ctx, &session)
+            .await.unwrap();
+        let result = handle("evaluate", &json!({
+            "expression":"1+1","contextId":created["executionContextId"],"returnByValue":true,
+        }), &mut ctx, &session).await.unwrap();
+        assert_eq!(result["result"]["value"], 2);
     }
 
     /// Regression for #122 item 7: puppeteer-extra's FrameManager.initialize

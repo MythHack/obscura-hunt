@@ -1912,7 +1912,32 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "grid-row-start" => set_grid_placement_side(style, value, false, true),
         "grid-row-end" => set_grid_placement_side(style, value, false, false),
         "transform" => parse_transform(style, value),
-        "transform-origin" => style.transform_origin = parse_transform_origin(value),
+        "transform-origin" => {
+            let tokens = split_ws_paren(value);
+            if (1..=3).contains(&tokens.len()) {
+                let xy = tokens[..tokens.len().min(2)].join(" ");
+                let z = if tokens.len() == 3 { parse_transform_z_length(tokens[2]) } else { Some(crate::TransformLength::px(0.0)) };
+                if let (Some(origin), Some(z)) = (parse_transform_origin(&xy), z) {
+                    if z.expression.is_none() {
+                        style.transform_origin = Some(origin);
+                        style.transform_origin_z = Some(z.value);
+                    }
+                }
+            }
+        }
+        "perspective-origin" => {
+            if let Some(origin) = parse_transform_origin(value) { style.perspective_origin = Some(origin); }
+        }
+        "transform-style" => match value.trim().to_ascii_lowercase().as_str() {
+            "preserve-3d" => style.preserve_3d = true,
+            "flat" | "initial" | "unset" | "revert" | "revert-layer" => style.preserve_3d = false,
+            _ => {}
+        },
+        "backface-visibility" => match value.trim().to_ascii_lowercase().as_str() {
+            "hidden" => style.backface_hidden = true,
+            "visible" | "initial" | "unset" | "revert" | "revert-layer" => style.backface_hidden = false,
+            _ => {}
+        },
         "translate" => parse_individual_translate(style, value),
         "rotate" => parse_individual_rotate(style, value),
         "scale" => parse_individual_scale(style, value),
@@ -2258,6 +2283,9 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "grid-row-end"
             | "transform"
             | "transform-origin"
+            | "perspective-origin"
+            | "transform-style"
+            | "backface-visibility"
             | "translate"
             | "rotate"
             | "scale"
@@ -2285,7 +2313,6 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             "filter"
                 | "backdrop-filter"
                 | "-webkit-backdrop-filter"
-                | "perspective"
                 | "contain"
                 | "content-visibility"
         )
@@ -2362,11 +2389,12 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
         "clip-path" | "-webkit-clip-path" => {
             value.eq_ignore_ascii_case("none") || parse_clip_path_polygon(value).is_some()
         }
-        // These properties currently participate only in containing-block
-        // bookkeeping. Advertising an effect that is not painted is worse
-        // than a conservative false result because feature queries commonly
-        // use them to select the only visible implementation of an effect.
-        "filter" | "backdrop-filter" | "-webkit-backdrop-filter" | "perspective" => {
+        "perspective" => value.eq_ignore_ascii_case("none") || parse_perspective_length(value).is_some(),
+        "perspective-origin" => parse_transform_origin(value).is_some(),
+        "transform-style" => matches!(value.to_ascii_lowercase().as_str(), "flat" | "preserve-3d"),
+        "backface-visibility" => matches!(value.to_ascii_lowercase().as_str(), "visible" | "hidden"),
+        // Filter effects still only establish containing blocks.
+        "filter" | "backdrop-filter" | "-webkit-backdrop-filter" => {
             value.eq_ignore_ascii_case("none")
         }
         "contain" => value.eq_ignore_ascii_case("none"),
@@ -3087,7 +3115,12 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
         "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => {
             parse_grid_line_kind(value).is_some()
         }
-        "transform-origin" => parse_transform_origin(value).is_some(),
+        "transform-origin" => {
+            let tokens = split_ws_paren(value);
+            (1..=3).contains(&tokens.len())
+                && parse_transform_origin(&tokens[..tokens.len().min(2)].join(" ")).is_some()
+                && (tokens.len() < 3 || parse_transform_z_length(tokens[2]).is_some_and(|z| z.expression.is_none()))
+        },
         "translate" => lower == "none" || dimensions(value, false, 3),
         "rotate" => lower == "none" || angle_degrees(value).is_some(),
         "scale" => {
@@ -3662,20 +3695,10 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
                 crate::TransformLength::px(0.0),
                 parse_transform_length(values[0])?,
             ),
-            "translate3d" if values.len() == 3 => {
-                // Without perspective, translation along Z does not change the
-                // projection of the element's plane. Keep accepting it so the
-                // useful X/Y part of common compositor transforms is retained.
-                parse_transform_z_length(values[2])?;
-                crate::TransformOp::Translate(
-                    parse_transform_length(values[0])?,
-                    parse_transform_length(values[1])?,
-                )
-            }
-            "translatez" if values.len() == 1 => {
-                parse_transform_z_length(values[0])?;
-                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
-            }
+            "translate3d" if values.len() == 3 => crate::TransformOp::Translate3d(
+                parse_transform_length(values[0])?, parse_transform_length(values[1])?, parse_transform_z_length(values[2])?),
+            "translatez" if values.len() == 1 => crate::TransformOp::Translate3d(
+                crate::TransformLength::px(0.0), crate::TransformLength::px(0.0), parse_transform_z_length(values[0])?),
             "scale" if (1..=2).contains(&values.len()) => {
                 let x = scale_number(values[0])?;
                 crate::TransformOp::Scale(
@@ -3692,46 +3715,22 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
             "scaley" if values.len() == 1 => {
                 crate::TransformOp::Scale(1.0, scale_number(values[0])?)
             }
-            "scale3d" if values.len() == 3 => {
-                let x = scale_number(values[0])?;
-                let y = scale_number(values[1])?;
-                scale_number(values[2])?;
-                crate::TransformOp::Scale(x, y)
-            }
-            "scalez" if values.len() == 1 && scale_number(values[0]).is_some() => {
-                crate::TransformOp::Matrix(crate::Affine2::IDENTITY)
-            }
+            "scale3d" if values.len() == 3 => crate::TransformOp::Scale3d(
+                scale_number(values[0])?, scale_number(values[1])?, scale_number(values[2])?),
+            "scalez" if values.len() == 1 => crate::TransformOp::Scale3d(1.0, 1.0, scale_number(values[0])?),
             "rotate" | "rotatez" if values.len() == 1 => {
                 crate::TransformOp::Rotate(angle_degrees(values[0])?)
             }
-            "rotatex" if values.len() == 1 => {
-                let radians = angle_degrees(values[0])?.to_radians();
-                crate::TransformOp::Scale(1.0, radians.cos())
-            }
-            "rotatey" if values.len() == 1 => {
-                let radians = angle_degrees(values[0])?.to_radians();
-                crate::TransformOp::Scale(radians.cos(), 1.0)
-            }
+            "rotatex" if values.len() == 1 => crate::TransformOp::Rotate3d(1.0, 0.0, 0.0, angle_degrees(values[0])?),
+            "rotatey" if values.len() == 1 => crate::TransformOp::Rotate3d(0.0, 1.0, 0.0, angle_degrees(values[0])?),
             "rotate3d" if values.len() == 4 => {
                 let x = values[0].parse::<f32>().ok()?;
                 let y = values[1].parse::<f32>().ok()?;
                 let z = values[2].parse::<f32>().ok()?;
-                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
-                    return None;
-                }
-                let angle = angle_degrees(values[3])?;
-                if x != 0.0 && y == 0.0 && z == 0.0 {
-                    crate::TransformOp::Scale(1.0, (angle * x.signum()).to_radians().cos())
-                } else if x == 0.0 && y != 0.0 && z == 0.0 {
-                    crate::TransformOp::Scale((angle * y.signum()).to_radians().cos(), 1.0)
-                } else if x == 0.0 && y == 0.0 && z != 0.0 {
-                    crate::TransformOp::Rotate(angle * z.signum())
-                } else {
-                    // A mixed 3D rotation axis cannot be represented by the
-                    // affine renderer without tracking Z between operations.
-                    return None;
-                }
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() { return None; }
+                crate::TransformOp::Rotate3d(x, y, z, angle_degrees(values[3])?)
             }
+            "perspective" if values.len() == 1 => crate::TransformOp::Perspective(parse_perspective_length(values[0])?),
             "skew" if (1..=2).contains(&values.len()) => crate::TransformOp::Skew(
                 angle_degrees(values[0])?,
                 values
@@ -3763,32 +3762,12 @@ fn parse_transform_ops(value: &str) -> Option<Vec<crate::TransformOp>> {
                 })
             }
             "matrix3d" if values.len() == 16 => {
-                let numbers = values
-                    .iter()
-                    .map(|value| value.parse::<f32>().ok())
-                    .collect::<Option<Vec<_>>>()?;
-                if numbers.iter().any(|value| !value.is_finite())
-                    || numbers[2] != 0.0
-                    || numbers[3] != 0.0
-                    || numbers[6] != 0.0
-                    || numbers[7] != 0.0
-                    || numbers[8] != 0.0
-                    || numbers[9] != 0.0
-                    || numbers[10] != 1.0
-                    || numbers[11] != 0.0
-                    || numbers[14] != 0.0
-                    || numbers[15] != 1.0
-                {
-                    return None;
+                let mut numbers = [0.; 16];
+                for (out, value) in numbers.iter_mut().zip(values) {
+                    *out = value.parse::<f32>().ok()?;
+                    if !out.is_finite() { return None; }
                 }
-                crate::TransformOp::Matrix(crate::Affine2 {
-                    a: numbers[0],
-                    b: numbers[1],
-                    c: numbers[4],
-                    d: numbers[5],
-                    e: numbers[12],
-                    f: numbers[13],
-                })
+                crate::TransformOp::Matrix3d(crate::Matrix4(numbers))
             }
             _ => return None,
         };
@@ -3836,27 +3815,28 @@ fn angle_degrees(value: &str) -> Option<f32> {
 }
 
 fn parse_transform_origin(value: &str) -> Option<(crate::Dimension, crate::Dimension)> {
+    let tokens = split_ws_paren(value);
+    if tokens.is_empty() || tokens.len() > 2 { return None; }
     let mut x = None;
     let mut y = None;
-    for token in value.split_whitespace().take(2) {
+    for token in tokens {
         match token.to_ascii_lowercase().as_str() {
-            "left" => x = Some(crate::Dimension::Percent(0.0)),
-            "right" => x = Some(crate::Dimension::Percent(1.0)),
-            "top" => y = Some(crate::Dimension::Percent(0.0)),
-            "bottom" => y = Some(crate::Dimension::Percent(1.0)),
+            "left" if x.is_none() => x = Some(crate::Dimension::Percent(0.0)),
+            "right" if x.is_none() => x = Some(crate::Dimension::Percent(1.0)),
+            "top" if y.is_none() => y = Some(crate::Dimension::Percent(0.0)),
+            "bottom" if y.is_none() => y = Some(crate::Dimension::Percent(1.0)),
             "center" if x.is_none() => x = Some(crate::Dimension::Percent(0.5)),
-            "center" => y = Some(crate::Dimension::Percent(0.5)),
-            _ if x.is_none() => x = Some(dimension_value(token)),
-            _ => y = Some(dimension_value(token)),
+            "center" if y.is_none() => y = Some(crate::Dimension::Percent(0.5)),
+            _ => {
+                let length = parse_transform_length(token)?;
+                if length.expression.is_some() { return None; }
+                if x.is_none() { x = Some(length.value); }
+                else if y.is_none() { y = Some(length.value); }
+                else { return None; }
+            }
         }
     }
-    if x.is_none() && y.is_none() {
-        return None;
-    }
-    Some((
-        x.unwrap_or(crate::Dimension::Percent(0.5)),
-        y.unwrap_or(crate::Dimension::Percent(0.5)),
-    ))
+    Some((x.unwrap_or(crate::Dimension::Percent(0.5)), y.unwrap_or(crate::Dimension::Percent(0.5))))
 }
 
 fn parse_individual_scale(style: &mut LayoutStyle, value: &str) {

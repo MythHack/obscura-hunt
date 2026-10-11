@@ -75,6 +75,7 @@ pub(crate) struct WindowMessage {
     pub target: WindowId,
     pub source_realm: u32,
     pub source_window: WindowId,
+    pub source_generation: u64,
     pub origin: String,
     pub target_origin: String,
     pub bytes: Vec<u8>,
@@ -249,7 +250,7 @@ fn root_for_document(state: &OpState, windows: &WindowRegistry, document: &Share
     let realms = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
     for _ in 0..=crate::ops::max_live_frames() {
         if let Some(root) = windows.root_for_realm(realm) { return Some(root); }
-        realm = realms.live_frame_owner(realm)?.0;
+        realm = realms.frame_parent(realm)?;
     }
     None
 }
@@ -259,17 +260,14 @@ pub(crate) fn context_document(state: &OpState, context: &v8::Global<v8::Context
 {
     let shared = state.borrow::<SharedWindows>().clone();
     let windows = shared.try_borrow().map_err(|_| JsErrorBox::generic("Window registry is busy"))?;
-    if let Some(window) = windows.windows.values().find(|window| !window.closed && &window.context == context) {
-        return Ok((shared.clone(), window.id, window.state.clone()));
-    }
     let document = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().by_context(context)
         .ok_or_else(security_error)?;
     let root = root_for_document(state, &windows, &document).ok_or_else(security_error)?;
     Ok((shared.clone(), root, document))
 }
 
-pub(crate) fn caller_window(scope: &mut v8::PinScope, state: &OpState)
-    -> Result<(SharedWindows, WindowId, SharedState), JsErrorBox>
+pub(crate) fn caller_context(scope: &mut v8::PinScope)
+    -> Result<v8::Global<v8::Context>, JsErrorBox>
 {
     // Shared ops' creation and entered host contexts are not the incumbent
     // principal, including when popup.eval runs inside an opener task.
@@ -282,8 +280,24 @@ pub(crate) fn caller_window(scope: &mut v8::PinScope, state: &OpState)
     // scope, without opening a nested HandleScope. Its lifetime cannot escape
     // this conversion to a persistent handle. A missing context is rejected.
     let context: v8::Local<v8::Context> = unsafe { std::mem::transmute(context) };
-    let context = v8::Global::new(scope, context);
+    Ok(v8::Global::new(scope, context))
+}
+
+pub(crate) fn caller_window(scope: &mut v8::PinScope, state: &OpState)
+    -> Result<(SharedWindows, WindowId, SharedState), JsErrorBox>
+{
+    let context = caller_context(scope)?;
     context_document(state, &context)
+}
+
+pub(crate) fn caller_dom_window(scope: &mut v8::PinScope, state: &OpState)
+    -> Result<(SharedWindows, WindowId, SharedState, bool), JsErrorBox>
+{
+    let context = caller_context(scope)?;
+    let (windows, root, document) = context_document(state, &context)?;
+    let universal_access = state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+        .context_universal_access(&context);
+    Ok((windows, root, document, universal_access))
 }
 
 pub(crate) fn close_window(scope: &mut v8::PinScope, state: &OpState, id: WindowId) {
@@ -301,7 +315,7 @@ pub(crate) fn close_window(scope: &mut v8::PinScope, state: &OpState, id: Window
             let mut realm = *realm;
             for _ in 0..=max_frames {
                 if realm == realm_id { return false; }
-                let Some((parent, _)) = registry.live_frame_owner(realm) else { break };
+                let Some(parent) = registry.frame_parent(realm) else { break };
                 realm = parent;
             }
             true
@@ -314,16 +328,18 @@ pub(crate) fn close_window(scope: &mut v8::PinScope, state: &OpState, id: Window
     // The engine's base module map also serves live sibling windows. Only
     // attached document maps can be retired by a window close.
     if let Some(module_realm) = module_realm { module_realm.retire(scope); }
+    realms.borrow_mut().retire_modules(scope);
     state.waker.wake();
 }
 
-fn document_access(windows: &WindowRegistry, source_root: WindowId, source: &SharedState,
-    target_root: WindowId, target: &SharedState) -> bool
+pub(crate) fn document_access(windows: &WindowRegistry, source_root: WindowId, source: &SharedState,
+    target_root: WindowId, target: &SharedState, universal_access: bool) -> bool
 {
     let Some(a) = windows.windows.get(&source_root) else { return false };
     let Some(b) = windows.windows.get(&target_root) else { return false };
     if a.closed || b.closed || a.group != b.group { return false; }
-    if Rc::ptr_eq(source, target) { return true; }
+    // An isolated grant bypasses only the origin comparison, never reachability.
+    if Rc::ptr_eq(source, target) || universal_access { return true; }
     let a = origin(&source.borrow());
     a != "null" && a == origin(&target.borrow())
 }
@@ -331,14 +347,297 @@ fn document_access(windows: &WindowRegistry, source_root: WindowId, source: &Sha
 pub(crate) fn storage_window(scope: &mut v8::PinScope, state: &OpState,
     receiver: v8::Local<v8::Object>) -> Result<(SharedWindows, WindowId, SharedState), JsErrorBox>
 {
-    let (shared, source_root, source) = caller_window(scope, state)?;
+    let (shared, source_root, source, universal_access) = caller_dom_window(scope, state)?;
     let context = receiver.get_creation_context(scope).ok_or_else(security_error)?;
     let context = v8::Global::new(scope, context);
     let (_, root, document) = context_document(state, &context)?;
-    if !document_access(&shared.borrow(), source_root, &source, root, &document) {
+    if !document_access(&shared.borrow(), source_root, &source, root, &document, universal_access) {
         return Err(security_error());
     }
     Ok((shared, root, document))
+}
+
+// These are traced V8 fields, not persistent handles rooted by their own
+// context. Retiring one execution world therefore releases only its callbacks.
+const WORLD_NODE_ID_SLOT: i32 = crate::ops::FRAME_MESSAGE_SLOT + 1;
+const WORLD_WRAP_NODE_SLOT: i32 = WORLD_NODE_ID_SLOT + 1;
+const WORLD_EVENT_CREATE_SLOT: i32 = WORLD_WRAP_NODE_SLOT + 1;
+const WORLD_EVENT_PHASE_SLOT: i32 = WORLD_EVENT_CREATE_SLOT + 1;
+const WORLD_EVENT_FINISH_SLOT: i32 = WORLD_EVENT_PHASE_SLOT + 1;
+const WORLD_NATIVE_INPUT_SLOT: i32 = WORLD_EVENT_FINISH_SLOT + 1;
+const WINDOW_EVENT_NODE: u32 = u32::MAX;
+
+pub(crate) fn initialize_world_callback_slots(context: v8::Local<v8::Context>,
+    undefined: v8::Local<v8::Value>) {
+    for slot in WORLD_NODE_ID_SLOT..=WORLD_NATIVE_INPUT_SLOT {
+        context.set_embedder_data(slot, undefined);
+    }
+}
+
+
+fn world_receiver(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>) -> Result<(v8::Global<v8::Context>, SharedState), JsErrorBox> {
+    let context = receiver.get_creation_context(scope).ok_or_else(security_error)?;
+    if !receiver.strict_equals(context.global(scope).into()) { return Err(security_error()); }
+    let (_, _, document) = storage_window(scope, state, receiver)?;
+    Ok((v8::Global::new(scope, context), document))
+}
+
+#[op2(nofast)]
+fn op_world_register(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, node_id: v8::Local<v8::Function>,
+    wrap_node: v8::Local<v8::Function>, event_create: v8::Local<v8::Function>,
+    event_phase: v8::Local<v8::Function>, event_finish: v8::Local<v8::Function>,
+    native_input: v8::Local<v8::Function>) -> Result<(), JsErrorBox> {
+    let (handle, _) = world_receiver(scope, state, receiver)?;
+    let context = v8::Local::new(scope, handle);
+    let functions = [node_id, wrap_node, event_create, event_phase, event_finish, native_input];
+    if functions.iter().any(|function| function.get_creation_context(scope) != Some(context)) {
+        return Err(security_error());
+    }
+    if context.get_embedder_data(scope, WORLD_NODE_ID_SLOT).is_some_and(|value| value.is_function()) {
+        return Err(JsErrorBox::type_error("Execution world callbacks are already registered"));
+    }
+    for (offset, function) in functions.into_iter().enumerate() {
+        context.set_embedder_data(WORLD_NODE_ID_SLOT + offset as i32, function.into());
+    }
+    Ok(())
+}
+
+
+#[op2(nofast)]
+fn op_world_dom_generation(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, tree: bool) -> Result<f64, JsErrorBox> {
+    let (_, document) = world_receiver(scope, state, receiver)?;
+    let owner = document.borrow();
+    let dom = owner.dom.as_ref().ok_or_else(security_error)?;
+    let generation = dom.topology_generation();
+    Ok(if tree { generation } else {
+        generation.wrapping_add(owner.activity_generation)
+            .wrapping_add(dom.external_stylesheet_generation())
+    } as f64)
+}
+
+fn world_function<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>,
+    context: &v8::Global<v8::Context>, slot: i32) -> Option<v8::Local<'s, v8::Function>> {
+    let context = v8::Local::new(scope, context);
+    v8::Local::<v8::Function>::try_from(context.get_embedder_data(scope, slot)?).ok()
+}
+
+// Branding-only helpers. Their native callers authenticate the creation
+// context through RealmStates before exposing or using the returned node.
+pub(crate) fn world_node_id(scope: &mut v8::PinScope, context: &v8::Global<v8::Context>,
+    value: v8::Local<v8::Value>) -> Option<u32> {
+    let callback = world_function(scope, context, WORLD_NODE_ID_SLOT)?;
+    let receiver = v8::undefined(scope);
+    let value = callback.call(scope, receiver.into(), &[value])?;
+    value.is_uint32().then(|| value.uint32_value(scope)).flatten()
+}
+
+pub(crate) fn world_wrap_node<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>,
+    context: &v8::Global<v8::Context>, node: u32) -> Option<v8::Local<'s, v8::Value>> {
+    let callback = world_function(scope, context, WORLD_WRAP_NODE_SLOT)?;
+    let receiver = v8::undefined(scope);
+    let node = v8::Integer::new_from_unsigned(scope, node);
+    callback.call(scope, receiver.into(), &[node.into()])
+}
+
+// Only the authenticated native runtime can reach this captured callback.
+// It mints individual input events without ambient authority: author getters,
+// constructors and listeners invoked during input always remain untrusted.
+pub(crate) fn world_native_input<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>,
+    context: &v8::Global<v8::Context>, payload: v8::Local<'s, v8::Value>)
+    -> Option<v8::Local<'s, v8::Value>>
+{
+    let callback = world_function(scope, context, WORLD_NATIVE_INPUT_SLOT)?;
+    let receiver = v8::undefined(scope);
+    callback.call(scope, receiver.into(), &[payload])
+}
+
+#[op2(reentrant)]
+fn op_world_node_id<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
+    receiver: v8::Local<'s, v8::Object>, value: v8::Local<'s, v8::Value>) -> v8::Local<'s, v8::Value> {
+    let node = (|| {
+        let (_, document) = world_receiver(scope, state, receiver).ok()?;
+        let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+        let context = object.get_creation_context(scope)?;
+        let context = v8::Global::new(scope, context);
+        let (_, _, owner) = context_document(state, &context).ok()?;
+        if !Rc::ptr_eq(&document, &owner) { return None; }
+        world_node_id(scope, &context, value)
+    })();
+    node.map(|node| v8::Integer::new_from_unsigned(scope, node).into())
+        .unwrap_or_else(|| v8::null(scope).into())
+}
+
+#[op2(nofast, reentrant)]
+fn op_world_focus(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, target: v8::Local<v8::Value>, update: bool) -> Result<u32, JsErrorBox> {
+    let (context, document) = world_receiver(scope, state, receiver)?;
+    let target = if update && !target.is_null() {
+        Some(obscura_dom::NodeId::new(world_node_id(scope, &context, target)
+            .filter(|node| *node != WINDOW_EVENT_NODE).ok_or_else(|| JsErrorBox::type_error("Illegal invocation"))?))
+    } else { None };
+    let mut owner = document.borrow_mut();
+    if update {
+        if target.is_some_and(|node| owner.dom.as_ref().is_none_or(|dom| !dom.is_connected(node))) {
+            return Ok(WINDOW_EVENT_NODE);
+        }
+        owner.focused_node = target;
+    }
+    if owner.focused_node.is_some_and(|node| owner.dom.as_ref().is_none_or(|dom| !dom.is_connected(node))) {
+        owner.focused_node = None;
+    }
+    Ok(owner.focused_node.map(|node| node.index() as u32).unwrap_or(WINDOW_EVENT_NODE))
+}
+
+struct WorldEventCallbacks {
+    context: v8::Global<v8::Context>,
+    create: v8::Global<v8::Function>,
+    phase: v8::Global<v8::Function>,
+    finish: v8::Global<v8::Function>,
+    event: Option<v8::Global<v8::Value>>,
+}
+
+fn world_is_live(state: &OpState, context: &v8::Global<v8::Context>, document: &SharedState) -> bool {
+    state.borrow::<Rc<RefCell<RealmStates>>>().borrow().by_context(context)
+        .is_some_and(|owner| Rc::ptr_eq(&owner, document))
+}
+
+fn event_phase(scope: &mut v8::PinScope, callbacks: &WorldEventCallbacks,
+    current: u32, capture: bool, phase: u32, status: u32) -> Option<u32> {
+    let context = v8::Local::new(scope, &callbacks.context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let event = v8::Local::new(scope, callbacks.event.as_ref()?);
+    let callback = v8::Local::new(scope, &callbacks.phase);
+    let current = v8::Integer::new_from_unsigned(scope, current);
+    let capture = v8::Boolean::new(scope, capture);
+    let phase = v8::Integer::new_from_unsigned(scope, phase);
+    let status = v8::Integer::new_from_unsigned(scope, status);
+    let receiver = v8::undefined(scope);
+    // Author listeners may recursively dispatch, mutate or retire worlds.
+    // No document/registry borrow, or native-input authority, survives this call.
+    callback.call(scope, receiver.into(), &[event, current.into(), capture.into(), phase.into(), status.into()])?
+        .uint32_value(scope)
+}
+
+#[op2(nofast, reentrant)]
+fn op_world_event_dispatch(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, target: v8::Local<v8::Value>,
+    event: v8::Local<v8::Value>) -> Result<bool, JsErrorBox> {
+    let (source, document) = world_receiver(scope, state, receiver)?;
+    let event_object = v8::Local::<v8::Object>::try_from(event)
+        .map_err(|_| JsErrorBox::type_error("Invalid event"))?;
+    let event_context = event_object.get_creation_context(scope)
+        .ok_or_else(|| JsErrorBox::type_error("Invalid event"))?;
+    storage_window(scope, state, event_object)?;
+    let event_context = v8::Global::new(scope, event_context);
+    let target = world_node_id(scope, &source, target).ok_or_else(|| JsErrorBox::type_error("Illegal invocation"))?;
+    let contexts = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().document_contexts(&document);
+    let mut callbacks = Vec::with_capacity(contexts.len());
+    for context in contexts {
+        let Some(create) = world_function(scope, &context, WORLD_EVENT_CREATE_SLOT) else { continue };
+        let Some(phase) = world_function(scope, &context, WORLD_EVENT_PHASE_SLOT) else { continue };
+        let Some(finish) = world_function(scope, &context, WORLD_EVENT_FINISH_SLOT) else { continue };
+        callbacks.push(WorldEventCallbacks { context, create: v8::Global::new(scope, create),
+            phase: v8::Global::new(scope, phase), finish: v8::Global::new(scope, finish), event: None });
+    }
+    let source_index = callbacks.iter().position(|callbacks| callbacks.context == source).ok_or_else(security_error)?;
+    let callback = v8::Local::new(scope, &callbacks[source_index].create);
+    let node = v8::Integer::new_from_unsigned(scope, target);
+    let original = v8::Boolean::new(scope, event_context == source);
+    // Native input provenance is consumed by the originating world's private
+    // callback; an author dispatch never receives ambient native authority.
+    let native_input = v8::Boolean::new(scope, false);
+    // One private cancellation/propagation cell is captured by every world's
+    // Event state, never exposed as an Event expando or a copied global.
+    let shared_flags = v8::Array::new(scope, 1);
+    let zero = v8::Integer::new(scope, 0);
+    shared_flags.set_index(scope, 0, zero.into());
+    let undefined = v8::undefined(scope);
+    let borrowed_state = if event_context == source { undefined.into() } else {
+        let create = world_function(scope, &event_context, WORLD_EVENT_CREATE_SLOT)
+            .ok_or_else(|| JsErrorBox::type_error("Invalid event"))?;
+        let context = v8::Local::new(scope, &event_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let original = v8::Boolean::new(scope, true);
+        // Probe the creating world's private brand/state before admitting a
+        // foreign Event. No author property supplies this dispatch authority.
+        create.call(scope, undefined.into(), &[event, undefined.into(), original.into(), native_input.into(), undefined.into()])
+            .ok_or_else(|| JsErrorBox::type_error("Invalid event"))?
+    };
+    let original_event = {
+        let context = v8::Local::new(scope, &source);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        callback.call(scope, undefined.into(), &[event, node.into(), original.into(), native_input.into(), shared_flags.into(), borrowed_state])
+            .ok_or_else(|| JsErrorBox::type_error("Invalid event"))?
+    };
+    callbacks[source_index].event = Some(v8::Global::new(scope, original_event));
+    let metadata = event_phase(scope, &callbacks[source_index], target, false, 0, 0)
+        .ok_or_else(|| JsErrorBox::type_error("Invalid event"))?;
+    let mut status = metadata & 1;
+    let trusted = metadata & 8 != 0;
+    for index in 0..callbacks.len() {
+        if index == source_index || !world_is_live(state, &callbacks[index].context, &document) { continue; }
+        let callback = v8::Local::new(scope, &callbacks[index].create);
+        let trusted = v8::Boolean::new(scope, trusted);
+        let original = v8::Boolean::new(scope, false);
+        let undefined = v8::undefined(scope);
+        let context = v8::Local::new(scope, &callbacks[index].context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        if let Some(wrapper) = callback.call(scope, undefined.into(), &[event, node.into(), original.into(), trusted.into(), shared_flags.into()]) {
+            callbacks[index].event = Some(v8::Global::new(scope, wrapper));
+        }
+    }
+    let path = {
+        let owner = document.borrow();
+        let dom = owner.dom.as_ref().ok_or_else(security_error)?;
+        let mut path = vec![target];
+        if target != WINDOW_EVENT_NODE {
+            let mut node = obscura_dom::NodeId::new(target);
+            if dom.with_node(node, |_| ()).is_none() { return Err(security_error()); }
+            while let Some(parent) = dom.with_node(node, |node| node.parent).flatten() {
+                path.push(parent.index() as u32);
+                node = parent;
+            }
+            if node == dom.document() && metadata & 32 == 0 { path.push(WINDOW_EVENT_NODE); }
+        }
+        path
+    };
+    let invoke = |scope: &mut v8::PinScope, current: u32, capture: bool, phase: u32, status: &mut u32| {
+        for callbacks in &callbacks {
+            if *status & 4 != 0 { break; }
+            if callbacks.event.is_none() || !world_is_live(state, &callbacks.context, &document) { continue; }
+            if let Some(flags) = event_phase(scope, callbacks, current, capture, phase, *status) {
+                *status |= flags & 7;
+            }
+        }
+    };
+    for current in path.iter().skip(1).rev() {
+        invoke(scope, *current, true, 1, &mut status);
+        if status & 2 != 0 { break; }
+    }
+    if status & 2 == 0 {
+        invoke(scope, target, true, 2, &mut status);
+        if status & 4 == 0 { invoke(scope, target, false, 2, &mut status); }
+    }
+    if metadata & 16 != 0 && status & 2 == 0 {
+        for current in path.iter().skip(1) {
+            invoke(scope, *current, false, 3, &mut status);
+            if status & 2 != 0 { break; }
+        }
+    }
+    for callbacks in &callbacks {
+        if callbacks.event.is_none() || !world_is_live(state, &callbacks.context, &document) { continue; }
+        let callback = v8::Local::new(scope, &callbacks.finish);
+        let event = v8::Local::new(scope, callbacks.event.as_ref().unwrap());
+        let flags = v8::Integer::new_from_unsigned(scope, status);
+        let undefined = v8::undefined(scope);
+        let context = v8::Local::new(scope, &callbacks.context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        callback.call(scope, undefined.into(), &[event, flags.into()]);
+    }
+    Ok(status & 1 == 0)
 }
 
 #[op2(fast)]
@@ -472,7 +771,11 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
         let window_id = v8::Integer::new_from_unsigned(scope, id);
         let realm = v8::Integer::new_from_unsigned(scope, realm_id);
         let receiver = v8::undefined(scope);
-        if callback.call(scope, receiver.into(), &[window.into(), window_id.into(), realm.into()]).is_none() {
+        let initialized = {
+            let scope = &mut v8::ContextScope::new(scope, parent_context);
+            callback.call(scope, receiver.into(), &[window.into(), window_id.into(), realm.into()]).is_some()
+        };
+        if !initialized {
             close_window(scope, state, id);
             return Err(JsErrorBox::generic("Window initialization failed"));
         }
@@ -489,22 +792,38 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
 
 #[op2(fast)]
 fn op_window_same_origin(scope: &mut v8::PinScope, state: &OpState, id: u32) -> bool {
-    let Ok((shared, source, document)) = caller_window(scope, state) else { return false };
+    let Ok((shared, source, document, universal_access)) = caller_dom_window(scope, state) else { return false };
     let windows = shared.borrow();
-    windows.windows.get(&id).is_some_and(|target| document_access(&windows, source, &document, id, &target.state))
+    windows.windows.get(&id).is_some_and(|target| document_access(&windows, source, &document, id, &target.state, universal_access))
 }
 
-#[op2]
-fn op_window_target<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState, id: u32) -> v8::Local<'s, v8::Value> {
-    let target = caller_window(scope, state).ok().and_then(|(shared, source, document)| {
+#[op2(reentrant)]
+fn op_window_target<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
+    id: u32, realm: u32) -> v8::Local<'s, v8::Value> {
+    let target = caller_dom_window(scope, state).ok().and_then(|(shared, source, document, universal_access)| {
         let windows = shared.borrow();
-        let target = windows.windows.get(&id)?;
-        document_access(&windows, source, &document, id, &target.state).then(|| target.context.clone())
+        windows.windows.get(&id).filter(|target| !target.closed)?;
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let target = registry.by_frame_id(realm)?;
+        let context = registry.context(realm)?;
+        drop(registry);
+        if root_for_document(state, &windows, &target) != Some(id)
+            || !document_access(&windows, source, &document, id, &target, universal_access) {
+            return None;
+        }
+        let callbacks = windows.callbacks.get(&realm)?;
+        (callbacks.context == context).then(|| callbacks.clone())
     });
-    match target {
-        Some(context) => v8::Local::new(scope, context).global(scope).into(),
-        None => v8::undefined(scope).into(),
-    }
+    let Some(callbacks) = target else { return v8::undefined(scope).into() };
+    let context = v8::Local::new(scope, callbacks.context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let callback = v8::Local::new(scope, callbacks.proxy);
+    let window = v8::Integer::new_from_unsigned(scope, id);
+    let realm = v8::Integer::new_from_unsigned(scope, realm);
+    let backing = v8::Boolean::new(scope, true);
+    let receiver = v8::undefined(scope);
+    callback.call(scope, receiver.into(), &[window.into(), realm.into(), backing.into()])
+        .unwrap_or_else(|| v8::undefined(scope).into())
 }
 
 #[op2(fast)]
@@ -514,21 +833,53 @@ fn op_window_closed(state: &OpState, id: u32) -> bool {
 
 #[op2]
 #[string]
-fn op_window_relation(scope: &mut v8::PinScope, state: &OpState, id: u32, #[string] name: &str) -> String {
-    let Ok((shared, source, _)) = caller_window(scope, state) else { return "{}".to_string() };
+fn op_window_relation(scope: &mut v8::PinScope, state: &OpState, id: u32,
+    #[string] name: &str, realm: v8::Local<v8::Value>) -> String {
+    let Ok((shared, source, document)) = caller_window(scope, state) else { return "{}".to_string() };
+    let document_realm = document.borrow().frame_id;
     let windows = shared.borrow();
     let Some(window) = windows.windows.get(&id) else { return "{}".to_string() };
     if windows.windows.get(&source).is_none_or(|source| source.group != window.group) { return "{}".to_string(); }
+    let target_realm = if realm.is_undefined() {
+        if id == source { document_realm } else { window.realm_id }
+    } else {
+        let Some(realm) = realm.is_uint32().then(|| realm.uint32_value(scope)).flatten() else {
+            return "{}".to_string();
+        };
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let Some(target) = registry.by_frame_id(realm).filter(|_| registry.context(realm).is_some()) else {
+            return "{}".to_string();
+        };
+        drop(registry);
+        if root_for_document(state, &windows, &target) != Some(id) { return "{}".to_string(); }
+        realm
+    };
+    let relation_realm = |top| {
+        let realms = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let mut realm = target_realm;
+        if top {
+            for _ in 0..=crate::ops::max_live_frames() {
+                let Some(parent) = realms.frame_parent(realm) else { break };
+                realm = parent;
+            }
+        } else if let Some(parent) = realms.frame_parent(realm) {
+            realm = parent;
+        }
+        realm
+    };
     match name {
-        "self" => serde_json::json!({"windowId": id, "realmId": window.realm_id, "name": window.name}).to_string(),
-        "parent" | "top" => serde_json::json!({"windowId": id, "realmId": window.realm_id}).to_string(),
+        "self" => serde_json::json!({"windowId": id,
+            "realmId": if realm.is_undefined() { window.realm_id } else { target_realm },
+            "name": window.name}).to_string(),
+        "parent" => serde_json::json!({"windowId": id, "realmId": relation_realm(false)}).to_string(),
+        "top" => serde_json::json!({"windowId": id, "realmId": relation_realm(true)}).to_string(),
         "opener" => window.opener.and_then(|opener| windows.windows.get(&opener)
             .filter(|opener| !opener.closed && opener.group == window.group)
             .map(|opener| serde_json::json!({"windowId": opener.id, "realmId": window.opener_frame.unwrap_or(opener.realm_id)})))
             .unwrap_or_else(|| serde_json::json!({"windowId": 0, "realmId": 0})).to_string(),
         "length" => {
             let count = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().live_frame_owners().iter()
-                .filter(|(_, parent, _)| *parent == window.realm_id).count();
+                .filter(|(_, parent, _)| *parent == target_realm).count();
             serde_json::json!({"length": count}).to_string()
         }
         _ => "{}".to_string(),
@@ -536,13 +887,23 @@ fn op_window_relation(scope: &mut v8::PinScope, state: &OpState, id: u32, #[stri
 }
 
 #[op2(fast)]
-fn op_window_source(state: &OpState, realm: u32) -> u32 {
-    state.borrow::<SharedWindows>().borrow().root_realms.get(&realm).copied().unwrap_or(0)
+fn op_window_source(scope: &mut v8::PinScope, state: &OpState, realm: u32) -> u32 {
+    (|| {
+        let (shared, source, _) = caller_window(scope, state).ok()?;
+        let windows = shared.borrow();
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let document = registry.by_frame_id(realm)?;
+        registry.context(realm)?;
+        drop(registry);
+        let root = root_for_document(state, &windows, &document)?;
+        let target = windows.windows.get(&root)?;
+        (!target.closed && windows.windows.get(&source)?.group == target.group).then_some(root)
+    })().unwrap_or(0)
 }
 
 #[op2(fast)]
 fn op_window_navigate(scope: &mut v8::PinScope, state: &OpState, id: u32,
-    #[string] url: &str, _replace: bool) -> Result<bool, JsErrorBox>
+    #[string] url: &str, _replace: bool, realm: u32) -> Result<bool, JsErrorBox>
 {
     let (shared, source, document) = caller_window(scope, state)?;
     let resolved = resolve_url(&document.borrow(), url)?;
@@ -550,7 +911,17 @@ fn op_window_navigate(scope: &mut v8::PinScope, state: &OpState, id: u32,
     if windows.windows.get(&id).is_none_or(|target| target.closed || windows.windows.get(&source)
         .is_none_or(|source| source.group != target.group)) { return Err(security_error()); }
     let source_url = document.borrow().url.clone();
-    Ok(queue_navigation(&mut windows, id, resolved, source_url, false))
+    if windows.windows.get(&id).is_some_and(|window| window.realm_id == realm) {
+        return Ok(queue_navigation(&mut windows, id, resolved, source_url, false));
+    }
+    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+    let target = registry.by_frame_id(realm).filter(|_| registry.context(realm).is_some())
+        .ok_or_else(security_error)?;
+    drop(registry);
+    if root_for_document(state, &windows, &target) != Some(id) { return Err(security_error()); }
+    target.borrow_mut().pending_navigation = Some((resolved, "GET".to_string(), String::new()));
+    state.waker.wake();
+    Ok(true)
 }
 
 #[op2(fast)]
@@ -569,10 +940,10 @@ fn op_window_close(scope: &mut v8::PinScope, state: &OpState, id: u32) -> Result
 fn op_window_command(scope: &mut v8::PinScope, state: &OpState, id: u32,
     #[string] command: &str, #[string] value: &str) -> Result<bool, JsErrorBox>
 {
-    let (shared, source, document) = caller_window(scope, state)?;
+    let (shared, source, document, universal_access) = caller_dom_window(scope, state)?;
     let mut windows = shared.borrow_mut();
     let target = windows.windows.get(&id).ok_or_else(security_error)?;
-    if !document_access(&windows, source, &document, id, &target.state) { return Err(security_error()); }
+    if !document_access(&windows, source, &document, id, &target.state, universal_access) { return Err(security_error()); }
     let target = windows.windows.get_mut(&id).unwrap();
     match command {
         "name" => target.name = value.to_string(),
@@ -598,11 +969,13 @@ fn op_window_post_message(scope: &mut v8::PinScope, state: &OpState, id: u32,
     #[string] target_origin: &str, data: v8::Local<v8::Value>, transfer: v8::Local<v8::Value>) -> Result<bool, JsErrorBox>
 {
     let (shared, source, document) = caller_window(scope, state)?;
-    let source_realm = document.borrow().frame_id;
-    let origin = origin(&document.borrow());
+    let (source_realm, source_generation, origin) = {
+        let source = document.borrow();
+        (source.frame_id, source.document_generation, origin(&source))
+    };
     let target_origin = match target_origin {
         "*" => "*".to_string(),
-        "/" | "" => origin.clone(),
+        "/" | "" => "/".to_string(),
         value => url::Url::parse(value).map(|url| url.origin().ascii_serialization())
             .map_err(|_| JsErrorBox::new("DOMExceptionSyntaxError", "Invalid postMessage target origin"))?,
     };
@@ -642,7 +1015,7 @@ fn op_window_post_message(scope: &mut v8::PinScope, state: &OpState, id: u32,
     for buffer in buffers { if buffer.detach(None) != Some(true) { return Err(clone_error("ArrayBuffer transfer failed")); } }
     windows.message_bytes += size;
     windows.messages.push_back(WindowMessage { target: id, source_realm, source_window: source,
-        origin, target_origin, bytes, transfers });
+        source_generation, origin, target_origin, bytes, transfers });
     drop(windows);
     state.waker.wake();
     Ok(true)
@@ -650,25 +1023,28 @@ fn op_window_post_message(scope: &mut v8::PinScope, state: &OpState, id: u32,
 
 #[op2(fast)]
 fn op_window_realm_same_origin(scope: &mut v8::PinScope, state: &OpState, realm: u32) -> bool {
-    let Ok((shared, source, document)) = caller_window(scope, state) else { return false };
+    let Ok((shared, source, document, universal_access)) = caller_dom_window(scope, state) else { return false };
     let windows = shared.borrow();
     if let Some(root) = windows.root_for_realm(realm) {
         return windows.windows.get(&root).is_some_and(|target|
-            document_access(&windows, source, &document, root, &target.state));
+            document_access(&windows, source, &document, root, &target.state, universal_access));
     }
     let realms = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
     let Some(target) = realms.by_frame_id(realm).filter(|_| realms.context(realm).is_some()) else { return false };
     drop(realms);
     let Some(root) = root_for_document(state, &windows, &target) else { return false };
-    document_access(&windows, source, &document, root, &target)
+    document_access(&windows, source, &document, root, &target, universal_access)
 }
 
 #[op2(reentrant)]
 fn op_window_realm_proxy<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
-    id: u32, realm: u32) -> v8::Local<'s, v8::Value>
+    id: u32, realm: u32, factory: v8::Local<v8::Function>) -> v8::Local<'s, v8::Value>
 {
-    let callbacks = (|| {
-        let (shared, source, _) = caller_window(scope, state).ok()?;
+    let resolved = (|| {
+        let source_context = caller_context(scope).ok()?;
+        let factory_context = factory.get_creation_context(scope)?;
+        if v8::Global::new(scope, factory_context) != source_context { return None; }
+        let (shared, source, source_document) = context_document(state, &source_context).ok()?;
         let windows = shared.borrow();
         let target = windows.windows.get(&id)?;
         if target.closed || windows.windows.get(&source)?.group != target.group { return None; }
@@ -677,10 +1053,16 @@ fn op_window_realm_proxy<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpSta
         realms.context(realm)?;
         drop(realms);
         if root_for_document(state, &windows, &document)? != id { return None; }
-        windows.callbacks.get(&target.realm_id).cloned()
+        // A relationship back to the calling document retains that world's
+        // global identity. Every foreign document goes through its live proxy.
+        if Rc::ptr_eq(&source_document, &document) { return Some((source_context, None)); }
+        Some((source_context, Some(v8::Global::new(scope, factory))))
     })();
-    let Some(callbacks) = callbacks else { return v8::undefined(scope).into() };
-    let callback = v8::Local::new(scope, callbacks.proxy);
+    let Some((context, callback)) = resolved else { return v8::undefined(scope).into() };
+    let context = v8::Local::new(scope, context);
+    let Some(callback) = callback else { return context.global(scope).into() };
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let callback = v8::Local::new(scope, callback);
     let window = v8::Integer::new_from_unsigned(scope, id);
     let realm = v8::Integer::new_from_unsigned(scope, realm);
     let receiver = v8::undefined(scope);
@@ -701,8 +1083,14 @@ pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows)
             let windows = shared.borrow();
             windows.windows.get(&message.target).filter(|window| !window.closed)
                 .and_then(|window| {
-                    let current_origin = origin(&window.state.borrow());
-                    if message.target_origin != "*" && (current_origin == "null" || current_origin != message.target_origin) { return None; }
+                    let document = window.state.borrow();
+                    let current_origin = origin(&document);
+                    if message.target_origin == "/" {
+                        if current_origin != message.origin || (current_origin == "null"
+                            && (window.id != message.source_window || window.realm_id != message.source_realm
+                                || document.document_generation != message.source_generation)) { return None; }
+                    } else if message.target_origin != "*"
+                        && (current_origin == "null" || current_origin != message.target_origin) { return None; }
                     windows.callbacks.get(&window.realm_id).cloned()
                 })
         };
@@ -735,5 +1123,6 @@ pub(crate) fn ops() -> Vec<OpDecl> {
     vec![op_window_current(), op_window_register(), op_window_open(), op_window_target(),
         op_window_same_origin(), op_window_closed(), op_window_relation(), op_window_source(),
         op_window_navigate(), op_window_close(), op_window_command(), op_window_post_message(),
-        op_window_realm_proxy(), op_window_realm_same_origin()]
+        op_window_realm_proxy(), op_window_realm_same_origin(), op_world_register(),
+        op_world_dom_generation(), op_world_node_id(), op_world_focus(), op_world_event_dispatch()]
 }

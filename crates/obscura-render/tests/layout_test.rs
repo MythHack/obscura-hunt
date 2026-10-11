@@ -4852,7 +4852,160 @@ fn perspective_computes_cascaded_lengths_and_establishes_containing_blocks() {
     let camera = layout.rects[&tree.get_element_by_id("camera").unwrap()];
     let badge = layout.rects[&tree.get_element_by_id("badge").unwrap()];
     assert_eq!((badge.x - camera.x, badge.y - camera.y), (4.0, 6.0));
-    assert!(!obscura_render::style::supports_declaration("perspective", "80px"));
+    assert!(obscura_render::style::supports_declaration("perspective", "80px"));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn perspective_projects_pixels_cssom_bounds_and_pointer_plane_together() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body { margin:0; background:white }
+        #stage { position:absolute;left:100px;top:80px;width:200px;height:200px;
+            perspective:400px;perspective-origin:0 0 }
+        #plane { width:100px;height:100px;background:red;transform:translateZ(200px) }
+        </style><div id="stage"><div id="plane"></div></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (500.0, 400.0), None, &mut resources).unwrap();
+    let plane = tree.get_element_by_id("plane").unwrap();
+    let rect = prepared.document_rect(plane).unwrap();
+    assert!((rect.x - 100.0).abs() < 0.01 && (rect.y - 80.0).abs() < 0.01, "{rect:?}");
+    assert!((rect.width - 200.0).abs() < 0.01 && (rect.height - 200.0).abs() < 0.01, "{rect:?}");
+    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+    assert_eq!(prepared.hit_test(&tree, &scroll, 250.0, 100.0), Some(plane));
+    let local = prepared.viewport_to_local(&tree, plane, &scroll, 250.0, 100.0).unwrap();
+    assert!((local.0 - 75.0).abs() < 0.01 && (local.1 - 10.0).abs() < 0.01);
+    assert_eq!(prepared.local_to_viewport(&tree, plane, &scroll, 100.0, 100.0), Some((300.0, 280.0)));
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    let pixel = image.pixel(250, 100).unwrap();
+    assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
+    let pixel = image.pixel(310, 100).unwrap();
+    assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 255, 255));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn preserve_3d_sorts_crossing_planes_per_pixel_and_hit_point() {
+    for (red_transform, blue_transform, colors, left_color, right_color) in [
+        ("rotateY(45deg)", "rotateY(-45deg)", ["red", "blue"], (255,0,0), (0,0,255)),
+        ("rotateY(45deg)", "rotateY(-45deg)", ["rgba(255,0,0,.5)", "rgba(0,0,255,.5)"], (191,63,127), (127,63,191)),
+        ("translateZ(50px)", "translateZ(50px)", ["red", "blue"], (255,0,0), (255,0,0)),
+    ] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            html,body {{ margin:0; background:white }}
+            #stage {{ position:absolute;left:100px;top:100px;width:200px;height:200px;
+                perspective:400px;transform-style:preserve-3d }}
+            .plane {{ position:absolute;left:50px;top:50px;width:100px;height:100px }}
+            #red {{ background:{};transform:{red_transform};z-index:2 }}
+            #blue {{ background:{};transform:{blue_transform};z-index:1 }}
+            </style><div id="stage"><div class="plane" id="red"></div><div class="plane" id="blue"></div></div>"#, colors[0], colors[1]));
+        let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        let mut prepared = obscura_render::prepare_dom(&tree, (400.0, 400.0), None, &mut resources).unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert_eq!(prepared.hit_test(&tree, &scroll, 170.0, 200.0), tree.get_element_by_id("red"));
+        assert_eq!(prepared.hit_test(&tree, &scroll, 230.0, 200.0), tree.get_element_by_id(if red_transform == blue_transform { "red" } else { "blue" }));
+        let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+        let left = image.pixel(170, 200).unwrap();
+        let right = image.pixel(230, 200).unwrap();
+        assert_eq!((left.red(), left.green(), left.blue()), left_color, "{red_transform}, {}", colors[0]);
+        assert_eq!((right.red(), right.green(), right.blue()), right_color, "{blue_transform}, {}", colors[1]);
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn perspective_flat_boundary_discards_descendant_depth_but_preserved_boundary_keeps_it() {
+    for (mode, width) in [("flat", 400.0 / 3.0), ("preserve-3d", 200.0)] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>
+            html,body {{ margin:0; background:white }}
+            #stage {{ width:200px;height:200px;perspective:400px;perspective-origin:0 0;transform-style:preserve-3d }}
+            #wrapper {{ width:100px;height:100px;transform:translateZ(100px);transform-style:{mode} }}
+            #child {{ width:100px;height:100px;background:red;transform:translateZ(100px) }}
+            </style><div id="stage"><div id="wrapper"><div id="child"></div></div></div>"#));
+        let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        let mut prepared = obscura_render::prepare_dom(&tree, (300.0, 250.0), None, &mut resources).unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        assert!((prepared.document_rect(child).unwrap().width - width).abs() < 0.02, "{mode}");
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert_eq!(prepared.hit_test(&tree, &scroll, width - 5.0, 20.0), Some(child));
+        assert_ne!(prepared.hit_test(&tree, &scroll, width + 5.0, 20.0), Some(child));
+        let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+        let inside = image.pixel((width - 5.0) as u32, 20).unwrap();
+        let outside = image.pixel((width + 5.0) as u32, 20).unwrap();
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0), "{mode}");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255), "{mode}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn rotate_y_origin_projects_exact_corners_not_bounding_box_corners() {
+    let tree = parse_html(r#"<!doctype html><style>html,body{margin:0;background:white}
+        #plane{width:100px;height:100px;background:red;transform-origin:0 0;
+            transform:perspective(400px) rotateY(60deg)}
+        </style><div id="plane"></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (200.0, 200.0), None, &mut resources).unwrap();
+    let plane = tree.get_element_by_id("plane").unwrap();
+    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+    let corner = prepared.local_to_viewport(&tree, plane, &scroll, 100.0, 100.0).unwrap();
+    assert!((corner.0 - 41.1013).abs() < 0.02 && (corner.1 - 82.2026).abs() < 0.02, "{corner:?}");
+    assert_eq!(prepared.hit_test(&tree, &scroll, 20.0, 30.0), Some(plane));
+    assert_ne!(prepared.hit_test(&tree, &scroll, 35.0, 95.0), Some(plane));
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    let inside = image.pixel(20, 30).unwrap();
+    let outside = image.pixel(35, 95).unwrap();
+    assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+    assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn camera_clipped_translucent_plane_paints_without_backface_or_singular_leaks() {
+    for (transform, hidden) in [
+        ("perspective(100px) rotateY(-60deg)", false),
+        ("rotateY(180deg)", true),
+        ("scaleX(0)", true),
+        ("scaleZ(0)", true),
+        ("perspective(100px) translateZ(100px)", true),
+        ("perspective(100px) translateZ(101px)", true),
+    ] {
+        let tree = parse_html(&format!(r#"<!doctype html><style>html,body{{margin:0;background:white}}
+            #plane{{width:200px;height:100px;background:rgba(255,0,0,.5);transform-origin:0 0;
+                backface-visibility:hidden;transform:{transform}}}
+            </style><div id="plane"></div>"#));
+        let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+        let mut prepared = obscura_render::prepare_dom(&tree, (300.0, 200.0), None, &mut resources).unwrap();
+        let plane = tree.get_element_by_id("plane").unwrap();
+        let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+        assert_eq!(prepared.viewport_to_local(&tree, plane, &scroll, 50.0, 20.0).is_none(), hidden, "{transform}");
+        assert_eq!(prepared.hit_test(&tree, &scroll, 50.0, 20.0) == Some(plane), !hidden, "{transform}");
+        assert_eq!(prepared.local_to_viewport(&tree, plane, &scroll, 10.0, 10.0).is_none(), hidden, "{transform}");
+        let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+        let pixel = image.pixel(50, 20).unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), if hidden { (255,255,255) } else { (255,127,127) }, "{transform}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn untransformed_geometry_and_paint_keep_the_identity_path() {
+    let tree = parse_html(r#"<!doctype html><style>html,body{margin:0;background:white}
+        #plane{position:absolute;left:30px;top:40px;width:100px;height:80px;background:red}
+        </style><div id="plane"></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (200.0, 200.0), None, &mut resources).unwrap();
+    assert!(prepared.layout().transforms.is_empty());
+    let plane = tree.get_element_by_id("plane").unwrap();
+    let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+    assert_eq!(prepared.local_to_viewport(&tree, plane, &scroll, 10.0, 15.0), Some((40.0, 55.0)));
+    assert_eq!(prepared.viewport_to_local(&tree, plane, &scroll, 40.0, 55.0), Some((10.0, 15.0)));
+    assert_eq!(prepared.hit_test(&tree, &scroll, 40.0, 55.0), Some(plane));
+    assert_ne!(prepared.hit_test(&tree, &scroll, 140.0, 55.0), Some(plane));
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    let inside = image.pixel(40, 55).unwrap();
+    let outside = image.pixel(140, 55).unwrap();
+    assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+    assert_eq!((outside.red(), outside.green(), outside.blue()), (255, 255, 255));
 }
 
 #[cfg(feature = "paint")]

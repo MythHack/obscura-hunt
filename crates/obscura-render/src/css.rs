@@ -5220,6 +5220,12 @@ fn identity_transform_operation(operation: &crate::TransformOp) -> crate::Transf
         crate::TransformOp::Translate(x, y) => {
             crate::TransformOp::Translate(zero_transform_length(x), zero_transform_length(y))
         }
+        crate::TransformOp::Translate3d(x, y, z) => crate::TransformOp::Translate3d(
+            zero_transform_length(x), zero_transform_length(y), zero_transform_length(z)),
+        crate::TransformOp::Scale3d(_, _, _) => crate::TransformOp::Scale3d(1.0, 1.0, 1.0),
+        crate::TransformOp::Rotate3d(x, y, z, _) => crate::TransformOp::Rotate3d(*x, *y, *z, 0.0),
+        crate::TransformOp::Matrix3d(_) => crate::TransformOp::Matrix3d(crate::Matrix4::IDENTITY),
+        crate::TransformOp::Perspective(_) => crate::TransformOp::Matrix3d(crate::Matrix4::IDENTITY),
         crate::TransformOp::Scale(_, _) => crate::TransformOp::Scale(1.0, 1.0),
         crate::TransformOp::Rotate(_) => crate::TransformOp::Rotate(0.0),
         crate::TransformOp::Skew(_, _) => crate::TransformOp::Skew(0.0, 0.0),
@@ -5258,6 +5264,17 @@ fn interpolate_transform_operation(
             interpolate_transform_length(from_x, to_x, position)?,
             interpolate_transform_length(from_y, to_y, position)?,
         ),
+        (crate::TransformOp::Translate3d(x,y,z), crate::TransformOp::Translate3d(tx,ty,tz)) =>
+            crate::TransformOp::Translate3d(interpolate_transform_length(x,tx,position)?,
+                interpolate_transform_length(y,ty,position)?, interpolate_transform_length(z,tz,position)?),
+        (crate::TransformOp::Scale3d(x,y,z), crate::TransformOp::Scale3d(tx,ty,tz)) =>
+            crate::TransformOp::Scale3d(lerp(*x,*tx),lerp(*y,*ty),lerp(*z,*tz)),
+        (crate::TransformOp::Rotate3d(x,y,z,a), crate::TransformOp::Rotate3d(tx,ty,tz,b))
+            if (x,y,z) == (tx,ty,tz) => crate::TransformOp::Rotate3d(*x,*y,*z,lerp(*a,*b)),
+        (crate::TransformOp::Matrix3d(a), crate::TransformOp::Matrix3d(b)) =>
+            crate::TransformOp::Matrix3d(crate::Matrix4(std::array::from_fn(|i| lerp(a.0[i],b.0[i])))),
+        (crate::TransformOp::Perspective(a), crate::TransformOp::Perspective(b)) =>
+            crate::TransformOp::Perspective(interpolate_transform_length(a,b,position)?),
         (crate::TransformOp::Scale(from_x, from_y), crate::TransformOp::Scale(to_x, to_y)) => {
             crate::TransformOp::Scale(lerp(*from_x, *to_x), lerp(*from_y, *to_y))
         }

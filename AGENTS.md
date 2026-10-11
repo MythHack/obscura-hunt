@@ -141,9 +141,9 @@ screenshots or reports.
   pass reference-node vs parent nid in a way that's easy to break. If you touch
   mutation methods, verify `before()`, `after()`, `replaceWith()`, and
   `replaceChild()` on connected elements.
-- **Multi-statement `--eval` starting with `const` returns `null`** (V8 gives
-  `const` an empty completion value). Wrap snippets in an IIFE:
-  `(function(){ ...; return result; })()`.
+- **Multi-statement `--eval` returns the final Script completion value.**
+  Statements and expressions are accepted; a declaration-only script has an
+  empty completion value, returned as `null`. An IIFE is optional for an explicit return scope.
 - **`canAccessOpener` must be in every `TargetInfo` payload**, or strict CDP
   clients (chromiumoxide) panic.
 - **The DOM reparenting guards in `tree.rs` are load-bearing.** `append_child` /

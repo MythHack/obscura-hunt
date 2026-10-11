@@ -48,8 +48,8 @@ an upstream interface can replace it without losing those browser semantics.
 
 Use the scoped `-p obscura-cli --bins` commands above to build `obscura` and
 `obscura-worker`. An unscoped workspace build also builds auxiliary programs such
-as `paint_file`, the upstream HTML-to-PNG rendering harness; HuntForge does not
-require that executable.
+as `paint_file`, the upstream HTML-to-PNG rendering harness. Those auxiliary
+programs are not required to use the browser CLI.
 
 
 ## Without rendering

@@ -1,4 +1,5 @@
 pub mod cdp_watchdog;
+mod embedding_policy;
 pub mod frame;
 mod import_map;
 pub mod markdown;

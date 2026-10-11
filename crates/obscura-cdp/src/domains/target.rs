@@ -200,8 +200,14 @@ pub async fn handle(
                 ctx.target_auto_attach_sessions.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
+                ctx.preload_scripts.retain(|script| script.session_id != session_id);
+                ctx.binding_sessions.retain(|_, owners| {
+                    owners.retain(|owner| owner != session_id);
+                    !owners.is_empty()
+                });
                 if let Some(page_id) = page_id {
                     ctx.refresh_runtime_event_collection(&page_id);
+                    ctx.refresh_preload_scripts(&page_id);
                     let params = json!({"sessionId": session_id, "targetId": page_id});
                     let event = match parent_session_id {
                         Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),

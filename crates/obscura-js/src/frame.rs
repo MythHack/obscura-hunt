@@ -84,10 +84,8 @@ impl FrameRealm {
             return None;
         }
         parent.copy_identity_to_realm(&context);
-        // A snapshot-created realm has null deno_core per-context state slots, so
-        // a promise rejection or dynamic import() in the frame would segfault in
-        // deno_core's global callbacks (#850, #841). Alias the main realm's state.
-        parent.share_deno_context_state_with_realm(&context);
+        // Every restored document owns a real module map. The shared async-op
+        // driver is attached natively without aliasing the main module map.
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -111,12 +109,12 @@ impl FrameRealm {
         if opaque { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
 
-        let realms = parent.realm_states();
-        realms.borrow_mut().register(
-            context.clone(),
-            frame_id,
-            Rc::new(std::cell::RefCell::new(state)),
-        );
+        let state = Rc::new(std::cell::RefCell::new(state));
+        let modules = parent.attach_document_module_realm(&context, &state);
+        let parent_state = parent.document_state_for_frame(parent_frame_id).ok()?;
+        realms.borrow_mut().register(context.clone(), frame_id, state);
+        realms.borrow_mut().bind_parent_document(frame_id, &parent_state);
+        realms.borrow_mut().attach_document_modules(&context, modules);
 
         let realm = FrameRealm {
             context,

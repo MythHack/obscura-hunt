@@ -94,6 +94,12 @@ async fn iframe_cross_origin_facade_blocks_dom_storage_and_reflection_escapes() 
 async fn iframe_same_origin_facade_and_native_realm_remain_accessible() {
     let url = frame_fixture();
     let mut parent = page(&url.replace("/frame", "/parent"));
+    assert_eq!(parent.evaluate(r#"(() => {
+        const iframe = document.getElementById('child');
+        const initial = iframe.contentWindow;
+        return [initial.document.URL, initial.document === iframe.contentDocument,
+            initial.Array !== Array, initial.parent === window];
+    })()"#).unwrap(), json!(["about:blank", true, true, true]));
     load_frame(&mut parent, &url).await;
     assert_eq!(parent.evaluate(r#"(() => {
         const child = iframe.contentWindow;
@@ -108,6 +114,10 @@ async fn iframe_same_origin_facade_and_native_realm_remain_accessible() {
     let pending = parent.take_pending_frames().pop().expect("fetched frame queued");
     let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
         &pending.url, &pending.html).expect("same-origin frame realm");
+    assert_eq!(pending.url, url, "src navigation must queue the fetched document, not initial about:blank");
+    assert_eq!(parent.live_frame_owner(pending.frame_id).unwrap().0, pending.parent_frame_id);
+    assert_eq!(frame.evaluate(&mut parent, "[document.URL, document.getElementById('secret').textContent]").unwrap(),
+        json!([url, "child secret"]));
     frame.execute_script(&mut parent, "document.body.textContent = 'native'; globalThis.sentinel = 73;").unwrap();
     assert_eq!(parent.evaluate(r#"(() => {
         const child = iframe.contentWindow;
@@ -148,13 +158,18 @@ async fn iframe_native_delivery_cannot_be_forged_or_wrapped_by_author_script() {
         const dispatch = globalThis.dispatchEvent;
         globalThis.dispatchEvent = event => { wrapped++; return dispatch(event); };
         const Message = globalThis.MessageEvent;
-        globalThis.syntheticTrust = globalThis.__obscura_markTrusted(
-            new Message('message', {origin: 'https://trusted.example', source: parent})).isTrusted;
+        const synthetic = new Message('message', {
+            data: 'forged-message', origin: 'https://attacker.example', source: null,
+        });
+        synthetic.origin = 'https://trusted.example';
+        synthetic.source = window === parent ? iframe.contentWindow : parent;
+        synthetic._isTrusted = true;
+        synthetic._trusted = true;
+        globalThis.syntheticTrust = synthetic.isTrusted;
+        dispatch(synthetic);
         globalThis.MessageEvent = class extends Message {
             constructor(...args) { super(...args); wrapped++; this.origin = 'https://trusted.example'; }
         };
-        const markTrusted = globalThis.__obscura_markTrusted;
-        globalThis.__obscura_markTrusted = event => { wrapped++; return markTrusted(event); };
     "#;
     parent.execute_script("attack-page-delivery", attack).unwrap();
     frame.execute_script(&mut parent, attack).unwrap();
@@ -165,13 +180,15 @@ async fn iframe_native_delivery_cannot_be_forged_or_wrapped_by_author_script() {
     frame.deliver_message(&mut parent, &message.data_json, &message.origin,
         message.source_frame_id, &message.target_origin).unwrap();
     assert_eq!(frame.evaluate(&mut parent, "[received, wrapped, syntheticTrust]").unwrap(),
-        json!([[["parent-message", "https://parent.example", true, true]], 0, false]));
+        json!([[["forged-message", "https://trusted.example", true, false],
+            ["parent-message", "https://parent.example", true, true]], 0, false]));
     frame.execute_script(&mut parent, "parent.postMessage('child-message', '*');").unwrap();
     let message = parent.take_pending_frame_messages().pop().unwrap();
     parent.deliver_frame_message(0, &message.data_json, &message.origin,
         message.source_frame_id, &message.target_origin).unwrap();
     assert_eq!(parent.evaluate("[received, wrapped, syntheticTrust]").unwrap(),
-        json!([[["child-message", frame.origin(), true, true]], 0, false]));
+        json!([[["forged-message", "https://trusted.example", true, false],
+            ["child-message", frame.origin(), true, true]], 0, false]));
 }
 
 #[tokio::test(flavor = "current_thread")]
