@@ -253,6 +253,21 @@ async fn headers_and_referrer(stealth: bool) {
     evaluate(&mut ctx, &session, "new Promise(resolve => { const f = document.createElement('iframe'); f.onload = () => resolve(true); f.src = '/header-policy.html'; document.body.append(f); })").await;
     evaluate(&mut ctx, &session, "document.querySelector('iframe').contentWindow.fetch('/echo').then(r => r.text())").await;
     assert_eq!(header(server.requests.lock().await.last().unwrap(), "referer"), None);
+    evaluate(&mut ctx, &session, "document.cookie = 'ambient=secret; path=/'; fetch('/echo?explicit-token', {credentials: 'omit', headers: {'Authorization': 'Bearer explicit'}}).then(r => r.text())").await;
+    let explicit = server.requests.lock().await.last().unwrap().clone();
+    assert_eq!(header(&explicit, "authorization").as_deref(), Some("Bearer explicit"));
+    assert_eq!(header(&explicit, "cookie"), None);
+    cdp(&mut ctx, &session, "Network.setExtraHTTPHeaders", json!({"headers": {
+        "User-Agent": "header-override-agent", "Accept-Language": "fr"
+    }})).await;
+    cdp(&mut ctx, &session, "Page.navigate", json!({"url": format!("{}overridden-identity", server.base)})).await;
+    let native = server.requests.lock().await.last().unwrap().clone();
+    assert_eq!(header(&native, "user-agent").as_deref(), Some("header-override-agent"));
+    assert_eq!(header(&native, "accept-language").as_deref(), Some("fr"));
+    for name in ["user-agent", "accept-language"] {
+        assert_eq!(native.lines().filter(|line| line.split_once(':')
+            .is_some_and(|(key, _)| key.eq_ignore_ascii_case(name))).count(), 1);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

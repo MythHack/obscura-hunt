@@ -594,6 +594,11 @@ fn detached_documents_adopt_real_nodes_without_losing_identity_or_mutating_the_l
             cdata.cloneNode().ownerDocument===xml,pi.cloneNode().ownerDocument===xml];
     })()"#).unwrap(),json!([true,null,"Editor","html",true,true,true,true,0,"draft",true,true,"draft","untouched",true,true,true,true,
         null,false,null,true,"urn:notes","public","system",true,true]));
+    assert_eq!(rt.evaluate(r#"(() => {
+        const parsed = new DOMParser().parseFromString('<broken>', 'application/xml');
+        return [parsed.documentElement.localName,
+            parsed.documentElement.ownerDocument === parsed, parsed.body];
+    })()"#).unwrap(), json!(["parsererror", true, null]));
 }
 #[tokio::test(flavor = "current_thread")]
 async fn mutation_observers_keep_original_values_filters_and_removed_subtrees_until_delivery() {
@@ -703,6 +708,17 @@ fn html_interfaces_do_not_misroute_style_loader_or_framework_value_trackers() {
             HTMLDivElement.prototype !== HTMLIFrameElement.prototype,constructorError,div.brand,
             document.createElement('iframe').brand,Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set instanceof Function];
     })()"#).unwrap(), json!([true,true,false,false,false,true,false,true,true,true,true,true,"TypeError","div","iframe",true]));
+    assert_eq!(rt.evaluate(r#"(() => {
+        class PrimaryWidget extends HTMLElement {}
+        class SecondaryWidget extends HTMLElement {}
+        class DerivedDiv extends HTMLDivElement {}
+        customElements.define('primary-widget', PrimaryWidget);
+        customElements.define('secondary-widget', SecondaryWidget);
+        const primary = document.createElement('primary-widget');
+        const ordinary = document.createElement('div');
+        return [ordinary instanceof PrimaryWidget, ordinary instanceof DerivedDiv,
+            primary instanceof PrimaryWidget, primary instanceof SecondaryWidget];
+    })()"#).unwrap(), json!([false, false, true, false]));
 }
 
 #[test]

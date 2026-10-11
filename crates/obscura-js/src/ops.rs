@@ -4677,7 +4677,7 @@ async fn fetch_url_inner(
         if let Some(referer) = referer { req = req.header("Referer", referer); }
 
         for (k, v) in &current_headers {
-            if !credentials_allowed && matches!(k.as_str(), "authorization" | "proxy-authorization" | "cookie") { continue; }
+            if !credentials_allowed && k == "cookie" { continue; }
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -4996,8 +4996,7 @@ async fn stealth_fetch_all(
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &current_headers {
-            if !credentials.allows(&page_origin, &current_url)
-                && matches!(k.as_str(), "authorization" | "proxy-authorization" | "cookie") { continue; }
+            if !credentials.allows(&page_origin, &current_url) && k == "cookie" { continue; }
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
@@ -6907,9 +6906,11 @@ fn op_initial_frame(
             let child = child.borrow();
             (document_base_url(&child).unwrap_or_else(|| child.url.clone()), child.import_map.clone())
         };
-        let proxy = windows.borrow().windows.get(&window_id).and_then(|window| window.loader.proxy_url.clone());
-        let root = windows.borrow().windows.get(&window_id).ok_or_else(||
-            deno_error::JsErrorBox::generic("Frame page owner is unavailable"))?.state.clone();
+        let (proxy, root) = {
+            let windows = windows.borrow();
+            let Some(owner) = windows.windows.get(&window_id) else { return 0 };
+            (owner.loader.proxy_url.clone(), owner.state.clone())
+        };
         let loader = Rc::new(crate::module_loader::ObscuraModuleLoader::with_page_state(&base, proxy, &child, imports)
             .with_network_state(&root));
         let modules = deno_core::BrowserRealm::attach(scope, context, loader);

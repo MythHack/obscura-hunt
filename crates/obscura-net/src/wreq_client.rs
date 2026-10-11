@@ -362,8 +362,13 @@ impl StealthHttpClient {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
 
-            req = req.header("user-agent", self.user_agent.read().await.as_str())
-                .header("accept-language", self.accept_language.read().await.as_str());
+            let extra_headers = self.extra_headers.read().await.clone();
+            if !extra_headers.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+                req = req.header("user-agent", self.user_agent.read().await.as_str());
+            }
+            if !extra_headers.keys().any(|name| name.eq_ignore_ascii_case("accept-language")) {
+                req = req.header("accept-language", self.accept_language.read().await.as_str());
+            }
             req = req
                 .header("accept", request.accept())
                 .header("sec-fetch-site", request_fetch_site(&request, &current_url))
@@ -395,7 +400,7 @@ impl StealthHttpClient {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            for (k, v) in &extra_headers {
                 if k.eq_ignore_ascii_case("referer") || ((strip_credential_headers || !request.sends_credentials_to(&current_url))
                     && crate::client::is_credential_header(k)) { continue; }
                 if k.eq_ignore_ascii_case("origin") {
@@ -410,7 +415,7 @@ impl StealthHttpClient {
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: extra_headers,
                 resource_type: request.resource_type,
             };
             if !request_callback_fired {

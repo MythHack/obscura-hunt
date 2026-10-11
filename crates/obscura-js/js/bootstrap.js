@@ -12370,6 +12370,7 @@ globalThis.DOMParser = class DOMParser {
     doc._contentType = mimeType;
     _cache.set(doc._nid, doc);
     _seedDetachedTreeState(doc);
+    if (isParserError) doc.replaceChildren(doc.querySelector('parsererror'));
     return doc;
   }
 };
@@ -13937,6 +13938,7 @@ globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
 const _htmlElementConstructionToken = Symbol('HTML element construction');
 const _htmlElementInterfaces = Object.create(null);
 (function _brandHtmlElementInterfaces() {
+  const ordinaryHasInstance = Function.prototype[Symbol.hasInstance];
   const tags = {
     HTMLAnchorElement:['a'], HTMLBRElement:['br'], HTMLBodyElement:['body'],
     HTMLButtonElement:['button'], HTMLCanvasElement:['canvas'], HTMLDataListElement:['datalist'],
@@ -13967,6 +13969,7 @@ const _htmlElementInterfaces = Object.create(null);
     }
     const brand = new Set(names);
     Object.defineProperty(Interface, Symbol.hasInstance, {value(value) {
+      if (this !== Interface) return ordinaryHasInstance.call(this, value);
       const nid = _weakMapGet(_nodeIdentity, value);
       return nid !== undefined && _domParse('namespace_uri', nid) === 'http://www.w3.org/1999/xhtml'
         && brand.has(_domParse('local_name', nid));
@@ -13977,6 +13980,7 @@ const _htmlElementInterfaces = Object.create(null);
   HTMLElementInterface.prototype = Element.prototype;
   globalThis.HTMLElement = HTMLElementInterface;
   Object.defineProperty(globalThis.HTMLElement, Symbol.hasInstance, {value(value) {
+    if (this !== HTMLElementInterface) return ordinaryHasInstance.call(this, value);
     const nid = _weakMapGet(_nodeIdentity, value);
     return nid !== undefined && _domParse('namespace_uri', nid) === 'http://www.w3.org/1999/xhtml';
   }, configurable:true});
