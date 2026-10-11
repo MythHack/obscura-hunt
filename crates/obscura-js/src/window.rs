@@ -224,7 +224,6 @@ pub(crate) struct WindowCallbacks {
     pub context: v8::Global<v8::Context>,
     pub initialize: v8::Global<v8::Function>,
     pub proxy: v8::Global<v8::Function>,
-    pub deliver: v8::Global<v8::Function>,
 }
 
 fn empty_storage() -> SharedStorage {
@@ -365,11 +364,12 @@ const WORLD_EVENT_CREATE_SLOT: i32 = WORLD_WRAP_NODE_SLOT + 1;
 const WORLD_EVENT_PHASE_SLOT: i32 = WORLD_EVENT_CREATE_SLOT + 1;
 const WORLD_EVENT_FINISH_SLOT: i32 = WORLD_EVENT_PHASE_SLOT + 1;
 const WORLD_NATIVE_INPUT_SLOT: i32 = WORLD_EVENT_FINISH_SLOT + 1;
+pub(crate) const WINDOW_MESSAGE_SLOT: i32 = WORLD_NATIVE_INPUT_SLOT + 1;
 const WINDOW_EVENT_NODE: u32 = u32::MAX;
 
 pub(crate) fn initialize_world_callback_slots(context: v8::Local<v8::Context>,
     undefined: v8::Local<v8::Value>) {
-    for slot in WORLD_NODE_ID_SLOT..=WORLD_NATIVE_INPUT_SLOT {
+    for slot in WORLD_NODE_ID_SLOT..=WINDOW_MESSAGE_SLOT {
         context.set_embedder_data(slot, undefined);
     }
 }
@@ -662,8 +662,7 @@ fn op_window_register(scope: &mut v8::PinScope, state: &OpState,
     let main_realm = windows.windows.values().any(|window|
         !window.closed && window.main_realm && window.context == context);
     windows.callbacks.insert(realm, WindowCallbacks { context,
-        initialize: v8::Global::new(scope, initialize), proxy: v8::Global::new(scope, proxy),
-        deliver: v8::Global::new(scope, deliver) });
+        initialize: v8::Global::new(scope, initialize), proxy: v8::Global::new(scope, proxy) });
     Ok(main_realm)
 }
 
@@ -1077,7 +1076,8 @@ fn op_window_realm_proxy<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpSta
         .unwrap_or_else(|| v8::undefined(scope).into())
 }
 
-pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows) -> Result<(), String> {
+pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows,
+    realms: &Rc<RefCell<RealmStates>>) -> Result<(), String> {
     // One task boundary drains only the messages already queued. Messages
     // posted by handlers belong to the next turn, not a recursive dispatch.
     let messages = {
@@ -1098,30 +1098,38 @@ pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows)
                                 || document.document_generation != message.source_generation)) { return None; }
                     } else if message.target_origin != "*"
                         && (current_origin == "null" || current_origin != message.target_origin) { return None; }
-                    windows.callbacks.get(&window.realm_id).cloned()
+                    Some(window.state.clone())
                 })
         };
         let Some(target) = target else { continue };
-        let context = v8::Local::new(scope, target.context);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        v8::tc_scope!(let scope, scope);
-        let deserializer = v8::ValueDeserializer::new(scope, Box::new(WindowClone), &message.bytes);
-        for (index, store) in message.transfers.iter().enumerate() {
-            let buffer = v8::ArrayBuffer::with_backing_store(scope, store);
-            deserializer.transfer_array_buffer(index as u32, buffer);
+        let contexts = realms.borrow().document_contexts(&target);
+        for context in contexts {
+            // Only the same current native document's execution worlds receive
+            // this delivery; handlers can retire worlds between callbacks.
+            if !realms.borrow().document_contexts(&target).contains(&context) { continue; }
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            v8::tc_scope!(let scope, scope);
+            let callback = context.get_embedder_data(scope, WINDOW_MESSAGE_SLOT)
+                .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                .ok_or("Window message delivery is unavailable")?;
+            let deserializer = v8::ValueDeserializer::new(scope, Box::new(WindowClone), &message.bytes);
+            for (index, store) in message.transfers.iter().enumerate() {
+                let buffer = v8::ArrayBuffer::with_backing_store(scope, store);
+                deserializer.transfer_array_buffer(index as u32, buffer);
+            }
+            if deserializer.read_header(context) != Some(true) { return Err("Posted message clone header is invalid".to_string()); }
+            let data = deserializer.read_value(context).ok_or("Posted message could not be deserialized")?;
+            let origin = v8::String::new(scope, &message.origin).ok_or("Message origin is too large")?;
+            let source = v8::Integer::new_from_unsigned(scope, message.source_window);
+            let source_realm = v8::Integer::new_from_unsigned(scope, message.source_realm);
+            let receiver = v8::undefined(scope);
+            if callback.call(scope, receiver.into(), &[data, origin.into(), source.into(), source_realm.into()]).is_none() {
+                tracing::warn!("page message handler threw: {}", scope.exception()
+                    .map(|error| error.to_rust_string_lossy(scope)).unwrap_or_default());
+            }
+            scope.perform_microtask_checkpoint();
         }
-        if deserializer.read_header(context) != Some(true) { return Err("Posted message clone header is invalid".to_string()); }
-        let data = deserializer.read_value(context).ok_or("Posted message could not be deserialized")?;
-        let origin = v8::String::new(scope, &message.origin).ok_or("Message origin is too large")?;
-        let source = v8::Integer::new_from_unsigned(scope, message.source_window);
-        let source_realm = v8::Integer::new_from_unsigned(scope, message.source_realm);
-        let callback = v8::Local::new(scope, target.deliver);
-        let receiver = v8::undefined(scope);
-        if callback.call(scope, receiver.into(), &[data, origin.into(), source.into(), source_realm.into()]).is_none() {
-            tracing::warn!("page message handler threw: {}", scope.exception()
-                .map(|error| error.to_rust_string_lossy(scope)).unwrap_or_default());
-        }
-        scope.perform_microtask_checkpoint();
     }
     Ok(())
 }

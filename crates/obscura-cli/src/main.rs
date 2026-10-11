@@ -17,6 +17,10 @@ struct Args {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Print machine-readable version, Git source, and compiled features, then exit.
+    #[arg(long, global = true)]
+    build_info: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -354,6 +358,50 @@ fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
 }
 
+fn write_build_info() -> anyhow::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Source {
+        repository: Option<&'static str>,
+        commit: Option<&'static str>,
+        dirty: Option<bool>,
+    }
+    #[derive(serde::Serialize)]
+    struct Features {
+        render: bool,
+        stealth: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct BuildInfo {
+        name: &'static str,
+        version: &'static str,
+        target: &'static str,
+        source: Source,
+        features: Features,
+    }
+    let info = BuildInfo {
+        name: "obscura",
+        version: env!("OBSCURA_BUILD_VERSION"),
+        target: env!("OBSCURA_BUILD_TARGET"),
+        source: Source {
+            repository: Some(env!("OBSCURA_BUILD_REPOSITORY")).filter(|value| !value.is_empty()),
+            commit: Some(env!("OBSCURA_BUILD_COMMIT")).filter(|value| !value.is_empty()),
+            dirty: match env!("OBSCURA_BUILD_DIRTY") {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+        },
+        features: Features {
+            render: cfg!(feature = "render"),
+            stealth: cfg!(feature = "stealth"),
+        },
+    };
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &info)?;
+    std::io::Write::write_all(&mut stdout, b"\n")?;
+    Ok(())
+}
+
 fn operator_network_error(error: impl std::fmt::Display) -> String {
     let message = error.to_string();
     match obscura_net::private_network_error_hint(&message) {
@@ -365,6 +413,9 @@ fn operator_network_error(error: impl std::fmt::Display) -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.build_info {
+        return write_build_info();
+    }
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
     // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left

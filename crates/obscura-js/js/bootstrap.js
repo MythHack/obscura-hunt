@@ -883,6 +883,7 @@ const _consoleRemoteObject = (value) => {
   remote.objectId = _consoleObjectId(value);
   return remote;
 };
+const _consoleExecutionGlobal = globalThis;
 const _consoleFn = (level, args) => {
   try {
     const text = args.map(a => {
@@ -909,7 +910,7 @@ const _consoleFn = (level, args) => {
           catch { return { type: typeof a, description: "<unavailable>" }; }
         }))
       : "";
-    __obscuraCore.ops.op_console_msg(level, text, eventArgs);
+    __obscuraCore.ops.op_console_msg(level, text, eventArgs, _consoleExecutionGlobal);
   } catch {}
 };
 
@@ -2481,7 +2482,7 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 // "Ensure pre-insertion validity" and the validity checks of "replace"
 // (`replacing` true). Steps run in the spec's order because the order is
 // observable through which exception is thrown.
-function _ensureInsertionValidity(parent, node, child, method, replacing) {
+function _ensureInsertionValidity(parent, node, child, method, replacing, replacingAll = false) {
   _requireSameArenaNode(parent, method);
   _requireSameArenaNode(node, method);
   if (child !== null) _requireSameArenaNode(child, method);
@@ -2526,12 +2527,12 @@ function _ensureInsertionValidity(parent, node, child, method, replacing) {
       parent,
     );
   }
-  if (parentType === 9) _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing);
+  if (parentType === 9) _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing, replacingAll);
 }
 
-function _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing) {
+function _ensureDocumentChildValidity(parent, node, nodeType, child, method, replacing, replacingAll) {
   const doc = parent;
-  const children = Array.from(doc.childNodes);
+  const children = replacingAll ? [] : Array.from(doc.childNodes);
   const childIndex = child === null ? children.length : children.indexOf(child);
   const hasElementOtherThanChild = children.some(c => c.nodeType === 1 && !(replacing && c === child));
   const doctypeFollowsChild = child !== null
@@ -5850,7 +5851,7 @@ class Element extends Node {
   replaceChildren(...nodes) {
     const node = _convertNodesIntoNode(nodes, this);
     const empty = node.nodeType === 11 && !node.firstChild;
-    _ensureInsertionValidity(this, node, null, "replaceChildren", false);
+    _ensureInsertionValidity(this, node, null, "replaceChildren", false, true);
     _replaceAllChildren(this, empty ? null : node, "replaceChildren");
   }
 }
@@ -19210,7 +19211,7 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
   const caretMembers = _installCaretGeometry();
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
-    _realmFrameId, _deliverRealmMessage, _frameObjects);
+    _realmFrameId, _deliverRealmMessage, _frameObjects, _deliverWindowMessage);
   if (_realmIsolated) {
     // Resolve the canonical realm through the existing authenticated window
     // target. The sentinel requests a borrowed native member even though both

@@ -674,12 +674,13 @@ impl ObscuraJsRuntime {
     /// Every scope, isolate entry and RefMut ends before returning Pending.
     pub fn poll_windows(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), String>> {
         let windows = self.windows.clone();
+        let realms = self.realm_states();
         self.retire_execution_world_modules();
         {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), main);
-            if let Err(error) = crate::window::deliver_messages(scope, &windows) { return Poll::Ready(Err(error)); }
+            if let Err(error) = crate::window::deliver_messages(scope, &windows, &realms) { return Poll::Ready(Err(error)); }
         }
         let result = self.runtime().poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
             .map(|result| result.map_err(|error| format!("Event loop error: {error}")));
@@ -1728,31 +1729,34 @@ impl ObscuraJsRuntime {
         source_frame_id: u32,
         target_origin: &str,
     ) -> Result<(), String> {
-        let context = if target_frame_id == 0 {
-            self.cdp_context()?
-        } else {
-            self.realm_states().borrow().context(target_frame_id)
-                .ok_or("Cannot find live child frame context")?
-        };
+        let realms = self.realm_states();
+        let document = realms.borrow().by_frame_id(target_frame_id)
+            .ok_or("Cannot find live message document")?;
+        let contexts = realms.borrow().document_contexts(&document);
+        if contexts.is_empty() { return Err("Cannot find live message execution world".into()); }
         self.begin_javascript_task();
         let result = (|| {
             let mut entered = self.runtime();
             v8::scope!(let scope, entered.v8_isolate());
-            let context = v8::Local::new(scope, context);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            v8::tc_scope!(let scope, scope);
-            let callback = context.get_embedder_data(scope, crate::ops::FRAME_MESSAGE_SLOT)
-                .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-                .ok_or("Realm message delivery is unavailable")?;
-            let data = v8::String::new(scope, data_json).ok_or("Message data too large")?;
-            let origin = v8::String::new(scope, origin).ok_or("Message origin too large")?;
-            let source = v8::Integer::new_from_unsigned(scope, source_frame_id);
-            let target = v8::String::new(scope, target_origin).ok_or("Message target origin too large")?;
-            let receiver = v8::undefined(scope);
-            if callback.call(scope, receiver.into(), &[data.into(), origin.into(), source.into(), target.into()]).is_none() {
-                return Err(exception_text(scope));
+            for context in contexts {
+                // A preceding listener may navigate or retire another world.
+                if !realms.borrow().document_contexts(&document).contains(&context) { continue; }
+                let context = v8::Local::new(scope, context);
+                let scope = &mut v8::ContextScope::new(scope, context);
+                v8::tc_scope!(let scope, scope);
+                let callback = context.get_embedder_data(scope, crate::ops::FRAME_MESSAGE_SLOT)
+                    .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    .ok_or("Realm message delivery is unavailable")?;
+                let data = v8::String::new(scope, data_json).ok_or("Message data too large")?;
+                let origin = v8::String::new(scope, origin).ok_or("Message origin too large")?;
+                let source = v8::Integer::new_from_unsigned(scope, source_frame_id);
+                let target = v8::String::new(scope, target_origin).ok_or("Message target origin too large")?;
+                let receiver = v8::undefined(scope);
+                if callback.call(scope, receiver.into(), &[data.into(), origin.into(), source.into(), target.into()]).is_none() {
+                    return Err(exception_text(scope));
+                }
+                scope.perform_microtask_checkpoint();
             }
-            scope.perform_microtask_checkpoint();
             Ok(())
         })();
         self.finish_heap_checked(result)
@@ -3151,6 +3155,15 @@ impl ObscuraJsRuntime {
                 tracing::error!(%error, "cannot initialize retired document context");
                 return;
             }
+        }
+        // A replaced document context does not inherit the old context's JS
+        // configuration. CSS geometry and native hit testing already use this
+        // retained viewport; install it before the new bootstrap chooses any
+        // screen-derived fingerprint dimensions for its window surfaces.
+        #[cfg(feature = "render")]
+        {
+            let (width, height) = self.state.borrow().viewport;
+            self.set_viewport(f64::from(width), f64::from(height));
         }
         self.state.borrow_mut().navigation_timing.record("domLoading");
         let source = format!("globalThis.__obscura_frameId = {}; globalThis.__obscura_init({});",

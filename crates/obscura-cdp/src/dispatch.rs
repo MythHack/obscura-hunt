@@ -1245,15 +1245,20 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
                             "timestamp": timestamp,
                         }),
                     ),
-                    obscura_js::ops::RuntimeEvent::Console(event) => (
-                        "Runtime.consoleAPICalled",
-                        json!({
+                    obscura_js::ops::RuntimeEvent::Console(event) => {
+                        let Some(context) = ctx.contexts_for_page(&page_id).find(|context|
+                            context.world.frame_id == event.frame_id
+                                && context.world.world_id == event.world_id
+                                && context.document_generation == event.document_generation) else {
+                            continue;
+                        };
+                        ("Runtime.consoleAPICalled", json!({
                             "type": event.kind,
                             "args": event.args,
-                            "executionContextId": execution_context_id,
+                            "executionContextId": context.id,
                             "timestamp": event.timestamp,
-                        }),
-                    ),
+                        }))
+                    },
                     obscura_js::ops::RuntimeEvent::Exception(event) => (
                         "Runtime.exceptionThrown",
                         json!({

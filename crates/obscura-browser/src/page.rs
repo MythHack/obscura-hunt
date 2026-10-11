@@ -9790,7 +9790,7 @@ mod tests {
         let mut page = page_with_transport_and_body("child-late", &format!("{origin}/page"), "<iframe id=child></iframe>");
         assert_eq!(page.evaluate(r#"(() => {
             const d = document.getElementById('child').contentDocument;
-            d.body.innerHTML = '<style>#box{width:10px}</style><div id=box></div><span id=text>iiiiiiiiii</span><span id=icon></span>';
+            d.body.innerHTML = '<style>#box{width:10px}</style><div id=box></div><span id=text>iiiiiiiiii</span><img id=icon>';
             const before = d.getElementById('box').getBoundingClientRect().width;
             const link = d.createElement('link'); link.rel='stylesheet'; link.href='/child.css';
             link.onload=()=>{globalThis.childSheetReady=true}; d.head.appendChild(link);

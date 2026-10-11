@@ -587,6 +587,9 @@ pub struct RuntimeConsoleEvent {
     pub kind: String,
     pub args: Vec<serde_json::Value>,
     pub timestamp: f64,
+    pub frame_id: u32,
+    pub world_id: Option<u64>,
+    pub document_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3484,21 +3487,37 @@ fn op_report_browser_exception<'s, 'i>(
     };
 }
 
-#[op2(fast)]
+#[op2(nofast)]
 fn op_console_msg(
+    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] level: &str,
     #[string] msg: &str,
     #[string] args_json: &str,
+    receiver: v8::Local<v8::Object>,
 ) {
+    // The lexical console binding authenticates its actual native execution
+    // world. Shared ops are bound in the root realm, not the emitting frame.
+    let Some(context) = receiver.get_creation_context(scope) else { return; };
+    if !receiver.strict_equals(context.global(scope).into()) { return; }
+    let context = v8::Global::new(scope, context);
+    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+    let Some(entry) = registry.entries.iter().find(|entry| entry.context == context && registry.entry_active(entry)) else { return; };
+    let (frame_id, world_id, document_generation) = (entry.frame_id, entry.world_id, entry.generation);
+    drop(registry);
     match level {
         "warn" | "warning" => tracing::warn!(target: "obscura::console", "{}", msg),
         "error" => tracing::error!(target: "obscura::console", "{}", msg),
         _ => tracing::info!(target: "obscura::console", "{}", msg),
     }
 
-    let page = state.borrow::<SharedState>().clone();
+    let Ok((windows, owner, _)) = crate::window::context_document(state, &context) else { return; };
+    let Some(page) = windows.borrow().windows.get(&owner)
+        .filter(|window| !window.closed).map(|window| window.state.clone()) else { return; };
     let mut page = page.borrow_mut();
+    // CDP execution worlds name their owning page's root as frame zero;
+    // nested native frame IDs stay unchanged. The owner was authenticated above.
+    let frame_id = if frame_id == page.frame_id { 0 } else { frame_id };
     if page.console_messages_enabled {
         if page.pending_console_messages.len() >= 1_024 {
             page.pending_console_messages.pop_front();
@@ -3525,6 +3544,9 @@ fn op_console_msg(
             kind: level.to_string(),
             args,
             timestamp,
+            frame_id,
+            world_id,
+            document_generation,
         }));
 }
 
@@ -6776,6 +6798,7 @@ fn op_register_document_realm(
     frame_id: u32,
     deliver_message: v8::Local<v8::Value>,
     frame_objects: v8::Local<v8::Value>,
+    deliver_window_message: v8::Local<v8::Value>,
 ) {
     if let Some(context) = members.get_creation_context(scope) {
         context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
@@ -6787,6 +6810,11 @@ fn op_register_document_realm(
             && context.get_embedder_data(scope, FRAME_MESSAGE_SLOT).is_none_or(|value| !value.is_function())
         {
             context.set_embedder_data(FRAME_MESSAGE_SLOT, deliver_message);
+        }
+        if deliver_window_message.is_function()
+            && context.get_embedder_data(scope, crate::window::WINDOW_MESSAGE_SLOT).is_none_or(|value| !value.is_function())
+        {
+            context.set_embedder_data(crate::window::WINDOW_MESSAGE_SLOT, deliver_window_message);
         }
         if frame_objects.is_object()
             && context.get_embedder_data(scope, FRAME_OBJECTS_SLOT).is_none_or(|value| !value.is_object())
