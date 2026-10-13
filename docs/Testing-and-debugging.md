@@ -92,6 +92,38 @@ async fn my_test() {
 
 `serve_once` and `cdp` helpers are copied across the parity tests; reuse them.
 
+### Upstream synchronization verification
+
+The sync of upstream [`8edfe48`](https://github.com/h4ckf0r0day/obscura/commit/8edfe480133b383f70e17f9d4ea55e3592cdfd24)
+into fork `bed6fc42` was verified on Windows with release builds and the retained
+local lockfile. Both `render` and `render,stealth` CLI builds completed.
+The final focused lifecycle, object-handle, module-network and native-window
+selection passed 43/43, including first-navigation cancellation without an
+existing runtime. An earlier broader selection passed 45/46; its remaining
+module-receipt test also failed before the sync on JSON number representation
+(`42.0` versus `42`). Actual CLI/CDP processes passed ten loopback scenarios
+in each transport mode, including cancellation of held document/script
+connections, first navigation without enabling Runtime, beforeunload
+dismissal/acceptance, popup messaging and nested frame access.
+
+The final full release nextest run was not green: 2107 passed, 188 failed and
+five were skipped. Every final failing test name also appeared in pre-sync
+baseline failures. Timing-sensitive tests varied across parallel and serial
+runs; a failure-name comparison does not establish identical causes or certify
+inherited failures as acceptable.
+The obstacle course passed 32/33: its fingerprint fixture expected
+`Europe/Berlin`, while Windows returned `Asia/Shanghai` despite
+`OBSCURA_TIMEZONE=Europe/Berlin`. The saved pre-sync executable failed the
+same fingerprint control.
+
+All 73 deterministic render fixtures produced paired screenshots. The behavior
+checker reported ten Chromium-side assertion failures and one Obscura-side
+perspective containing-block failure. That Obscura fixture produced identical
+pixels with an exact pre-sync production-source build. Representative captures
+attempted all 15 sites per position, with ten top and eleven bottom page pairs
+initially eligible. Failed requests, blank pages, unequal or unstable live
+states, and differing resource outcomes are excluded from fidelity conclusions.
+
 ## Logging
 
 ```bash

@@ -83,6 +83,7 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: std::rc::Rc<std::cell::RefCell<HashMap<String, Vec<String>>>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -189,6 +190,7 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             pending_events: Vec::new(),
+            pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -576,6 +578,7 @@ impl CdpContext {
         self.native_windows.remove(id);
         self.native_navigation_generations.remove(id);
         self.pending_native_navigations.remove(id);
+        self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -876,10 +879,16 @@ impl CdpContext {
             .as_ref()
             .and_then(|sid| self.sessions.get(sid))
             .cloned()?;
+        let mut initialized = false;
         if let Some(target) = self.pages.iter_mut().find(|p| p.id == page_id) {
             if !target.has_js() {
                 target.resume_js();
+                initialized = target.has_js();
             }
+        }
+        if initialized {
+            // Bringing the existing document live is not a navigation.
+            self.record_native_navigation(&page_id);
         }
         self.get_page_mut(&page_id)
     }

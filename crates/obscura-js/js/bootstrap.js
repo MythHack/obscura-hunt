@@ -22,7 +22,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_language', '__obscura_languages',
-    '__obscura_stealth', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
+    '__obscura_cancelPendingResourceLoads',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -303,6 +304,27 @@ let __parserBlockingScriptQueue = [];
 let __parserBlockingScriptBusy = false;
 let __parserBlockingScriptPending = 0;
 const __documentWriteScripts = new WeakSet();
+let __resourceLoadEpoch = 0;
+Object.defineProperty(globalThis, '__obscura_cancelPendingResourceLoads', {
+  value: function() {
+    // Existing continuations must not drain old queues through the fresh native
+    // load handles installed by stopLoading. New author work uses the new epoch.
+    __resourceLoadEpoch++;
+    __dynScriptQueue.length = 0;
+    __parserBlockingScriptQueue.length = 0;
+    __dynScriptBusy = false;
+    __parserBlockingScriptBusy = false;
+    __dynClassicPending = 0;
+    __dynLoadDelayingPending = 0;
+    __parserBlockingScriptPending = 0;
+    for (const node of _cache.values()) {
+      if (node instanceof HTMLImageElement) node._cancelImageRequest();
+    }
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 Object.defineProperty(globalThis, '__obscura_hasPendingDynamicScripts', {
   value: function() {
     return __dynClassicPending > 0 || __dynScriptBusy || __dynScriptQueue.length > 0;
@@ -409,6 +431,7 @@ function __startDynClassicFetch(task) {
   );
 }
 async function __runDynScriptTask(task) {
+  if (task.resourceLoadEpoch !== __resourceLoadEpoch) return;
   try {
     if (task.isModule) {
       await import(task.url);
@@ -417,6 +440,7 @@ async function __runDynScriptTask(task) {
       if (body === undefined) {
         if (!task.fetchResult) __startDynClassicFetch(task);
         const fetched = await task.fetchResult;
+        if (task.resourceLoadEpoch !== __resourceLoadEpoch) return;
         if (fetched.error) throw fetched.error;
         body = fetched.body;
       }
@@ -428,6 +452,7 @@ async function __runDynScriptTask(task) {
         // parser script happened to trigger the microtask checkpoint.
         await new Promise(resolve => {
           const execute = () => {
+            if (task.resourceLoadEpoch !== __resourceLoadEpoch) { resolve(); return; }
             globalThis.__currentScriptNid = task.nid;
             try { (0, eval)(body); }
             catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
@@ -438,57 +463,62 @@ async function __runDynScriptTask(task) {
         });
       }
     }
+    if (task.resourceLoadEpoch !== __resourceLoadEpoch) return;
     // Fire load via dispatchEvent only: it invokes the element's onload
     // property handler and any addEventListener('load') listeners, read live
     // off the element. Calling onload separately would double-fire it.
     try { task.dispatchEvent(new Event('load')); } catch(e) {}
   } catch(e) {
+    if (task.resourceLoadEpoch !== __resourceLoadEpoch) return;
     console.error('Dynamic script fetch error:', e.message);
     try { task.dispatchEvent(new Event('error')); } catch(ex) {}
   } finally {
-    if (task.delaysLoad) {
+    if (task.delaysLoad && task.resourceLoadEpoch === __resourceLoadEpoch) {
       task.delaysLoad = false;
       __dynLoadDelayingPending = Math.max(0, __dynLoadDelayingPending - 1);
     }
   }
 }
 async function __runAsyncClassicScript(task) {
+  const epoch = task.resourceLoadEpoch;
   __dynClassicPending++;
   try {
     await __runDynScriptTask(task);
   } finally {
-    __dynClassicPending--;
+    if (epoch === __resourceLoadEpoch) __dynClassicPending--;
   }
 }
 async function __processDynScriptQueue() {
   if (__dynScriptBusy) return;
+  const epoch = __resourceLoadEpoch;
   __dynScriptBusy = true;
   // try/finally so the busy flag is always cleared even if a task throws
   // outside its own guard; otherwise the queue would wedge and silently
   // block every later module or explicitly in-order script on the page.
   try {
-    while (__dynScriptQueue.length > 0) {
+    while (epoch === __resourceLoadEpoch && __dynScriptQueue.length > 0) {
       await __runDynScriptTask(__dynScriptQueue.shift());
     }
   } finally {
-    __dynScriptBusy = false;
+    if (epoch === __resourceLoadEpoch) __dynScriptBusy = false;
   }
 }
 async function __processParserBlockingScriptQueue() {
   if (__parserBlockingScriptBusy) return;
+  const epoch = __resourceLoadEpoch;
   __parserBlockingScriptBusy = true;
   try {
-    while (__parserBlockingScriptQueue.length > 0) {
+    while (epoch === __resourceLoadEpoch && __parserBlockingScriptQueue.length > 0) {
       const entry = __parserBlockingScriptQueue.shift();
       if (!entry.blocking) {
         __runAsyncClassicScript(entry.task);
         continue;
       }
       try { await __runDynScriptTask(entry.task); }
-      finally { __parserBlockingScriptPending--; }
+      finally { if (epoch === __resourceLoadEpoch) __parserBlockingScriptPending--; }
     }
   } finally {
-    __parserBlockingScriptBusy = false;
+    if (epoch === __resourceLoadEpoch) __parserBlockingScriptBusy = false;
   }
 }
 // Resolve a resource URL (script src / link href) against <base href> or the
@@ -2015,7 +2045,13 @@ function _eventTargetDispatch(target, event) {
     const eventHandler = target === globalThis ? target['on' + event.type] : null;
     if (typeof eventHandler === 'function') {
       try {
-        if (eventHandler.call(target, event) === false) event.preventDefault();
+        const result = eventHandler.call(target, event);
+        if (event.type === 'beforeunload' && _weakMapHas(_beforeUnloadValues, event)) {
+          if (result != null) {
+            event.preventDefault();
+            if (event.returnValue === '') event.returnValue = result;
+          }
+        } else if (result === false) event.preventDefault();
       } catch (error) {
         console.error(error);
       }
@@ -2060,7 +2096,13 @@ function _domEventInvoke(target, event, capture, phase) {
       ? target._resolveInlineHandler(handlerName) : null);
     if (typeof inlineFn === "function") {
       try {
-        if (inlineFn.call(target, event) === false) event.preventDefault();
+        const result = inlineFn.call(target, event);
+        if (event.type === 'beforeunload' && _weakMapHas(_beforeUnloadValues, event)) {
+          if (result != null) {
+            event.preventDefault();
+            if (event.returnValue === '') event.returnValue = result;
+          }
+        } else if (result === false) event.preventDefault();
       } catch (error) {
         console.error(error);
       }
@@ -2255,6 +2297,7 @@ function __prepareInsertedScript(script) {
     }
     const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
     const task = {
+      resourceLoadEpoch: __resourceLoadEpoch,
       url: fullUrl,
       isModule,
       nid: script._nid,
@@ -2300,6 +2343,7 @@ function __prepareInsertedScript(script) {
   } else if (isModule) {
     const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
     const task = {
+      resourceLoadEpoch: __resourceLoadEpoch,
       url: dataUrl,
       isModule: true,
       nid: script._nid,
@@ -2316,6 +2360,7 @@ function __prepareInsertedScript(script) {
     __parserBlockingScriptQueue.push({
       blocking: true,
       task: {
+        resourceLoadEpoch: __resourceLoadEpoch,
         inlineCode: code,
         isModule: false,
         nid: script._nid,
@@ -7155,6 +7200,7 @@ class HTMLImageElement extends Element {
     super(nid);
     this._imageRequest = 0;
     this._imageQueued = false;
+    this._imageStopped = false;
     this._imageInitialized = false;
     this._imageCompletionDeferred = false;
     this._imageComplete = typeof __obscuraCore.ops.op_image_metadata === "function"
@@ -7280,6 +7326,20 @@ class HTMLImageElement extends Element {
     });
   }
 
+  _cancelImageRequest() {
+    this._refreshImageFromCache();
+    if (this._imageComplete) return;
+    this._imageRequest++;
+    this._imageQueued = false;
+    this._imageStopped = true;
+    this._imageCompletionDeferred = false;
+    this._imageComplete = true;
+    this._imageDecoded = false;
+    this._imageNaturalWidth = 0;
+    this._imageNaturalHeight = 0;
+    this._rejectImageDecodes();
+  }
+
   _imageSourceChanged() {
     // The lightweight build has no retained render-resource cache. It still
     // preserves the historical non-blocking Image lifecycle so preloaders do
@@ -7294,6 +7354,7 @@ class HTMLImageElement extends Element {
   _adoptImageCandidate(currentSrc) {
     this._rejectImageDecodes();
     this._imageRequest++;
+    this._imageStopped = false;
     this._imageQueued = false;
     this._imageNaturalWidth = 0;
     this._imageNaturalHeight = 0;
@@ -7303,7 +7364,7 @@ class HTMLImageElement extends Element {
   }
 
   _queueImageRequest() {
-    if (this._imageQueued || this._imageComplete) return;
+    if (this._imageStopped || this._imageQueued || this._imageComplete) return;
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
@@ -7365,6 +7426,7 @@ class HTMLImageElement extends Element {
           this._imageCompletionDeferred = true;
         }
       }
+      if (this._imageStopped) return;
       if (metadata.state === "pending") {
         if (selected && this._imageComplete) {
           this._adoptImageCandidate(selected);
@@ -11519,6 +11581,14 @@ globalThis.DOMException = (function () {
 // author dispatch never gains an ambient privilege.
 const _trustedEvents = new WeakSet();
 const _nativeInputEvents = new WeakSet();
+let _hasStickyActivation = false;
+function _recordStickyActivation(event) {
+  if ((event.type === 'keydown' && event.key !== 'Escape') || event.type === 'mousedown'
+      || (event.type === 'pointerdown' && event.pointerType === 'mouse')
+      || (event.type === 'pointerup' && event.pointerType !== 'mouse') || event.type === 'touchend') {
+    _hasStickyActivation = true;
+  }
+}
 const _events = new WeakSet();
 const _eventState = new WeakMap();
 function _eventFlags(event) {
@@ -11545,6 +11615,7 @@ function _dispatchTrustedDomEvent(target, Constructor, type, options) {
   const event = new Constructor(type, options);
   _weakSetAdd(_trustedEvents, event);
   _weakSetAdd(_nativeInputEvents, event);
+  _recordStickyActivation(event);
   return _domEventDispatch(target, event);
 }
 
@@ -11617,6 +11688,32 @@ globalThis.Event = class Event {
     return path;
   }
 };
+
+const _beforeUnloadValues = new WeakMap();
+const _beforeUnloadEventConstructor = Event;
+const _setBeforeUnloadPrototype = Object.setPrototypeOf;
+globalThis.BeforeUnloadEvent = class BeforeUnloadEvent extends Event {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get returnValue() {
+    if (!_weakMapHas(_beforeUnloadValues, this)) throw new TypeError('Illegal invocation');
+    return _weakMapGet(_beforeUnloadValues, this);
+  }
+  set returnValue(value) {
+    if (!_weakMapHas(_beforeUnloadValues, this)) throw new TypeError('Illegal invocation');
+    _weakMapSet(_beforeUnloadValues, this, String(value));
+  }
+};
+const _beforeUnloadPrototype = BeforeUnloadEvent.prototype;
+globalThis.__obscura_fireBeforeUnload = function() {
+  const event = new _beforeUnloadEventConstructor('beforeunload', { cancelable: true });
+  _weakMapSet(_beforeUnloadValues, event, '');
+  _setBeforeUnloadPrototype(event, _beforeUnloadPrototype);
+  _weakSetAdd(_trustedEvents, event);
+  _weakSetAdd(_nativeInputEvents, event);
+  const allowed = _realmRegistered ? _domEventDispatch(globalThis, event) : _eventTargetDispatch(globalThis, event);
+  return _hasStickyActivation && (!allowed || event.returnValue !== '');
+};
+_markNative(BeforeUnloadEvent);
 _markNative(Event);
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }

@@ -1936,6 +1936,10 @@ impl ObscuraJsRuntime {
         }
     }
 
+    pub fn document_url(&self) -> String {
+        self.state.borrow().url.clone()
+    }
+
     /// Set the document's character encoding (WHATWG canonical name). Backs
     /// `document.characterSet` and the `<a>`/`<area>` URL query encoding
     /// override for legacy-charset documents.
@@ -1990,6 +1994,44 @@ impl ObscuraJsRuntime {
 
     pub fn has_pending_navigation(&self) -> bool {
         self.state.borrow().pending_navigation.is_some()
+    }
+    /// Cancel current native loads while retaining live document realms and receipts.
+    pub fn cancel_pending_resource_loads(&mut self) {
+        self.sync_window_document();
+        let registry = self.realm_states();
+        let (documents, contexts) = {
+            let registry = registry.borrow();
+            (registry.render_document_states(&self.state).cloned().collect::<Vec<_>>(),
+                registry.page_contexts(self.state.borrow().frame_id))
+        };
+        for document in documents {
+            let cancel = {
+                let mut state = document.borrow_mut();
+                state.pending_navigation = None;
+                state.pending_history_traversal = None;
+                state.pending_frames.clear();
+                state.pending_frame_bytes = 0;
+                std::mem::replace(&mut state.resource_load_cancel, deno_core::CancelHandle::new_rc())
+            };
+            cancel.cancel();
+        }
+        {
+            let mut windows = self.windows.borrow_mut();
+            windows.navigations.retain(|navigation| navigation.id != self.window_id);
+            if let Some(window) = windows.windows.get_mut(&self.window_id) {
+                window.navigation_generation = window.navigation_generation.wrapping_add(1);
+            }
+        }
+        for context in contexts {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            let source = v8::String::new(scope, "globalThis.__obscura_cancelPendingResourceLoads()");
+            if let Some(source) = source.and_then(|source| v8::Script::compile(scope, source, None)) {
+                let _ = source.run(scope);
+            }
+        }
+        #[cfg(feature = "render")]
+        self.stop_render_resource_loading();
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
@@ -2052,6 +2094,15 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         state.network_response_body_order.retain(|id| id != request_id);
         state.network_response_bodies.remove(request_id)
+    }
+
+    /// Move retained bodies in completion order before the runtime is suspended.
+    pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
+        let mut state = self.state.borrow_mut();
+        let order = std::mem::take(&mut state.network_response_body_order);
+        order.into_iter().filter_map(|id| {
+            state.network_response_bodies.remove(&id).map(|body| (id, body))
+        }).collect()
     }
 
     pub fn window_http_client(&self, id: crate::window::WindowId) -> Option<std::sync::Arc<obscura_net::ObscuraHttpClient>> {
@@ -2827,6 +2878,33 @@ impl ObscuraJsRuntime {
         registry.cancel_inactive_frame_timers();
         for state in registry.render_document_states(&self.state) {
             state.borrow_mut().abandon_render_resources();
+        }
+    }
+
+    /// Cancel this document's current loads without letting the next render
+    /// turn rediscover and restart them. Future new URLs can still load.
+    #[cfg(feature = "render")]
+    pub fn stop_render_resource_loading(&mut self) {
+        self.apply_render_resource_results();
+        let registry = self.realm_states();
+        let registry = registry.borrow();
+        for document in registry.render_document_states(&self.state) {
+            let mut state = document.borrow_mut();
+            let pending = std::mem::take(&mut state.render_resource_in_flight);
+            let backlog = std::mem::take(&mut state.render_resource_backlog);
+            let queued = state.render_resources.take_sync_misses(usize::MAX);
+            let images = std::mem::take(&mut state.render_image_in_flight);
+            // Completed loads are still observable after Page.stopLoading.
+            let events = std::mem::take(&mut state.render_resource_events);
+            state.abandon_render_resources();
+            state.render_resource_events = events;
+            for (url, profile, _) in pending.into_iter().chain(backlog).chain(queued) {
+                state.render_resources.stop_resource(&url, profile);
+            }
+            for ((_, url, profile), (cancel, _)) in images {
+                state.render_resources.stop_resource(&url, Some(profile));
+                let _ = cancel.send(());
+            }
         }
     }
 
@@ -5052,16 +5130,23 @@ impl ObscuraJsRuntime {
 
         for (i, arg) in arguments.iter().enumerate() {
             let arg_name = format!("__arg{}", i);
-            if let Some(value) = arg.get("value") {
-                let json_str =
-                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
-                setup_lines.push(format!("var {} = {};", arg_name, json_str));
-            } else if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
+            // objectId wins over value. go-rod marshals CallArgument through a
+            // struct, and Go's `omitempty` is a no-op on structs, so every
+            // object handle it sends arrives as `{"value":null,"objectId":...}`.
+            // Chromium reads objectId first and ignores the null; reading value
+            // first passed `null` as the argument and broke rod's JS helpers
+            // (`functions.selectable = ...` → "Cannot set properties of null").
+            if let Some(oid) = arg.get("objectId").and_then(|v| v.as_str()) {
                 if let Some(retrieval) = self.resolve_remote_object(oid) {
                     setup_lines.push(format!("var {} = {};", arg_name, retrieval));
                 } else {
                     setup_lines.push(format!("var {} = undefined;", arg_name));
                 }
+            } else if let Some(value) = arg.get("value") {
+                // No handle: a plain JSON argument, explicit null included.
+                let json_str =
+                    serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_string());
+                setup_lines.push(format!("var {} = {};", arg_name, json_str));
             } else if let Some(unser) = arg.get("unserializableValue").and_then(|v| v.as_str()) {
                 // CDP defines UnserializableValue as a closed set. Anything
                 // else is arbitrary source text arriving in a data field;

@@ -11,6 +11,7 @@ use deno_core::ModuleLoader;
 use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
+use deno_core::CancelFuture;
 
 use deno_error::JsErrorBox;
 
@@ -255,7 +256,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
                 Ok((client, stealth, state.callbacks.clone(), state.frame_id, state.document_generation,
-                    document_referrer_policy(&state), state.inherited_origin.as_deref() == Some("null")))
+                    document_referrer_policy(&state), state.inherited_origin.as_deref() == Some("null"),
+                    state.resource_load_cancel.clone()))
             })(),
             None => self
                 .standalone_client
@@ -265,7 +267,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None, 0, 0, String::new(), false)
+                    (client, stealth, None, 0, 0, String::new(), false, deno_core::CancelHandle::new_rc())
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -282,7 +284,7 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks, frame_id, generation, referrer_policy, opaque_origin)) => {
+                Ok((client, stealth, callbacks, frame_id, generation, referrer_policy, opaque_origin, load_cancel)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let mut request = obscura_net::ResourceRequest::module_script(&document_url, &referrer);
@@ -290,6 +292,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     // URL resolution and the native document principal are distinct:
                     // an opaque sandbox must not gain its URL origin's credentials.
                     if opaque_origin { request.initiator = Some(ModuleSpecifier::parse("about:blank").unwrap()); }
+                    let fetch = async {
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
                         Some(stealth) => stealth
@@ -320,6 +323,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                             )
                             .await
                     };
+                        resp
+                    };
+                    let resp = fetch.or_cancel(load_cancel).await;
                     if let Some(owner) = page_state.as_ref().and_then(Weak::upgrade) {
                         let owner = owner.try_borrow().map_err(|_| io_err(
                             "Module document owner is already borrowed".to_string()))?;
@@ -329,6 +335,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     } else if page_state.is_some() {
                         return Err(io_err("Module document owner was dropped".to_string()));
                     }
+                    let resp = resp.map_err(|_| io_err("Module load was stopped".to_string()))?;
                     let resp = resp.map_err(|error| {
                         let message = format!("Failed to fetch module {}: {}", url, error);
                         if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
@@ -342,6 +349,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                         }
                         io_err(message)
                     })?;
+                    // Keep the real response even if graph preparation or evaluation fails.
+                    // Status 0 is the transport's blocked-tracker sentinel.
                     if resp.status != 0 {
                         if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
                             record_network_response(&state, JsNetworkEvent {

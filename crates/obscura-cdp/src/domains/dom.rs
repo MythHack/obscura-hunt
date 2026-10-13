@@ -158,6 +158,8 @@ pub async fn handle(
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
+            // go-rod sends only objectId for an existing element handle.
+            // Resolve all three identifiers in their owning frame document.
             let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let html = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(world.frame_id, |dom| {

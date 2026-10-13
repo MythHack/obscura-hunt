@@ -5238,7 +5238,6 @@ impl Page {
         }
     }
 
-
     fn record_network_event_with_body(
         &mut self,
         url: &str,
@@ -5408,7 +5407,22 @@ impl Page {
         if self.js.is_none() {
             return;
         }
+        // Event synchronization already transfers completed request bodies.
+        // Retain any bodies whose event was evicted before the realm is dropped.
         self.sync_js_network_events();
+        let max_entries = response_body_entry_limit();
+        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
+            self.response_bodies.insert(id.clone(), StoredResponseBody {
+                body: body.body,
+                base64_encoded: body.base64_encoded,
+            });
+            self.response_body_order.push_back(id);
+        }
+        while self.response_body_order.len() > max_entries {
+            if let Some(oldest) = self.response_body_order.pop_front() {
+                self.response_bodies.remove(&oldest);
+            }
+        }
         // Suspension rebuilds the renderer cache on resume (`take_dom`), so
         // results for the suspended realm would have nowhere to go.
         self.retire_render_resources();
@@ -5478,6 +5492,13 @@ impl Page {
         self.js
             .as_ref()
             .is_some_and(|js| js.has_pending_navigation())
+    }
+
+    /// Discard a queued document navigation and cancel retained resource loads.
+    /// The CDP processor separately cancels its borrowed navigation future.
+    pub fn stop_loading(&mut self) {
+        if let Ok(mut traversal) = self.pending_history_traversal.lock() { *traversal = None; }
+        if let Some(js) = &mut self.js { js.cancel_pending_resource_loads(); }
     }
 
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {

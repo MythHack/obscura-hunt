@@ -166,6 +166,8 @@ struct CachedRasterPaint {
 /// Successful bytes use `Arc` so consumers never clone an image/font body.
 pub struct RenderResourceCache {
     entries: HashMap<String, CachedResource>,
+    // Cancellation belongs to the document, not the retryable byte cache.
+    stopped: HashSet<String>,
     order: VecDeque<String>,
     retained_bytes: usize,
     raster_paints: VecDeque<CachedRasterPaint>,
@@ -213,6 +215,7 @@ impl RenderResourceCache {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            stopped: HashSet::new(),
             order: VecDeque::new(),
             retained_bytes: 0,
             raster_paints: VecDeque::new(),
@@ -297,7 +300,9 @@ impl RenderResourceCache {
     }
 
     pub fn has_live_outcome(&self, url: &str) -> bool {
-        match self.entries.get(&network_resource_url(url)) {
+        let key = network_resource_url(url);
+        if self.stopped.contains(&key) { return true; }
+        match self.entries.get(&key) {
             Some(CachedResource::Bytes { .. }) => true,
             Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
             None => false,
@@ -348,8 +353,20 @@ impl RenderResourceCache {
     /// Seed already-shared bytes without copying a complete response body.
     pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
         let url = network_resource_url(&url);
+        self.stopped.remove(&url);
         self.remove(&url);
         self.insert_bytes(url, bytes);
+    }
+
+    /// Keep a canceled request stopped until this document's cache is replaced.
+    pub fn stop_resource(&mut self, url: &str, profile: Option<ImageRequestProfile>) {
+        let key = match profile {
+            Some(profile) => image_resource_key(url, profile),
+            None => network_resource_url(url),
+        };
+        if self.has_cached_bytes(&key) { return; }
+        self.remove(&key);
+        self.stopped.insert(key);
     }
 
     /// Retain a page-transport failure so capture does not immediately repeat
@@ -397,7 +414,9 @@ impl RenderResourceCache {
                     .map(|(width, height)| (resolved_url, width, height)),
             );
         }
-        match self.entries.get(&network_resource_url(&resolved_url)) {
+        let key = network_resource_url(&resolved_url);
+        if self.stopped.contains(&key) { return Some(None); }
+        match self.entries.get(&key) {
             Some(entry @ CachedResource::Bytes { .. }) => Some(
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
                     .map(|(width, height)| (resolved_url, width, height)),
@@ -420,6 +439,7 @@ impl RenderResourceCache {
             return self.cached_image_metadata(&resolved_url, None);
         }
         let key = image_resource_key(&resolved_url, profile);
+        if self.stopped.contains(&key) { return Some(None); }
         match self.entries.get(&key) {
             Some(entry @ CachedResource::Bytes { .. }) => Some(
                 entry.image_intrinsic().and_then(crate::ReplacedIntrinsic::natural_size)
@@ -537,6 +557,7 @@ impl RenderResourceCache {
 
     fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
+        if self.stopped.contains(&url) { return None; }
         if let Some(entry) = self.entries.get(&url) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
@@ -567,6 +588,7 @@ impl RenderResourceCache {
 
     fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
         let key = image_resource_key(url, profile);
+        if self.stopped.contains(&key) { return None; }
         if let Some(entry) = self.entries.get(&key) {
             match entry {
                 CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
@@ -15049,6 +15071,43 @@ mod tests {
     }
 
     #[test]
+    fn stopped_resources_survive_cache_eviction_and_preserve_request_profiles() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let mut cache = RenderResourceCache::with_loader_and_limits(move |_url: &str| {
+            loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }, 1, 4096);
+        let url = "https://example.test/image.png";
+        cache.stop_resource(url, Some(ImageRequestProfile::CorsInclude));
+        assert!(cache.has_live_image_outcome(url, ImageRequestProfile::CorsInclude));
+        assert!(!cache.has_live_image_outcome(url, ImageRequestProfile::NoCorsInclude));
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::CorsInclude).is_none());
+        cache.stop_resource(url, None);
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some(),
+            "canceling a duplicate request must preserve already-loaded bytes");
+        cache.seed_shared("https://example.test/other.png".to_owned(), raster_cache_fixture());
+        cache.stop_resource(url, None);
+        assert!(cache.has_live_outcome(url));
+        assert_eq!(cache.cached_image_metadata(url, None), Some(None));
+        assert!(cache.get_or_load(url, true).is_none());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::CorsInclude).is_none());
+        cache.set_sync_loading_enabled(false);
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_none());
+        assert!(cache.take_sync_misses(usize::MAX).is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let new_url = "https://example.test/new.png";
+        assert!(cache.get_or_load(new_url, false).is_none());
+        assert_eq!(cache.take_sync_misses(usize::MAX), vec![(new_url.to_owned(), None, false)]);
+        cache.seed_shared(url.to_owned(), raster_cache_fixture());
+        assert!(cache.get_or_load_image(url, ImageRequestProfile::NoCorsInclude).is_some());
+        assert_eq!(cache.retained_entry_count(), 1);
+        assert!(!RenderResourceCache::default().has_live_outcome(url));
+    }
+
+    #[test]
     fn cached_raster_relative_urls_preserve_request_profiles_and_pixels() {
         let url = "https://example.test/images/image.png";
         let base = "https://example.test/pages/index.html";
@@ -18801,7 +18860,8 @@ mod tests {
             observed.lock().unwrap().push(url.to_owned());
             Some(SERIF_FONT_BYTES.to_vec())
         });
-        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[]);
+        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[],
+            (800.0, 600.0), crate::CssMediaType::Screen);
         assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
             vec!["Second", "First", "Shadow"]);
         assert_eq!(fonts[0].weight, Some((700, 700)));
@@ -18815,7 +18875,8 @@ mod tests {
         });
         tree.with_node_mut(preload, |node| node.set_attribute("href", "first.ttf".into()));
         tree.remove(visible);
-        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[]);
+        let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[],
+            (800.0, 600.0), crate::CssMediaType::Screen);
         assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
             vec!["Changed", "Second", "Shadow"]);
         assert_eq!(fonts[0].weight, Some((600, 600)));
@@ -18946,6 +19007,8 @@ mod tests {
             Some("https://example.test/page.html"),
             &mut resources,
             &[],
+            (800.0, 600.0),
+            crate::CssMediaType::Screen,
         );
 
         assert_eq!(fonts.len(), 1);

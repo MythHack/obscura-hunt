@@ -1966,7 +1966,15 @@ async fn process_with_interception(
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
+    let previous_url = page.url.clone();
+    let previous_lifecycle = page.lifecycle;
+    let previous_document_generation = page.window_document_generation();
+    let previous_has_runtime = page.has_js();
+    let navigation_url = url_owned.clone();
+    let navigation_method = nav_method.clone();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut cancel_tx = Some(cancel_tx);
+    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>, bool)>(1);
     let nav_v8_lock = ctx.v8_lock.clone();
 
     tokio::task::spawn_local(async move {
@@ -1980,20 +1988,25 @@ async fn process_with_interception(
         // must run BEFORE the page's own scripts (CDP contract). Hand them
         // to the page so navigate_single can inject them at the right point.
         page.set_preload_scripts(preload_scripts);
-        let result = if !send_command_response {
-            page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
-        } else if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
-        } else {
-            page.navigate_with_wait(&url_owned, wait_until).await
-        }
-        .map_err(|e| e.to_string());
+        let (result, cancelled) = tokio::select! {
+            result = async {
+                if !send_command_response {
+                    page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
+                } else if nav_method == "POST" && !nav_body.is_empty() {
+                    page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
+                } else {
+                    page.navigate_with_wait(&url_owned, wait_until).await
+                }
+            } => (result.map_err(|e| e.to_string()), false),
+            _ = cancel_rx => (Err("net::ERR_ABORTED".into()), true),
+        };
         drop(_v8_guard);
-        let _ = nav_done_tx.send((page, result)).await;
+        let _ = nav_done_tx.send((page, result, cancelled)).await;
     });
 
     let navigate_result: Result<(), String>;
     let page_back: Option<obscura_browser::Page>;
+    let cancelled: bool;
 
     // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
     // While the spawned nav task is executing V8 (potentially parked on
@@ -2019,9 +2032,10 @@ async fn process_with_interception(
         let has_irx = intercept_rx.is_some();
 
         tokio::select! {
-            Some((returned_page, result)) = nav_done_rx.recv() => {
+            Some((returned_page, result, was_cancelled)) = nav_done_rx.recv() => {
                 page_back = Some(returned_page);
                 navigate_result = result;
+                cancelled = was_cancelled;
                 break;
             }
             Some(intercepted) = async {
@@ -2050,6 +2064,22 @@ async fn process_with_interception(
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
+                        if let Ok(command) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                            let same_page = command.session_id.as_ref()
+                                .and_then(|session| ctx.sessions.get(session)) == Some(&page_id);
+                            let stop = command.method == "Page.stopLoading" && same_page;
+                            let close = (command.method == "Page.close" && same_page)
+                                || (command.method == "Target.closeTarget"
+                                    && command.params.get("targetId").and_then(|id| id.as_str()) == Some(page_id.as_str()));
+                            if stop || close {
+                                if let Some(cancel) = cancel_tx.take() { let _ = cancel.send(()); }
+                                if stop {
+                                    let response = crate::types::CdpResponse::success(command.id, json!({}), command.session_id);
+                                    if let Ok(json) = serde_json::to_string(&response) { let _ = msg.reply_tx.send(json); }
+                                    continue;
+                                }
+                            }
+                        }
                         if msg.text.contains("Fetch.continueRequest")
                             || msg.text.contains("Fetch.fulfillRequest")
                             || msg.text.contains("Fetch.failRequest")
@@ -2094,6 +2124,23 @@ async fn process_with_interception(
     // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
+    // A child Document receipt or a changed URL is not a main-frame commit.
+    // Native document generations also distinguish same-URL reloads.
+    // The first installed document creates a runtime at generation zero, just
+    // like a blank page without a runtime, so runtime creation is also a commit.
+    let committed = page.window_document_generation() != previous_document_generation
+        || (!previous_has_runtime && page.has_js());
+    if cancelled {
+        page.stop_loading();
+        if committed {
+            page.lifecycle = obscura_browser::LifecycleState::Failed;
+            page.push_history(page.url_string());
+        } else {
+            page.url = previous_url;
+            page.lifecycle = previous_lifecycle;
+        }
+        intercepted_paused.retain(|_, resolver| !resolver.is_closed());
+    }
 
     // Fold in network events for script-initiated requests (fetch/XHR/dynamic
     // resource) so they emit as Network.requestWillBeSent / responseReceived
@@ -2106,14 +2153,19 @@ async fn process_with_interception(
 
     ctx.pages.push(page);
 
-    let response = match navigate_result {
+    let response = if cancelled {
+        crate::types::CdpResponse::success(req.id,
+            if is_reload { json!({}) } else if committed { json!({"frameId": frame_id, "loaderId": loader_id}) }
+            else { json!({"frameId": frame_id, "loaderId": loader_id, "errorText": "net::ERR_ABORTED"}) },
+            req.session_id.clone())
+    } else { match navigate_result {
         Ok(()) => crate::types::CdpResponse::success(
             req.id,
             if is_reload { json!({}) } else { json!({"frameId": frame_id, "loaderId": loader_id}) },
             req.session_id.clone(),
         ),
         Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
-    };
+    }};
 
     if send_command_response {
         if let Ok(json) = serde_json::to_string(&response) {
@@ -2126,17 +2178,49 @@ async fn process_with_interception(
     // makes `page.goto()` resolve to a Response, and the #192 per-isolated-
     // world fresh context ids. Pushes to `ctx.pending_events`; we then drain
     // to the WS reply channel.
-    crate::domains::page::emit_navigation_events(
-        ctx,
-        &session_for_events,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id_for_events,
-        &network_events,
-        wait_until,
-        reached_network_idle,
-    );
+    if cancelled {
+        // This attempt is fully accounted for here. In particular, an old
+        // install receipt must not replay the retained Loaded document after
+        // an uncommitted navigation restores its lifecycle.
+        ctx.record_native_navigation(&page_id_for_events);
+        if committed {
+            // Keep the installed native realm usable, but do not publish a
+            // successful frame/context/lifecycle boundary for an aborted load.
+            ctx.commit_default_context(&page_id_for_events, &frame_id, &page_url);
+            ctx.current_loader_ids.insert(page_id_for_events.clone(), loader_id.clone());
+            if let Some(document) = network_events.iter().find(|event|
+                event.frame_id == 0 && event.resource_type == "Document" && event.url == page_url)
+            {
+                if let Some(page) = ctx.get_page_mut(&page_id_for_events) {
+                    page.alias_response_body(&document.request_id, &loader_id);
+                }
+            }
+        } else {
+            crate::domains::page::emit_aborted_navigation(ctx, &session_for_events, &frame_id,
+                &loader_id, &navigation_url, &navigation_method, &page_id_for_events);
+        }
+        crate::domains::page::emit_runtime_network_events(ctx, &session_for_events, &frame_id,
+            &page_url, &page_id_for_events, &network_events);
+        if committed {
+            ctx.pending_events.push(crate::types::CdpEvent {
+                method: "Page.frameStoppedLoading".into(),
+                params: json!({"frameId": frame_id}),
+                session_id: session_for_events.clone(),
+            });
+        }
+    } else {
+        crate::domains::page::emit_navigation_events(
+            ctx,
+            &session_for_events,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id_for_events,
+            &network_events,
+            wait_until,
+            reached_network_idle,
+        );
+    }
     ctx.sync_native_windows();
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
@@ -3600,6 +3684,225 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_intercept_continue_has_no_timer_delay() {
         assert_navigation_intercept_reply_without_timer("continueRequest").await;
+    }
+
+    async fn assert_stop_loading_cancels_navigation(
+        script: bool,
+        method: &str,
+        retained_document: bool,
+        initialize_runtime: bool,
+    ) {
+        use super::{process_cdp_message, process_with_interception, CdpMessage, ServerMessage};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::task::LocalSet::new().run_until(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+            let fixture = tokio::task::spawn_local(async move {
+                if script {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 2048];
+                    stream.read(&mut buffer).await.unwrap();
+                    let body = "<!doctype html><title>Partial</title><script src='/held.js'></script>";
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 2048];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                requested_tx.send(()).unwrap();
+                // No response: cancellation must drop the pending HTTP request.
+                assert_eq!(stream.read(&mut buffer).await.unwrap(), 0);
+            });
+            let context = obscura_browser::context::BrowserContext::with_storage_and_network(
+                "stop-loading-test".into(), None, false, None, None, true,
+            );
+            let mut ctx = crate::dispatch::CdpContext::new_with_shared_context(std::sync::Arc::new(context));
+            let page_id = ctx.create_page();
+            let other_page = ctx.create_page();
+            let session = format!("{page_id}-session");
+            ctx.sessions.insert(session.clone(), page_id.clone());
+            ctx.sessions.insert("raw-session".into(), page_id.clone());
+            ctx.sessions.insert("other-session".into(), other_page.clone());
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            if initialize_runtime {
+                ctx.get_page_mut(&page_id).unwrap().resume_js();
+            }
+            assert_eq!(ctx.get_page(&page_id).unwrap().has_js(), initialize_runtime);
+            let retained_body = "<!doctype html><title>Retained</title><p>old document</p>";
+            let previous_receipts = if retained_document {
+                for (id, method, params) in [
+                    (90, "Page.navigate", json!({"url": format!("data:text/html,{retained_body}")})),
+                    (91, "Runtime.enable", json!({})),
+                    (92, "Runtime.evaluate", json!({"expression": "globalThis.retainedValue = 42"})),
+                ] {
+                    process_cdp_message(&json!({"id": id, "method": method,
+                        "sessionId": session, "params": params}).to_string(), &mut ctx, &reply_tx).await;
+                }
+                let setup: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                    .map(|text| serde_json::from_str(&text).unwrap()).collect();
+                let context_id = setup.iter().find(|reply| reply["method"] == "Runtime.executionContextCreated")
+                    .unwrap()["params"]["context"]["id"].as_i64().unwrap();
+                let loader_id = setup.iter().find(|reply| reply["id"] == 90)
+                    .unwrap()["result"]["loaderId"].as_str().unwrap().to_string();
+                Some((context_id, loader_id))
+            } else { None };
+            let original_url = ctx.get_page(&page_id).unwrap().url_string();
+            let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
+            let navigation_reply = reply_tx.clone();
+            let url = format!("http://{address}/");
+            let command = json!({"id": 1, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": url, "waitUntil": "load"}}).to_string();
+            let navigation = tokio::task::spawn_local(async move {
+                let mut paused = HashMap::new();
+                let mut deferred = std::collections::VecDeque::new();
+                process_with_interception(&command, &mut ctx, &navigation_reply,
+                    &mut server_rx, &mut None, &mut paused, &mut deferred, true).await;
+                (ctx, paused, deferred)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), requested_rx)
+                .await.expect("fixture request").unwrap();
+            for (id, session) in [(2, "other-session"), (3, "raw-session")] {
+                server_tx.send(ServerMessage::Cdp(CdpMessage {
+                    text: json!({"id": id, "method": if id == 2 { "Page.stopLoading" } else { method },
+                        "sessionId": session, "params": {"targetId": page_id}}).to_string(),
+                    reply_tx: reply_tx.clone(),
+                })).unwrap();
+            }
+            let (mut ctx, paused, deferred) = tokio::time::timeout(std::time::Duration::from_secs(2), navigation)
+                .await.expect("Page.stopLoading must cancel without waiting for the HTTP timeout").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), fixture)
+                .await.expect("pending request socket must close").unwrap();
+            assert!(paused.is_empty());
+            assert_eq!(deferred.len(), if method == "Page.stopLoading" { 1 } else { 2 },
+                "another target's stop must not cancel this navigation");
+            for message in deferred {
+                if let ServerMessage::Cdp(message) = message {
+                    process_cdp_message(&message.text, &mut ctx, &message.reply_tx).await;
+                }
+            }
+            let replies: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            assert_eq!(replies.iter().filter(|reply| reply["id"] == 3).count(), 1);
+            let stopped = replies.iter().find(|reply| reply["id"] == 3).unwrap();
+            assert!(stopped.get("error").is_none(), "{stopped}");
+            let aborted = replies.iter().find(|reply| reply["id"] == 1).unwrap();
+            assert!(aborted.get("error").is_none(), "{aborted}");
+            if !script {
+                assert_eq!(aborted["result"]["errorText"], "net::ERR_ABORTED", "{aborted}");
+            } else {
+                assert!(aborted["result"].get("errorText").is_none(), "{aborted}");
+                assert!(aborted["result"]["frameId"].is_string(), "{aborted}");
+                assert!(aborted["result"]["loaderId"].is_string(), "{aborted}");
+            }
+            assert!(!replies.iter().any(|reply| reply["method"] == "Page.loadEventFired"));
+            assert!(!replies.iter().any(|reply| matches!(reply["method"].as_str(),
+                Some("Page.domContentEventFired" | "Page.frameNavigated"
+                    | "Runtime.executionContextsCleared" | "Runtime.executionContextCreated"))));
+            assert!(!replies.iter().any(|reply| reply["method"] == "Page.lifecycleEvent"
+                && matches!(reply["params"]["name"].as_str(), Some("DOMContentLoaded" | "load"))));
+            assert!(replies.iter().any(|reply| reply["method"] == "Page.frameStoppedLoading"));
+            assert!(ctx.get_page(&other_page).is_some());
+            if method != "Page.stopLoading" {
+                assert!(ctx.get_page(&page_id).is_none());
+                assert_eq!(replies.iter().filter(|reply| reply["method"] == "Target.targetDestroyed").count(), 1);
+                return;
+            }
+            let expected_url = if script { &url } else { &original_url };
+            assert_eq!(ctx.get_page(&page_id).unwrap().url_string(), *expected_url);
+            if script {
+                assert_eq!(ctx.get_page(&page_id).unwrap().lifecycle, obscura_browser::LifecycleState::Failed);
+            }
+            if initialize_runtime || script {
+                assert_eq!(ctx.get_page_mut(&page_id).unwrap().evaluate("1 + 2").as_f64(), Some(3.0));
+            }
+            for (id, method, params) in [
+                (95, "Target.getTargetInfo", json!({"targetId": page_id})),
+                (96, "Page.getFrameTree", json!({})),
+            ] {
+                process_cdp_message(&json!({"id": id, "method": method,
+                    "sessionId": session, "params": params}).to_string(), &mut ctx, &reply_tx).await;
+            }
+            let observed: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                .map(|text| serde_json::from_str(&text).unwrap()).collect();
+            let target = observed.iter().find(|reply| reply["id"] == 95).unwrap();
+            assert_eq!(target["result"]["targetInfo"]["url"], *expected_url, "{target}");
+            let frame_tree = observed.iter().find(|reply| reply["id"] == 96).unwrap();
+            assert_eq!(frame_tree["result"]["frameTree"]["frame"]["url"], *expected_url, "{frame_tree}");
+            if script {
+                assert_eq!(frame_tree["result"]["frameTree"]["frame"]["loaderId"],
+                    aborted["result"]["loaderId"], "{frame_tree}");
+            }
+            if initialize_runtime || script {
+                for (id, expression) in [(97, "document.URL"), (98, "document.title")] {
+                    process_cdp_message(&json!({"id": id, "method": "Runtime.evaluate", "sessionId": session,
+                        "params": {"expression": expression, "returnByValue": true}}).to_string(),
+                        &mut ctx, &reply_tx).await;
+                }
+                let document: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                    .map(|text| serde_json::from_str(&text).unwrap()).collect();
+                let document_url = document.iter().find(|reply| reply["id"] == 97).unwrap();
+                assert_eq!(document_url["result"]["result"]["value"], *expected_url, "{document_url}");
+                let title = document.iter().find(|reply| reply["id"] == 98).unwrap();
+                assert_eq!(title["result"]["result"]["value"],
+                    if script { "Partial" } else if retained_document { "Retained" } else { "" }, "{title}");
+            } else {
+                assert!(!ctx.get_page(&page_id).unwrap().has_js());
+            }
+            if let Some((context_id, loader_id)) = previous_receipts {
+                process_cdp_message(&json!({"id": 93, "method": "Runtime.evaluate", "sessionId": session,
+                    "params": {"expression": "retainedValue", "contextId": context_id, "returnByValue": true}})
+                    .to_string(), &mut ctx, &reply_tx).await;
+                process_cdp_message(&json!({"id": 94, "method": "Network.getResponseBody", "sessionId": session,
+                    "params": {"requestId": loader_id}}).to_string(), &mut ctx, &reply_tx).await;
+                let retained: Vec<serde_json::Value> = std::iter::from_fn(|| reply_rx.try_recv().ok())
+                    .map(|text| serde_json::from_str(&text).unwrap()).collect();
+                let evaluated = retained.iter().find(|reply| reply["id"] == 93).unwrap();
+                assert_eq!(evaluated["result"]["result"]["value"].as_f64(), Some(42.0), "{evaluated}");
+                let body = retained.iter().find(|reply| reply["id"] == 94).unwrap();
+                assert_eq!(body["result"]["body"], retained_body, "{body}");
+                assert_eq!(body["result"]["base64Encoded"], false);
+            }
+            process_cdp_message(&json!({"id": 4, "method": "Page.navigate", "sessionId": session,
+                "params": {"url": "about:blank"}}).to_string(), &mut ctx, &reply_tx).await;
+            assert_eq!(ctx.get_page(&page_id).unwrap().url_string(), "about:blank");
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_a_held_document_request() {
+        assert_stop_loading_cancels_navigation(false, "Page.stopLoading", false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_a_held_parser_script_request() {
+        assert_stop_loading_cancels_navigation(true, "Page.stopLoading", false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_commits_a_first_navigation_with_a_held_parser_script() {
+        assert_stop_loading_cancels_navigation(true, "Page.stopLoading", false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_does_not_commit_a_first_navigation_with_a_held_document() {
+        assert_stop_loading_cancels_navigation(false, "Page.stopLoading", false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_for_page_close() {
+        assert_stop_loading_cancels_navigation(false, "Page.close", false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_cancels_for_target_close() {
+        assert_stop_loading_cancels_navigation(false, "Target.closeTarget", false, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_loading_preserves_the_previous_document_context_and_body() {
+        assert_stop_loading_cancels_navigation(false, "Page.stopLoading", true, true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

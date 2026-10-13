@@ -11,6 +11,11 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 基于 [官方 Obscura](https://github.com/h4ckf0r0day/obscura)，保留原生引擎和 stealth 选项，
 在同步上游更新的同时，持续改进浏览器操作流程。
 
+最近一次上游同步包含
+[`8edfe48`](https://github.com/h4ckf0r0day/obscura/commit/8edfe480133b383f70e17f9d4ea55e3592cdfd24)。
+新增 CDP 对象句柄兼容、页面关闭与停止加载、ES 模块网络事件及响应正文，
+同时保留本分支的原生 popup 和子 frame 所有权语义。
+
 ## 为什么选择 Obscura-Hunt？
 
 如果你已经在使用官方 Obscura，以下改进能帮助自动化完成多步骤流程，

@@ -169,11 +169,10 @@ pub async fn handle(
                 .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or("targetId required")?;
-            let Some(page) = ctx.get_page_mut(target_id) else {
+            if ctx.get_page(target_id).is_none() {
                 return Ok(json!({"success": false}));
-            };
-            page.close_window();
-            ctx.sync_native_windows();
+            }
+            close_target(ctx, target_id);
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => {
@@ -273,6 +272,13 @@ pub async fn handle(
         }
         _ => Err(format!("Unknown Target method: {}", method)),
     }
+}
+
+/// Close the native window and route its destruction to every owning session.
+pub(crate) fn close_target(ctx: &mut CdpContext, target_id: &str) {
+    let Some(page) = ctx.get_page_mut(target_id) else { return };
+    page.close_window();
+    ctx.sync_native_windows();
 }
 
 #[cfg(test)]

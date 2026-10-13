@@ -14,6 +14,12 @@ not just a single page fetch. Maintained by
 and stealth options, and brings upstream updates together with its own browser
 workflow improvements.
 
+The latest upstream sync includes
+[`8edfe48`](https://github.com/h4ckf0r0day/obscura/commit/8edfe480133b383f70e17f9d4ea55e3592cdfd24).
+It adds CDP object-handle compatibility, page close and load cancellation,
+and ES module network events and response bodies while retaining the fork's
+native popup and child-frame ownership.
+
 ## Why choose Obscura-Hunt?
 
 If you already use official Obscura, these improvements help your automation
