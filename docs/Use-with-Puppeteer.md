@@ -175,6 +175,12 @@ builds also cancel pending image/font loads, including `Image`/`decode()`
 requests, without restarting those URLs on the next render turn. Already-loaded
 resources are preserved. Ordinary JavaScript `fetch()` calls are not canceled.
 
+If cancellation happens before a document is installed, the previous document
+is retained and navigation returns `net::ERR_ABORTED`. Once installation has
+committed, the partial document is retained, including on the first navigation
+before a JavaScript runtime existed. That cancellation does not report the
+committed document as aborted.
+
 `Page.close` runs the top-level document's `beforeunload` handlers. A document
 activated through native input can request confirmation, reported through
 `Page.javascriptDialogOpening` with type `beforeunload`. Use
