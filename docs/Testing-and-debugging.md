@@ -94,6 +94,62 @@ async fn my_test() {
 
 ### Upstream synchronization verification
 
+#### Latest update: upstream `bd95294`
+
+The October 17 synchronization incorporates 69 upstream commits into fork
+`85f3d10`, retaining the fork's native window/frame ownership and cancellation
+boundaries. The four pre-existing worktree changes were kept separate from the
+merge. Both release CLI builds completed with `render` and `render,stealth`.
+Focused IndexedDB, frame lifecycle, sandbox, document ownership and transport
+coverage passed 36/36. This includes trusted IndexedDB events through the real
+bootstrap, connected native owner checks for queued frame cleanup, opaque frame
+constructor selection, import/adopt ownership and malformed-XML error documents.
+The integration uses the fork's closure-private event state rather than the
+removed upstream global helper.
+
+The final merge-only full release nextest run was not green: 2240 passed, 208
+failed and five were skipped. The failures include two GC-stress teardown
+process aborts also present in the earlier report. Of the failing names, 187
+appeared in that report and 21 were newly tested; none had previously passed.
+Name comparisons do not establish identical causes or certify inherited status.
+All nine previously passing tests that failed in the earlier merge candidate
+passed after the integration repairs and an offline run with proxy environment
+variables cleared. No test assertion was weakened or re-pinned.
+
+Actual loopback CLI boundary checks passed 12/12 in each transport mode,
+including `--stealth`: imported and adopted nodes retain the right document,
+malformed XML exposes a document-owned `parsererror` without an HTML body,
+and opaque sandbox frames retain a non-null WindowProxy, load successfully,
+and deny access in both directions.
+
+Actual CLI/CDP/MCP process checks passed seven of eleven scenarios in each
+transport mode, using `--stealth` for the stealth executable; one user-WIP check
+was skipped because these binaries contain only the merge. Passing paths
+include IndexedDB transactions across navigation, popup messaging, first-load
+cancellation and MCP tab/timer preservation. Profile localStorage persistence,
+nested srcdoc access, removed Attr ownership and Fetch interception remained
+failing; the same four scenarios also failed with the saved committed pre-merge
+executable. No failed assertion was converted into an expected pass. The
+offline obstacle course remained 32/33, with the same Windows timezone mismatch
+(`Asia/Shanghai` instead of `Europe/Berlin`) as the pre-merge control.
+
+All 75 deterministic render fixtures produced nonblank paired captures against
+the pre-merge executable and Chromium. Of these, 74 were pixel-identical to the
+pre-merge output. The remaining inline-block fixture improved to match Chromium.
+The behavior checker still reported ten Chromium-side expectation failures and
+the existing Obscura perspective-containing-block failure. Representative
+captures attempted all 15 sites at both top and bottom positions; nine pairs at
+each position met the comparison gates and matched pre-merge pixels.
+Blank captures, different live documents, resource outcomes and unstable
+capture boundaries were excluded, not counted as fidelity passes. The merged
+Porkbun captures ended at a tracker URL. A loopback named-form-target control
+navigated the top-level page with both executables, proving that defect exists
+before the merge, but not explaining its activation on the live site. Termius
+produced a blank top capture and an unstable bottom comparison. These live-site
+observations remain unresolved, not certified as harmless noise.
+
+#### Earlier update: upstream `8edfe48`
+
 The sync of upstream [`8edfe48`](https://github.com/h4ckf0r0day/obscura/commit/8edfe480133b383f70e17f9d4ea55e3592cdfd24)
 into fork `bed6fc42` was verified on Windows with release builds and the retained
 local lockfile. Both `render` and `render,stealth` CLI builds completed.

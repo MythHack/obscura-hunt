@@ -41,7 +41,11 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        /// Already-decoded request body. Bytes rather than `String`: a POST the
+        /// client rewrites may be a protobuf, a gzip stream or a multipart part,
+        /// and passing those through `String` replaces every non-UTF-8 sequence
+        /// with U+FFFD before they reach the wire.
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -159,12 +163,22 @@ impl NavigationTiming {
     }
 }
 
+#[derive(Default)]
+struct StorageOriginCache {
+    url: String,
+    inherited_origin: Option<String>,
+    origin: String,
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
-    /// Initial about:blank documents retain their creator's base URL and origin.
+    /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
     pub(crate) inherited_origin: Option<String>,
+    pub(crate) scripting_enabled: bool,
+    pub(crate) sandbox_opaque_origin: bool,
+    storage_origin_cache: RefCell<StorageOriginCache>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -174,6 +188,8 @@ pub struct ObscuraState {
     /// must not report `text/html` just because the URL has no extension.
     pub content_type: String,
     pub title: String,
+    /// (reduced motion, dark scheme), shared by every document in this page.
+    pub(crate) media_preferences: Rc<Cell<(bool, bool)>>,
     /// URL of the document that initiated this document's navigation. Direct
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
@@ -182,6 +198,8 @@ pub struct ObscuraState {
     pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    pub indexed_db: Arc<crate::indexed_db::IndexedDbStorage>,
+    pub(crate) indexed_db_owner: Option<crate::indexed_db::IndexedDbOwner>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -346,6 +364,8 @@ pub struct ObscuraState {
     /// parsing/indexing when ordered CSS source and viewport remain identical.
     #[cfg(feature = "render")]
     pub stylesheet_cache: obscura_render::StylesheetCache,
+    #[cfg(feature = "render")]
+    pub(crate) style_query_cache: Option<StyleQueryCache>,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -427,7 +447,14 @@ impl Drop for ObscuraState {
 
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
+        self.media_preferences = parent.media_preferences.clone();
+        #[cfg(feature = "render")]
+        {
+            let (reduce, dark) = parent.media_preferences.get();
+            self.render_media = self.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+        }
         self.cookie_jar = parent.cookie_jar.clone();
+        self.indexed_db = parent.indexed_db.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
         self.encoding = parent.encoding.clone();
@@ -475,14 +502,20 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
+            scripting_enabled: true,
+            sandbox_opaque_origin: false,
+            storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
             encoding: "UTF-8".to_string(),
             content_type: String::new(),
             title: String::new(),
+            media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
             referrer_policy: String::new(),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            indexed_db: Arc::new(crate::indexed_db::IndexedDbStorage::default()),
+            indexed_db_owner: None,
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -556,6 +589,8 @@ impl ObscuraState {
             render_resource_backlog: Vec::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
+            #[cfg(feature = "render")]
+            style_query_cache: None,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
@@ -852,10 +887,10 @@ fn op_abort_signal_state<'s, 'i>(
 
 /// Dropping a request at any await boundary must emit one failure, including
 /// when cancelling the header future or the separately owned response body.
-struct FetchNetworkGuard {
-    state: std::rc::Weak<RefCell<ObscuraState>>,
-    event: Option<JsNetworkEvent>,
-    cancel: Option<Rc<CancelHandle>>,
+pub(crate) struct FetchNetworkGuard {
+    pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
+    pub(crate) event: Option<JsNetworkEvent>,
+    pub(crate) cancel: Option<Rc<CancelHandle>>,
 }
 
 impl Drop for FetchNetworkGuard {
@@ -997,6 +1032,10 @@ struct FrameTimers {
 impl RealmStates {
     pub(crate) fn set_main_context(&mut self, context: v8::Global<v8::Context>) {
         self.main_context = Some(context);
+    }
+
+    pub(crate) fn media_realms(&self) -> Vec<(v8::Global<v8::Context>, SharedState)> {
+        self.entries.iter().map(|entry| (entry.context.clone(), entry.state.clone())).collect()
     }
 
     pub(crate) fn live_count(&self) -> usize {
@@ -1179,9 +1218,12 @@ impl RealmStates {
     fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
         let parent_state = parent.borrow();
         let generation = parent_state.document_generation;
-        let sandboxed_opaque = parent_state.dom.as_ref()
+        // Sandbox flags propagate to descendant browsing contexts, so a frame
+        // inside an opaque creator is opaque even without its own attribute.
+        let sandboxed_opaque = parent_state.sandbox_opaque_origin || parent_state.dom.as_ref()
             .and_then(|dom| dom.with_node(node, |node| node.get_attribute("sandbox")
-                .map(|tokens| !tokens.split_whitespace().any(|token| token == "allow-same-origin"))))
+                .map(|tokens| !tokens.split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("allow-same-origin")))))
             .flatten().unwrap_or(false);
         self.frame_timers.insert(frame_id, FrameTimers {
             owner: Some((Rc::downgrade(parent), node, generation)),
@@ -1222,7 +1264,7 @@ impl RealmStates {
         self.frame_timers.keys().copied().find(|id| self.frame_owner_matches(*id, parent, node))
     }
 
-    fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
+    pub(crate) fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
         // A child document is active only while all of its owners are active.
         // Keep the walk bounded even if an invalid frame-parent chain arrives.
         for _ in 0..=self.frame_timers.len() {
@@ -1424,12 +1466,12 @@ fn render_mutation_impact(
             let Some((name, value)) = arg2.split_once('\0') else {
                 return RenderMutationImpact::default();
             };
-            let old = dom
-                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute(name) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "set_attribute_ns" => {
@@ -1444,14 +1486,12 @@ fn render_mutation_impact(
                 .split_once(':')
                 .map(|(_, local)| local)
                 .unwrap_or(qualified);
-            let old = dom
-                .with_node(target, |node| {
-                    node.get_attribute_ns(namespace, local).map(str::to_owned)
-                })
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute_ns(namespace, local) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "remove_attribute" => {
@@ -1485,12 +1525,13 @@ fn render_mutation_impact(
             let (Some(parent), Some(child)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+            let (Some(()), Some(old_parent)) =
+                (dom.with_node(parent, |_| ()), dom.with_node(child, |node| node.parent))
+            else {
                 return RenderMutationImpact::default();
-            }
-            let old_parent = dom.get_node(child).and_then(|node| node.parent);
-            let already_last =
-                old_parent == Some(parent) && dom.children(parent).last().copied() == Some(child);
+            };
+            let already_last = old_parent == Some(parent)
+                && dom.with_node(parent, |node| node.last_child) == Some(Some(child));
             RenderMutationImpact {
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
@@ -1504,23 +1545,23 @@ fn render_mutation_impact(
             };
             RenderMutationImpact {
                 connected: node_is_connected(dom, child),
-                actual_change: dom.get_node(child).and_then(|node| node.parent).is_some(),
+                actual_change: dom.with_node(child, |node| node.parent.is_some()).unwrap_or(false),
             }
         }
         "insert_before" => {
             let (Some(new_node), Some(reference)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(new_node).is_none() {
+            if dom.with_node(new_node, |_| ()).is_none() {
                 return RenderMutationImpact::default();
             }
-            let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+            let Some((Some(reference_parent), reference_prev)) =
+                dom.with_node(reference, |node| (node.parent, node.prev_sibling))
             else {
                 return RenderMutationImpact::default();
             };
             let new_was_connected = node_is_connected(dom, new_node);
-            let already_immediately_before =
-                dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+            let already_immediately_before = reference_prev == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
                 actual_change: new_node != reference && (!already_immediately_before
@@ -1535,7 +1576,7 @@ fn render_mutation_impact(
                 connected: node_is_connected(dom, target),
                 // Parsing normalizes source text, so a cheap string comparison
                 // cannot prove equality. Connected replacement remains dirty.
-                actual_change: dom.get_node(target).is_some(),
+                actual_change: dom.with_node(target, |_| ()).is_some(),
             }
         }
         "set_text_content" => {
@@ -1640,8 +1681,8 @@ fn retained_style_mutation(
         }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
-            dom.get_node(node)?;
-            let old_parent = dom.get_node(child)?.parent;
+            dom.with_node(node, |_| ())?;
+            let old_parent = dom.with_node(child, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node: child,
@@ -1652,16 +1693,16 @@ fn retained_style_mutation(
             )
         }
         "remove_child" => {
-            let old_parent = dom.get_node(node)?.parent?;
+            let old_parent = dom.with_node(node, |node| node.parent)??;
             Some(obscura_render::TreeStyleMutation::Remove { node, old_parent }.into())
         }
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
-            let new_parent = dom.get_node(reference)?.parent?;
+            let new_parent = dom.with_node(reference, |node| node.parent)??;
             if dom.containing_shadow_root(new_parent).is_some() {
                 return None;
             }
-            let old_parent = dom.get_node(node)?.parent;
+            let old_parent = dom.with_node(node, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node,
@@ -1671,18 +1712,20 @@ fn retained_style_mutation(
                 .into(),
             )
         }
-        "set_text_content" => match &dom.get_node(node)?.data {
-            NodeData::Text { .. } => Some(
+        "set_text_content" => match dom
+            .with_node(node, |node| matches!(node.data, NodeData::Text { .. }).then_some(node.parent))?
+        {
+            Some(parent) => Some(
                 obscura_render::TreeStyleMutation::Text {
                     node,
-                    parent: dom.get_node(node)?.parent,
+                    parent,
                 }
                 .into(),
             ),
             // Element/fragment textContent replaces a child list. That can
             // flip :empty and structural/relational selectors, so the local
             // text fast path cannot describe the mutation safely.
-            _ => None,
+            None => None,
         },
         _ => None,
     }
@@ -2276,7 +2319,7 @@ fn op_dom(
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
         let may_remove_focus = matches!(cmd.as_str(), "remove_child" | "append_child" | "insert_before"
             | "set_inner_html" | "set_inner_html_context" | "set_text_content" | "document_write" | "document_write_close");
-        let result = op_dom_inner(&shared, cmd, arg1, arg2);
+        let result = op_dom_inner(shared.clone(), cmd, arg1, arg2);
         if may_remove_focus {
             let mut document = shared.borrow_mut();
             if document.focused_node.is_some_and(|node| document.dom.as_ref().is_none_or(|dom| !dom.is_connected(node))) {
@@ -2302,7 +2345,13 @@ fn op_dom(
     })
 }
 
-fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -> String {
+fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "prefers_reduced_motion" {
+        return shared.borrow().media_preferences.get().0.to_string();
+    }
+    if cmd == "prefers_dark" {
+        return shared.borrow().media_preferences.get().1.to_string();
+    }
     if cmd == "performance_time_origin" {
         return shared.borrow().navigation_timing.time_origin.to_string();
     }
@@ -2397,21 +2446,6 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
             .as_ref()
             .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
             .unwrap_or_default();
-        #[cfg(feature = "render")]
-        let keep_inline_style_values = state.prepared_render.is_some();
-        #[cfg(feature = "render")]
-        let retained_style_mutation = state
-            .dom
-            .as_ref()
-            .and_then(|dom| {
-                retained_style_mutation(
-                    dom,
-                    &cmd,
-                    &arg1,
-                    &arg2,
-                    keep_inline_style_values,
-                )
-            });
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
@@ -2423,6 +2457,14 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
         // state is deliberately excluded because `:checked` can affect style.
         let invalidate_geometry =
             invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        #[cfg(feature = "render")]
+        let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
+            state.dom.as_ref().and_then(|dom| {
+                retained_style_mutation(dom, &cmd, &arg1, &arg2, true)
+            })
+        } else {
+            None
+        };
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
             state
@@ -2473,12 +2515,12 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|reference| state.dom.as_ref()?.get_node(reference)?.parent),
+                    .and_then(|reference| state.dom.as_ref()?.with_node(reference, |node| node.parent).flatten()),
                 "remove_child" => arg1
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|child| state.dom.as_ref()?.get_node(child)?.parent),
+                    .and_then(|child| state.dom.as_ref()?.with_node(child, |node| node.parent).flatten()),
                 "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
                     arg1.parse::<u32>().ok().map(NodeId::new)
                 }
@@ -2574,6 +2616,8 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "scripting_enabled" => gs.scripting_enabled.to_string(),
+        "sandbox_opaque_origin" => gs.sandbox_opaque_origin.to_string(),
         "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
             url::Url::parse(&gs.url).map(|url| url.origin().ascii_serialization())
                 .unwrap_or_else(|_| "null".to_string())
@@ -2883,6 +2927,33 @@ fn op_dom_inner(shared: &SharedState, cmd: String, arg1: String, arg2: String) -
                 })
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
+        }
+        "parse_html_document" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            if root == dom.document() || !dom.with_node(root, |node| matches!(node.data, NodeData::Document)).unwrap_or(false)
+                || !dom.children(root).is_empty()
+            {
+                return "null".into();
+            }
+            use html5ever::tendril::TendrilSink;
+            let mut options = html5ever::ParseOpts::default();
+            options.tree_builder.scripting_enabled = false;
+            let parsed = html5ever::parse_document(DomTree::new(), options).from_utf8().one(arg2.as_bytes());
+            dom.import_children_from(root, &parsed, parsed.document());
+            mark_script_subtree_started(&gs, root);
+            if parsed.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into()
+        }
+        "attribute_metadata" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let info = dom.with_node(NodeId::new(nid), |node| {
+                let attr = node.attrs()?.iter().find(|attr| attr.qualified_name_eq(&arg2))?;
+                Some(serde_json::json!({
+                    "name": attr.qualified_name(), "value": attr.value,
+                    "namespaceURI": if attr.name.ns.is_empty() { None } else { Some(&*attr.name.ns) },
+                    "prefix": attr.name.prefix.as_ref().map(|prefix| &**prefix),
+                }))
+            }).flatten();
+            serde_json::to_string(&info).unwrap_or("null".into())
         }
         "attribute_names" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -4427,7 +4498,7 @@ async fn fetch_url_inner(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body.map(String::into_bytes);
+                    override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -6490,6 +6561,61 @@ fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
     jar.get_js_visible_cookies(&url)
 }
 
+/// Origin of the calling realm's document. A cross-origin frame must land in
+/// its own origin's bucket rather than the top document's, so this resolves the
+/// realm that made the call instead of reading page state directly.
+fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
+    let cache = state.storage_origin_cache.borrow();
+    // Document identity can change without rebuilding the realm.
+    if cache.url == state.url && cache.inherited_origin == state.inherited_origin {
+        return std::cell::Ref::map(cache, |cache| cache.origin.as_str());
+    }
+    drop(cache);
+    let mut cache = state.storage_origin_cache.borrow_mut();
+    cache.url.clone_from(&state.url);
+    cache.inherited_origin.clone_from(&state.inherited_origin);
+    cache.origin = state.inherited_origin.clone().unwrap_or_else(|| {
+        url::Url::parse(&state.url)
+            .map(|url| if url.scheme() == "file" { "file://".to_string() }
+                else { url.origin().ascii_serialization() })
+            .unwrap_or_else(|_| "null".to_string())
+    });
+    drop(cache);
+    std::cell::Ref::map(state.storage_origin_cache.borrow(), |cache| cache.origin.as_str())
+}
+
+#[op2(fast)]
+fn op_storage_access(scope: &mut v8::PinScope, state: &OpState) -> bool {
+    let gs = realm_state(scope, state);
+    let gs = gs.borrow();
+    let origin = storage_origin(&gs);
+    &*origin != "null"
+}
+
+#[op2]
+#[string]
+fn op_indexed_db(scope: &mut v8::PinScope, state: &OpState, #[string] action: &str, #[string] payload: &str) -> String {
+    if payload.len() > 24 * 1024 * 1024 { return "{\"error\":\"QuotaExceededError\"}".into(); }
+    let gs = realm_state(scope, state);
+    let mut gs = gs.borrow_mut();
+    if gs.indexed_db_owner.is_none() {
+        gs.indexed_db_owner = Some(crate::indexed_db::IndexedDbOwner::new(gs.indexed_db.clone()));
+    }
+    let origin = storage_origin(&gs);
+    let result = serde_json::from_str(payload).map(|data|
+        gs.indexed_db_owner.as_ref().map(|owner| if action == "notices" {
+            serde_json::json!(owner.take_notices())
+        } else { owner.command(&origin, action, data) }).unwrap_or_default())
+        .unwrap_or_else(|_| serde_json::json!({"error":"DataError"}));
+    result.to_string()
+}
+
+#[op2(fast)]
+#[number]
+fn op_indexed_db_task(state: &OpState) -> u64 {
+    state.borrow::<SharedState>().borrow().animation_task_generation
+}
+
 #[op2(fast)]
 fn op_set_cookie(scope: &mut v8::PinScope, state: &OpState, #[string] cookie_str: &str) {
     let gs = realm_state(scope, state);
@@ -6875,21 +7001,24 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
-/// An initial about:blank needs its own realm before the next JS statement.
-#[op2(nofast, reentrant)]
+/// An initial blank or srcdoc document needs its own realm before the next JS
+/// statement, resolved from the creator's native document and owner node.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
     parent_frame_id: u32,
     initialize: v8::Local<v8::Function>,
     owner_node: u32,
+    #[string] srcdoc: Option<String>,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
         let Some(parent_context) = initialize.get_creation_context(scope) else { return 0 };
         let receiver = parent_context.global(scope);
-        let Ok((windows, window_id, parent_state)) = crate::window::storage_window(scope, state, receiver) else { return 0 };
+        let Ok((windows, window_id, parent_state)) =
+            crate::window::storage_window(scope, state, receiver) else { return 0 };
         if parent_state.borrow().frame_id != parent_frame_id { return 0; }
         let parent_handle = v8::Global::new(scope, parent_context);
         if !registry.borrow().by_context(&parent_handle).is_some_and(|document| Rc::ptr_eq(&document, &parent_state)) {
@@ -6917,15 +7046,27 @@ fn op_initial_frame(
             };
             return if initialized { frame_id } else { 0 };
         }
-        let opaque_sandbox = parent_state.borrow().dom.as_ref()
-            .and_then(|dom| dom.with_node(node, |node| node.get_attribute("sandbox")
-                .map(|tokens| !tokens.split_whitespace().any(|token| token == "allow-same-origin"))))
-            .flatten().unwrap_or(false);
-        if opaque_sandbox { return 0; }
+        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
+        // Sandbox flags are captured once, from the reserved owner node, and
+        // never re-read from the live attribute afterwards.
+        let sandbox = parent_state.borrow().dom.as_ref()
+            .and_then(|dom| dom.with_node(node, |node|
+                node.get_attribute("sandbox").map(str::to_owned)).flatten());
+        let sandbox_token = |token: &str| sandbox.as_deref().is_some_and(|value|
+            value.split_ascii_whitespace().any(|part| part.eq_ignore_ascii_case(token)));
+        let element_opaque = sandbox.is_some() && !sandbox_token("allow-same-origin");
+        // A blank document under an opaque sandbox has nothing to publish; a
+        // srcdoc document is materialized, but never under the creator's
+        // principal. Sandbox flags also propagate to descendant contexts.
+        if element_opaque && srcdoc.is_none() { return 0; }
+        let opaque = element_opaque || parent_state.borrow().sandbox_opaque_origin;
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
-            || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
-        { return 0; }
+            || page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+        {
+            return 0;
+        }
         let Some(frame_id) = allocate_frame_id() else { return 0 };
         let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
             .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
@@ -6938,10 +7079,20 @@ fn op_initial_frame(
         child.set_viewport(300.0, 150.0);
         {
             let parent = parent_state.borrow();
-            child.dom = Some(obscura_dom::parse_html("<html><head></head><body></body></html>"));
+            child.sandbox_opaque_origin = opaque;
+            child.url = frame_url.to_string();
             child.frame_id = frame_id;
             child.about_base_url = document_base_url(&parent);
-            child.inherited_origin = Some(crate::window::origin(&parent));
+            child.scripting_enabled = parent.scripting_enabled
+                && (sandbox.is_none() || sandbox_token("allow-scripts"));
+            child.dom = Some(if let Some(html) = srcdoc.as_deref() {
+                obscura_dom::parse_srcdoc(html, child.scripting_enabled)
+            } else {
+                obscura_dom::parse_html("<html><head></head><body></body></html>")
+            });
+            child.inherited_origin = Some(if opaque { "null".to_string() } else {
+                crate::window::origin(&parent)
+            });
             child.inherit_resources(&parent);
         }
         let child = Rc::new(RefCell::new(child));
@@ -6976,11 +7127,18 @@ fn op_initial_frame(
             registry.borrow_mut().retire_modules(scope);
             return 0;
         }
+        // Initialization needs the creator's token; author code must never
+        // retain it when the sandbox requires an opaque origin.
+        if opaque { context.use_default_security_token(); }
         let mut page = page.borrow_mut();
-        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
         page.pending_frames.push(PendingFrame {
-            frame_id, parent_frame_id, url: "about:blank".to_string(), html: String::new(),
-            viewport_width: 300, viewport_height: 150,
+            frame_id,
+            parent_frame_id,
+            url: frame_url.to_string(),
+            html: String::new(),
+            viewport_width: 300,
+            viewport_height: 150,
         });
         frame_id
     })).unwrap_or(0)
@@ -8101,6 +8259,9 @@ pub fn build_extension() -> Extension {
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),
+        op_storage_access(),
+        op_indexed_db(),
+        op_indexed_db_task(),
         op_navigate(),
         op_session_history(),
         op_history_traverse(),
@@ -8634,6 +8795,8 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
 
 pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
     state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    { state.style_query_cache = None; }
 }
 
 #[op2(fast)]
@@ -9406,6 +9569,16 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 /// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
 /// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
+pub(crate) struct StyleQueryCache {
+    task_generation: u64,
+    activity_generation: u64,
+    stylesheet_generation: u64,
+    viewport: (f32, f32),
+    media: obscura_render::CssMediaType,
+    cascade: obscura_render::dom::NonGeometricStyleCache,
+}
+
+#[cfg(feature = "render")]
 #[op2]
 #[string]
 fn op_computed_style(
@@ -9421,19 +9594,41 @@ fn op_computed_style(
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let base_url = document_base_url_for_javascript_task(&gs);
-    let needs_layout = gs.prepared_render.as_ref().is_none_or(|prepared| {
+    let needs_style_resolution = gs.prepared_render.as_ref().is_none_or(|prepared| {
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
-            || prepared.animation_sample() != gs.animation_sample
     }) || !gs.pending_style_mutations.is_empty();
-    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty() {
-        if let Some(snapshot) = gs.dom.as_ref().and_then(|dom| {
-            obscura_render::dom::computed_style_without_layout(
-                dom, nid, gs.viewport, gs.render_media, &gs.stylesheet_cache, &property,
-            )
+    // An animation-only time change can resample the existing frame without
+    // duplicating its style graph in the ancestor-cascade cache.
+    if pseudo.is_empty() && needs_style_resolution && gs.animation_timeline.waapi_nodes().is_empty()
+        && obscura_render::dom::NonGeometricStyleCache::supports(&property)
+    {
+        let mut cached = gs.style_query_cache.take();
+        let stylesheet_generation = gs.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation());
+        if !cached.as_ref().is_some_and(|cache| {
+            cache.task_generation == gs.animation_task_generation
+                && cache.activity_generation == gs.activity_generation
+                && cache.stylesheet_generation == stylesheet_generation
+                && cache.viewport == gs.viewport && cache.media == gs.render_media
         }) {
+            cached = gs.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::NonGeometricStyleCache::new(
+                    dom, gs.viewport, gs.render_media, &gs.stylesheet_cache,
+                )
+            }).map(|cascade| StyleQueryCache {
+                task_generation: gs.animation_task_generation,
+                activity_generation: gs.activity_generation,
+                stylesheet_generation, viewport: gs.viewport, media: gs.render_media, cascade,
+            });
+        }
+        let snapshot = cached.as_mut().and_then(|cache| {
+            cache.cascade.resolve(gs.dom.as_ref()?, nid, &property)
+        });
+        gs.style_query_cache = cached;
+        if let Some(snapshot) = snapshot {
             return serde_json::json!([false, snapshot]).to_string();
         }
     }
+    gs.style_query_cache = None;
     let Some(prepared) = ensure_prepared_render_with_base_url(&mut gs, base_url) else {
         return String::new();
     };
@@ -9448,6 +9643,11 @@ fn op_computed_style(
             |value| serde_json::to_string(value).unwrap_or_else(|_| "none".to_string()),
         );
         return serde_json::json!([true, { "content": content, "display": display }]).to_string();
+    }
+    if pseudo.is_empty() && obscura_render::dom::NonGeometricStyleCache::supports(&property) {
+        if let Some(snapshot) = prepared.computed_non_geometric_style(nid) {
+            return serde_json::json!([false, snapshot]).to_string();
+        }
     }
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();

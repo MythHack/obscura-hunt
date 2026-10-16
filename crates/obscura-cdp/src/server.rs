@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpStream;
@@ -655,7 +656,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
-    persistence_ctx.save_cookies();
+    persistence_ctx.save_storage();
     Ok(())
 }
 
@@ -827,9 +828,11 @@ fn run_connection(
         .name("obscura-cdp-conn".into())
         .spawn(move || {
             let mut slot_guard = SlotGuard(Some(slot));
-            let default_context = Arc::new(
-                context_template.isolated_copy("default".to_string(), true),
-            );
+            let mut connection_context = context_template.isolated_copy("default".to_string(), true);
+            // Pages must not flush isolated snapshots over another client's profile.
+            // Only the persistence context writes the merged deltas on disconnect.
+            connection_context.storage_dir = None;
+            let default_context = Arc::new(connection_context);
             let initial_cookies = default_context.cookie_jar.get_all_cookies();
             let persisted_context = default_context.clone();
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -914,9 +917,10 @@ fn run_connection(
             drop(local);
             drop(rt);
 
-            // Apply only this connection's cookie changes to the persistence
-            // template. Unchanged cookies cannot overwrite another connection's
-            // updates, while explicit deletes and replacements still persist.
+            // Apply only this connection's cookie and Web Storage changes to the
+            // persistence template. Unchanged entries cannot overwrite another
+            // connection's updates, while explicit deletes and replacements
+            // still persist.
             if persistence_context.storage_dir.is_some() {
                 let _guard = persistence_lock.lock().unwrap_or_else(|e| e.into_inner());
                 merge_cookie_delta(
@@ -924,7 +928,32 @@ fn run_connection(
                     &initial_cookies,
                     &persisted_context.cookie_jar.get_all_cookies(),
                 );
-                persistence_context.save_cookies();
+                // Namespace locks are always taken template -> connection ->
+                // persistence, and are released before `save_storage` (which
+                // locks the persistence namespace again) or the same mutex
+                // would deadlock this thread against itself.
+                {
+                    let initial_storage = context_template
+                        .local_storage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let connection_storage = persisted_context
+                        .local_storage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut persisted_storage = persistence_context
+                        .local_storage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Err(error) = persisted_storage.merge_delta(&initial_storage, &connection_storage) {
+                        // Keep successfully merged origins even if another exceeds its quota.
+                        warn!(
+                            "localStorage persistence merge from connection '{}' failed: {:?}",
+                            persisted_context.id, error
+                        );
+                    }
+                }
+                persistence_context.save_storage();
             }
 
             drop(persisted_context);
@@ -1601,6 +1630,13 @@ async fn pump_live_page_event_loop(
     ctx: &mut CdpContext,
     idle_pages: &mut HashSet<String>,
 ) -> Result<bool, String> {
+    pump_page_event_loops(ctx.pages.iter_mut(), idle_pages).await
+}
+
+pub(crate) async fn pump_page_event_loops<'a>(
+    pages: impl Iterator<Item = &'a mut obscura_browser::Page>,
+    idle_pages: &mut HashSet<String>,
+) -> Result<bool, String> {
     use std::future::Future;
     use std::task::Poll;
 
@@ -1610,10 +1646,16 @@ async fn pump_live_page_event_loop(
     // Publish it now, then omit idle pages until a command schedules new work;
     // otherwise an idle peer would keep a waiting connection spinning.
     let mut groups = HashSet::new();
-    let mut turns: Vec<_> = ctx.pages.iter_mut()
-        .filter(|page| page.has_js() && !idle_pages.contains(&page.id)
-            && groups.insert(page.window_group_id()))
-        .map(|page| (page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+    let mut turns: Vec<_> = pages.filter_map(|page| {
+            // Pending IndexedDB notifications are work the page can emit
+            // without a command, so wake it back up first.
+            if page.has_pending_indexed_db_notifications() { idle_pages.remove(&page.id); }
+            // Pages sharing a native window drive one turn: two turns in the
+            // same poll would interleave one window's realms.
+            if !page.has_js() || idle_pages.contains(&page.id)
+                || !groups.insert(page.window_group_id()) { return None; }
+            Some((page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
+        })
         .collect();
     std::future::poll_fn(|cx| {
         let mut all_idle = true;
@@ -1828,52 +1870,77 @@ fn handle_fetch_resolution(
         let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
         tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
 
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
+        if intercepted_paused.contains_key(request_id) {
             tracing::info!("INTERCEPTION resolved: {}", request_id);
+            // Build the resolution before taking the pause. A malformed command
+            // is answered with an error and the request stays paused, so a
+            // corrected answer on the same requestId still drives the fetch --
+            // taking the pause first would wedge the request on a client typo.
             let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
+                "Fetch.continueRequest" => {
                     // Honor the client's overrides (Playwright route.continue,
                     // Puppeteer request.continue). op_fetch_url applies each and
                     // re-validates a rewritten URL through the SSRF gate. Leaving
                     // these None silently sent the request unmodified (issue #365).
-                    url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    headers: parse_cdp_headers(&req.params),
-                    body: req.params.get("postData").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                },
+                    match decode_optional_binary(&req.params, "postData", "continueRequest postData") {
+                        Ok(body) => Ok(obscura_js::ops::InterceptResolution::Continue {
+                            url: req.params.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            method: req.params.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            headers: parse_cdp_headers(&req.params),
+                            body,
+                        }),
+                        Err(message) => Err(message),
+                    }
+                }
                 "Fetch.fulfillRequest" => {
                     let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
                     let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
                     // `body` is a lossy text view; `body_base64` carries the CDP
                     // body (already base64) through unchanged so op_fetch_url can
                     // hand JS the exact bytes for a binary fulfill (#912).
-                    let body = decode_base64(raw_body);
-                    let body_base64 = raw_body.to_string();
-                    let headers = parse_cdp_response_headers(&req.params);
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body, body_base64 }
+                    // Validate before consuming the pause; keep exact bytes for JS.
+                    match decode_optional_binary(&req.params, "body", "fulfillRequest body") {
+                        Ok(bytes) => Ok(obscura_js::ops::InterceptResolution::Fulfill {
+                            status,
+                            headers: parse_cdp_response_headers(&req.params),
+                            body: String::from_utf8_lossy(&bytes.unwrap_or_default()).to_string(),
+                            body_base64: raw_body.to_string(),
+                        }),
+                        Err(message) => Err(message),
+                    }
                 }
                 "Fetch.failRequest" => {
                     let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
+                    Ok(obscura_js::ops::InterceptResolution::Fail { reason })
                 }
                 _ => return false,
             };
-            if resolver.send(resolution).is_ok() && method == "Fetch.failRequest" {
-                let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed");
-                let mut error_text = String::from("net::ERR_");
-                for (index, ch) in reason.chars().enumerate() {
-                    if index > 0 && ch.is_ascii_uppercase() { error_text.push('_'); }
-                    error_text.push(ch.to_ascii_uppercase());
+            let resp = match resolution {
+                Ok(resolution) => {
+                    let resolver = intercepted_paused
+                        .remove(request_id)
+                        .expect("the pause was present a few lines above and nothing else can take it");
+                    if resolver.send(resolution).is_ok() && method == "Fetch.failRequest" {
+                        let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed");
+                        let mut error_text = String::from("net::ERR_");
+                        for (index, ch) in reason.chars().enumerate() {
+                            if index > 0 && ch.is_ascii_uppercase() { error_text.push('_'); }
+                            error_text.push(ch.to_ascii_uppercase());
+                        }
+                        let _ = reply_tx.send(json!({
+                            "method": "Network.loadingFailed", "sessionId": req.session_id,
+                            "params": {"requestId": request_id, "type": "Fetch", "errorText": error_text,
+                                "canceled": reason == "Aborted",
+                                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().as_secs_f64()},
+                        }).to_string());
+                    }
+                    crate::types::CdpResponse::success(req.id, json!({}), req.session_id)
                 }
-                let _ = reply_tx.send(json!({
-                    "method": "Network.loadingFailed", "sessionId": req.session_id,
-                    "params": {"requestId": request_id, "type": "Fetch", "errorText": error_text,
-                        "canceled": reason == "Aborted",
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default().as_secs_f64()},
-                }).to_string());
-            }
-            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
+                // -32602 is the invalid-params code; the pause is deliberately left
+                // in place so the client can answer this requestId again.
+                Err(message) => crate::types::CdpResponse::error(req.id, -32602, message, req.session_id),
+            };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = reply_tx.send(json);
             }
@@ -2332,31 +2399,37 @@ async fn process_cdp_message(
 
 }
 
+/// Lossy text view of a base64 CDP field, for the two callers that serve it
+/// as a string. `decode_base64_bytes` is the decoder; this only flattens its
+/// result the way those call sites already expect.
 pub(crate) fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
+    String::from_utf8_lossy(&decode_base64_bytes(input).unwrap_or_default()).to_string()
+}
+
+/// Read an optional CDP `binary` parameter as the bytes it encodes.
+///
+/// `Ok(None)` means the field was absent, which is "leave this alone" rather
+/// than "make it empty". An unparseable value is an error rather than a
+/// best-effort decode: base64 that is not base64 is a client mistake, and
+/// answering it silently is what let a raw-text `postData` reach the wire as
+/// mangled bytes with nothing anywhere saying so.
+pub(crate) fn decode_optional_binary(
+    params: &serde_json::Value,
+    field: &str,
+    what: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = params.get(field) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| format!("{what} must be a base64 string"))?;
+    match decode_base64_bytes(raw) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(why) => Err(format!("{what} is not valid base64: {why}")),
     }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
-    }
-    String::from_utf8_lossy(&out).to_string()
+}
+
+fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, String> {
+    BASE64.decode(input).map_err(|error| error.to_string())
 }
 
 fn fast_path_response(text: &str) -> Option<String> {
@@ -3616,7 +3689,7 @@ mod tests {
                     params["url"] = json!("https://example.com/rewritten");
                     params["method"] = json!("POST");
                     params["headers"] = json!([{"name": "X-Check", "value": "kept"}]);
-                    params["postData"] = json!("payload");
+                    params["postData"] = json!("cGF5bG9hZA==");
                 }
                 "fulfillRequest" => {
                     params["responseCode"] = json!(201);
@@ -3650,7 +3723,7 @@ mod tests {
                     assert_eq!(url.as_deref(), Some("https://example.com/rewritten"));
                     assert_eq!(method.as_deref(), Some("POST"));
                     assert_eq!(headers.unwrap().get("X-Check").map(String::as_str), Some("kept"));
-                    assert_eq!(body.as_deref(), Some("payload"));
+                    assert_eq!(body.as_deref(), Some(b"payload".as_slice()));
                 }
                 ("fulfillRequest", InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
                     assert_eq!(status, 201);
@@ -3959,6 +4032,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn indexeddb_versionchange_rearms_an_idle_page_until_its_delayed_close() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = ctx.create_page();
+            let session = Some(format!("{id}-session"));
+            ctx.sessions.insert(session.clone().unwrap(),id.clone());
+            crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<body>idb</body>"}), &mut ctx, &session).await.unwrap();
+            ctx.get_page_mut(&id).unwrap().js.as_mut().unwrap().set_url("https://idb.test/");
+            ids.push(id);
+        }
+        let mut idle = Default::default();
+        ctx.get_page_mut(&ids[0]).unwrap().evaluate(r#"(() => {
+            const r = indexedDB.open('idle-upgrade',1);
+            globalThis.opened = false;
+            r.onsuccess = () => {globalThis.opened = true;
+                r.result.onversionchange = () => setTimeout(() => r.result.close(),10);};
+        })()"#);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap() {}
+        }).await.unwrap();
+        assert!(idle.contains(&ids[0]));
+        assert_eq!(ctx.get_page_mut(&ids[0]).unwrap().evaluate("opened"),json!(true));
+        ctx.get_page_mut(&ids[1]).unwrap().evaluate(r#"(() => {
+            globalThis.upgraded = false;
+            setTimeout(() => {const r = indexedDB.open('idle-upgrade',2);
+                r.onsuccess = () => globalThis.upgraded = r.result.version === 2;},10);
+        })()"#);
+        idle.remove(&ids[1]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                pump_live_page_event_loop(&mut ctx,&mut idle).await.unwrap();
+                if ctx.get_page_mut(&ids[1]).unwrap().evaluate("upgraded") == json!(true) {break;}
+            }
+        }).await.expect("versionchange must wake the idle page and retain its delayed-close work");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn autonomous_pages_do_not_wait_for_another_pages_distant_timer() {
         let mut ctx = crate::dispatch::CdpContext::new();
         let mut idle_pages = Default::default();
@@ -4024,6 +4135,174 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !pump_live_page_event_loop(&mut ctx, &mut idle_pages).await.unwrap() {}
         }).await.expect("all idle pages must disarm the pump instead of spinning");
+    }
+
+    // #569 / #365 — postData is declared `binary` in the CDP domain, so a
+    // client sends it base64-encoded. Passing the encoded text straight through
+    // made the request body the base64 itself, which a server reads as neither
+    // the JSON nor the form the page meant to send.
+    #[test]
+    fn continue_request_decodes_a_base64_post_data() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // base64 of {"a":1}
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some(br#"{"a":1}"#.as_slice()),
+            "the request body must be the bytes the client encoded, not the base64 text"
+        );
+    }
+
+    // The body a client rewrites is not always text -- a protobuf, a gzip
+    // stream, a multipart file part. Carrying it through `String` replaced
+    // every non-UTF-8 sequence with U+FFFD before it reached the wire.
+    #[test]
+    fn continue_request_keeps_a_non_utf8_post_data_intact() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // base64 of the three bytes 00 FF FE, which are not valid UTF-8
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"AP/+"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert_eq!(
+            body.as_deref(),
+            Some([0x00u8, 0xFF, 0xFE].as_slice()),
+            "a binary body must reach the wire byte for byte"
+        );
+    }
+
+    // Base64 that is not base64 is a client mistake. Answering it silently is
+    // how raw text reached the wire as mangled bytes; answering it with an
+    // error while keeping the pause lets the client correct itself.
+    #[test]
+    fn continue_request_rejects_post_data_that_is_not_base64_without_wedging_it() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":9,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"!!!not-base64"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["id"], 9);
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("continueRequest postData is not valid base64"),
+            "the error must name the field, got {:?}",
+            rejected["error"]["message"]
+        );
+        assert!(
+            resolution_rx.try_recv().is_err(),
+            "a rejected command must not resolve the pause"
+        );
+        assert!(
+            paused.contains_key("request-1"),
+            "a rejected command must leave the request paused so it can be answered again"
+        );
+
+        // the same requestId, answered correctly, still drives the fetch
+        assert!(handle_fetch_resolution(
+            r#"{"id":10,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":"eyJhIjoxfQ=="}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("the corrected continueRequest must resolve as Continue");
+        };
+        assert_eq!(body.as_deref(), Some(br#"{"a":1}"#.as_slice()));
+    }
+
+    // The same strictness on the other arm carrying a CDP `binary` field.
+    #[test]
+    fn fulfill_request_rejects_a_body_that_is_not_base64() {
+        let (resolution_tx, _resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":11,"method":"Fetch.fulfillRequest","params":{"requestId":"request-1","responseCode":200,"body":"<html>"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&reply_rx.try_recv().expect("one command response")).unwrap();
+        assert_eq!(rejected["error"]["code"], -32602);
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("fulfillRequest body is not valid base64")
+        );
+        assert!(paused.contains_key("request-1"), "the request must stay paused");
+    }
+
+    #[test]
+    fn continue_request_rejects_invalid_binary_values_and_allows_retry() {
+        for value in [json!(null), json!(42), json!("AA="), json!("AB=="), json!("====")] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let mut paused = HashMap::from([("request-1".to_string(), tx)]);
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            let command = json!({"id": 1, "method": "Fetch.continueRequest",
+                "params": {"requestId": "request-1", "postData": value}}).to_string();
+            assert!(handle_fetch_resolution(&command, &reply_tx, &mut paused));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32602, "accepted invalid postData: {value}");
+            assert!(matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            assert!(paused.contains_key("request-1"));
+            assert!(handle_fetch_resolution(
+                r#"{"id":2,"method":"Fetch.continueRequest","params":{"requestId":"request-1","postData":""}}"#,
+                &reply_tx, &mut paused,
+            ));
+            assert!(matches!(rx.try_recv(), Ok(obscura_js::ops::InterceptResolution::Continue { body: Some(body), .. }) if body.is_empty()));
+            let reply: serde_json::Value = serde_json::from_str(&reply_rx.try_recv().unwrap()).unwrap();
+            assert!(reply.get("error").is_none());
+        }
+    }
+
+    // An absent postData still means "leave the body alone", not "send empty".
+    #[test]
+    fn continue_request_without_post_data_leaves_the_body_alone() {
+        let (resolution_tx, mut resolution_rx) = tokio::sync::oneshot::channel();
+        let mut paused = HashMap::from([("request-1".to_string(), resolution_tx)]);
+        let (reply_tx, _reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        assert!(handle_fetch_resolution(
+            r#"{"id":1,"method":"Fetch.continueRequest","params":{"requestId":"request-1"}}"#,
+            &reply_tx,
+            &mut paused,
+        ));
+
+        let Ok(obscura_js::ops::InterceptResolution::Continue { body, .. }) = resolution_rx.try_recv() else {
+            panic!("continueRequest must resolve as Continue");
+        };
+        assert!(body.is_none(), "an absent postData must not become an empty body");
     }
 
     #[cfg(feature = "render")]

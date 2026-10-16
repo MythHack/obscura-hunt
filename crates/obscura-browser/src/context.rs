@@ -8,8 +8,11 @@ pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
     /// Live origin-partitioned localStorage for every page in this context.
-    /// The existing storage directory policy persists cookies only.
+    /// Owned by the context rather than by a V8 realm, so an entry written in
+    /// one document is still there in the next (issue #678), and shared with
+    /// every native window the context opens.
     pub local_storage: SharedStorage,
+    pub indexed_db: Arc<obscura_js::indexed_db::IndexedDbStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -35,6 +38,74 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+}
+
+/// One origin's persisted `localStorage`. The origin is inside the file, so the
+/// file name only has to be unique and stable, not reversible.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredOriginStorage {
+    origin: String,
+    /// `[key, value]` pairs in insertion order, the order `Storage.key(i)` uses.
+    entries: Vec<(String, String)>,
+}
+
+/// Filename-safe stem for an origin: a sanitized prefix for readability plus the
+/// full FNV-1a digest of the origin, so `https://a-b.example` and
+/// `https://a_b.example` cannot share a file.
+fn storage_file_stem(origin: &str) -> String {
+    let prefix: String = origin
+        .chars()
+        .take(48)
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' })
+        .collect();
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in origin.as_bytes() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{prefix}-{digest:016x}")
+}
+
+/// Write through a temporary file so an interrupted write cannot leave a
+/// half-written profile behind.
+fn write_file_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Restore `{storage_dir}/localStorage/*.json` into a fresh store.
+fn load_web_storage(storage: &SharedStorage, dir: Option<&PathBuf>) {
+    use std::io::Read;
+    let Some(dir) = dir else { return };
+    let root = dir.join("localStorage");
+    let Ok(read_dir) = std::fs::read_dir(&root) else { return };
+    let mut storage = storage.lock().expect("local storage namespace lock is poisoned");
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        // A 5 MiB store can expand sixfold when encoded as JSON escapes.
+        let mut contents = String::new();
+        let limit = 32 * 1024 * 1024;
+        let read = std::fs::File::open(&path).and_then(|file| file.take(limit + 1).read_to_string(&mut contents));
+        if read.is_err() || contents.len() as u64 > limit {
+            tracing::warn!("Failed to read {}", path.display());
+            continue;
+        }
+        match serde_json::from_str::<StoredOriginStorage>(&contents) {
+            Ok(stored) => {
+                let valid_origin = stored.origin == "file://" || url::Url::parse(&stored.origin)
+                    .is_ok_and(|url| url.origin().ascii_serialization() == stored.origin && stored.origin != "null");
+                if !valid_origin || !storage.load(&stored.origin, stored.entries) {
+                    tracing::warn!("Ignoring invalid or over-budget {}", path.display());
+                }
+            }
+            Err(e) => tracing::warn!("Ignoring unreadable {}: {}", path.display(), e),
+        }
+    }
 }
 
 impl BrowserContext {
@@ -123,10 +194,16 @@ impl BrowserContext {
             *guard = resolved_ua.clone();
         }
         let http_client = Arc::new(client);
+        let local_storage: SharedStorage = Arc::new(Mutex::new(StorageNamespace::default()));
+        if let Some(ref dir) = storage_dir {
+            load_web_storage(&local_storage, Some(dir));
+        }
+
         BrowserContext {
             id,
             cookie_jar,
-            local_storage: Arc::new(Mutex::new(StorageNamespace::default())),
+            local_storage,
+            indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -159,21 +236,17 @@ impl BrowserContext {
         Self::with_options(id, proxy_url, false)
     }
 
-    /// Create a context with the same browser configuration but independent
-    /// mutable state. Persistent copies start with the template's current
-    /// cookies and localStorage; incognito copies start empty and never write
+    /// Create a context that owns its network state, Web Storage view and
+    /// IndexedDB store outright. A persistent copy starts from the template's
+    /// current localStorage snapshot and keeps writing the same storage
+    /// directory (the connection-scoped persistence handle is what merges those
+    /// writes for the profile); an incognito copy starts empty and never writes
     /// to the template's storage directory.
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
             cookie_jar.copy_from(&self.cookie_jar);
         }
-        let local_storage = if persistent {
-            self.local_storage.lock().expect("local storage namespace lock is poisoned").clone()
-        } else {
-            StorageNamespace::default()
-        };
-
         let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
             self.proxy_url.as_deref(),
@@ -189,7 +262,24 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
-            local_storage: Arc::new(Mutex::new(local_storage)),
+            // Network state is owned independently by every copy, and so is the
+            // Web Storage view: the CDP server builds one connection context per
+            // client from the immutable startup snapshot (server.rs connection
+            // setup), so a persistent copy starts from the template's entries and
+            // then stands alone instead of letting one client see another
+            // client's writes. The dedicated persistence handle merges deltas.
+            local_storage: if persistent {
+                Arc::new(Mutex::new(self.local_storage.lock()
+                    .expect("local storage namespace lock is poisoned")
+                    .clone()))
+            } else {
+                Arc::new(Mutex::new(StorageNamespace::default()))
+            },
+            // IndexedDB is never written to the storage directory, so sharing it
+            // across copies would let one identity read another identity's data
+            // for free; every copy gets its own store instead, shared only by
+            // this context's pages and native child windows.
+            indexed_db: Arc::new(obscura_js::indexed_db::IndexedDbStorage::default()),
             http_client: Arc::new(client),
             user_agent: self.user_agent.clone(),
             platform: self.platform.clone(),
@@ -203,6 +293,49 @@ impl BrowserContext {
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
             allow_private_network: self.allow_private_network,
         }
+    }
+
+    /// Flush `localStorage` to `{storage_dir}/localStorage`. Only the origins
+    /// that changed since the last successful write are touched, and an origin
+    /// that lost its last entry has its file removed so a restart cannot
+    /// resurrect it. The store is only marked clean once every touched origin
+    /// reached the disk, so a failed write is retried instead of lost.
+    pub fn save_local_storage(&self) {
+        let Some(ref dir) = self.storage_dir else {
+            return;
+        };
+        let mut storage = self.local_storage.lock().expect("local storage namespace lock is poisoned");
+        if !storage.is_dirty() {
+            return;
+        }
+        let root = dir.join("localStorage");
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            tracing::warn!("Failed to create {}: {}", root.display(), e);
+            return;
+        }
+        storage.flush_changed(|origin, entries| {
+            let path = root.join(format!("{}.json", storage_file_stem(origin)));
+            let result = if entries.is_empty() {
+                match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                }
+            } else {
+                let stored = StoredOriginStorage { origin: origin.to_string(), entries: entries.to_vec() };
+                serde_json::to_vec(&stored).map_err(std::io::Error::other)
+                    .and_then(|bytes| write_file_atomically(&path, &bytes))
+            };
+            match result {
+                Ok(()) => true,
+                Err(e) => { tracing::warn!("Failed to persist {}: {}", path.display(), e); false }
+            }
+        });
+    }
+
+    /// Persist cookies and Web Storage if storage_dir is configured.
+    pub fn save_storage(&self) {
+        self.save_local_storage();
+        self.save_cookies();
     }
 
     /// Persist cookies to disk if storage_dir is configured.
@@ -251,10 +384,275 @@ mod tests {
         assert_eq!(ctx.user_agent, client_ua);
     }
 
+    /// Lock the context's Web Storage namespace for a test.
+    fn ns(context: &BrowserContext) -> std::sync::MutexGuard<'_, StorageNamespace> {
+        context.local_storage.lock().expect("local storage namespace lock is poisoned")
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn with_options_keeps_default_user_agent() {
         let ctx = BrowserContext::with_options("test".to_string(), None, false);
         assert!(ctx.user_agent.contains("Chrome"));
+    }
+
+    fn temp_storage_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "obscura-storage-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// --storage-dir has to survive a restart, which is the whole point of a
+    /// profile: a second context over the same directory reads back what the
+    /// first one wrote.
+    #[test]
+    fn local_storage_retries_failed_writes_without_rewriting_successes() {
+        let dir = temp_storage_dir("write-retry");
+        let context = BrowserContext::with_storage("write-retry".into(), Some(dir.clone()));
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let failed = root.join(format!("{}.json", storage_file_stem("https://failed.test")));
+        let blocked = failed.with_extension("json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(ns(&context).set("https://failed.test", "token", "kept").is_ok());
+        assert!(ns(&context).set("https://saved.test", "token", "saved").is_ok());
+        context.save_local_storage();
+        assert!(ns(&context).is_dirty(), "failed writes must remain retryable");
+        let saved = root.join(format!("{}.json", storage_file_stem("https://saved.test")));
+        let saved_before = std::fs::metadata(&saved).unwrap().modified().unwrap();
+        std::fs::remove_dir(&blocked).unwrap();
+        context.save_local_storage();
+        assert!(!ns(&context).is_dirty());
+        // Only the origin whose write failed is retried.
+        assert_eq!(
+            std::fs::metadata(&saved).unwrap().modified().unwrap(),
+            saved_before,
+            "a flushed origin must not be rewritten by a retry"
+        );
+        let reloaded = BrowserContext::with_storage("reloaded".into(), Some(dir.clone()));
+        assert_eq!(ns(&reloaded).get("https://failed.test", "token").as_deref(), Some("kept"));
+        assert_eq!(ns(&reloaded).get("https://saved.test", "token").as_deref(), Some("saved"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn local_storage_ignores_non_regular_profile_files() {
+        let dir = temp_storage_dir("non-regular");
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let pipe = root.join("blocked.json");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let profile = dir.clone();
+        let reader = std::thread::spawn(move || {
+            let context = BrowserContext::with_storage("reader".into(), Some(profile));
+            tx.send(ns(&context).is_dirty()).unwrap();
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(2));
+        if completed.is_err() {
+            // Release the broken reader before reporting the failure.
+            std::fs::write(&pipe, b"{}").unwrap();
+        }
+        reader.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(completed.ok(), Some(false), "profile loading must not block on a FIFO");
+    }
+
+    #[test]
+    fn local_storage_retries_failed_deletions() {
+        let dir = temp_storage_dir("delete-retry");
+        let context = BrowserContext::with_storage("delete-retry".into(), Some(dir.clone()));
+        assert!(ns(&context).set("https://app.test", "token", "old").is_ok());
+        context.save_local_storage();
+        let path = dir.join("localStorage").join(format!("{}.json", storage_file_stem("https://app.test")));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        ns(&context).clear("https://app.test");
+        context.save_local_storage();
+        assert!(ns(&context).is_dirty(), "a failed deletion must not be acknowledged");
+        std::fs::remove_dir(&path).unwrap();
+        context.save_local_storage();
+        assert!(!ns(&context).is_dirty());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_storage_retries_mutations_made_during_a_flush() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        let dir = temp_storage_dir("concurrent-flush");
+        let context = Arc::new(BrowserContext::with_storage("writer".into(), Some(dir.clone())));
+        // An isolated copy owns its own store, so the mutation concurrent with
+        // the flush has to target the same namespace to exercise the serialized
+        // writer and the dirty marker the flush acknowledges.
+        let other = Arc::clone(&context);
+        let root = dir.join("localStorage");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("{}.json", storage_file_stem("https://app.test")));
+        let pipe = path.with_extension("json.tmp");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let old = "x".repeat(64 * 1024);
+        assert!(ns(&context).set("https://app.test", "token", &old).is_ok());
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::open(pipe).unwrap();
+            opened_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let writer_context = context.clone();
+        let writer = std::thread::spawn(move || writer_context.save_local_storage());
+        opened_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let mutator = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            assert!(ns(&other).set("https://app.test", "token", "latest").is_ok());
+            changed_tx.send(()).unwrap();
+        });
+        attempted_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // Let the old unlocked writer lose a mutation while its FIFO is held.
+        // A serialized writer keeps the mutation blocked until the flush ends.
+        let _ = changed_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        mutator.join().unwrap();
+        let written: StoredOriginStorage = serde_json::from_slice(&reader.join().unwrap()).unwrap();
+        assert_eq!(written.entries, vec![("token", old)]);
+        assert!(ns(&context).is_dirty(), "a newer mutation must survive the older flush acknowledgement");
+        context.save_local_storage();
+        let reloaded = BrowserContext::with_storage("reloaded".into(), Some(dir.clone()));
+        assert_eq!(ns(&reloaded).get("https://app.test", "token").as_deref(), Some("latest"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_storage_round_trips_through_the_storage_dir() {
+        let dir = temp_storage_dir("roundtrip");
+        let first = BrowserContext::with_storage("profile-a".into(), Some(dir.clone()));
+        assert!(ns(&first).set("https://app.example", "token", "abc").is_ok());
+        assert!(ns(&first).set("https://app.example", "theme", "dark").is_ok());
+        assert!(ns(&first).set("https://other.example", "k", "v").is_ok());
+        first.save_local_storage();
+
+        let files: Vec<String> = std::fs::read_dir(dir.join("localStorage"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(files.len(), 2, "one file per origin: {files:?}");
+
+        let second = BrowserContext::with_storage("profile-b".into(), Some(dir.clone()));
+        assert_eq!(
+            ns(&second).get("https://app.example", "token"),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            ns(&second).get("https://app.example", "theme"),
+            Some("dark".to_string())
+        );
+        assert_eq!(
+            ns(&second).get("https://other.example", "k"),
+            Some("v".to_string())
+        );
+        // Insertion order is part of the format: Storage.key(i) depends on it.
+        let keys: Vec<String> = ns(&second).snapshot("https://app.example")
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec!["token".to_string(), "theme".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without --storage-dir nothing is written and nothing is loaded, and the
+    /// incognito copy of a persistent context stays empty.
+    #[test]
+    fn local_storage_stays_in_memory_without_a_storage_dir() {
+        let persistent = BrowserContext::with_storage("no-dir".into(), None);
+        assert!(persistent.storage_dir.is_none());
+        assert!(ns(&persistent).set("https://app.example", "k", "v").is_ok());
+        persistent.save_local_storage();
+        // No directory is configured, so the write is a no-op and the entry
+        // stays in this process only.
+        assert!(ns(&persistent).is_dirty());
+        assert_eq!(
+            ns(&persistent).get("https://app.example", "k"),
+            Some("v".to_string())
+        );
+
+        let incognito = persistent.isolated_copy("incognito".into(), false);
+        assert_eq!(ns(&incognito).get("https://app.example", "k"), None);
+        // The template keeps its own entry.
+        assert_eq!(
+            ns(&persistent).get("https://app.example", "k"),
+            Some("v".to_string())
+        );
+    }
+
+    /// An unchanged store must not touch the disk, or every navigation on a
+    /// large profile would rewrite every origin file.
+    #[test]
+    fn save_local_storage_skips_untouched_origins() {
+        let dir = temp_storage_dir("dirty");
+        let context = BrowserContext::with_storage("dirty-check".into(), Some(dir.clone()));
+        assert!(ns(&context).set("https://app.example", "k", "v").is_ok());
+        context.save_local_storage();
+        let first_write = std::fs::metadata(
+            dir.join("localStorage").join(format!("{}.json", storage_file_stem("https://app.example"))),
+        )
+        .and_then(|meta| meta.modified())
+        .expect("the first write must land");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        context.save_local_storage();
+        let second_write = std::fs::metadata(
+            dir.join("localStorage").join(format!("{}.json", storage_file_stem("https://app.example"))),
+        )
+        .and_then(|meta| meta.modified())
+        .expect("the file must still exist");
+        assert_eq!(
+            first_write, second_write,
+            "an unchanged store must not be rewritten"
+        );
+
+        // A write to one origin must leave another origin's file alone.
+        assert!(ns(&context).set("https://other.example", "x", "y").is_ok());
+        context.save_local_storage();
+        let other_path = dir.join("localStorage").join(format!(
+            "{}.json",
+            storage_file_stem("https://other.example")
+        ));
+        let other_first = std::fs::metadata(&other_path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(ns(&context).set("https://app.example", "k2", "v2").is_ok());
+        context.save_local_storage();
+        let other_second = std::fs::metadata(&other_path).unwrap().modified().unwrap();
+        assert_eq!(other_first, other_second, "an untouched origin must not be rewritten");
+
+        // Clearing an origin removes its file instead of leaving it behind for
+        // the next load to resurrect.
+        ns(&context).clear("https://other.example");
+        context.save_local_storage();
+        assert!(!other_path.exists(), "a cleared origin must not keep its file");
+        let after_clear =
+            BrowserContext::with_storage("dirty-check-3".into(), Some(dir.clone()));
+        assert_eq!(ns(&after_clear).get("https://other.example", "x"), None);
+
+        let reloaded = BrowserContext::with_storage("dirty-check-2".into(), Some(dir.clone()));
+        assert_eq!(
+            ns(&reloaded).get("https://app.example", "k2"),
+            Some("v2".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -93,9 +93,17 @@ impl FrameRealm {
         // published below.
         // A fetched sandbox document has an opaque principal captured when its
         // browsing context was reserved, even if author code removes sandbox.
-        let opaque = realms.borrow().live_frame_owner(frame_id).is_some()
+        let reserved_opaque = realms.borrow().live_frame_owner(frame_id).is_some()
             && realms.borrow().frame_is_sandboxed_opaque(frame_id);
-        let origin = if opaque { "null".to_string() } else { origin_of(url) };
+        // Sandbox flags also propagate to descendant browsing contexts, so the
+        // creator realm's principal is part of this frame's own.
+        let (scripting_enabled, creator_opaque) = realms.borrow().by_frame_id(parent_frame_id)
+            .map(|creator| {
+                let creator = creator.borrow();
+                (creator.scripting_enabled, creator.sandbox_opaque_origin)
+            }).unwrap_or((true, false));
+        let sandbox_opaque_origin = creator_opaque || reserved_opaque;
+        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
         let same_origin = origin != "null" && origin == parent.page_origin();
         if same_origin {
             parent.share_security_token_with_realm(&context);
@@ -106,7 +114,9 @@ impl FrameRealm {
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
-        if opaque { state.inherited_origin = Some("null".to_string()); }
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
         parent.share_resources_with(&mut state);
         state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
 
@@ -355,6 +365,14 @@ impl FrameRealm {
     /// Resolves a subresource URL against the frame's own document URL, not the
     /// parent's. A relative `src` in a frame is relative to the frame.
     fn resolve(&self, src: &str) -> String {
+        if self.url == "about:srcdoc" {
+            if let Some(base) = self.realms.borrow().by_frame_id(self.frame_id)
+                .and_then(|state| crate::ops::document_base_url(&state.borrow()))
+            {
+                return url::Url::parse(&base).and_then(|base| base.join(src))
+                    .map(|url| url.to_string()).unwrap_or_else(|_| src.to_string());
+            }
+        }
         url::Url::parse(&self.url)
             .and_then(|base| base.join(src))
             .map(|url| url.to_string())
@@ -366,6 +384,7 @@ impl FrameRealm {
         let state = self.realms.borrow().by_frame_id(self.frame_id)
             .ok_or_else(|| "could not list frame scripts: missing realm".to_string())?;
         let state = state.borrow();
+        if !state.scripting_enabled { return Ok(Vec::new()); }
         let dom = state.dom.as_ref()
             .ok_or_else(|| "could not list frame scripts: missing document".to_string())?;
         let nodes = dom.query_selector_all("script")?;
@@ -430,15 +449,12 @@ mod tests {
     #[test]
     fn borrowed_content_type_getter_reads_the_frame_document() {
         let mut parent = ObscuraJsRuntime::new();
-        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_dom(parse_html("<html><body><iframe id='child'></iframe></body></html>"));
         parent.set_url("https://parent.example/page");
         parent.set_content_type("text/plain");
         parent.run_page_init();
-        let _frame = FrameRealm::new(&mut parent, 1, 0,
-            "https://parent.example/frame", "<html><body>Child</body></html>")
-            .expect("frame realm");
         assert_eq!(parent.evaluate(r#"(function(){
-            const child = globalThis.__obscura_frameObjects[1].document;
+            const child = document.getElementById('child').contentDocument;
             const get = Object.getOwnPropertyDescriptor(Document.prototype, 'contentType').get;
             return [get.call(child), child.contentType, document.contentType];
         })()"#).unwrap(), serde_json::json!(["text/html", "text/html", "text/plain"]));
@@ -1591,4 +1607,47 @@ mod tests {
             "iterableIterator": true
         }));
     }
+
+    /// An awaited `Runtime.evaluate` handle belongs to the frame realm that
+    /// created it. Readiness, the stored value and the follow-up metadata read
+    /// must all resolve that one execution context: reading the pending record
+    /// in the isolate's main realm makes the handle land in the page's object
+    /// table and the command answer `undefined`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn awaited_frame_evaluation_keeps_reference_handles_in_the_frame_realm() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let _frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/frame",
+            "<html><body>child</body></html>",
+        )
+        .expect("frame realm");
+        let world = crate::runtime::CdpExecutionWorld { frame_id: 1, world_id: None };
+        let info = parent
+            .evaluate_for_cdp_in_frame(world, "Promise.resolve({answer: 42})", false, true, 2_000)
+            .await
+            .expect("awaited frame evaluation");
+        assert!(!info.thrown, "awaited frame evaluation rejected: {info:?}");
+        assert_eq!(
+            info.js_type, "object",
+            "awaited frame value lost its frame realm: {info:?}",
+        );
+        let handle = info.object_id.expect("awaited frame object handle");
+        let read = parent
+            .call_function_on_for_cdp_in_frame(
+                world,
+                "function() { return this.answer; }",
+                Some(&handle),
+                &[],
+                true,
+                false,
+                2_000,
+            )
+            .await
+            .expect("frame handle read");
+        assert_eq!(read.value.as_ref().and_then(serde_json::Value::as_f64), Some(42.0));
+    }
+
 }

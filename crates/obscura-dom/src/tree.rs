@@ -794,6 +794,7 @@ impl DomTree {
         let inner = self.inner.borrow();
         Self::would_create_host_including_cycle(&inner, node, ancestor)
     }
+
     /// DOM insertion rejects a node when it is a host-including inclusive
     /// ancestor of the destination parent. Ordinary parent links are not enough
     /// for this check because a ShadowRoot's parent is intentionally null.
@@ -2283,6 +2284,52 @@ mod tests {
         tree.insert_before(shadow_child, host);
         assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
         assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn host_including_ancestor_query_follows_parents_and_hosts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        let leaf = element(&tree, "i");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_host_including_inclusive_ancestor(shadow_child, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, host));
+        assert!(tree.is_host_including_inclusive_ancestor(host, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(document, shadow_child));
+        assert!(!tree.is_host_including_inclusive_ancestor(shadow_child, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(leaf, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(host, outer));
+    }
+
+    #[test]
+    fn inclusive_ancestor_query_stops_at_shadow_roots() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_inclusive_ancestor(outer, outer));
+        assert!(tree.is_inclusive_ancestor(document, host));
+        assert!(tree.is_inclusive_ancestor(root, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, outer));
     }
 
     #[test]

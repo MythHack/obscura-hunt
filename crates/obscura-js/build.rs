@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=js/windows.js");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=native");
@@ -16,10 +17,12 @@ fn main() {
     let host = std::env::var("HOST").unwrap_or_default();
     let is_cross = target != host;
 
-    // Keep the native window facade inside bootstrap's private closure in every
-    // snapshot path. The marker is deliberately the only stitch point: it is
-    // not a page-visible API and it is available before __obscura_init runs.
+    // Keep the native window facade and IndexedDB shim inside bootstrap's
+    // private closure in every snapshot path. The markers are deliberately the
+    // only stitch points: they are not page-visible APIs and they are available
+    // before __obscura_init runs.
     let bootstrap_js = include_str!("js/bootstrap.js")
+        .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
         .replace("/* OBSCURA_WINDOWS */", include_str!("js/windows.js"));
 
     if is_cross {

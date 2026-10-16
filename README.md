@@ -15,10 +15,12 @@ and stealth options, and brings upstream updates together with its own browser
 workflow improvements.
 
 The latest upstream sync includes
-[`8edfe48`](https://github.com/h4ckf0r0day/obscura/commit/8edfe480133b383f70e17f9d4ea55e3592cdfd24).
-It adds CDP object-handle compatibility, page close and load cancellation,
-and ES module network events and response bodies while retaining the fork's
-native popup and child-frame ownership.
+[`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588).
+Its 69 commits add IndexedDB, Web Storage updates, iframe lifecycle work, MCP
+improvements, request interception and rendering fixes while retaining the fork's
+native popup and child-frame ownership. See the
+[verification report](docs/Testing-and-debugging.md#latest-update-upstream-bd95294)
+for exercised coverage and unresolved failures.
 
 ## Why choose Obscura-Hunt?
 
@@ -185,6 +187,9 @@ Puppeteer connects to `ws://127.0.0.1:9222/devtools/browser`.
 Playwright's `chromium.connectOverCDP` connects to `ws://127.0.0.1:9222`.
 See the [Puppeteer](docs/Use-with-Puppeteer.md) and
 [Playwright](docs/Use-with-Playwright.md) guides for working examples.
+See [media preference emulation](docs/CDP-media.md) for color-scheme and
+reduced-motion overrides, and [production operation](docs/Run-in-production-at-scale.md)
+for graceful worker recycling.
 
 ### Scrape several pages
 
@@ -193,6 +198,8 @@ obscura scrape https://example.com https://news.ycombinator.com --concurrency 2 
 ```
 
 Keep `obscura-worker` beside `obscura`.
+`scrape` and batch `fetch` keep at most `--concurrency` jobs active and preserve
+input order in their results.
 
 ### Use an MCP client
 

@@ -1,4 +1,4 @@
-`--storage-dir` persists cookies to disk. Web Storage is currently in memory:
+`--storage-dir` persists cookies and `localStorage` so they survive across runs.
 `localStorage` is shared by same-origin pages in one browser context, while
 `sessionStorage` belongs to each top-level window. A related new window copies
 its opener's session namespace once; later changes are independent. Navigation
@@ -12,8 +12,8 @@ obscura fetch https://example.com --storage-dir ./obscura-data
 obscura fetch https://example.com --storage-dir ./obscura-data
 ```
 
-The second invocation restores the cookies left by the first. It does not restore
-`localStorage` or `sessionStorage` from the previous process.
+The second invocation starts with the cookies and `localStorage` left by the first.
+It does not restore `sessionStorage` from the previous process.
 
 ## Server
 
@@ -25,11 +25,29 @@ Pages in the default browser context share its cookie jar and live localStorage.
 Separate CDP browser contexts have isolated mutable state. Use different
 `--storage-dir` paths for separately persisted cookie profiles.
 
+For MCP, put the profile flag before the subcommand:
+
+```bash
+obscura --storage-dir ./obscura-data mcp
+```
+
+The MCP server also accepts `OBSCURA_STORAGE_DIR` and flushes the profile on exit.
+
 ## Layout
 
 Inside `./obscura-data`:
 
 - `cookies.json`: cookie jar in a stable format with `same_site`, `expires`, `http_only`, `secure`.
+- `localStorage/<origin>-<digest>.json`: one file per origin, holding
+  `{"origin": "...", "entries": [["key", "value"], ...]}`. The digest is an FNV-1a
+  hash of the origin, avoiding collisions caused by filename sanitization.
+  This implementation retains entries in insertion order.
+
+Inspect one with `jq`:
+
+```bash
+jq '.entries' ./obscura-data/localStorage/*.json
+```
 
 The format is stable. Inspect with `jq`:
 
@@ -39,9 +57,54 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 
 ## When state is written
 
-- Cookies are saved through the browser context's persistence path, including
-  graceful shutdown. Forced process termination is not a persistence guarantee.
-- Neither Web Storage namespace is written to disk.
+- After every navigation completes (CDP `Page.navigate`, MCP `browser_navigate`),
+  and only when something actually changed.
+- On clean process exit (Ctrl-C, SIGTERM). Forced process termination is not a
+  persistence guarantee.
+- Manually via CDP `Network.setCookie` and `Network.deleteCookies`.
+
+`sessionStorage` is deliberately not written to disk. It belongs to one tab and
+is dropped when the tab goes away, the same as a real browser, but it does
+survive navigation and CDP target switching within the process
+([#678](https://github.com/h4ckf0r0day/obscura/issues/678)).
+
+Web Storage is limited to 5 MiB and 16,384 entries per origin, 64 MiB per
+backing store and 256 origins. Failed profile writes and removals stay pending
+for a later flush. The native budgets count UTF-16 key/value bytes together
+with per-entry and per-origin metadata. Strings containing unpaired UTF-16 units
+or starting with NUL use a NUL-prefixed JSON string escape internally, including
+in profile files; the JavaScript API decodes them losslessly. Normal strings are
+stored unchanged. Encoded strings consume more of the byte budget.
+Shared contexts serialize flushes with storage mutations. Use separate profile
+directories for independent browser processes; this is not a cross-process
+database. Opaque-origin documents cannot access either store.
+
+Automatic cross-document `storage` events are not implemented by this change.
+
+## IndexedDB
+
+IndexedDB data lives in memory, shared by pages in the same browser context and
+origin. It survives navigation, but not process restart. Incognito contexts do
+not share it. `--storage-dir` does not persist IndexedDB.
+
+Transactions stage record changes and publish them atomically on completion;
+aborting also rolls back schema changes and generated keys. Values use structured
+serialization, including typed keys, cyclic graphs, files and symmetric crypto
+keys. Readonly writes and uncloneable values fail instead of reporting success.
+Upgrades notify existing connections and wait for them to close.
+
+The context has a 64 MiB budget for committed records, schema and pending writes,
+including serialized-value and record overhead. Individual serialized values
+are limited to 16 MiB and encoded keys to 64 KiB. Quota failures abort an
+unhandled write transaction, leaving its committed records unchanged.
+
+This is not full IndexedDB conformance. Transactions currently serialize per
+database, including readonly transactions; index queries and cursor steps scan
+records rather than using a native index. Store/index renaming,
+`continuePrimaryKey()`, the newer bulk-read options dictionaries, and on-disk
+durability are not implemented. Database and schema names containing unpaired
+UTF-16 units are not supported. These limits do not change the behavior of
+cookies or Web Storage.
 
 ## Login once, scrape many
 
@@ -49,9 +112,9 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 obscura serve --storage-dir ./session-1
 ```
 
-Drive a cookie-based login flow once via Puppeteer or Playwright, then stop the
-server gracefully. Subsequent runs restore those cookies; logins that also need
-Web Storage must recreate that state.
+Drive a login flow once via Puppeteer or Playwright, then stop the server
+gracefully. Subsequent runs restore its cookies and `localStorage`.
+`sessionStorage` and IndexedDB must be recreated after a process restart.
 
 ## Multiple identities
 

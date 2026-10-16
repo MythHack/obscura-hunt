@@ -1733,6 +1733,15 @@ impl PreparedRender {
         None
     }
 
+    /// Read common style-only properties without copying the full CSSOM and
+    /// inherited custom-property environment for each element.
+    pub fn computed_non_geometric_style(
+        &self,
+        id: obscura_dom::tree::NodeId,
+    ) -> Option<HashMap<&'static str, String>> {
+        Some(non_geometric_computed_style(self.layout.styles.get(&id)?))
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -2441,7 +2450,7 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
     );
     out.insert(
         "visibility",
-        if style.visibility_hidden.unwrap_or(false) {
+        if style.visibility_hidden.unwrap_or(style.computed_visibility_hidden) {
             "hidden"
         } else {
             "visible"
@@ -13776,7 +13785,10 @@ mod tests {
         for active in ["yes", "no"] {
             tree.with_node_mut(body, |node| node.set_attribute("data-active", active.into()));
             let full = prepare_dom(&tree, viewport, None, &mut resources).unwrap();
-            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child"] {
+            let mut shared = crate::dom::NonGeometricStyleCache::new(
+                &tree, viewport, crate::CssMediaType::Screen, &cache,
+            ).unwrap();
+            for name in ["flex", "contents", "item", "float", "suppressed", "suppressed-child", "hidden"] {
                 let id = tree.get_element_by_id(name).unwrap();
                 let fast = crate::dom::computed_style_without_layout(
                     &tree, id, viewport, crate::CssMediaType::Screen, &cache, "color",
@@ -13786,7 +13798,17 @@ mod tests {
                     assert_eq!(value, expected[property], "{name}.{property} with {active}");
                 }
             }
-            for name in ["inherit", "hidden", "animated", "query"] {
+            // Reverse the usual traversal, crossing branches and then reading
+            // cached ancestors after their children.
+            for name in ["item", "contents", "flex", "suppressed-child", "suppressed", "float"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let fast = shared.resolve(&tree, id, "color").unwrap();
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in fast {
+                    assert_eq!(value, expected[property], "shared {name}.{property} with {active}");
+                }
+            }
+            for name in ["inherit", "animated", "query"] {
                 assert!(crate::dom::computed_style_without_layout(
                     &tree, tree.get_element_by_id(name).unwrap(), viewport,
                     crate::CssMediaType::Screen, &cache, "display",

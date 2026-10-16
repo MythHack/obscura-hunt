@@ -16,7 +16,7 @@ use deno_core::CancelFuture;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::{ObscuraState, JsNetworkEvent, record_network_response, push_js_network_event, document_referrer_policy};
+use crate::ops::{ObscuraState, JsNetworkEvent, record_network_response, push_js_network_event, document_referrer_policy, FetchNetworkGuard};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -292,6 +292,18 @@ impl ModuleLoader for ObscuraModuleLoader {
                     // URL resolution and the native document principal are distinct:
                     // an opaque sandbox must not gain its URL origin's credentials.
                     if opaque_origin { request.initiator = Some(ModuleSpecifier::parse("about:blank").unwrap()); }
+                    // Keep failed and cancelled graph fetches visible to the
+                    // same Network listeners as ordinary fetch/XHR failures.
+                    let mut network_guard = network_state.as_ref().map(|state| FetchNetworkGuard {
+                        state: state.clone(), cancel: None,
+                        event: Some(JsNetworkEvent {
+                            request_id: request_id.clone(), frame_id, frame_generation: generation,
+                            intercepted: false, url: url.clone(), method: "GET".to_string(),
+                            resource_type: "Script".to_string(), status: 0,
+                            response_headers: Default::default(), body_size: 0,
+                            timestamp: 0.0, error_text: None,
+                        }),
+                    });
                     let fetch = async {
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
@@ -336,6 +348,11 @@ impl ModuleLoader for ObscuraModuleLoader {
                         return Err(io_err("Module document owner was dropped".to_string()));
                     }
                     let resp = resp.map_err(|_| io_err("Module load was stopped".to_string()))?;
+                    // Past this point the loader writes this request's receipt
+                    // itself; a response, including the blocked-tracker
+                    // sentinel, is not a transport failure, even if graph
+                    // preparation or evaluation later fails.
+                    if let Some(guard) = &mut network_guard { guard.event = None; }
                     let resp = resp.map_err(|error| {
                         let message = format!("Failed to fetch module {}: {}", url, error);
                         if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {

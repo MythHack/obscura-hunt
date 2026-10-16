@@ -2007,6 +2007,28 @@ fn inline_block_flex_items_keep_block_inner_flow() {
 }
 
 #[test]
+fn inline_block_block_children_stack_and_shrink_to_the_widest_child() {
+    let tree = parse_html(include_str!("../../../render-repros/inline-block-block-children.html"));
+    let layout = layout_dom(&tree, (300.0, 200.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for (id, expected) in [
+        ("plain", (0.0, 0.0, 144.0, 74.0)),
+        ("plain-one", (12.0, 12.0, 80.0, 20.0)),
+        ("plain-two", (12.0, 32.0, 120.0, 30.0)),
+        ("margins", (0.0, 74.0, 144.0, 89.0)),
+        ("margin-one", (12.0, 86.0, 80.0, 20.0)),
+        ("margin-two", (12.0, 121.0, 120.0, 30.0)),
+    ] {
+        let actual = rect(id);
+        assert!((actual.x - expected.0).abs() < 0.01
+            && (actual.y - expected.1).abs() < 0.01
+            && (actual.width - expected.2).abs() < 0.01
+            && (actual.height - expected.3).abs() < 0.01,
+            "{id}: {actual:?}, expected {expected:?}");
+    }
+}
+
+#[test]
 fn percentage_height_under_indefinite_parent_uses_content_height() {
     let tree = parse_html(include_str!(
         "../../../render-repros/percentage-height-indefinite-parent.html"
