@@ -122,9 +122,15 @@ malformed XML exposes a document-owned `parsererror` without an HTML body,
 and opaque sandbox frames retain a non-null WindowProxy, load successfully,
 and deny access in both directions.
 
-Actual CLI/CDP/MCP process checks passed seven of eleven scenarios in each
-transport mode, using `--stealth` for the stealth executable; one user-WIP check
-was skipped because these binaries contain only the merge. Passing paths
+Separate real CDP server checks passed 23/23 in each transport mode, including
+`--stealth`: concurrent connections keep Web Storage and IndexedDB isolated,
+disconnect merges persist both clients' deltas, page reloads do not overwrite
+the shared profile, and restart preserves edits and deletions. This server
+profile path is distinct from the failing CLI persistence scenario below.
+
+Actual CLI/CDP/MCP process checks passed six scenarios, failed four and skipped
+one user-WIP scenario in each transport mode, using `--stealth` for the stealth
+executable. These binaries contain only the merge. Passing paths
 include IndexedDB transactions across navigation, popup messaging, first-load
 cancellation and MCP tab/timer preservation. Profile localStorage persistence,
 nested srcdoc access, removed Attr ownership and Fetch interception remained
@@ -147,6 +153,22 @@ navigated the top-level page with both executables, proving that defect exists
 before the merge, but not explaining its activation on the live site. Termius
 produced a blank top capture and an unstable bottom comparison. These live-site
 observations remain unresolved, not certified as harmless noise.
+
+After restoring the four original worktree changes, focused coverage again
+passed 36/36 and both release CLI builds completed. The full release nextest
+run reported 2239 passed, 209 failed and five skipped. The additional failure,
+`intercepted_request_bursts_and_script_navigation_keep_servicing_replies`, also
+failed in isolation at `Runtime.evaluate` after zero intercepted requests.
+Its cause has not been established; the restored-worktree result is not green.
+
+Actual restored-worktree CLI boundary checks passed 12/12 in each transport
+mode. Redirect checks passed 5/5 in each mode: manual redirects expose an opaque
+response without issuing the target request, error mode rejects, and follow
+mode alone reaches the target. Blob/File popup transport also passed in both
+modes. The complete CLI/CDP/MCP smoke passed seven scenarios and failed the same
+four listed above in each mode, without skipping the user-WIP scenario. The
+restored render executable again scored 32/33 in the offline obstacle course,
+with the same timezone mismatch.
 
 #### Earlier update: upstream `8edfe48`
 
