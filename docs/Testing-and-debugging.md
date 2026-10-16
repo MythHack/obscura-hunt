@@ -159,7 +159,10 @@ passed 36/36 and both release CLI builds completed. The full release nextest
 run reported 2239 passed, 209 failed and five skipped. The additional failure,
 `intercepted_request_bursts_and_script_navigation_keep_servicing_replies`, also
 failed in isolation at `Runtime.evaluate` after zero intercepted requests.
-Its cause has not been established; the restored-worktree result is not green.
+Retained pre-merge runs also show this test failing with zero intercepted
+requests, so the failure predates this merge. That does not establish its root
+cause or whether the restored changes affect its frequency. The restored
+worktree result is not green.
 
 Actual restored-worktree CLI boundary checks passed 12/12 in each transport
 mode. Redirect checks passed 5/5 in each mode: manual redirects expose an opaque
