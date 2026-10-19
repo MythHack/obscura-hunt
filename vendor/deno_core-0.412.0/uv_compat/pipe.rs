@@ -220,7 +220,8 @@ pub unsafe fn uv_pipe_set_pending_instances(
   }
 }
 
-/// Wrapper to implement `AsRawFd` for `AsyncFd`.
+/// Non-owning descriptor view for `AsyncFd`. The pipe keeps the fd open and
+/// drops its registration before closing or transferring the descriptor.
 #[cfg(unix)]
 pub struct RawFdWrapper(pub RawFd);
 
@@ -321,7 +322,9 @@ pub unsafe fn uv_pipe_open(pipe: *mut uv_pipe_t, fd: c_int) -> c_int {
     // Create AsyncFd eagerly so the reactor tracks this fd from the
     // start. This avoids edge-triggered readiness races where creating
     // AsyncFd lazily can miss events that fired before registration.
-    if let Ok(afd) = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd)) {
+    // SAFETY: internal_fd owns this valid fd. close_pipe and
+    // uv_pipe_connect drop the registration before closing or adopting it.
+    if let Ok(afd) = tokio::io::unix::AsyncFd::register(RawFdWrapper(fd)) {
       (*pipe).internal_async_fd = Some(afd);
     }
     // Note: do NOT set UV_HANDLE_ACTIVE here. In libuv, uv_pipe_open
@@ -771,6 +774,7 @@ pub unsafe fn uv_pipe_connect(
   });
   let future = Box::pin(async move {
     if let Some(stream) = bound_stream {
+      use std::os::fd::AsFd;
       use std::os::unix::io::AsRawFd;
 
       let fd = stream.as_raw_fd();
@@ -804,7 +808,10 @@ pub unsafe fn uv_pipe_connect(
           }
 
           // Wait for connect to complete by polling for write readiness.
-          let async_fd = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd))
+          // SAFETY: the borrow keeps stream's fd valid and unchanged until
+          // async_fd is dropped, including when the connect is cancelled.
+          let async_fd = tokio::io::unix::AsyncFd::register(stream.as_fd())
+            .map_err(std::io::Error::from)
             .map_err(std::io::Error::other)?;
           let _guard =
             async_fd.writable().await.map_err(std::io::Error::other)?;
@@ -827,9 +834,8 @@ pub unsafe fn uv_pipe_connect(
             return Err(std::io::Error::from_raw_os_error(err_val));
           }
 
-          // Drop AsyncFd before creating UnixStream to avoid
-          // double reactor registration. RawFdWrapper does not
-          // close the fd on drop, so this is safe.
+          // Drop the borrowed registration before transferring stream into
+          // Tokio to avoid registering the same descriptor twice.
           drop(_guard);
           drop(async_fd);
         }
@@ -1301,7 +1307,9 @@ pub(crate) unsafe fn read_start_pipe(
       && (*pipe).internal_fd.is_some()
     {
       let fd = (*pipe).internal_fd.unwrap();
-      if let Ok(afd) = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd)) {
+      // SAFETY: internal_fd owns fd, and the pipe drops internal_async_fd
+      // before closing or transferring that descriptor.
+      if let Ok(afd) = tokio::io::unix::AsyncFd::register(RawFdWrapper(fd)) {
         (*pipe).internal_async_fd = Some(afd);
       }
     }
@@ -1931,9 +1939,11 @@ pub(crate) unsafe fn poll_pipe_handle(
         }
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
           // Lazily create AsyncFd for write readiness tracking.
+          // SAFETY: internal_fd keeps fd valid and unchanged until the
+          // registration is dropped before closing or transferring it.
           if (*pipe_ptr).internal_async_fd.is_none()
             && let Some(fd) = (*pipe_ptr).internal_fd
-            && let Ok(afd) = tokio::io::unix::AsyncFd::new(RawFdWrapper(fd))
+            && let Ok(afd) = tokio::io::unix::AsyncFd::register(RawFdWrapper(fd))
           {
             (*pipe_ptr).internal_async_fd = Some(afd);
             let _ = (*pipe_ptr)

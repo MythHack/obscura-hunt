@@ -36,6 +36,16 @@ native child-frame coordinate input require `render`; the no-render frame
 contract verifies the unsupported-input boundary and uses DOM activation for
 same-document navigation.
 
+Native C++ builds classify the pinned V8 SDK as external/system headers while
+retaining warnings for local shims. Linux validation covers both normal and
+`v8_enable_pointer_compression` builds with `CXXFLAGS=-Werror`; a first-party
+unused-parameter negative control must still fail compilation.
+
+Unix UV registrations use Tokio's explicit unsafe `AsyncFd::register` API. Keep
+the descriptor valid and unchanged until deregistration, and retain the existing
+deregister-before-close or transfer ordering. Registration failures preserve the
+existing UV error-class mapping.
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation

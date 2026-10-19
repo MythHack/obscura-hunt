@@ -13,7 +13,6 @@ fn main() {
     build
         .cpp(true)
         .std("c++20")
-        .include(&include)
         .file(native.join("incumbent_context.cc"))
         .file(native.join("window_proxy.cc"))
         .cpp_link_stdlib(None);
@@ -35,6 +34,15 @@ fn main() {
             .static_crt(features.split(',').any(|feature| feature == "crt-static"))
             .flag("/Zc:__cplusplus")
             .flag("/Zl");
+    }
+
+    // Only the pinned SDK is external; keep warnings enabled for our shims.
+    if build.get_compiler().is_like_msvc() {
+        let mut external_include = std::ffi::OsString::from("/external:I");
+        external_include.push(&include);
+        build.flag(external_include).flag("/external:W0");
+    } else {
+        build.flag("-isystem").flag(&include);
     }
 
     build.compile("obscura_v8_native");

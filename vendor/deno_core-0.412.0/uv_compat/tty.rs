@@ -59,6 +59,8 @@ pub enum uv_tty_vtermstate_t {
 
 // ---- AsyncFd wrapper (Unix) ----
 
+// Non-owning view: stop_tty and shutdown_select_fallback deregister before
+// closing their raw descriptors; stdio descriptors are left open.
 #[cfg(unix)]
 pub(crate) struct TtyFd(RawFd);
 
@@ -1337,10 +1339,14 @@ pub unsafe fn uv_tty_init(
       // Wrap in AsyncFd for reactor integration.
       //
       // On macOS, kqueue doesn't work with some /dev devices (e.g.
-      // /dev/tty). When AsyncFd::new fails, we probe kqueue to
+      // /dev/tty). When registration fails, we probe kqueue to
       // confirm, then set up a select(2) fallback thread — matching
       // libuv's uv__stream_try_select.
-      match AsyncFd::new(TtyFd(actual_fd)) {
+      // SAFETY: actual_fd stays valid and unchanged in internal_fd until
+      // stop_tty drops internal_reactor, before closing any non-stdio fd.
+      match AsyncFd::register(TtyFd(actual_fd))
+        .map_err(std::io::Error::from)
+      {
         Ok(afd) => {
           reactor = Some(TtyReactor::Normal(afd));
         }
@@ -2806,7 +2812,12 @@ fn setup_select_fallback(fd: RawFd) -> Result<SelectFallbackState, c_int> {
   }
 
   // Wrap fake_fd in AsyncFd — socketpairs work fine with kqueue.
-  let async_fd = match AsyncFd::new(TtyFd(fake_fd)) {
+  // SAFETY: fake_fd stays open and unchanged until async_fd is dropped.
+  // Both the spawn-error path and shutdown_select_fallback deregister it
+  // before closing the socketpair.
+  let async_fd = match unsafe { AsyncFd::register(TtyFd(fake_fd)) }
+    .map_err(std::io::Error::from)
+  {
     Ok(afd) => afd,
     Err(e) => {
       unsafe {

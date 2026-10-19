@@ -184,8 +184,7 @@ void ThrowIllegalInvocation(v8::Isolate* isolate);
 void ThrowSecurityError(v8::Isolate* isolate, const Target& target,
                         v8::Local<v8::Value> property);
 
-void ResolveTarget(v8::Isolate* isolate, v8::Local<v8::Object> holder,
-                   Target* target) {
+void ResolveTarget(v8::Local<v8::Object> holder, Target* target) {
   target->window = holder;
   // `context->Global()` is the WindowProxy even when the callback holder is
   // the backing global object.  A detached proxy keeps its identity and its
@@ -427,8 +426,9 @@ bool CallDeny(v8::Isolate* isolate, const Target& target,
   v8::Local<v8::Function> deny = value.As<v8::Function>();
   v8::Local<v8::Value> argv[] = {property};
   v8::Local<v8::Value> ignored;
-  deny->Call(context, target.window, 1, argv).ToLocal(&ignored);
-  return isolate->HasPendingException();
+  const bool completed =
+      deny->Call(context, target.window, 1, argv).ToLocal(&ignored);
+  return !completed && isolate->HasPendingException();
 }
 
 // Throws in the accessing realm so callers see their own DOMException
@@ -594,10 +594,9 @@ bool SetAccessorDescriptor(v8::Isolate* isolate, const Target& target,
 
 // Resolves a callback target from a function receiver.  The target may have
 // no bundle (internal context); identity names still resolve in that case.
-void TargetFromThis(v8::Isolate* isolate, v8::Local<v8::Value> this_value,
-                    Target* target) {
+void TargetFromThis(v8::Local<v8::Value> this_value, Target* target) {
   if (this_value->IsObject()) {
-    ResolveTarget(isolate, this_value.As<v8::Object>(), target);
+    ResolveTarget(this_value.As<v8::Object>(), target);
   } else {
     target->window = {};
     target->bundle = {};
@@ -610,7 +609,7 @@ v8::Intercepted DispatchNamed(v8::Local<v8::Name> property,
                               bool descriptor) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   if (!IsStringName(property)) {
     if (IsEnumeratedSymbol(isolate, property)) {
       info.GetReturnValue().Set(v8::Undefined(isolate));
@@ -643,7 +642,7 @@ v8::Intercepted NamedSetter(v8::Local<v8::Name> property,
                             const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   const v8::Local<v8::Context> source = isolate->GetCurrentContext();
   if (IsStringName(property) && value->IsFunction() &&
       ClassifyName(isolate, property) == CrossName::kUnknown &&
@@ -683,7 +682,7 @@ v8::Intercepted NamedQuery(v8::Local<v8::Name> property,
                            const v8::PropertyCallbackInfo<v8::Integer>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   if (IsStringName(property)) {
     CrossName id = ClassifyName(isolate, property);
     if (NameEquals(isolate, property, "document") &&
@@ -715,7 +714,7 @@ v8::Intercepted NamedDeleter(
     const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   ThrowSecurityError(isolate, target, property.As<v8::Value>());
   return v8::Intercepted::kYes;
 }
@@ -725,7 +724,7 @@ v8::Intercepted NamedDefiner(
     const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   (void)descriptor;
   ThrowSecurityError(isolate, target, property.As<v8::Value>());
   return v8::Intercepted::kYes;
@@ -736,7 +735,7 @@ v8::Intercepted NamedDescriptor(
     const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   v8::Local<v8::Object> descriptor = NewDescriptor(isolate);
   if (!IsStringName(property)) {
     if (IsEnumeratedSymbol(isolate, property)) {
@@ -793,7 +792,7 @@ v8::Intercepted IndexedGetter(uint32_t index,
                               const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   v8::Local<v8::Value> argv[] = {
       v8::Integer::NewFromUnsigned(isolate, index)};
   v8::Local<v8::Function> lookup = BundleFunction(isolate, target, "index");
@@ -818,7 +817,7 @@ v8::Intercepted IndexedSetter(
     const v8::PropertyCallbackInfo<v8::Boolean>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   char buffer[16];
   std::snprintf(buffer, sizeof(buffer), "%u", index);
   v8::Local<v8::String> property = v8::String::NewFromUtf8(
@@ -832,7 +831,7 @@ v8::Intercepted IndexedDescriptor(
     uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   v8::Local<v8::Value> argv[] = {
       v8::Integer::NewFromUnsigned(isolate, index)};
   v8::Local<v8::Function> lookup = BundleFunction(isolate, target, "index");
@@ -887,7 +886,7 @@ void NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
 void IndexedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info) {
   v8::Isolate* isolate = info.GetIsolate();
   Target target;
-  ResolveTarget(isolate, info.Holder(), &target);
+  ResolveTarget(info.Holder(), &target);
   v8::Local<v8::Context> context = isolate->GetCurrentContext();
   uint32_t length = 0;
   v8::Local<v8::Value> value;
@@ -933,7 +932,7 @@ void NamedValueGetterThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
   CrossName id = static_cast<CrossName>(raw_id);
   Target target;
-  TargetFromThis(isolate, info.This(), &target);
+  TargetFromThis(info.This(), &target);
   v8::Local<v8::Value> value;
   ValueStatus status = ResolveNamed(isolate, target, id, {}, false, &value);
   if (status == ValueStatus::kFound) {
@@ -954,7 +953,7 @@ void LocationSetterThunk(const v8::FunctionCallbackInfo<v8::Value>& info) {
     return;
   }
   Target target;
-  TargetFromThis(isolate, info.This(), &target);
+  TargetFromThis(info.This(), &target);
   v8::Local<v8::Value> value = info.Length() > 0
                                    ? info[0]
                                    : v8::Undefined(isolate).As<v8::Value>();
@@ -973,9 +972,8 @@ bool AccessCheck(v8::Local<v8::Context> accessing_context,
                  v8::Local<v8::Object> accessed_object,
                  v8::Local<v8::Value> data) {
   (void)data;
-  v8::Isolate* isolate = v8::Isolate::GetCurrent();
   Target target;
-  ResolveTarget(isolate, accessed_object, &target);
+  ResolveTarget(accessed_object, &target);
   // A DOM-only grant deliberately remains behind the property interceptors.
   return AccessFor(accessing_context, target) == WindowAccess::kSameWorld;
 }
@@ -992,7 +990,7 @@ void FailedAccessCheck(v8::Local<v8::Object> target, v8::AccessType type,
   v8::Isolate* isolate = v8::Isolate::GetCurrent();
   v8::HandleScope handle_scope(isolate);
   Target resolved;
-  ResolveTarget(isolate, target, &resolved);
+  ResolveTarget(target, &resolved);
   ThrowSecurityError(isolate, resolved,
                      Utf8Key(isolate, "window").As<v8::Value>());
 }
