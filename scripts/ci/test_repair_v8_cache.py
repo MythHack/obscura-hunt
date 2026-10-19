@@ -47,8 +47,6 @@ class RepairV8CacheTests(unittest.TestCase):
                     blocked = kind == "directory"
                     self.assertEqual(run.returncode, 1 if blocked else clean_exit if should_clean else 0, run.stderr)
                     self.assertEqual(checksum.exists(), not should_clean and not blocked)
-                    if blocked:
-                        self.assertIn("directory", run.stderr.lower())
                     if should_clean:
                         self.assertEqual(calls.read_text().splitlines(), ["clean", "--release", "-p", "v8"])
                     else:

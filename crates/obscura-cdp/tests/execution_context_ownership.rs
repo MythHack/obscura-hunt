@@ -160,11 +160,13 @@ async fn attached_isolated_contexts_have_private_globals_and_shared_dom() {
     let isolated = cdp(&mut ctx, 5, "Page.createIsolatedWorld", json!({"worldName":"utility"}), Some(&session))
         .await.result.unwrap()["executionContextId"].as_i64().unwrap();
     let private = cdp(&mut ctx, 6, "Runtime.evaluate", json!({
-        "expression": "(()=>{let p=document.getElementById('probe'),input=document.getElementById('focus');let before=[typeof realmProbe,typeof p.expando,typeof Element.prototype.authorOnly];globalThis.realmProbe='utility';p.textContent='shared';p.expando=2;return [before,input.value,document.activeElement===input,p.parentNode===document.body,p.isConnected,getComputedStyle(p).color]})()",
+        "expression": "(()=>{let p=document.getElementById('probe'),input=document.getElementById('focus');let before=[typeof realmProbe,typeof p.expando,typeof Element.prototype.authorOnly];globalThis.realmProbe='utility';p.textContent='shared';p.expando=2;return [before,input.value,document.activeElement===input,p.parentNode===document.body,p.isConnected]})()",
         "contextId": isolated, "returnByValue": true,
     }), Some(&session)).await;
     assert!(private.error.is_none(), "{:?}", private.error);
-    assert_eq!(private.result.unwrap()["result"]["value"], json!([["undefined","undefined","undefined"],"preserved",true,true,true,"rgb(1, 2, 3)"]));
+    assert_eq!(private.result.unwrap()["result"]["value"], json!([["undefined","undefined","undefined"],"preserved",true,true,true]));
+    #[cfg(feature = "render")]
+    assert_eq!(world_value(&mut ctx, &session, Some(isolated), "getComputedStyle(document.getElementById('probe')).color").await, "rgb(1, 2, 3)");
     let default = cdp(&mut ctx, 7, "Runtime.evaluate", json!({
         "expression":"[realmProbe,document.getElementById('probe').textContent,document.getElementById('probe').expando]","returnByValue":true,
     }), Some(&session)).await.result.unwrap();

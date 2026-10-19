@@ -237,41 +237,89 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
         .params["frame"];
     assert_frame_contract(child_event_frame);
 
-    // Input uses native hit testing, not an author-overridden elementFromPoint.
-    let route_rect = cdp(
-        &mut ctx,
-        7,
-        "Runtime.evaluate",
-        json!({
-            "expression": "JSON.stringify(document.getElementById('route').getBoundingClientRect().toJSON())",
-            "returnByValue": true
-        }),
-        Some(&session_id),
-    )
-    .await;
-    let route_rect: Value =
-        serde_json::from_str(route_rect["result"]["value"].as_str().unwrap()).unwrap();
-    assert!(route_rect["width"].as_f64().unwrap() > 0.0);
-    assert!(route_rect["height"].as_f64().unwrap() > 0.0);
-    let x = route_rect["x"].as_f64().unwrap() + route_rect["width"].as_f64().unwrap() / 2.0;
-    let y = route_rect["y"].as_f64().unwrap() + route_rect["height"].as_f64().unwrap() / 2.0;
-    cdp(
-        &mut ctx,
-        8,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": x, "y": y, "button": "left"}),
-        Some(&session_id),
-    )
-    .await;
     let route_event_start = ctx.pending_events.len();
-    cdp(
-        &mut ctx,
-        9,
-        "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": x, "y": y, "button": "left"}),
-        Some(&session_id),
-    )
-    .await;
+    #[cfg(feature = "render")]
+    {
+        // Input on a page with native child frames requires rendered hit testing.
+        let route_rect = cdp(
+            &mut ctx,
+            7,
+            "Runtime.evaluate",
+            json!({
+                "expression": "JSON.stringify(document.getElementById('route').getBoundingClientRect().toJSON())",
+                "returnByValue": true
+            }),
+            Some(&session_id),
+        )
+        .await;
+        let route_rect: Value =
+            serde_json::from_str(route_rect["result"]["value"].as_str().unwrap()).unwrap();
+        assert!(route_rect["width"].as_f64().unwrap() > 0.0);
+        assert!(route_rect["height"].as_f64().unwrap() > 0.0);
+        let x = route_rect["x"].as_f64().unwrap() + route_rect["width"].as_f64().unwrap() / 2.0;
+        let y = route_rect["y"].as_f64().unwrap() + route_rect["height"].as_f64().unwrap() / 2.0;
+        cdp(
+            &mut ctx,
+            8,
+            "Input.dispatchMouseEvent",
+            json!({"type": "mousePressed", "x": x, "y": y, "button": "left"}),
+            Some(&session_id),
+        )
+        .await;
+        cdp(
+            &mut ctx,
+            9,
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseReleased", "x": x, "y": y, "button": "left"}),
+            Some(&session_id),
+        )
+        .await;
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        let state_params = json!({
+            "expression": "JSON.stringify([location.href,document.documentElement.outerHTML,document.activeElement?.outerHTML])",
+            "returnByValue": true,
+        });
+        let before = cdp(
+            &mut ctx, 7, "Runtime.evaluate", state_params.clone(), Some(&session_id),
+        ).await;
+        assert!(before["result"]["value"].is_string(), "{before}");
+        // Native frame-coordinate input is explicitly unsupported without layout.
+        for (id, event_type) in [(8, "mousePressed"), (9, "mouseReleased")] {
+            let response = dispatch(&CdpRequest {
+                id,
+                method: "Input.dispatchMouseEvent".to_string(),
+                params: json!({"type": event_type, "x": 10, "y": 10, "button": "left"}),
+                session_id: Some(session_id.clone()),
+            }, &mut ctx).await;
+            assert!(response.result.is_none());
+            let error = response.error.expect("native child-frame input must be unsupported");
+            assert_eq!(error.code, -32601);
+        }
+        let unchanged = cdp(
+            &mut ctx, 10, "Runtime.evaluate", state_params, Some(&session_id),
+        ).await;
+        assert_eq!(unchanged["result"]["value"], before["result"]["value"]);
+        assert!(!ctx.pending_events[route_event_start..].iter().any(|event| {
+            matches!(event.method.as_str(),
+                "Page.navigatedWithinDocument" | "Page.frameNavigated"
+                    | "Runtime.executionContextsCleared" | "Page.loadEventFired")
+        }));
+        // DOM activation preserves the same-document frame contract without coordinates.
+        let activated = cdp(
+            &mut ctx,
+            11,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.getElementById('route').click();location.pathname",
+                "returnByValue": true,
+            }),
+            Some(&session_id),
+        ).await;
+        assert!(activated.get("exceptionDetails").is_none(), "{activated}");
+        assert_eq!(activated["result"]["value"], "/next");
+    }
     let route_event = &ctx.pending_events[route_event_start..]
         .iter()
         .find(|event| event.method == "Page.navigatedWithinDocument")
@@ -288,7 +336,7 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
     }));
     let routed_tree = cdp(
         &mut ctx,
-        10,
+        12,
         "Page.getFrameTree",
         json!({}),
         Some(&session_id),

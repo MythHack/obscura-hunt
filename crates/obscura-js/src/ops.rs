@@ -8915,6 +8915,7 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
         op_begin_render_task(),
+        op_set_hovered(),
     ];
     ops.extend(crate::window::ops());
     ops.extend(crate::storage::ops());
@@ -8939,7 +8940,6 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
-        ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -10285,7 +10285,7 @@ fn op_computed_style(
     serde_json::json!([true, object]).to_string()
 }
 
-#[cfg(feature = "render")]
+// Hover belongs to native DOM input state, even when rendering is disabled.
 #[op2(fast)]
 fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
     let shared = frame_state(state, frame_id);
@@ -10295,9 +10295,12 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
     });
     if changed {
         state.activity_generation = state.activity_generation.wrapping_add(1);
-        state.prepared_render = None;
-        state.pending_style_mutations.clear();
-        state.resolved_scroll = None;
+        #[cfg(feature = "render")]
+        {
+            state.prepared_render = None;
+            state.pending_style_mutations.clear();
+            state.resolved_scroll = None;
+        }
     }
 }
 

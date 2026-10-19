@@ -31,6 +31,11 @@ and enables `sccache` separately.
 Linux-only storage tests use POSIX FIFOs; Windows results do not cover those
 tests. Keep the Linux CI gate when changing storage persistence.
 
+No-render CI must retain click, form and hover-state coverage. Computed CSS and
+native child-frame coordinate input require `render`; the no-render frame
+contract verifies the unsupported-input boundary and uses DOM activation for
+same-document navigation.
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation
