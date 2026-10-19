@@ -11694,7 +11694,7 @@ mod tests {
         assert!(after != before && after > 0.0, "before {before}, after {after}");
         assert!(
             elapsed < std::time::Duration::from_millis(3_500),
-            "resolved after {elapsed:?}, expected shortly after the 1.2 s response"
+            "resolved after {elapsed:?}, expected shortly after the 1.2 s response (font changed at {at_ms} ms, before {before}, after {after}, requests {requests:?})"
         );
         assert!(
             requests.iter().any(|line| line.starts_with("GET /late.ttf ")),

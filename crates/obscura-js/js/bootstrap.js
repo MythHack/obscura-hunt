@@ -2155,7 +2155,7 @@ function _worldEventCreate(source, nid, original, trusted, shared, borrowedState
       'metaKey', 'button', 'buttons', 'movementX', 'movementY', 'key', 'code', 'location', 'repeat',
       'keyCode', 'charCode', 'which', 'data', 'inputType', 'pointerId', 'width', 'height', 'pressure',
       'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'pointerType', 'isPrimary', 'deltaX', 'deltaY',
-      'deltaZ', 'deltaMode']) {
+      'deltaZ', 'deltaMode', 'oldURL', 'newURL']) {
       if (name in source) options[name] = source[name];
     }
     if (source.view) options.view = globalThis;
@@ -2175,6 +2175,7 @@ function _worldEventCreate(source, nid, original, trusted, shared, borrowedState
     else if ('relatedTarget' in source) Constructor = _worldEventConstructors.FocusEvent;
     else if ('inputType' in source) Constructor = _worldEventConstructors.InputEvent;
     else if ('submitter' in source) Constructor = _worldEventConstructors.SubmitEvent;
+    else if ('oldURL' in source || 'newURL' in source) Constructor = _worldEventConstructors.HashChangeEvent;
     else if ('detail' in source) Constructor = _worldEventConstructors.CustomEvent;
     event = new Constructor(String(source.type), options);
     event.timeStamp = source.timeStamp;
@@ -4700,7 +4701,7 @@ class Element extends Node {
         const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
         if (link) {
           const href = link.getAttribute('href');
-          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+          if (href && !href.startsWith('javascript:')) {
             location.assign(href);
             return;
           }
@@ -6186,13 +6187,27 @@ class Element extends Node {
   }
 }
 // ---- Reflected IDL attributes (WHATWG) ---------------------------------------
-// Installed ONCE on Element.prototype as shared getter/setter pairs. This is
+class HTMLOListElement extends Element {
+  constructor(nid, token) {
+    if (token !== _htmlElementConstructionToken) throw new TypeError('Illegal constructor');
+    super(nid);
+  }
+  get [Symbol.toStringTag]() { return "HTMLOListElement"; }
+}
+class HTMLLIElement extends Element {
+  constructor(nid, token) {
+    if (token !== _htmlElementConstructionToken) throw new TypeError('Illegal constructor');
+    super(nid);
+  }
+  get [Symbol.toStringTag]() { return "HTMLLIElement"; }
+}
+// Installed ONCE on shared prototypes as getter/setter pairs. This is
 // data-driven so there is no per-element defineProperty: element creation and
 // the querySelector/mutation hot paths are unaffected (each access is a normal
 // prototype getter that reads the backing attribute). Covers the global content
 // attributes reflected on every element plus the ARIAMixin (aria-* + ariaXxx).
 (function installElementReflectors() {
-  const P = Element.prototype;
+  let P = Element.prototype;
   const def = (name, get, set) => {
     if (Object.prototype.hasOwnProperty.call(P, name)) return; // never clobber an existing member
     Object.defineProperty(P, name, { get, set, enumerable: true, configurable: true });
@@ -6207,7 +6222,7 @@ class Element extends Node {
   };
   // IDL `long` conversion (ToInt32): finite, truncated, wrapped to 32-bit signed.
   const toLong = (v) => {
-    let n = Number(v);
+    let n = +v;
     if (!Number.isFinite(n)) n = 0;
     n = Math.trunc(n) % 4294967296;
     if (n >= 2147483648) n -= 4294967296;
@@ -6283,6 +6298,13 @@ class Element extends Node {
     ariaValueMin: "aria-valuemin", ariaValueNow: "aria-valuenow", ariaValueText: "aria-valuetext",
   };
   for (const prop in ARIA) reflectNullable(prop, ARIA[prop]);
+
+  P = HTMLOListElement.prototype;
+  reflectBool("reversed", "reversed");
+  reflectLong("start", "start", 1);
+  reflectStr("type", "type");
+  P = HTMLLIElement.prototype;
+  reflectLong("value", "value", 0);
 })();
 
 function _parseXPathPredicate(part) {
@@ -6493,7 +6515,7 @@ class Document extends Node {
   get location() { return this._detached ? null : globalThis.location; }
   set location(url) {
     if (this._detached) return;
-    __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', '');
+    __locationNavigate(String(url), false);
   }
   get defaultView() {
     if (this._detached) return null;
@@ -8196,26 +8218,69 @@ function __currentUrl() {
   return _domParse("document_reflected_url") || _domParse("document_url") || "about:blank";
 }
 const _previewUrl = (url) => __obscuraCore.ops.op_set_reflected_url(globalThis, url);
+let __navigateToFragment;
+// HTML "navigate": a target that has a fragment and otherwise equals the
+// current URL is a same-document fragment navigation. It must not load a new
+// document; the history IIFE below adds (or replaces) a session-history entry
+// and queues hashchange. Keep the entry point private to this document realm.
+function __stripFragment(url) {
+  var i = url.indexOf('#');
+  return i < 0 ? url : url.slice(0, i);
+}
+function __locationNavigate(url, replace) {
+  var r = _resolveUrl(url);
+  var target = r;
+  try { target = new URL(r).href; } catch (e) {}
+  var current = __currentUrl();
+  if (target.indexOf('#') >= 0 && __stripFragment(target) === __stripFragment(current)) {
+    __navigateToFragment(target, replace);
+    return;
+  }
+  _previewUrl(r);
+  __obscuraCore.ops.op_navigate(r, 'GET', '');
+}
+// Location setters (HTML spec): change one component of a copy of the current
+// URL, then navigate to it. Only the fragment setter can stay in-document.
+function __locationSetPart(part, value) {
+  var u;
+  try { u = new URL(__currentUrl()); } catch (e) { return; }
+  if (part === 'hash') {
+    var previousHash = u.hash;
+    var input = String(value);
+    u.hash = input === '' ? '#' : input;
+    if (u.hash === previousHash) return;
+    __locationNavigate(u.href, false);
+    return;
+  }
+  u[part] = String(value);
+  __locationNavigate(u.href, false);
+}
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { __locationNavigate(url, false); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
+  set host(v) { __locationSetPart('host', v); },
   get hostname() { try { return new URL(this.href).hostname; } catch { return ""; } },
+  set hostname(v) { __locationSetPart('hostname', v); },
   get pathname() { try { return new URL(this.href).pathname; } catch { return "/"; } },
+  set pathname(v) { __locationSetPart('pathname', v); },
   get search() { try { return new URL(this.href).search; } catch { return ""; } },
+  set search(v) { __locationSetPart('search', v); },
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
+  set hash(v) { __locationSetPart('hash', v); },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
+  set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { __locationNavigate(url, false); },
   reload() { var r = _resolveUrl(this.href); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set(url) { __locationNavigate(String(url), false); },
   configurable: false,
   enumerable: true,
 });
@@ -12275,7 +12340,13 @@ globalThis.PopStateEvent = class extends Event {
     this.state = init && 'state' in init ? init.state : null;
   }
 };
-globalThis.HashChangeEvent = class extends Event {};
+globalThis.HashChangeEvent = class extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.oldURL = init.oldURL === undefined ? "" : String(init.oldURL);
+    this.newURL = init.newURL === undefined ? "" : String(init.newURL);
+  }
+};
 globalThis.MessageEvent = class extends Event {
   constructor(t,o={}) {
     super(t,o);
@@ -13891,6 +13962,28 @@ globalThis.atob = globalThis.atob || ((s) => {
     // The empty string clears back to the committed document URL.
     __obscuraCore.ops.op_set_reflected_url(globalThis, entry.url ?? '');
   };
+  // Same-document fragment navigation, reached from the Location setters and
+  // `<a href="#x">` activation. Per the HTML spec it adds a history entry
+  // (or replaces the current one), keeps the document, and queues a
+  // hashchange task when the fragment changed. No popstate fires here.
+  __navigateToFragment = (url, replace) => {
+    const prevUrl = __currentUrl();
+    if (prevUrl === url) return;
+    if (replace) {
+      stack[idx] = {state: null, url};
+    } else {
+      stack.length = idx + 1;
+      stack.push({state: null, url});
+      idx = stack.length - 1;
+      forwardCleared = true;
+    }
+    applyVirtual();
+    setTimeout(() => {
+      const ev = new HashChangeEvent('hashchange');
+      ev.oldURL = prevUrl; ev.newURL = url;
+      try { globalThis.dispatchEvent(ev); } catch {}
+    }, 0);
+  };
   const fireHashChangeIfNeeded = (prevUrl) => {
     try {
       const next = __currentUrl();
@@ -14712,6 +14805,8 @@ globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
   get httpEquiv() { return this.getAttribute('http-equiv') || ''; }
   set httpEquiv(value) { this.setAttribute('http-equiv', String(value)); }
 };
+globalThis.HTMLOListElement = HTMLOListElement;
+globalThis.HTMLLIElement = HTMLLIElement;
 // <slot> needs its own brand: with `HTMLSlotElement = Element` every element
 // was an instance, but assignedElements() did not exist, so the common
 // `el instanceof HTMLSlotElement && el.assignedElements()` guard (Swiper's
@@ -17843,22 +17938,31 @@ if (!globalThis.crypto.subtle) {
   }
   function makeKey(type, extractable, algorithm, usages, bytes) {
     const k = Object.create(CryptoKey.prototype);
+    const publicAlgorithm = Object.assign({}, algorithm);
+    if (algorithm.hash) publicAlgorithm.hash = Object.assign({}, algorithm.hash);
     Object.defineProperty(k, "type", { value: type, enumerable: true });
     Object.defineProperty(k, "extractable", { value: !!extractable, enumerable: true });
-    Object.defineProperty(k, "algorithm", { value: algorithm, enumerable: true });
+    Object.defineProperty(k, "algorithm", { value: publicAlgorithm, enumerable: true });
     Object.defineProperty(k, "usages", { value: Object.freeze((usages || []).slice()), enumerable: true });
-    keyMaterial.set(k, bytes);
+    keyMaterial.set(k, {bytes, algorithm, usages: k.usages});
     return k;
   }
-  function keyBytes(key) {
+  function keyBytes(key, algorithm, usage) {
     if (!(key instanceof CryptoKey) || !keyMaterial.has(key)) {
       throw new DOMException("Argument is not a valid CryptoKey", "InvalidAccessError");
     }
-    return keyMaterial.get(key);
+    const material = keyMaterial.get(key);
+    if (usage && algorithm !== "AES-KW" && algorithm !== "AES-GCM" && algorithm !== "AES-CBC" && algorithm !== "AES-CTR") {
+      throw new DOMException("Unsupported key wrapping algorithm: " + algorithm, "NotSupportedError");
+    }
+    if (usage && (material.algorithm.name !== algorithm || !material.usages.includes(usage))) {
+      throw new DOMException("Key does not allow " + usage + " with " + algorithm, "InvalidAccessError");
+    }
+    return material.bytes;
   }
   _idbPlatformCodecs.push({
     name:"CryptoKey", test:key => keyMaterial.has(key),
-    encode:key => ({type:key.type,extractable:key.extractable,algorithm:key.algorithm,usages:key.usages,bytes:keyBytes(key)}),
+    encode:key => ({type:key.type,extractable:key.extractable,...keyMaterial.get(key)}),
     decode:data => makeKey(data.type,data.extractable,data.algorithm,data.usages,data.bytes),
   });
   // A CryptoKey cloned via structuredClone or postMessage is a different
@@ -17873,7 +17977,9 @@ if (!globalThis.crypto.subtle) {
   // material is registered once), matching structuredClone's identity rules.
   globalThis.__obscura_clone_hooks["CryptoKey"] = function (src, seen) {
     if (seen && seen.has(src)) return seen.get(src);
-    const copy = makeKey(src.type, src.extractable, src.algorithm, src.usages, keyBytes(src));
+    const bytes = keyBytes(src);
+    const material = keyMaterial.get(src);
+    const copy = makeKey(src.type, src.extractable, material.algorithm, material.usages, bytes);
     if (seen) seen.set(src, copy);
     return copy;
   };
@@ -17930,6 +18036,16 @@ if (!globalThis.crypto.subtle) {
     }
   }
 
+  // The JWK `alg` of an AES or HMAC key, or undefined for the others.
+  function jwkAlg(key, bytes) {
+    const algorithm = keyMaterial.get(key).algorithm;
+    if (algorithm.name && algorithm.name.indexOf("AES-") === 0) {
+      return "A" + (bytes.length * 8) + algorithm.name.slice(4);
+    }
+    if (algorithm.name === "HMAC") return "HS" + algorithm.hash.name.slice(4);
+    return undefined;
+  }
+
   function keyAlgorithmFor(alg, bytes) {
     switch (alg.name) {
       case "HMAC":
@@ -17977,12 +18093,14 @@ if (!globalThis.crypto.subtle) {
       if (!key.extractable) throw new DOMException("Key is not extractable", "InvalidAccessError");
       if (format === "raw") return bufferOf(bytes);
       if (format === "jwk") {
-        const jwk = { kty: "oct", k: bytesToB64url(bytes), ext: key.extractable, key_ops: key.usages.slice() };
-        if (key.algorithm.name && key.algorithm.name.indexOf("AES-") === 0) {
-          jwk.alg = "A" + (bytes.length * 8) + key.algorithm.name.slice(4);
-        } else if (key.algorithm.name === "HMAC") {
-          jwk.alg = "HS" + key.algorithm.hash.name.slice(4);
-        }
+        // Members in lexicographic order, as browsers return a JsonWebKey and
+        // as wrapKey serializes it.
+        const alg = jwkAlg(key, bytes);
+        const jwk = alg ? { alg } : {};
+        jwk.ext = key.extractable;
+        jwk.k = bytesToB64url(bytes);
+        jwk.key_ops = key.usages.slice();
+        jwk.kty = "oct";
         return jwk;
       }
       throw new DOMException("Only 'raw' and 'jwk' export is supported", "NotSupportedError");
@@ -18071,18 +18189,43 @@ if (!globalThis.crypto.subtle) {
     },
 
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+      const alg = normalizeAlgo(wrapAlgorithm);
+      const wrappingBytes = keyBytes(wrappingKey, alg.name, "wrapKey");
       const exported = await this.exportKey(format, key);
-      const bytes = format === "jwk"
-        ? new TextEncoder().encode(JSON.stringify(exported))
-        : new Uint8Array(exported);
+      // A JWK is serialized natively rather than with the page's JSON.stringify,
+      // so a toJSON or another prototype override can't change the wrapped bytes.
+      let bytes;
+      if (format === "jwk") {
+        const material = keyBytes(key);
+        bytes = __obscuraCore.ops.op_subtle_jwk_json(
+          jwkAlg(key, material) || "", key.extractable, bytesToB64url(material), key.usages.map(String));
+      } else {
+        bytes = new Uint8Array(exported);
+      }
+      // AES-KW has no encrypt, only its key wrap.
+      if (alg.name === "AES-KW") {
+        return bufferOf(runOp(() => __obscuraCore.ops.op_subtle_aes_kw(true, wrappingBytes, bytes)));
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, bytes);
     },
 
     async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
-      const decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
-      const keyData = format === "jwk"
-        ? JSON.parse(new TextDecoder().decode(new Uint8Array(decrypted)))
-        : decrypted;
+      const alg = normalizeAlgo(unwrapAlgorithm);
+      const unwrappingBytes = keyBytes(unwrappingKey, alg.name, "unwrapKey");
+      const decrypted = alg.name === "AES-KW"
+        ? runOp(() => __obscuraCore.ops.op_subtle_aes_kw(false, unwrappingBytes, toBytes(wrappedKey)))
+        : new Uint8Array(await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey));
+      let keyData;
+      if (format === "jwk") {
+        // Parsed natively too, not with the page's JSON.parse.
+        try {
+          keyData = __obscuraCore.ops.op_subtle_jwk_parse(decrypted);
+        } catch (e) {
+          throw new DOMException("The unwrapped key is not a JSON Web Key", "DataError");
+        }
+      } else {
+        keyData = bufferOf(decrypted);
+      }
       return this.importKey(format, keyData, unwrappedKeyAlgorithm, extractable, keyUsages);
     },
   };
@@ -19606,7 +19749,7 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['modalState', function() { return _modalState; }],
 ]));
 const _worldEventConstructors = Object.freeze({ Event, MouseEvent, PointerEvent, KeyboardEvent,
-  FocusEvent, InputEvent, CustomEvent, SubmitEvent, WheelEvent });
+  FocusEvent, InputEvent, CustomEvent, SubmitEvent, WheelEvent, HashChangeEvent });
 
 // Only the native context slot retains this closure. Its events carry one-shot
 // private provenance, never an ambient privilege that author code can inherit.

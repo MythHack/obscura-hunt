@@ -11,13 +11,15 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 基于 [官方 Obscura](https://github.com/h4ckf0r0day/obscura)，保留原生引擎和 stealth 选项，
 在同步上游更新的同时，持续改进浏览器操作流程。
 
-最近一次上游同步包含
-[`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588)。
-这 69 个提交包含 IndexedDB、Web Storage 更新、iframe 生命周期、MCP 改进、
-请求拦截与渲染修复，同时保留本分支的原生 popup 和子 frame 所有权语义。
-合并阶段的历史记录见[同步记录](docs/Testing-and-debugging.md#merge-stage-record-upstream-bd95294)。
+最近一次上游同步已到
+[`8b49681`](https://github.com/h4ckf0r0day/obscura/commit/8b49681)，在
+[`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588)
+基础上新增 14 个提交，包含同文档片段跳转、有序列表属性反射、AES-KW 密钥包装、
+原生 JWK 处理，以及 MCP 函数等待期间的页面任务推进，并保留原生 popup 和子 frame 所有权语义。
+本次验证见[最新同步报告](docs/Testing-and-debugging.md#upstream-sync-8b49681)。
+此前合并阶段的历史记录见[同步记录](docs/Testing-and-debugging.md#merge-stage-record-upstream-bd95294)。
 当前 `main` 已升级至 `v8`（rusty_v8）152.2.0，运行时引擎版本为 `15.2.124.1-rusty`；
-最新验证结果见 [10 月 19 日 V8 升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
+此前的引擎验证结果见 [10 月 19 日 V8 升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
 
 ## 为什么选择 Obscura-Hunt？
 
@@ -221,7 +223,8 @@ obscura serve --port 9222 --allow-private-network
 ## 本地基准（2026-10-11）
 
 以下数据保留为 10 月 11 日的历史记录，不代表当前 V8 152 的性能或验收状态。
-当前版本的验证与测量见 [10 月 19 日升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
+本次同步验证见[最新同步报告](docs/Testing-and-debugging.md#upstream-sync-8b49681)；
+此前的 V8 升级测量见 [10 月 19 日升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
 
 以下是本机实测，不是上游发布的 Linux/无渲染成绩。机器为 Windows x64（10.0.26300）、
 Intel Core Ultra 7 265K、20 个逻辑 CPU、47.28 GiB 可用内存、Python 3.13.12。
@@ -378,7 +381,7 @@ Pop-Location
 ## 更多指南
 
 - [文档索引](docs/README.md)
-- [当前 V8 升级验证](docs/Testing-and-debugging.md#upgrade-validation-october-19)
+- [最新上游同步验证](docs/Testing-and-debugging.md#upstream-sync-8b49681)
 - [CLI 参数参考](docs/CLI-reference.md)
 - [Cookie 与存储](docs/Persist-cookies-and-storage.md)
 - [从源码构建](docs/Build-from-source.md)

@@ -6026,7 +6026,7 @@ mod tests {
     // buffer straight from an untrusted u32 length. Each must reject a length
     // above its fixed maximum before allocating, and still work for ordinary
     // inputs. See #910.
-    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, hkdf_derive, random_bytes};
+    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, aes_kw, hkdf_derive, oct_jwk_json, random_bytes};
 
     #[test]
     fn hkdf_rejects_excessive_output_length() {
@@ -6049,6 +6049,49 @@ mod tests {
         let okm = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(okm.len(), 32, "derived key must have the requested length");
+    }
+
+    // RFC 3394, section 4.1: 128 bits of key data with a 128-bit KEK.
+    #[test]
+    fn aes_kw_matches_rfc_3394() {
+        let kek: Vec<u8> = (0u8..16).collect();
+        let data: Vec<u8> = (0u8..16).map(|i| i * 0x11).collect();
+        let wrapped = aes_kw(true, &kek, &data).expect("a 128-bit key wraps");
+        assert_eq!(
+            wrapped,
+            [
+                0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+                0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5
+            ]
+        );
+        assert_eq!(aes_kw(false, &kek, &wrapped).expect("the wrap unwraps"), data);
+    }
+
+    #[test]
+    fn aes_kw_rejects_tampering_and_bad_sizes() {
+        let kek = [7u8; 32];
+        let mut wrapped = aes_kw(true, &kek, &[1u8; 24]).expect("a 192-bit key wraps");
+        wrapped[3] ^= 1;
+        assert!(aes_kw(false, &kek, &wrapped).is_err(), "a tampered wrap must not unwrap");
+        assert!(aes_kw(false, &[8u8; 32], &aes_kw(true, &kek, &[1u8; 16]).unwrap()).is_err(), "another key must not unwrap");
+        assert!(aes_kw(true, &kek, &[1u8; 20]).is_err(), "data not a multiple of 8 bytes must not wrap");
+        assert!(aes_kw(true, &kek, &[1u8; 8]).is_err(), "a single block must not wrap");
+        assert!(aes_kw(false, &kek, &[1u8; 16]).is_err(), "a single wrapped block must not unwrap");
+        assert!(aes_kw(false, &kek, &[]).is_err(), "nothing must not unwrap");
+        assert!(aes_kw(true, &[7u8; 20], &[1u8; 16]).is_err(), "a 160-bit KEK is not an AES key");
+    }
+
+    #[test]
+    fn oct_jwk_json_is_in_lexicographic_order() {
+        let ops = vec!["sign".to_string(), "verify".to_string()];
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("HS256", true, "AQID", &ops)).unwrap(),
+            r#"{"alg":"HS256","ext":true,"k":"AQID","key_ops":["sign","verify"],"kty":"oct"}"#
+        );
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("", false, "AQID", &[])).unwrap(),
+            r#"{"ext":false,"k":"AQID","key_ops":[],"kty":"oct"}"#
+        );
     }
 
     #[test]
@@ -7897,7 +7940,7 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
 // These ops are stateless. The JS shim in bootstrap.js owns the CryptoKey
 // objects and their raw key bytes; it hands the bytes plus normalized algorithm
 // parameters to these ops for each operation. Only secret-key algorithms live
-// here (HMAC, AES-GCM/CBC/CTR, PBKDF2, HKDF); public-key algorithms are rejected
+// here (HMAC, AES-GCM/CBC/CTR/KW, PBKDF2, HKDF); public-key algorithms are rejected
 // in the shim. A fallible op returns a JsErrorBox that the shim turns into the
 // appropriate DOMException (OperationError for a bad tag or padding, etc.).
 // ---------------------------------------------------------------------------
@@ -8064,6 +8107,114 @@ fn op_subtle_aes_ctr(
         }
     }
     Ok(buf)
+}
+
+/// AES-KW (RFC 3394) key wrap and unwrap, for `wrapKey` / `unwrapKey`. RFC 3394
+/// wraps at least two 64-bit blocks, so the data to wrap must be a multiple of
+/// 8 bytes and at least 16 (a wrap, at least 24); unwrapping checks the
+/// integrity value, so a wrong key or a tampered wrap is an error too (the
+/// shim's OperationError). Split out from the op so it is unit-testable.
+fn aes_kw(wrap: bool, key: &[u8], data: &[u8]) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use aes_kw::{KeyInit, KwAes128, KwAes192, KwAes256};
+    // The primitive accepts a single block; WebCrypto requires at least two.
+    if data.len() < if wrap { 16 } else { 24 } {
+        return Err(crypto_err("AES-KW wraps at least two 64-bit blocks"));
+    }
+    if data.len() % aes_kw::IV_LEN != 0 {
+        return Err(crypto_err("AES-KW data must be a multiple of 8 bytes"));
+    }
+    macro_rules! run {
+        ($kek:ty) => {{
+            let kek = <$kek>::new_from_slice(key).map_err(crypto_err)?;
+            let len = if wrap { data.len() + aes_kw::IV_LEN } else { data.len() - aes_kw::IV_LEN };
+            let mut output = vec![0; len];
+            if wrap { kek.wrap_key(data, &mut output) } else { kek.unwrap_key(data, &mut output) }
+                .map_err(crypto_err)?;
+            output
+        }};
+    }
+    Ok(match key.len() {
+        16 => run!(KwAes128),
+        24 => run!(KwAes192),
+        32 => run!(KwAes256),
+        _ => return Err(crypto_err("AES-KW keys are 128, 192 or 256 bits")),
+    })
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_aes_kw(
+    wrap: bool,
+    #[buffer] key: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    aes_kw(wrap, key, data)
+}
+
+/// A symmetric ("oct") JWK as `wrapKey` serializes it. Members are declared in
+/// lexicographic order, the order `JSON.stringify` gives a JsonWebKey
+/// dictionary.
+#[derive(serde::Serialize)]
+struct OctJwk<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alg: Option<&'a str>,
+    ext: bool,
+    k: &'a str,
+    key_ops: &'a [String],
+    kty: &'static str,
+}
+
+/// The UTF-8 JSON text of an "oct" JWK, for `wrapKey`. Built here rather than
+/// with the page's `JSON.stringify`, so a `toJSON` or another override on the
+/// page's prototypes can't change the wrapped bytes: the spec serializes it in
+/// the context of a new global object. An empty `alg` is left out.
+fn oct_jwk_json(alg: &str, ext: bool, k: &str, key_ops: &[String]) -> Vec<u8> {
+    let jwk = OctJwk {
+        alg: (!alg.is_empty()).then_some(alg),
+        ext,
+        k,
+        key_ops,
+        kty: "oct",
+    };
+    serde_json::to_vec(&jwk).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_jwk_json(
+    #[string] alg: &str,
+    ext: bool,
+    #[string] k: &str,
+    #[serde] key_ops: Vec<String>,
+) -> Vec<u8> {
+    oct_jwk_json(alg, ext, k, &key_ops)
+}
+
+/// Parses an unwrapped JWK with V8's intrinsic JSON parser, never the page's
+/// `JSON.parse`. Keeping the native value preserves ECMAScript JSON semantics,
+/// including overflowing numbers or lone surrogates in ignored JWK members.
+#[op2]
+fn op_subtle_jwk_parse<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    #[buffer] bytes: &[u8],
+) -> Result<v8::Local<'s, v8::Value>, deno_error::JsErrorBox> {
+    let json = v8::String::new_from_utf8(scope, bytes, v8::NewStringType::Normal)
+        .ok_or_else(|| crypto_err("the unwrapped JWK is too large"))?;
+    v8::tc_scope!(let scope, scope);
+    let Some(value) = v8::json::parse(scope, json) else {
+        if scope.has_terminated() || !scope.can_continue() {
+            scope.rethrow();
+            // Discarded by the pending exception, as in Deno's native ops.
+            return Ok(v8::undefined(scope).into());
+        }
+        // The shim maps this failure to DataError, not V8's pending SyntaxError.
+        scope.reset();
+        return Err(crypto_err("the unwrapped key is not JSON"));
+    };
+    if !value.is_object() || value.is_array() {
+        return Err(crypto_err("the unwrapped key is not a JSON object"));
+    }
+    Ok(value)
 }
 
 /// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
@@ -8903,6 +9054,9 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_gcm(),
         op_subtle_aes_cbc(),
         op_subtle_aes_ctr(),
+        op_subtle_aes_kw(),
+        op_subtle_jwk_json(),
+        op_subtle_jwk_parse(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
         op_random_bytes(),

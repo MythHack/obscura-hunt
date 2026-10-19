@@ -182,6 +182,117 @@ engine speedup.
 These results describe the October 19 source revision, not the earlier
 `v0.1.2` tag or October 11 README benchmark binaries.
 
+### Upstream sync: `8b49681`
+
+This sync adds 14 upstream commits after `bd95294`, through
+[`8b49681`](https://github.com/h4ckf0r0day/obscura/commit/8b49681). It integrates
+same-document fragment navigation, ordered-list attribute reflection, AES-KW,
+native JWK wrapping/parsing and MCP function-wait task progression. The fork's
+V8 152 dependency patches, native WindowProxy ownership and classic-script
+completion semantics remain in place.
+
+#### Integration details
+
+- Fragment-only navigation updates the owning document without a full load.
+  Repeating the current fragment preserves history state and length, while a
+  changed fragment carries the correct `hashchange` old/new URLs. Both main and
+  isolated execution worlds must receive a receiver-world `HashChangeEvent`.
+- List interfaces reflect numeric and boolean attributes. Their new explicit
+  constructors retain the fork's private construction token: direct construction
+  throws `TypeError`, while parsing, DOM factories and cloning remain valid.
+- `aes-kw 0.3.1` matches the fork's `aes 0.9` / `cipher 0.5` dependency family.
+  Native wrapping validates key algorithm and usages; AES-KW integrity failures
+  remain errors. JWK parsing uses the intrinsic V8 JSON parser, not page-overridden
+  `JSON.parse` or a lossy serde JSON-value conversion. Unrecognized members such
+  as `vendor: 1e400` must not reject an otherwise valid key. Malformed or
+  non-object JSON still produces `DataError`.
+- MCP function waits advance successive native task wakes inside each polling
+  interval. Once a task consumes navigation, navigation completion occurs
+  outside the cancelable wait so the next poll cannot strand the document state.
+- Incoming navigation tests use the fork's full `PendingNavigation` record,
+  including URL, method, body and owning frame. They do not restore the old tuple
+  representation or a top-level-return evaluation wrapper.
+
+#### Focused reproduction
+
+Use the existing crate-local consumer regressions, with nextest process isolation:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --locked \
+  --features render -p obscura-js -p obscura-mcp \
+  -E 'test(/location_|same_fragment|fragment_hashchange_from_|list_element|aes_kw|wrapped_jwk|unwrapped_jwk|key_wrapp|key_unwrapp|unsupported_wrapping|cloned_wrapping|oct_jwk|function_wait_/)' \
+  --no-fail-fast
+```
+
+The added world-event, list-constructor and ignored-JWK-member regressions were
+all observed failing before the integration repairs. The pre-sync binary still
+passed the list construction and ignored-member JWK cases, confirming that these
+are preserved consumer contracts rather than new implementation assumptions.
+
+#### Runtime and rendering checks
+
+The merged Windows release CLI passed ten focused loopback CDP/MCP scenarios:
+same-document navigation and retained history state, ordered-list reflection,
+the RFC 3394 AES-KW vector and roundtrip, page-independent JWK processing,
+wrapping permissions and integrity errors, successive MCP fetch completions,
+MCP navigation, list construction restrictions, both directions of cross-world
+`hashchange`, and an ignored overflowing JWK extension member. The same ten
+scenarios passed with the Linux release CLI.
+
+Windows also passed all eleven retained protocol scenarios with no skipped
+checks, all nine native-window identity/access checks, and the authoritative
+local obstacle course at **33/33** (`--runs 1 --warmup 0`). The native-window
+checks include same-origin identity and cross-origin access denial.
+
+All **77** deterministic `render-repros/*.html` fixtures produced successful,
+nonblank screenshots for both the pre-sync and merged Windows render binaries.
+At 900 × 1000 with a two-second settle, all 77 pairs were pixel-identical.
+List indentation, table-row geometry and form-control geometry were additionally
+visually inspected. This is a bounded regression comparison, not a new
+performance measurement or a broad real-site fidelity claim.
+
+#### Windows test observation boundaries
+
+The first full Windows run reported 13 failures. A controlled unchanged-source
+serial selection passed 12 of those 13; the adaptive active-task fixture still
+failed before callback completion was established. Its zero-delay timer did not
+establish native-ready work at the start of the measured call. The common runtime
+task pump and the affected fixtures predated this upstream sync.
+
+The fixture repairs keep exact behavior assertions while awaiting actual
+callback delivery rather than treating short wall-clock pumps as completion.
+Active-task fixtures enqueue native-ready `scheduler.postTask` work, retaining
+the 20 ms observation budget, 600 ms task and 500–1500 ms completion bounds.
+The fairness fixture requires two sibling scheduler acknowledgments while the
+promise wait is pending, rather than a machine-dependent timer-throughput count.
+No production deadline, watchdog limit, concurrency setting or ignored-test
+policy is relaxed.
+
+#### Final release verification
+
+| Gate | Windows x64 | Linux x64 (WSL) |
+| --- | --- | --- |
+| Affected release-mode nextest selection | 44 passed | 44 passed |
+| Full `--features render --no-fail-fast` nextest | 2520 passed, 5 skipped | 2528 passed, 5 skipped |
+| Release CLI and worker, `--features render` | Passed, no warnings | Passed, no warnings |
+| All four CLI/worker feature combinations | Passed | Passed |
+| No-render focused nextest | 29 passed | 29 passed |
+| Optional transport nextest, including gzip | 138 passed | 138 passed |
+| Local obstacle course | 33/33 | 33/33 |
+
+The final suites use normal nextest concurrency, not the serial diagnostic
+selection. The five skipped cases are unchanged. Linux builds run with
+`CARGO_NET_OFFLINE=true`; the added `aes-kw 0.3.1` archive and sparse-index entry
+were copied from the existing Windows cache after verifying the locked checksum.
+
+Both platforms built `render`, `render,stealth`, `--no-default-features`, and
+`--no-default-features --features stealth`. Each actual binary passed the ten
+focused CDP/MCP scenarios and nine native-window checks. Both rendering variants
+also passed all eleven protocol scenarios. Optional-transport runs explicitly
+used `--stealth`; gzip used the loopback allowance separately so private-network
+denial tests retained their default policy. The minimal `obscura-render` feature
+configuration also passed release `cargo check` on both platforms.
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation

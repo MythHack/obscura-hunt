@@ -44,10 +44,13 @@ async fn color_scheme_reaches_existing_and_new_child_documents() {
     rt.evaluate(r#"(() => {
         const f = document.createElement('iframe'); document.body.appendChild(f);
         globalThis.child = f.contentWindow;
-        child.eval("globalThis.q = matchMedia('(prefers-color-scheme: dark)'); globalThis.changes = []; q.onchange = e => changes.push(e.matches)");
+        child.eval("globalThis.q = matchMedia('(prefers-color-scheme: dark)'); globalThis.changes = []; globalThis.changed = new Promise(resolve => { globalThis.changeResolve = resolve; }); q.onchange = e => { changes.push(e.matches); changeResolve(); };");
     })()"#).unwrap();
     rt.set_media_preferences(true, true);
-    rt.run_event_loop_bounded(30).await.unwrap();
+    rt.evaluate_for_cdp(
+        "child.changed.then(() => child.eval('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))'))",
+        true, true,
+    ).await.unwrap();
     assert_eq!(
         rt.evaluate("[child.q.matches, child.changes]").unwrap(),
         json!([true, [true]])
@@ -56,8 +59,12 @@ async fn color_scheme_reaches_existing_and_new_child_documents() {
         const f = document.createElement('iframe'); document.body.appendChild(f);
         return f.contentWindow.matchMedia('(prefers-color-scheme: dark) and (prefers-reduced-motion: reduce)').matches;
     })()"#).unwrap(), json!(true));
+    rt.evaluate(r#"child.eval("globalThis.changed = new Promise(resolve => { changeResolve = resolve; });");"#).unwrap();
     rt.set_media_preferences(false, false);
-    rt.run_event_loop_bounded(30).await.unwrap();
+    rt.evaluate_for_cdp(
+        "child.changed.then(() => child.eval('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))'))",
+        true, true,
+    ).await.unwrap();
     assert_eq!(
         rt.evaluate("[child.q.matches, child.changes]").unwrap(),
         json!([false, [true, false]])

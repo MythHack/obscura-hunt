@@ -14,17 +14,20 @@ not just a single page fetch. Maintained by
 and stealth options, and brings upstream updates together with its own browser
 workflow improvements.
 
-The latest upstream sync includes
-[`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588).
-Its 69 commits add IndexedDB, Web Storage updates, iframe lifecycle work, MCP
-improvements, request interception and rendering fixes while retaining the fork's
-native popup and child-frame ownership. The current branch also upgrades raw
+The latest upstream sync reaches
+[`8b49681`](https://github.com/h4ckf0r0day/obscura/commit/8b49681), adding 14 commits
+since [`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588).
+It adds same-document fragment navigation, ordered-list attribute reflection,
+AES-KW wrapping, native JWK processing and page-task progression during MCP
+function waits, while preserving native popup and child-frame ownership.
+The current branch also upgrades raw
 `rusty_v8` from `150.4.0` to **`152.2.0`** (engine **`15.2.124.1-rusty`**).
 The native SDK, C++ shims, startup snapshots and optional ICU 78 data are aligned.
-See the
-[October 19 validation](docs/Testing-and-debugging.md#upgrade-validation-october-19)
-for local Windows/Linux coverage and the successful
-[upgrade CI run](https://github.com/MythHack/obscura-hunt/actions/runs/39230174839).
+See the [latest upstream validation](docs/Testing-and-debugging.md#upstream-sync-8b49681)
+for this integration. The separate
+[October 19 V8 validation](docs/Testing-and-debugging.md#upgrade-validation-october-19)
+and [V8 upgrade CI run](https://github.com/MythHack/obscura-hunt/actions/runs/39230174839)
+cover the earlier engine migration.
 The [merge-stage report](docs/Testing-and-debugging.md#merge-stage-record-upstream-bd95294)
 is retained as a historical record, not the current validation status.
 
@@ -263,8 +266,8 @@ The suite is [official obscura-benchmark at
 with the checked-in [Windows measurement patch](render-repros/benchmark-windows.patch).
 
 These pinned October 11 results are historical, not measurements of the current
-V8 152 build. For the latest exercised gates and the bounded V8 upgrade
-comparison, see [October 19 validation](docs/Testing-and-debugging.md#upgrade-validation-october-19).
+V8 152 build. See the [latest integration gates](docs/Testing-and-debugging.md#upstream-sync-8b49681)
+and the earlier [bounded V8 upgrade comparison](docs/Testing-and-debugging.md#upgrade-validation-october-19).
 
 ### Capability and stealth
 
@@ -424,7 +427,7 @@ These local artifacts are not upstream's published results.
 ## More guides
 
 - [Documentation index](docs/README.md)
-- [Current V8 upgrade validation](docs/Testing-and-debugging.md#upgrade-validation-october-19)
+- [Latest upstream validation](docs/Testing-and-debugging.md#upstream-sync-8b49681)
 - [CLI reference](docs/CLI-reference.md)
 - [Cookies and storage](docs/Persist-cookies-and-storage.md)
 - [Build from source](docs/Build-from-source.md)

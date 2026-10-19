@@ -57,6 +57,7 @@ sha2 = "0.11.0"
 # with a shared digest 0.11 / cipher 0.5 API family.
 hmac = "0.13.0"
 aes = "0.9.3"
+aes-kw = { version = "0.3.1", default-features = false }
 aes-gcm = "0.11.1"
 cbc = { version = "0.2.1", features = ["alloc"] }
 ctr = "0.10.1"

@@ -20,11 +20,18 @@ async fn reduced_motion_updates_queries_and_change_events() {
     let mut rt = ObscuraJsRuntime::new();
     rt.set_dom(obscura_dom::parse_html("<body></body>"));
     rt.run_page_init();
-    rt.evaluate("(() => { globalThis.q = matchMedia('(prefers-reduced-motion: reduce)'); globalThis.changes = []; q.onchange = e => changes.push(e.matches); })()").unwrap();
+    rt.evaluate("(() => { globalThis.q = matchMedia('(prefers-reduced-motion: reduce)'); globalThis.changes = []; globalThis.changed = new Promise(resolve => { globalThis.changeResolve = resolve; }); q.onchange = e => { changes.push(e.matches); changeResolve(); }; })()").unwrap();
     rt.set_reduced_motion(true);
-    rt.run_event_loop_bounded(30).await.unwrap();
+    rt.evaluate_for_cdp(
+        "changed.then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))",
+        true, true,
+    ).await.unwrap();
+    rt.evaluate("globalThis.changed = new Promise(resolve => { changeResolve = resolve; }); null").unwrap();
     rt.set_reduced_motion(false);
-    rt.run_event_loop_bounded(30).await.unwrap();
+    rt.evaluate_for_cdp(
+        "changed.then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))",
+        true, true,
+    ).await.unwrap();
     assert_eq!(rt.evaluate("[q.matches, changes]").unwrap(), json!([false, [true, false]]));
 }
 

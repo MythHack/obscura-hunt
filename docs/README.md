@@ -14,6 +14,10 @@ The `v0.1.2` tag predates this upgrade; it is not a V8 152 build. See the
 for the exercised configurations and results, rather than treating an engine
 version change as a performance claim.
 
+The latest upstream integration reaches `8b49681`. Its
+[current-source validation](Testing-and-debugging.md#upstream-sync-8b49681)
+extends the engine-upgrade record above.
+
 Rendering builds support screenshots, scroll-aware layout, CDP screencasting
 and raster PDF export. Rendering and the optional transport feature are selected
 independently; see [Installation](Installation.md) for all four configurations.

@@ -7016,12 +7016,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn string_interval_handler_repeats_and_can_clear_itself() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        rt.evaluate("globalThis.__ticks=0").unwrap();
+        rt.evaluate("globalThis.__ticks=0;globalThis.__intervalDone=new Promise(resolve=>{globalThis.__intervalResolve=resolve;});null").unwrap();
         rt.evaluate(
-            "globalThis.__timerId=setInterval('__ticks++;if(__ticks===2)clearInterval(__timerId)',1)",
+            "globalThis.__timerId=setInterval('__ticks++;if(__ticks===2){clearInterval(__timerId);__intervalResolve();}',1)",
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        // Cross subsequent 1 ms timer deadlines so an uncancelled third tick is observable.
+        rt.evaluate_for_cdp("__intervalDone.then(() => new Promise(resolve => setTimeout(() => setTimeout(resolve, 1), 1)))", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate("globalThis.__ticks").unwrap(),
             serde_json::json!(2.0)
@@ -8217,6 +8219,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(path, serde_json::json!("/dashboard"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_navigates_to_a_fragment_in_the_same_document() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#tab'>tab</a></body></html>");
+        rt.execute_script(
+            "fragment-navigation",
+            r#"
+                globalThis.__events = [];
+                addEventListener('hashchange', (e) => __events.push(e.oldURL + ' -> ' + e.newURL));
+                globalThis.__marker = 'same-document';
+                location.hash = 'one';
+                globalThis.__syncHash = location.hash;
+                location.hash = '#one';
+                location.href = '#two';
+                document.getElementById('tab').click();
+            "#,
+        )
+        .unwrap();
+        assert_eq!(rt.take_pending_navigation(), None, "a fragment change must not load a new document");
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate("[__syncHash, location.href, history.length, __marker, __events]")
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "#one",
+                "http://example.com/test#tab",
+                4,
+                "same-document",
+                [
+                    "http://example.com/test -> http://example.com/test#one",
+                    "http://example.com/test#one -> http://example.com/test#two",
+                    "http://example.com/test#two -> http://example.com/test#tab",
+                ],
+            ])
+        );
+        rt.evaluate("history.back()").unwrap();
+        assert_eq!(rt.evaluate("location.hash").unwrap(), serde_json::json!("#two"));
+    }
+
+    #[test]
+    fn location_replace_with_a_fragment_replaces_the_history_entry() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate("(function(){ location.replace('#r'); return [location.hash, history.length]; })()")
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["#r", 1]));
+        assert_eq!(rt.take_pending_navigation(), None);
+    }
+
+    #[test]
+    fn location_component_setters_load_the_new_url() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.search = 'q=1'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/test?q=1".into(),
+                method: "GET".into(),
+                body: String::new(),
+                origin_frame_id: 0,
+            }),
+        );
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate("location.pathname = '/other'").unwrap();
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/other".into(),
+                method: "GET".into(),
+                body: String::new(),
+                origin_frame_id: 0,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn location_hash_preserves_leading_hashes_and_ignores_an_unchanged_empty_fragment() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("hash-setter", r#"
+            globalThis.__hashEvents = [];
+            addEventListener('hashchange', e => __hashEvents.push([e.oldURL, e.newURL]));
+            location.hash = '';
+            location.hash = '#';
+            globalThis.__emptyHashResult = [location.href, history.length];
+            location.hash = '##panel';
+            location.hash = '##panel';
+        "#).unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[__emptyHashResult, location.href, location.hash, history.length, __hashEvents]").unwrap(),
+            serde_json::json!([
+                ["http://example.com/test", 1],
+                "http://example.com/test##panel", "##panel", 2,
+                [["http://example.com/test", "http://example.com/test##panel"]],
+            ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_fragment_navigation_preserves_history_state() {
+        let mut rt = setup_runtime("<html><body><a id=tab href='#panel'>tab</a></body></html>");
+        rt.execute_script("same-fragment", r#"
+            history.replaceState({saved: 1}, '', '#panel');
+            globalThis.__sameHashEvents = 0;
+            addEventListener('hashchange', () => __sameHashEvents++);
+            location.assign('#panel');
+            location.href = '#panel';
+            location.replace('#panel');
+            document.getElementById('tab').click();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(rt.evaluate("[history.state, history.length, location.hash, __sameHashEvents]").unwrap(),
+            serde_json::json!([{ "saved": 1 }, 1, "#panel", 0]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_hashchange_from_main_world_preserves_urls_and_brand_in_isolated_world() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let world_id = rt.ensure_isolated_world(0, "fragment-events", false).unwrap();
+        let world = CdpExecutionWorld { frame_id: 0, world_id: Some(world_id) };
+        rt.evaluate_in_cdp_frame(world, r#"
+            globalThis.receivedHashChanges = [];
+            addEventListener('hashchange', event => receivedHashChanges.push([
+                event instanceof HashChangeEvent, event.oldURL, event.newURL,
+            ]));
+        "#).unwrap();
+        rt.evaluate("location.hash = 'from-main'").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(
+            rt.evaluate_in_cdp_frame(world, "receivedHashChanges").unwrap(),
+            serde_json::json!([[
+                true, "http://example.com/test", "http://example.com/test#from-main",
+            ]]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_hashchange_from_isolated_world_preserves_urls_and_brand_in_main_world() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let world_id = rt.ensure_isolated_world(0, "fragment-events", false).unwrap();
+        let world = CdpExecutionWorld { frame_id: 0, world_id: Some(world_id) };
+        rt.execute_script("receive-isolated-hashchange", r#"
+            globalThis.receivedHashChanges = [];
+            addEventListener('hashchange', event => receivedHashChanges.push([
+                event instanceof HashChangeEvent, event.oldURL, event.newURL,
+            ]));
+        "#).unwrap();
+        rt.evaluate_in_cdp_frame(world, "location.hash = 'from-isolated'").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.take_pending_navigation(), None);
+        assert_eq!(
+            rt.evaluate("receivedHashChanges").unwrap(),
+            serde_json::json!([[
+                true, "http://example.com/test", "http://example.com/test#from-isolated",
+            ]]),
+        );
     }
 
     #[test]
@@ -10687,6 +10849,130 @@ mod tests {
     }
 
     #[test]
+    fn list_element_brands_survive_parsing_creation_and_cloning() {
+        let mut rt = setup_runtime("<html><body><ol><li>item</li></ol></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            return [['ol', HTMLOListElement], ['li', HTMLLIElement]].map(([tag, C]) => {
+                const parsed = document.querySelector(tag);
+                const created = document.createElement(tag);
+                const nodes = [parsed, created, parsed.cloneNode(true), created.cloneNode(),
+                    document.importNode(parsed, true)];
+                return [nodes.map(node => node instanceof C && node instanceof HTMLElement
+                    && node.constructor === C), Object.prototype.toString.call(created),
+                    [document.createElement('div'), document.createElement('ul'),
+                        document.createElementNS('urn:test', tag),
+                        document.createElementNS('urn:test', tag.toUpperCase()).cloneNode(),
+                        document.createElementNS('http://www.w3.org/2000/svg', tag)]
+                        .map(node => node instanceof C)];
+            });
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[true, true, true, true, true], "[object HTMLOListElement]",
+                [false, false, false, false, false]],
+            [[true, true, true, true, true], "[object HTMLLIElement]",
+                [false, false, false, false, false]]
+        ]));
+    }
+
+    #[test]
+    fn list_element_constructors_reject_direct_construction_without_breaking_dom_factories() {
+        let mut rt = setup_runtime("<html><body><ol><li>item</li></ol></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            return [['ol', HTMLOListElement], ['li', HTMLLIElement]].map(([tag, C]) => {
+                let construction;
+                try { new C(); construction = 'accepted'; }
+                catch (error) { construction = error instanceof TypeError ? error.name : 'unexpected error'; }
+                const parsed = document.querySelector(tag);
+                const created = document.createElement(tag);
+                const nodes = [parsed, created, parsed.cloneNode(true), created.cloneNode()];
+                return [construction, nodes.map(node => {
+                    node.setAttribute('data-factory', 'native-element');
+                    return node instanceof C && node instanceof HTMLElement && node.constructor === C
+                        && node.nodeType === 1 && node.localName === tag && node.ownerDocument === document
+                        && node.getAttribute('data-factory') === 'native-element';
+                })];
+            });
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            ["TypeError", [true, true, true, true]],
+            ["TypeError", [true, true, true, true]],
+        ]));
+    }
+
+    #[test]
+    fn list_element_properties_reflect_boolean_and_string_attributes() {
+        let mut rt = setup_runtime(
+            "<html><body><ol reversed start='-2' type='A'><li value='-4'>item</li></ol></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const parsed = document.querySelector('ol');
+            const list = document.createElement('ol');
+            const initial = [parsed.reversed, parsed.start, parsed.type,
+                document.querySelector('li').value, list.reversed, list.start, list.type];
+            const states = [];
+            list.reversed = true;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.reversed = false;
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.setAttribute('reversed', 'false');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.removeAttribute('reversed');
+            states.push([list.reversed, list.getAttribute('reversed')]);
+            list.type = 'i';
+            const written = [list.type, list.getAttribute('type')];
+            list.setAttribute('type', 'invalid');
+            const changed = list.type;
+            list.removeAttribute('type');
+            const removed = list.type;
+            list.type = null;
+            return [initial, states, written, changed, removed, list.getAttribute('type'),
+                'reversed' in document.createElement('div'),
+                'start' in document.createElement('li'),
+                ['reversed', 'start', 'type'].every(name =>
+                    Object.getOwnPropertyDescriptor(HTMLOListElement.prototype, name)?.enumerable),
+                Object.getOwnPropertyDescriptor(HTMLLIElement.prototype, 'value')?.enumerable];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, -2, "A", -4, false, 1, ""],
+            [[true, ""], [false, null], [true, "false"], [false, null]],
+            ["i", "i"], "invalid", "", "null", false, false,
+            true, true
+        ]));
+    }
+
+    #[test]
+    fn list_element_integer_reflection_defaults_parses_and_wraps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const list = document.createElement('ol');
+            const item = document.createElement('li');
+            const attributes = [null, '', 'invalid', '  +12tail', '-3.8',
+                '2147483648', '-2147483649', '99999999999999999999', '0x10'].map(value => {
+                if (value === null) { list.removeAttribute('start'); item.removeAttribute('value'); }
+                else { list.setAttribute('start', value); item.setAttribute('value', value); }
+                return [list.start, item.value];
+            });
+            const setters = [4294967297, 2147483648, -2147483649, NaN, Infinity,
+                -0, 3.8, null].map(value => {
+                list.start = value;
+                item.value = value;
+                return [list.start, list.getAttribute('start'), item.value, item.getAttribute('value')];
+            });
+            const bigints = [[list, 'start'], [item, 'value'], [list, 'tabIndex']].map(([node, key]) => {
+                try { node[key] = 1n; return 'accepted'; } catch (error) { return error.name; }
+            });
+            return [attributes, setters, bigints];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[1, 0], [1, 0], [1, 0], [12, 12], [-3, -3], [1, 0], [1, 0], [1, 0], [0, 0]],
+            [[1, "1", 1, "1"], [-2147483648i64, "-2147483648", -2147483648i64, "-2147483648"],
+                [2147483647, "2147483647", 2147483647, "2147483647"], [0, "0", 0, "0"],
+                [0, "0", 0, "0"], [0, "0", 0, "0"], [3, "3", 3, "3"], [0, "0", 0, "0"]],
+            ["TypeError", "TypeError", "TypeError"]
+        ]));
+    }
+
+    #[test]
     fn meta_http_equiv_reflection_supports_snapshot_csp_filtering() {
         let mut rt = setup_runtime(
             r#"<html><head><meta id="plain" charset="utf-8">
@@ -11789,12 +12075,14 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
             "task-crossing-observation-deadline",
-            "globalThis.__longTaskCompleted = false;\
-             setTimeout(() => {\
+            "globalThis.__longTaskStarted = false;\
+             globalThis.__longTaskCompleted = false;\
+             scheduler.postTask(() => {\
+               __longTaskStarted = true;\
                const end = performance.now() + 600;\
                while (performance.now() < end) {}\
                __longTaskCompleted = true;\
-             }, 0);",
+             });",
         )
         .unwrap();
 
@@ -11802,15 +12090,17 @@ mod tests {
         rt.run_event_loop_bounded(20).await.unwrap();
         let elapsed = started.elapsed();
 
+        assert_eq!(rt.evaluate("globalThis.__longTaskStarted").unwrap(), serde_json::json!(true),
+            "the ready native posted task was not admitted before observation expired");
+        assert_eq!(
+            rt.evaluate("globalThis.__longTaskCompleted").unwrap(),
+            serde_json::json!(true),
+            "a screenshot/readiness deadline must not interrupt an admitted task",
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(500)
                 && elapsed < std::time::Duration::from_millis(1_500),
             "capture must wait for the active task boundary without becoming unbounded: {elapsed:?}",
-        );
-        assert_eq!(
-            rt.evaluate("globalThis.__longTaskCompleted").unwrap(),
-            serde_json::json!(true),
-            "a screenshot/readiness deadline must not terminate valid page work",
         );
     }
 
@@ -11819,12 +12109,14 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(
             "adaptive-task-crossing-observation-deadline",
-            "globalThis.__adaptiveLongTaskCompleted = false;\
-             setTimeout(() => {\
+            "globalThis.__adaptiveLongTaskStarted = false;\
+             globalThis.__adaptiveLongTaskCompleted = false;\
+             scheduler.postTask(() => {\
+               __adaptiveLongTaskStarted = true;\
                const end = performance.now() + 600;\
                while (performance.now() < end) {}\
                __adaptiveLongTaskCompleted = true;\
-             }, 0);",
+             });",
         )
         .unwrap();
 
@@ -11832,16 +12124,18 @@ mod tests {
         rt.run_event_loop_until_quiescent(20, 10).await.unwrap();
         let elapsed = started.elapsed();
 
-        assert!(
-            elapsed >= std::time::Duration::from_millis(500)
-                && elapsed < std::time::Duration::from_millis(1_500),
-            "adaptive settle must wait for the active task boundary: {elapsed:?}",
-        );
+        assert_eq!(rt.evaluate("globalThis.__adaptiveLongTaskStarted").unwrap(), serde_json::json!(true),
+            "the ready native posted task was not admitted before adaptive observation expired");
         assert_eq!(
             rt.evaluate("globalThis.__adaptiveLongTaskCompleted")
                 .unwrap(),
             serde_json::json!(true),
-            "adaptive readiness must not terminate valid page work",
+            "adaptive readiness must not interrupt an admitted task",
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500)
+                && elapsed < std::time::Duration::from_millis(1_500),
+            "adaptive settle must wait for the active task boundary: {elapsed:?}",
         );
     }
 
@@ -12374,10 +12668,14 @@ mod tests {
             r#"
                 globalThis.__sameFrameOrder = [];
                 globalThis.__sameFrameInitial = false;
+                globalThis.__sameFrameInitialDone = new Promise(resolve => {
+                    globalThis.__sameFrameInitialResolve = resolve;
+                });
                 const target = document.getElementById("target");
                 globalThis.__sameFrameObserver = new IntersectionObserver(entries => {
                     if (!__sameFrameInitial) {
                         __sameFrameInitial = true;
+                        __sameFrameInitialResolve();
                         return;
                     }
                     if (entries.some(entry => entry.isIntersecting)) {
@@ -12388,20 +12686,25 @@ mod tests {
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(50).await.unwrap();
+        rt.evaluate_for_cdp("__sameFrameInitialDone", true, true).await.unwrap();
 
         rt.execute_script(
             "mutate-in-animation-frame",
             r#"
-                requestAnimationFrame(() => {
-                    __sameFrameOrder.push("raf");
-                    document.getElementById("spacer").style.height = "0px";
-                    requestAnimationFrame(() => __sameFrameOrder.push("next-raf"));
+                globalThis.__sameFrameDone = new Promise(resolve => {
+                    requestAnimationFrame(() => {
+                        __sameFrameOrder.push("raf");
+                        document.getElementById("spacer").style.height = "0px";
+                        requestAnimationFrame(() => {
+                            __sameFrameOrder.push("next-raf");
+                            resolve();
+                        });
+                    });
                 });
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(80).await.unwrap();
+        rt.evaluate_for_cdp("__sameFrameDone", true, true).await.unwrap();
 
         assert_eq!(
             rt.evaluate("__sameFrameOrder").unwrap(),
@@ -12442,6 +12745,7 @@ mod tests {
             "animation-frame-yield",
             r#"
                 globalThis.__rafOrder = [];
+                globalThis.__rafDone = new Promise(resolve => { globalThis.__rafResolve = resolve; });
                 let frameId = 0;
                 function frame() {
                     __rafOrder.push("raf");
@@ -12450,6 +12754,7 @@ mod tests {
                         __rafOrder.push("timer");
                         cancelAnimationFrame(frameId);
                         __rafOrder.push("cancelled");
+                        __rafResolve();
                     }, 1);
                 }
                 frameId = requestAnimationFrame(frame);
@@ -12457,7 +12762,9 @@ mod tests {
         )
         .unwrap();
 
-        rt.run_event_loop_bounded(100).await.unwrap();
+        // Cross the rendering opportunity at which an uncancelled callback would run.
+        rt.evaluate_for_cdp("__rafDone.then(() => new Promise(resolve => requestAnimationFrame(resolve)))", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate("__rafOrder").unwrap(),
             serde_json::json!(["raf", "timer", "cancelled"]),
@@ -15991,6 +16298,7 @@ mod tests {
             "resize-observer-boxes",
             r#"
                 globalThis.__resizeRecords = [];
+                globalThis.__resizeDelivered = new Promise(resolve => { globalThis.__resizeResolve = resolve; });
                 globalThis.__resizeObserver = new ResizeObserver(entries => {
                     __resizeRecords.push(...entries.map(entry => ({
                         interfaces: [
@@ -16016,12 +16324,13 @@ mod tests {
                             entry.devicePixelContentBoxSize[0].blockSize,
                         ],
                     })));
+                    __resizeResolve();
                 });
                 __resizeObserver.observe(document.getElementById("target"));
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("__resizeDelivered", true, true).await.unwrap();
         assert_eq!(
             rt.evaluate("__resizeRecords").unwrap(),
             serde_json::json!([{
@@ -16037,15 +16346,19 @@ mod tests {
         // observed geometry must not produce a speculative notification.
         rt.evaluate(r#"document.getElementById("target").style.color = "red""#)
             .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp(
+            "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+            true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("__resizeRecords.length").unwrap().as_f64(),
             Some(1.0)
         );
 
-        rt.evaluate(r#"document.getElementById("target").style.width = "140px""#)
+        rt.evaluate(r#"globalThis.__resizeDelivered = new Promise(resolve => { __resizeResolve = resolve; });
+            document.getElementById("target").style.width = "140px"; null"#)
             .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("__resizeDelivered", true, true).await.unwrap();
         assert_eq!(
             rt.evaluate("__resizeRecords.map(record => [record.content[0], record.border[0]])")
             .unwrap(),
@@ -16178,27 +16491,35 @@ mod tests {
             r#"
                 globalThis.__contentWidths = [];
                 globalThis.__borderWidths = [];
+                globalThis.__contentDelivered = new Promise(resolve => { globalThis.__contentResolve = resolve; });
+                globalThis.__borderDelivered = new Promise(resolve => { globalThis.__borderResolve = resolve; });
                 const target = document.getElementById("target");
                 globalThis.__contentObserver = new ResizeObserver(entries => {
                     __contentWidths.push(entries[0].contentBoxSize[0].inlineSize);
+                    __contentResolve();
                 });
                 globalThis.__borderObserver = new ResizeObserver(entries => {
                     __borderWidths.push(entries[0].borderBoxSize[0].inlineSize);
+                    __borderResolve();
                 });
                 __contentObserver.observe(target, { box: "content-box" });
                 __borderObserver.observe(target, { box: "border-box" });
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("Promise.all([__contentDelivered, __borderDelivered])", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
             serde_json::json!([[88], [100]])
         );
 
         // A viewport update is a rendering update even without a DOM mutation.
+        rt.evaluate(r#"globalThis.__contentDelivered = new Promise(resolve => { __contentResolve = resolve; });
+            globalThis.__borderDelivered = new Promise(resolve => { __borderResolve = resolve; }); null"#).unwrap();
         rt.set_viewport(300.0, 100.0);
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("Promise.all([__contentDelivered, __borderDelivered])", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
             serde_json::json!([[88, 138], [100, 150]])
@@ -16206,9 +16527,13 @@ mod tests {
 
         // With border-box sizing a thicker border shrinks the content box but
         // leaves the selected border box unchanged.
-        rt.evaluate(r#"document.getElementById("target").style.borderWidth = "4px""#)
+        rt.evaluate(r#"globalThis.__contentDelivered = new Promise(resolve => { __contentResolve = resolve; });
+            document.getElementById("target").style.borderWidth = "4px"; null"#)
             .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp(
+            "__contentDelivered.then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))",
+            true, true,
+        ).await.unwrap();
         assert_eq!(
             rt.evaluate("[__contentWidths, __borderWidths]").unwrap(),
             serde_json::json!([[88, 138, 134], [100, 150]])
@@ -16328,9 +16653,11 @@ mod tests {
             r#"
                 globalThis.__resizeCallbacks = 0;
                 globalThis.__resizeLoopErrors = 0;
+                globalThis.__resizeCycleDone = new Promise(resolve => { globalThis.__resizeCycleResolve = resolve; });
                 addEventListener("error", event => {
                     if (event.message === "ResizeObserver loop completed with undelivered notifications.") {
                         __resizeLoopErrors++;
+                        __resizeCycleResolve();
                     }
                 });
                 const target = document.getElementById("target");
@@ -16342,7 +16669,9 @@ mod tests {
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        // Cross the 16 ms render-rearm deadline without requesting new rendering work.
+        rt.evaluate_for_cdp("__resizeCycleDone.then(() => new Promise(resolve => setTimeout(resolve, 32)))", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate(
                 "[__resizeCallbacks, __resizeLoopErrors, __obscura_nextPendingTimeoutDelay()]"
@@ -16353,9 +16682,11 @@ mod tests {
 
         // A later external rendering change starts a fresh bounded cycle; the
         // suppressed same-depth observation did not poison future delivery.
-        rt.evaluate(r#"document.getElementById("target").style.width = "60px""#)
+        rt.evaluate(r#"globalThis.__resizeCycleDone = new Promise(resolve => { __resizeCycleResolve = resolve; });
+            document.getElementById("target").style.width = "60px"; null"#)
             .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("__resizeCycleDone.then(() => new Promise(resolve => setTimeout(resolve, 32)))", true, true)
+            .await.unwrap();
         assert_eq!(
             rt.evaluate("[__resizeCallbacks, __resizeLoopErrors]")
                 .unwrap(),
@@ -17073,19 +17404,22 @@ mod tests {
             "intersection-root-scroll",
             r#"
                 globalThis.__rootScrollIoRecords = [];
+                globalThis.__rootScrollIoDelivered = new Promise(resolve => { globalThis.__rootScrollIoResolve = resolve; });
                 globalThis.__rootScrollIo = new IntersectionObserver(entries => {
                     __rootScrollIoRecords.push(...entries.map(entry => [
                         entry.isIntersecting,
                         Math.round(entry.boundingClientRect.top),
                     ]));
+                    __rootScrollIoResolve();
                 });
                 __rootScrollIo.observe(document.getElementById("target"));
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
-        rt.evaluate("window.scrollTo(0, 100)").unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+        rt.evaluate_for_cdp("__rootScrollIoDelivered", true, true).await.unwrap();
+        rt.evaluate(r#"globalThis.__rootScrollIoDelivered = new Promise(resolve => { __rootScrollIoResolve = resolve; });
+            window.scrollTo(0, 100); null"#).unwrap();
+        rt.evaluate_for_cdp("__rootScrollIoDelivered", true, true).await.unwrap();
         assert_eq!(
             rt.evaluate("__rootScrollIoRecords").unwrap(),
             serde_json::json!([[false, 150], [true, 50]])
@@ -17231,18 +17565,30 @@ mod tests {
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
 
-        rt.evaluate("window.scrollTo(0, 250)").unwrap();
-        rt.run_event_loop_bounded(20).await.unwrap();
+        rt.evaluate_for_cdp(r#"(async () => {
+            const delivered = Promise.all([
+                new Promise(resolve => window.addEventListener('scroll', resolve, {once:true})),
+                new Promise(resolve => document.addEventListener('scroll', resolve, {once:true})),
+            ]);
+            window.scrollTo(0, 250);
+            await delivered;
+        })()"#, true, true).await.unwrap();
         let no_op = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
+                (async () => {
                     let win = 0, doc = 0;
-                    window.addEventListener("scroll", () => win++);
-                    document.addEventListener("scroll", () => doc++);
+                    const onWindowScroll = () => win++;
+                    const onDocumentScroll = () => doc++;
+                    window.addEventListener("scroll", onWindowScroll);
+                    document.addEventListener("scroll", onDocumentScroll);
                     document.getElementById("target").scrollIntoView({ block: "nearest" });
-                    setTimeout(() => resolve([win, doc, scrollY]), 5);
-                })
+                    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    await scheduler.postTask(() => null);
+                    window.removeEventListener("scroll", onWindowScroll);
+                    document.removeEventListener("scroll", onDocumentScroll);
+                    return [win, doc, scrollY];
+                })()
                 "#,
                 true,
                 true,
@@ -17251,18 +17597,32 @@ mod tests {
             .unwrap();
         assert_eq!(no_op.value.unwrap(), serde_json::json!([0, 0, 250]));
 
-        rt.evaluate("window.scrollTo(0, 0)").unwrap();
-        rt.run_event_loop_bounded(20).await.unwrap();
+        rt.evaluate_for_cdp(r#"(async () => {
+            const delivered = Promise.all([
+                new Promise(resolve => window.addEventListener('scroll', resolve, {once:true})),
+                new Promise(resolve => document.addEventListener('scroll', resolve, {once:true})),
+            ]);
+            window.scrollTo(0, 0);
+            await delivered;
+        })()"#, true, true).await.unwrap();
         let moved = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
-                    let win = 0, doc = 0;
-                    window.addEventListener("scroll", () => win++);
-                    document.addEventListener("scroll", () => doc++);
+                (async () => {
+                    let win = 0, doc = 0, finish;
+                    const delivered = new Promise(resolve => { finish = resolve; });
+                    const onWindowScroll = () => { win++; if (doc) finish(); };
+                    const onDocumentScroll = () => { doc++; if (win) finish(); };
+                    window.addEventListener("scroll", onWindowScroll);
+                    document.addEventListener("scroll", onDocumentScroll);
                     document.getElementById("target").scrollIntoView({ block: "center" });
-                    setTimeout(() => resolve([win, doc, scrollY]), 5);
-                })
+                    await delivered;
+                    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    await scheduler.postTask(() => null);
+                    window.removeEventListener("scroll", onWindowScroll);
+                    document.removeEventListener("scroll", onDocumentScroll);
+                    return [win, doc, scrollY];
+                })()
                 "#,
                 true,
                 true,
@@ -20642,22 +21002,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_promise_wait_yields_to_other_tasks() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-
         let mut rt = setup_runtime("<html><body></body></html>");
-        let turns = Arc::new(AtomicUsize::new(0));
-        let observed = turns.clone();
-        let heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                observed.fetch_add(1, Ordering::Relaxed);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let mut sibling = tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            pending_rx.await.unwrap();
+            let mut passes = 0;
+            for _ in 0..2 {
+                tokio::task::yield_now().await;
+                passes += 1;
             }
+            passes
         });
-        tokio::task::yield_now().await;
-        assert!(!rt.resolve_promises_until(|_| false, 80).await);
-        heartbeat.abort();
-        assert!(turns.load(Ordering::Relaxed) > 1,
-            "an idle promise wait must yield instead of spinning until its deadline");
+        ready_rx.await.unwrap();
+        let mut wait = std::pin::pin!(rt.resolve_promises_until(|_| false, 80));
+        let first_poll = std::future::poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending(), "the unresolved wait must become pending before releasing its sibling");
+        pending_tx.send(()).unwrap();
+        let passes = tokio::select! {
+            result = &mut wait => panic!("the promise wait finished before its runnable sibling acknowledged two passes: {result}"),
+            result = &mut sibling => result.unwrap(),
+        };
+        assert_eq!(passes, 2, "an idle promise wait must allow multiple sibling scheduler passes while pending");
+        assert!(!wait.await);
     }
 
     #[tokio::test(flavor = "current_thread")]
