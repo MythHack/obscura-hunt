@@ -42,7 +42,7 @@ pub const DENO_SNAPSHOT_FORMAT: u32 = 2;
 
 /// V8 release the native Window headers and callback table were compiled
 /// against. `V8::get_version()` may append build metadata after a `-`.
-pub const LINKED_V8_VERSION: &str = "15.0.245.2";
+pub const LINKED_V8_VERSION: &str = "15.2.124.1";
 
 const SIDECAR_MAX_BYTES: u64 = 64 * 1024;
 
@@ -127,7 +127,7 @@ pub fn ensure_v8_version(version: &str) -> Result<(), String> {
     if version.split('-').next() != Some(LINKED_V8_VERSION) {
         return Err(format!(
             "linked V8 {version} does not match the native Window headers for V8 \
-             {LINKED_V8_VERSION}; refresh crates/obscura-js/native/v8-{LINKED_V8_VERSION} \
+             {LINKED_V8_VERSION}; refresh crates/obscura-js/native/v8-152.2.0 \
              and the obscura-v8-native callback table before generating snapshots"
         ));
     }

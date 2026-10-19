@@ -382,7 +382,7 @@ pub struct ObscuraJsRuntime {
 /// `OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI`; the linked helper reports the value it
 /// was actually compiled with. A missing env is a compile-time failure, not a
 /// silent fallback. Bits: 0 pointer compression, 1 31-bit Smis, 2 sandbox,
-/// 3 shared cage, 8..15 `sizeof(void*)`.
+/// 3 shared cage, 4 cppgc microtask queue, 8..15 `sizeof(void*)`.
 fn verify_native_window_abi() {
     let expected: u32 = match env!("OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI").parse() {
         Ok(value) => value,
@@ -393,7 +393,7 @@ fn verify_native_window_abi() {
     let actual = obscura_v8_native::native_window_abi();
     if actual != expected {
         panic!(
-            "native WindowProxy ABI mismatch: snapshot requires {expected:#010x}, linked helper reports {actual:#010x} (pointer compression bit0, 31-bit Smis bit1, sandbox bit2, shared cage bit3, sizeof(void*) bits 8..15)"
+            "native WindowProxy ABI mismatch: snapshot requires {expected:#010x}, linked helper reports {actual:#010x} (pointer compression bit0, 31-bit Smis bit1, sandbox bit2, shared cage bit3, cppgc microtask queue bit4, sizeof(void*) bits 8..15)"
         );
     }
 }
@@ -439,13 +439,6 @@ fn is_cdp_unserializable_value(value: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-// ICU symbols keep their major-version suffix in the statically linked V8.
-#[cfg(windows)]
-unsafe extern "C" {
-    #[link_name = "ucal_setDefaultTimeZone_77"]
-    fn ucal_setDefaultTimeZone(zone: *const u16, status: *mut i32);
-}
-
 /// Pin the process timezone before the first isolate is created.
 ///
 /// V8's Date and Intl read their zone from ICU, which on Windows does not
@@ -466,12 +459,8 @@ fn configure_process_timezone() -> bool {
             unsafe { std::env::set_var("TZ", &zone) };
         }
         #[cfg(windows)]
-        {
-            let mut utf16: Vec<u16> = zone.encode_utf16().collect();
-            utf16.push(0);
-            let mut status: i32 = 0;
-            unsafe { ucal_setDefaultTimeZone(utf16.as_ptr(), &mut status) };
-            if status > 0 { return false; }
+        if !v8::icu::set_default_time_zone(&zone) {
+            return false;
         }
         true
     });

@@ -7,6 +7,11 @@ The main dependency of this crate is
 [rusty_v8](https://github.com/denoland/rusty_v8), which provides the V8-Rust
 bindings.
 
+This vendored copy targets raw V8 152.2.0. Its startup flags omit the removed
+`--no-validate-asm`: V8 stops parsing at that flag and ignores the remaining
+options, including `--enable-queue-microtask`. Retaining the supported flags
+keeps the shared core wrapper on V8's native microtask queue.
+
 This Rust crate contains the essential V8 bindings for Deno's command-line
 interface (Deno CLI). The main abstraction here is the JsRuntime which provides
 a way to execute JavaScript.

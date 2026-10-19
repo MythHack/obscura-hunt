@@ -20,6 +20,8 @@ const TREES: &[&str] = &[
     // The patched deno_core fork owns snapshot serialization, the sidecar
     // format, and the extension/external-reference encoding.
     "vendor/deno_core-0.412.0",
+    // The deno_v8 facade pins the raw V8 dependency and re-exports its API.
+    "vendor/deno_v8-0.4.0",
     // The authoritative V8 headers and the native callback table source.
     "crates/obscura-js/native",
     // The runtime consumer's extension/order/index assumptions and ops source.

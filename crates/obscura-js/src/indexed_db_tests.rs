@@ -72,6 +72,74 @@ async fn indexeddb_abort_rolls_back_and_readonly_writes_throw() {
 }
 
 #[tokio::test]
+async fn indexeddb_committed_record_survives_later_abort_and_document_replacement() {
+    let storage = std::sync::Arc::new(crate::indexed_db::IndexedDbStorage::default());
+    let setup = |storage| {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(obscura_dom::parse_html("<!doctype html><body></body>"));
+        rt.set_url("https://idb.test/");
+        rt.set_indexed_db(storage);
+        rt.run_page_init();
+        rt
+    };
+    let mut first = setup(storage.clone());
+    first.execute_script("commit-then-abort", r#"
+        globalThis.idbResult = null;
+        (async () => {
+            const request = indexedDB.open('commit-then-abort',1);
+            request.onupgradeneeded = () => request.result.createObjectStore('items');
+            const db = await new Promise((resolve,reject) => {
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+            const finished = tx => new Promise(resolve => {
+                tx.oncomplete = () => resolve({state:'complete',error:null});
+                tx.onabort = () => resolve({state:'abort',error:tx.error && {name:tx.error.name,message:tx.error.message}});
+            });
+            const read = key => new Promise((resolve,reject) => {
+                const request = db.transaction('items').objectStore('items').get(key);
+                request.onsuccess = () => resolve(request.result === undefined ? null : request.result);
+                request.onerror = () => reject(request.error);
+            });
+            const commitTx = db.transaction('items','readwrite'), committed = finished(commitTx);
+            commitTx.objectStore('items').put('kept','alpha');
+            const commitResult = await committed;
+            const abortTx = db.transaction('items','readwrite'), aborted = finished(abortTx);
+            abortTx.objectStore('items').put('gone','beta');
+            abortTx.abort();
+            return {committed:commitResult,aborted:await aborted,value:await read('alpha'),gone:await read('beta')};
+        })().then(value => idbResult = value,error => idbResult = {error:error.name,message:error.message});
+    "#).unwrap();
+    first.run_event_loop_bounded(1000).await.unwrap();
+    assert_eq!(first.evaluate("idbResult").unwrap(), json!({
+        "committed":{"state":"complete","error":null},
+        "aborted":{"state":"abort","error":null},
+        "value":"kept","gone":null
+    }));
+    drop(first);
+
+    let mut second = setup(storage);
+    second.execute_script("read-after-document-replacement", r#"
+        globalThis.idbResult = null;
+        (async () => {
+            const request = indexedDB.open('commit-then-abort',1);
+            const db = await new Promise((resolve,reject) => {
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+            const read = key => new Promise((resolve,reject) => {
+                const request = db.transaction('items').objectStore('items').get(key);
+                request.onsuccess = () => resolve(request.result === undefined ? null : request.result);
+                request.onerror = () => reject(request.error);
+            });
+            return {value:await read('alpha'),gone:await read('beta')};
+        })().then(value => idbResult = value,error => idbResult = {error:error.name,message:error.message});
+    "#).unwrap();
+    second.run_event_loop_bounded(1000).await.unwrap();
+    assert_eq!(second.evaluate("idbResult").unwrap(), json!({"value":"kept","gone":null}));
+}
+
+#[tokio::test]
 async fn indexeddb_values_are_cloned_and_duplicate_add_aborts_atomically() {
     let out = probe(r#"
         const db = await opened('clone');

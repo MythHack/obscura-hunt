@@ -50,7 +50,8 @@ pub const WINDOW_CALLBACK_COUNT: usize = 12;
 
 /// V8 ABI flags compiled into this helper and linked at runtime:
 /// bit 0 pointer compression, bit 1 31-bit Smis, bit 2 sandbox,
-/// bit 3 shared pointer-compression cage, bits 8..15 `sizeof(void*)`.
+/// bit 3 shared pointer-compression cage, bit 4 cppgc-managed microtask queue,
+/// bits 8..15 `sizeof(void*)`.
 pub fn native_window_abi() -> u32 {
     unsafe { obscura_native_window_abi() }
 }

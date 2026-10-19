@@ -10782,6 +10782,117 @@ mod tests {
         (address, seen_rx)
     }
 
+    #[cfg(feature = "render")]
+    struct HeldSvgServer {
+        body_release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(feature = "render")]
+    impl HeldSvgServer {
+        fn release_body(&self) {
+            self.body_release.as_ref().unwrap().send(())
+                .expect("SVG fixture must still be waiting for body release");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    impl Drop for HeldSvgServer {
+        fn drop(&mut self) {
+            drop(self.body_release.take());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Observe requests independently of the current-thread runtime, but send
+    /// no SVG body until the test releases it. Dropping the guard stops the
+    /// listener and closes held responses, including during assertion unwinding.
+    #[cfg(feature = "render")]
+    fn spawn_held_svg_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        HeldSvgServer,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#f00"/></svg>"##;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut held = Vec::<std::net::TcpStream>::new();
+            let mut released = false;
+            while std::time::Instant::now() < deadline {
+                match release_rx.try_recv() {
+                    Ok(()) => released = true,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                if released {
+                    for mut stream in held.drain(..) {
+                        let _ = stream.write_all(body);
+                    }
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_write_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+                        let request_deadline = deadline.min(
+                            std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        );
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n")
+                            && request.len() <= 16_384
+                        {
+                            let remaining = request_deadline.saturating_duration_since(std::time::Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            stream.set_read_timeout(Some(remaining)).unwrap();
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(size) => request.extend_from_slice(&chunk[..size]),
+                            }
+                        }
+                        if request.len() > 16_384
+                            || !request.windows(4).any(|part| part == b"\r\n\r\n")
+                        {
+                            continue;
+                        }
+                        let first = String::from_utf8_lossy(&request)
+                            .lines().next().unwrap_or_default().to_string();
+                        let _ = seen_tx.send(first);
+                        if stream.write_all(response.as_bytes()).is_err() {
+                            continue;
+                        }
+                        if released {
+                            let _ = stream.write_all(body);
+                        } else {
+                            held.push(stream);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (address, seen_rx, HeldSvgServer {
+            body_release: Some(release_tx),
+            thread: Some(thread),
+        })
+    }
+
     /// A page with a transport and one `<img>`, wired the way `init_js` does
     /// it (transport installed on the runtime before page script runs).
     #[cfg(feature = "render")]
@@ -10844,32 +10955,22 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn cache_only_layout_never_blocks_on_a_slow_asset_and_late_bytes_update_geometry() {
-        let (address, seen_rx) = spawn_delayed_svg_server(1_200, 8);
+        let (address, mut seen_rx, server) = spawn_held_svg_server();
         let page_url = format!("http://{address}/page");
         let asset_url = format!("http://{address}/slow.svg");
         let mut page = page_with_transport_and_image("cache-only", &page_url, &asset_url);
-        assert!(
-            !page
-                .js
-                .as_ref()
-                .unwrap()
-                .render_resource_sync_loading_enabled(),
-            "a page-owned runtime must not own a synchronous loader"
-        );
-
-        // Layout must answer from placeholder geometry immediately instead of
-        // fetching the asset on the V8 thread.
-        let started = std::time::Instant::now();
+        // Keep the first layout cold. It must answer while the fixture's body
+        // is held, regardless of unrelated first-layout initialization costs.
         let width = page
             .js
             .as_mut()
             .unwrap()
             .evaluate("document.getElementById('i').getBoundingClientRect().width")
             .unwrap();
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(600),
-            "layout query took {:?} while the asset needs 1.2 s",
-            started.elapsed()
+        assert_eq!(
+            seen_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "cold layout must not open a synchronous asset request"
         );
         // Chromium lays out a not-yet-loaded <img> without size attributes as
         // an empty box; the intrinsic width must not be known yet either way.
@@ -10890,22 +10991,24 @@ mod tests {
         page.queue_pending_render_resources();
         assert!(page.has_pending_render_resources());
         page.queue_pending_render_resources();
-        // The load runs on the runtime, so yield to it instead of blocking the
-        // single test thread on the channel.
-        let mut first_request = None;
-        for _ in 0..40 {
-            if let Ok(line) = seen_rx.try_recv() {
-                first_request = Some(line);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            first_request
-                .as_deref()
-                .is_some_and(|line| line.starts_with("GET /slow.svg ")),
-            "transport request expected, got {first_request:?}"
-        );
+        // Yield to the page transport, then keep its response body held while
+        // querying geometry again. A synchronous asset wait cannot satisfy
+        // these observations before the explicit release below.
+        let first_request = tokio::time::timeout(
+            std::time::Duration::from_secs(2), seen_rx.recv(),
+        ).await.expect("transport request must reach the fixture")
+            .expect("SVG fixture must remain alive");
+        assert!(first_request.starts_with("GET /slow.svg "),
+            "transport request expected, got {first_request:?}");
+        assert!(page.has_pending_render_resources());
+        let held_geometry = page.js.as_mut().unwrap().evaluate(
+            "[document.getElementById('i').getBoundingClientRect().width, document.getElementById('i').naturalWidth]",
+        ).unwrap();
+        assert_eq!(held_geometry[0].as_f64(), width.as_f64(), "held bytes must retain placeholder geometry");
+        assert_eq!(held_geometry[1].as_f64(), Some(0.0));
+        assert_eq!(seen_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "repeated layout must reuse the in-flight page transport request");
+        server.release_body();
 
         // Waiting for the transport (here via the capture warmup) applies the
         // late bytes: cache known, intrinsic size visible to script and layout.

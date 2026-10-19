@@ -58,6 +58,120 @@ the descriptor valid and unchanged until deregistration, and retain the existing
 deregister-before-close or transfer ordering. Registration failures preserve the
 existing UV error-class mapping.
 
+### V8 dependency and snapshot alignment
+
+The current locked family is `deno_core 0.412.0` / `serde_v8 0.321.0` /
+`deno_v8 0.4.0` / raw `v8 152.2.0`, with engine version `15.2.124.1-rusty`.
+The local `deno_v8` patch selects that raw engine for both core and serde;
+the facade's `0.4.0` is not a Deno CLI version. Deno CLI `2.9.7` uses the same
+core/serde/facade family but raw V8 `150.4.0`, not this fork's engine.
+
+Treat an engine upgrade as a single compatibility change across the facade,
+linked archive, `native/v8-152.2.0/include` SDK, C++ shims, build script,
+standalone producer and runtime. The SDK and archive must have matching native
+ABI settings, including pointer compression. In 152, simdutf is built in;
+the Cargo feature is a compatibility no-op, not an archive variant. Remove
+obsolete simdutf-specific archive overrides from external caches and mirrors.
+
+Native builds generate a snapshot inline. To produce an external artifact,
+run this from the fork workspace on the intended target or a compatible runner:
+
+```bash
+cargo run --release --locked -p obscura-js-snapshot -- --out-dir ./target/v8-snapshot
+```
+
+The producer writes `OBSCURA_SNAPSHOT.bin` and `OBSCURA_SNAPSHOT.bin.json`.
+Copy both together to the build machine. For a cross build, use an artifact
+produced for that build's target triple, not the build-script host. Point the
+consumer at its directory with `OBSCURA_SNAPSHOT_DIR`, or at the blob with
+`OBSCURA_SNAPSHOT_BIN`, but do not set both. For example, from the same checkout
+and target configuration:
+
+```bash
+OBSCURA_SNAPSHOT_DIR=./target/v8-snapshot cargo build --release --locked -p obscura-cli --bins --features render
+```
+
+Producer and consumer must use the same dependency resolution, patched source
+trees, bootstrap, native callback schema and effective target configuration.
+Enable the producer's `v8_enable_pointer_compression` feature if the consumer
+uses that configuration. The sidecar validation checks engine version, target,
+native ABI, build/source fingerprints and blob identity; a mismatch is a build
+error, not permission to reuse an old snapshot or substitute stock `mksnapshot`.
+Regenerate artifacts after upgrading from 150.4 to 152.2, and do not edit the
+sidecar to bypass its checks.
+
+For upgrade acceptance, exercise the inline snapshot and standalone producer /
+consumer paths, native Window/related-realm behavior and the existing runtime,
+CDP and CLI gates in each supported build configuration. Engine alignment is
+not itself a passing behavior-test result. External Rust consumers also need
+the [consumer-root patches](Use-as-a-Rust-library.md#add-the-dependency).
+
+#### Upgrade validation (October 19)
+
+V8 152 removes `--no-validate-asm`. Keeping that obsolete leading flag made V8
+ignore later initialization flags, including `--enable-queue-microtask`, and
+caused valid IndexedDB transactions to abort. The core removes only the obsolete
+flag; it does not replace the native microtask queue or mask transaction errors.
+The consumer regression covers a committed record surviving a later transaction
+abort and document replacement. The existing core snapshot test now enters its
+required Tokio runtime before using the foreground-task platform. The render
+resource regression holds a real SVG response body: cold and in-flight layout
+must retain placeholder geometry, make one page-transport request, and update
+to the decoded intrinsic geometry only after body release. It intentionally
+does not use a wall-clock layout threshold, because cold font/layout setup is
+not evidence of a synchronous asset wait.
+
+Local release-mode acceptance uses isolated Windows and WSL Linux build targets:
+
+| Gate | Windows x86_64 | Linux x86_64 |
+| --- | --- | --- |
+| Full `render` workspace nextest | 2494 passed, 5 skipped | 2502 passed, 5 skipped |
+| No-render workspace nextest | 1490 passed, 3 skipped | 1498 passed, 3 skipped |
+| No-render embeddable API nextest | 31 passed | 31 passed |
+| Stealth network nextest | 138 passed | 138 passed |
+| CLI release configurations | All four built | All four built |
+| Layout-only renderer check | Passed | Passed |
+
+The four CLI configurations are `render`, `render,stealth`, no default features,
+and no default features with `stealth`. No-render workspace coverage excludes
+`obscura` and `obscura-render`; the API suite and layout-only check above cover
+those separately without enabling rendering through workspace feature unification.
+The loopback gzip test runs separately with `OBSCURA_ALLOW_PRIVATE_NETWORK=1`;
+the other 137 network tests retain the default private-network policy. The listed
+builds and checks completed without compiler warnings.
+
+Additional exercised paths:
+
+- Windows focused browser/engine nextest: 138 passed. The selected upstream-core
+  runtime, snapshot, inspector, value and op regressions passed 45/45 both with
+  default features and with the matching optional ICU 78 data.
+- Actual CLI/CDP/MCP scenarios: 11/11 in both render transport configurations.
+  Mode-specific MCP input smoke passed in all four CLI configurations.
+- Linux standalone snapshots were generated, consumed and executed in both
+  normal and pointer-compressed builds, including native Window behavior.
+  Wrong engine versions and wrong build fingerprints were both rejected.
+- Date/Intl probes passed six canonical-zone, DST, precedence and fallback cases
+  in both Linux snapshot modes. Windows also passed its existing whitespace
+  normalization behavior. This upgrade does not add Unix timezone normalization.
+- Offline obstacle course: 33/33. All 77 deterministic baseline/candidate render
+  pairs succeeded, were nonblank and were pixel-identical to the 150.4.0 baseline.
+
+The Windows performance comparison uses the tracked
+`scripts/ci/perf_smoke.py` DOM and storage scenarios, identical loopback inputs,
+one warmup and nine alternating baseline/candidate release-process rounds.
+`--wait 0` is used for this latency-only check, not the rendering evidence above.
+Each cell below is minimum / median / maximum; memory is peak working set.
+
+| Scenario | 150.4.0 latency (ms) | 152.2.0 latency (ms) | 150.4.0 memory (MiB) | 152.2.0 memory (MiB) |
+| --- | --- | --- | --- | --- |
+| DOM build | 154.1 / 163.9 / 189.3 | 157.0 / 161.9 / 186.0 | 50.33 / 50.59 / 50.99 | 50.81 / 50.89 / 51.50 |
+| Storage | 55.0 / 56.8 / 60.5 | 55.9 / 57.9 / 62.5 | 39.89 / 39.98 / 40.11 | 40.14 / 40.22 / 40.43 |
+
+No material regression was observed in these two scenarios. The timing changes
+are within the repository's roughly 10% noise floor, not evidence of a general
+engine speedup.
+
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation
@@ -453,8 +567,12 @@ rtk proxy env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p ob
 ```
 
 Then rerun the failing nextest command, which rebuilds its own feature-specific
-snapshot as needed. Do not copy generated snapshots between revisions or
-feature configurations.
+snapshot as needed. If `OBSCURA_SNAPSHOT_BIN` or `OBSCURA_SNAPSHOT_DIR` is set,
+touching the bootstrap does not replace that external artifact: regenerate its
+blob and sidecar with the matching target-native producer, or unset the override
+for an inline native build. Do not copy generated snapshots between engines,
+revisions or feature configurations. See
+[V8 dependency and snapshot alignment](#v8-dependency-and-snapshot-alignment).
 
 ### `Target.createTarget timed out`
 

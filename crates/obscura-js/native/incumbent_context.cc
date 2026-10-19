@@ -1,7 +1,7 @@
-// The include directory is the unmodified v8-isolate.h dependency closure from
-// rusty_v8 150.4.0 (V8 15.0.245.2). See v8-150.4.0/LICENSE for its BSD license.
-// Refresh these headers together with the version guard in build.rs when V8
-// changes. No generated GN header or private engine source is needed here.
+// The include directory contains unmodified public headers from rusty_v8
+// 152.2.0 (V8 15.2.124.1). See v8-152.2.0/LICENSE for its BSD license.
+// Refresh these headers together with the guard in snapshot_generation.rs
+// when V8 changes. No generated GN header or private engine source is needed.
 #include "v8-isolate.h"
 
 // The isolate must be live and entered on its owning thread, with a caller-owned

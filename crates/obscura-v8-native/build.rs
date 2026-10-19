@@ -3,7 +3,7 @@ use std::path::PathBuf;
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let native = manifest.join("../obscura-js/native");
-    let include = native.join("v8-150.4.0/include");
+    let include = native.join("v8-152.2.0/include");
 
     println!("cargo:rerun-if-changed={}", native.join("incumbent_context.cc").display());
     println!("cargo:rerun-if-changed={}", native.join("window_proxy.cc").display());
@@ -16,6 +16,16 @@ fn main() {
         .file(native.join("incumbent_context.cc"))
         .file(native.join("window_proxy.cc"))
         .cpp_link_stdlib(None);
+
+    // Match rusty_v8 152.2.0's .gn defaults and V8's external_config.
+    // MicrotaskQueue is cppgc-managed in the release archive; omitting this
+    // define would declare the old owning factory and a different vtable.
+    build
+        .define("V8_CPPGC_MICROTASK_QUEUE", None)
+        .define("V8_ARRAY_BUFFER_INTERNAL_FIELD_COUNT", "2")
+        .define("V8_ARRAY_BUFFER_VIEW_INTERNAL_FIELD_COUNT", "2")
+        .define("V8_PROMISE_INTERNAL_FIELD_COUNT", "1")
+        .define("V8_USE_DEFAULT_HASHER_SECRET", "0");
 
     // Keep the helper's V8 type layout identical to the archive selected by
     // deno_core's `v8_enable_pointer_compression` feature. The prebuilt V8

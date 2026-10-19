@@ -1,8 +1,8 @@
 ## Requirements
 
-- Rust 1.75+ ([rustup.rs](https://rustup.rs))
-- C compiler (gcc or clang)
-- ~5 GB free disk space (V8 compiles from source on first build)
+- Current stable Rust ([rustup.rs](https://rustup.rs)); the V8 dependency uses Rust 2024
+- C++20 compiler (GCC, Clang, or Visual Studio C++ Build Tools)
+- Several GB of free disk space for native dependencies and release artifacts
 
 Build time depends on the machine and cache state. Cargo reuses unchanged
 dependencies, but a release source edit can still require substantial compilation
@@ -77,6 +77,41 @@ isolate, and navigating or closing one document retires only its module work.
 The original dependency keeps `JsRealm` and `ModuleMap` private, so this integration
 cannot be implemented through its public interface alone. Keep the patch until
 an upstream interface can replace it without losing those browser semantics.
+
+### V8 version, SDK and snapshots
+
+The locked dependency chain is `deno_core 0.412.0` and `serde_v8 0.321.0`, both
+using the `deno_v8 0.4.0` facade. The local facade patch pins the underlying
+`v8` package (rusty_v8) to **exactly `152.2.0`**, whose engine reports
+**V8 `15.2.124.1-rusty`**. `deno_v8 0.4.0` is a Rust facade version, not a Deno CLI
+version. Deno CLI `2.9.7` uses this same core/serde/facade family, but its
+unpatched facade selects rusty_v8 `150.4.0`; installing that CLI does not select
+Obscura's engine.
+
+The core's optional `include_icu_data` feature uses `deno_core_icudata 0.78.0`
+and V8's ICU 78 data-loading API. ICU 77 data must not be paired with this engine.
+
+The native SDK is pinned at `crates/obscura-js/native/v8-152.2.0/include`.
+Its include tree comes unchanged from the official `v8 152.2.0` crate, with the
+V8 license from commit `c4ca1eccb90c5464d826b7713dc27178a53b0cfe` alongside it.
+Keep the SDK, C++ shims, patched facade, build-time V8, standalone snapshot
+producer and runtime consumer aligned on this engine and native ABI, including
+pointer-compression settings. Updating only `Cargo.lock` or only the headers is
+not a supported engine upgrade.
+
+By default rusty_v8 downloads a matching prebuilt archive; building Obscura from
+source does not mean compiling V8 itself. `V8_FROM_SOURCE=1` requests a V8 source
+build. In `152.2.0`, simdutf is always built in: the Cargo `simdutf` feature is a
+compatibility no-op, and archive names no longer vary by simdutf selection.
+Any archive or mirror override must supply the matching `152.2.0` target and ABI,
+not an older cached archive.
+
+Snapshots must be regenerated for this engine. Native builds generate them
+automatically; cross builds require the target-native producer's blob and JSON
+sidecar from the same sources and configuration. See
+[V8 dependency and snapshot alignment](Testing-and-debugging.md#v8-dependency-and-snapshot-alignment).
+Embedded Rust consumers must also select these patches at their own Cargo
+workspace root; see [Add the dependency](Use-as-a-Rust-library.md#add-the-dependency).
 
 Use the scoped `-p obscura-cli --bins` commands above to build `obscura` and
 `obscura-worker`. An unscoped workspace build also builds auxiliary programs such

@@ -344,7 +344,7 @@ fn incumbent_context_local<'s>(scope: &v8::PinScope<'s, '_>)
     // a pointer to Rust's Isolate wrapper, which addresses a pointer holder.
     let raw = unsafe { obscura_v8_incumbent_context(scope.as_raw_isolate_ptr()) };
     let context = std::ptr::NonNull::new(raw.cast_mut())?;
-    // SAFETY: rusty_v8 150.4.0's Local is repr(C), containing NonNull<T>
+    // SAFETY: rusty_v8 152.2.0's Local is repr(C), containing NonNull<T>
     // followed only by PhantomData. The shim returns a V8 local in this
     // scope, without opening a nested HandleScope. Its lifetime cannot escape
     // this scope. A missing context is rejected by the caller.

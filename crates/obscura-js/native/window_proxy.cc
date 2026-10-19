@@ -1072,6 +1072,9 @@ extern "C" uint32_t obscura_native_window_abi() {
 #ifdef V8_COMPRESS_POINTERS_IN_SHARED_CAGE
   flags |= 1u << 3;
 #endif
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+  flags |= 1u << 4;
+#endif
   flags |= static_cast<uint32_t>(sizeof(void*)) << 8;
   return flags;
 }

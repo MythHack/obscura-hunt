@@ -1,19 +1,54 @@
-The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page` / `Element` API plus a cookie store, no CDP round-trips. It builds V8 from source, so it is a git dependency rather than a crates.io release.
+The `obscura` crate embeds the engine in a Rust program with a `Browser` / `Page` / `Element` API plus a cookie store, no CDP round-trips. This fork is used from a source checkout rather than a crates.io release; its native V8 dependency normally uses a prebuilt archive.
 
 ## Add the dependency
 
+Check out this fork next to your consumer project. From their common parent
+directory:
+
+```bash
+git clone https://github.com/MythHack/obscura-hunt.git
+```
+
+With sibling directories `my-app/` and `obscura-hunt/`, put the following in
+`my-app/Cargo.toml`. If `my-app` is a workspace member, put `[patch.crates-io]`
+in the consumer workspace's root `Cargo.toml` instead, and adjust its paths
+relative to that manifest:
+
 ```toml
 [dependencies]
-obscura = { git = "https://github.com/h4ckf0r0day/obscura" }
+obscura = { path = "../obscura-hunt/crates/obscura" }
 tokio = { version = "1", features = ["rt", "macros"] }
 anyhow = "1"
+
+[patch.crates-io]
+deno_core = { path = "../obscura-hunt/vendor/deno_core-0.412.0" }
+deno_v8 = { path = "../obscura-hunt/vendor/deno_v8-0.4.0" }
+taffy = { path = "../obscura-hunt/vendor/taffy" }
+cosmic-text = { path = "../obscura-hunt/vendor/cosmic-text" }
 ```
 
-The first build compiles V8 from source, so it is slow and needs the same build tools as [Build from source](Build-from-source.md). Pin a tag for reproducible builds:
+Cargo ignores patches declared in a dependency's workspace root, including
+when the dependency is fetched through git. Selecting the fork alone therefore
+does not inherit its patches. The consumer root must explicitly select both
+`deno_core` (the browser-realm integration) and `deno_v8` (the facade pinning raw
+`v8` to `=152.2.0`). The `taffy` and `cosmic-text` patches preserve this fork's
+layout and font behavior when `obscura`'s `render` feature is enabled; keep all
+four entries when using rendering. These paths refer to the explicit checkout
+above, not to an assumed `vendor/` directory inside your application or Cargo's
+git cache.
 
-```toml
-obscura = { git = "https://github.com/h4ckf0r0day/obscura", tag = "v0.1.7" }
-```
+The locked engine family is `deno_core 0.412.0`, `serde_v8 0.321.0`,
+`deno_v8 0.4.0` and raw `v8 152.2.0` (V8 `15.2.124.1`). `deno_v8` is a facade,
+not Deno CLI `2.9.7`; that CLI uses the same facade family but raw V8 `150.4.0`.
+Keep the fork checkout at a recorded commit and commit the consumer's own
+`Cargo.lock` with the patched versions selected; the dependency's lockfile does
+not pin your application's resolution. Use the same checkout for the library
+and all four patches.
+
+The first build includes native dependencies and needs the tools described in
+[Build from source](Build-from-source.md). The native SDK, snapshot producer and
+embedded runtime must agree on V8 and its ABI; do not reuse a snapshot from the
+old engine. See [V8 dependency and snapshot alignment](Testing-and-debugging.md#v8-dependency-and-snapshot-alignment).
 
 ## Quickstart
 

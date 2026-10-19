@@ -197,6 +197,13 @@ fn test_snapshot_creator_warmup() {
 #[test]
 fn es_snapshot() {
   let _snapshot_lock = super::snapshot_test_lock();
+  // Compiling this module graph can post delayed V8 foreground tasks, which
+  // require a tokio runtime context when each isolate is created.
+  let tokio = tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap();
+  let _guard = tokio.enter();
   fn create_module(
     runtime: &mut JsRuntime,
     i: usize,
