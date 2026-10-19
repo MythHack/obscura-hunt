@@ -258,10 +258,19 @@ pub mod inline {
             None
         }
 
-        /// Layout-only builds do not load page fonts. Preserve the same
-        /// line-vs-fragment contract with deterministic bundled metrics.
+        /// Layout-only builds do not load page fonts. Preserve the existing
+        /// font-size approximation for fragment boxes.
         pub(crate) fn inline_font_box_height(&self, style: &crate::LayoutStyle) -> f32 {
             style.font_size.unwrap_or(16.0)
+        }
+
+        /// Use the bundled sans fallback's ascent/descent proportions from
+        /// `inline::bundled_face_metrics`, normalized to the layout-only font
+        /// box. CSS line-height and leading remain separate.
+        pub(crate) fn inline_font_box_metrics(&self, style: &crate::LayoutStyle) -> (f32, f32) {
+            let height = self.inline_font_box_height(style);
+            let ascent = height * (1854.0 / (1854.0 + 434.0));
+            (ascent, height - ascent)
         }
 
         pub(crate) fn selected_line_height(&self, style: &crate::LayoutStyle) -> f32 {

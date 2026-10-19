@@ -94,6 +94,16 @@ cargo build --release -p obscura-cli --bins --no-default-features --features ste
 The second command keeps stealth while excluding layout, screenshots,
 screencasting, and PDF export.
 
+The renderer crate separately supports layout without its `paint` feature:
+
+```bash
+cargo check --release -p obscura-render --no-default-features
+```
+
+That layout-only build does not load page fonts. Its ascent/descent proportions
+come from the bundled sans fallback, normalized to the existing one-em font box;
+CSS line-height and leading remain separate. Paint builds use selected-face metrics.
+
 The stealth feature builds BoringSSL and generates Rust bindings. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM
 development libraries. On Ubuntu/Debian:
