@@ -1,9 +1,9 @@
 mod batch;
+mod fonts;
+mod pool;
 
 use std::sync::Arc;
 use std::time::Instant;
-
-mod pool;
 
 use clap::{Parser, Subcommand};
 use obscura_browser::{BrowserContext, Page};
@@ -50,6 +50,21 @@ struct Args {
 
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
+
+    /// Recursively load TTF, TTC, OTF, and OTC files from this directory
+    /// before the first render. Repeat for multiple directories. These fonts
+    /// are added to the system fonts the page can already use.
+    /// Global: applies to fetch, the CDP server, serve, scrape, and mcp.
+    /// Requires a render-enabled build.
+    #[arg(long = "font-dir", value_name = "DIR", global = true)]
+    font_dirs: Vec<std::path::PathBuf>,
+
+    /// Do not load the fonts installed on the operating system. Bundled fonts
+    /// and any `--font-dir` fonts remain available.
+    /// Global: applies to fetch, the CDP server, serve, scrape, and mcp.
+    /// Requires a render-enabled build.
+    #[arg(long = "no-system-fonts", global = true)]
+    no_system_fonts: bool,
 
     /// Permit fetches to loopback, RFC1918, and link-local addresses.
     /// Default is to block them (SSRF fix from #4). Use this for local
@@ -130,11 +145,6 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
-
-        /// Recursively load TTF, TTC, OTF, and OTC files from this directory.
-        /// Repeat for multiple directories. Requires a render-enabled build.
-        #[arg(long = "font-dir", value_name = "DIR")]
-        font_dirs: Vec<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -222,10 +232,6 @@ enum Command {
     },
 
     Mcp {
-        /// Recursively load additional font files before the first render.
-        #[arg(long = "font-dir", value_name = "DIR")]
-        font_dirs: Vec<std::path::PathBuf>,
-
         #[arg(long)]
         http: bool,
 
@@ -302,28 +308,24 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
-fn configure_font_directories(font_dirs: &[std::path::PathBuf]) -> anyhow::Result<()> {
-    if font_dirs.is_empty() {
-        return Ok(());
-    }
+/// Validate and apply the process-wide font policy for one command.
+///
+/// The render layer caches its font database at the first render, so this runs
+/// once in `run_cli`, before any transport starts or page is created. Every
+/// requested directory is validated up front so an explicit bad path fails the
+/// command instead of being silently dropped.
+fn apply_font_policy(
+    font_dirs: &[std::path::PathBuf],
+    no_system_fonts: bool,
+) -> anyhow::Result<()> {
+    fonts::configure(font_dirs, no_system_fonts).map_err(anyhow::Error::msg)?;
     for directory in font_dirs {
-        if !directory.is_dir() {
-            anyhow::bail!(
-                "Font directory does not exist or is not a directory: {}",
-                directory.display()
-            );
-        }
+        tracing::info!("Font dir: {}", directory.display());
     }
-
-    #[cfg(feature = "render")]
-    {
-        if !obscura_js::configure_font_directories(font_dirs.to_vec()) {
-            anyhow::bail!("Font directories must be configured before the first render");
-        }
-        Ok(())
+    if no_system_fonts {
+        tracing::info!("System fonts disabled");
     }
-    #[cfg(not(feature = "render"))]
-    anyhow::bail!("--font-dir requires a render-enabled build")
+    Ok(())
 }
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
@@ -442,12 +444,11 @@ async fn run_cli() -> anyhow::Result<()> {
         return write_build_info();
     }
 
-    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
-    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
-    // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
+    // Select the timezone before the first V8 isolate. The runtime applies it
+    // to native ICU on Windows, where ICU does not read TZ. This keeps Date
+    // and Intl.DateTimeFormat consistent without JavaScript overrides.
+    // Default to Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's
+    // region. An existing TZ from the host is respected.
     // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
     // effectively single threaded here.
     if let Some(tz) = std::env::var("OBSCURA_TIMEZONE")
@@ -472,6 +473,11 @@ async fn run_cli() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Fonts are process-global and cached at the first render. Apply the
+    // policy once before dispatch so fetch, the default CDP server, serve,
+    // mcp, and scrape all see the same configuration.
+    apply_font_policy(&args.font_dirs, args.no_system_fonts)?;
 
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
@@ -510,9 +516,11 @@ async fn run_cli() -> anyhow::Result<()> {
             ready_file,
             allow_file_access,
             storage_dir,
-            font_dirs,
             quiet: _,
         }) => {
+            // `--storage-dir` is accepted globally (before the subcommand) and
+            // on `serve` itself; both name the same profile directory.
+            let storage_dir = storage_dir.or_else(|| global_storage_dir.clone());
             let policy = pool::RecyclePolicy {
                 max_connections: worker_max_connections,
                 max_rss_mb: worker_max_rss,
@@ -532,7 +540,6 @@ async fn run_cli() -> anyhow::Result<()> {
                     .ok()
                     .filter(|s| !s.is_empty())
             });
-            configure_font_directories(&font_dirs)?;
             if ready_file.is_some() && workers != 1 {
                 anyhow::bail!("--ready-file requires --workers 1");
             }
@@ -547,9 +554,6 @@ async fn run_cli() -> anyhow::Result<()> {
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
-            }
-            for directory in &font_dirs {
-                tracing::info!("Font dir: {}", directory.display());
             }
             if stealth {
                 #[cfg(feature = "stealth")]
@@ -569,7 +573,8 @@ async fn run_cli() -> anyhow::Result<()> {
                     proxy,
                     stealth,
                     user_agent,
-                    font_dirs,
+                    args.font_dirs.clone(),
+                    args.no_system_fonts,
                     max_connections,
                     policy,
                     Duration::from_secs(worker_drain_timeout),
@@ -655,7 +660,9 @@ async fn run_cli() -> anyhow::Result<()> {
                     output,
                     quiet,
                     global_proxy,
-                    storage_dir,
+                    // The profile flag is global; `fetch --storage-dir` is the
+                    // same option placed after the subcommand.
+                    storage_dir.or_else(|| global_storage_dir.clone()),
                     args.allow_private_network,
                     obey_robots,
                     screenshot,
@@ -681,18 +688,18 @@ async fn run_cli() -> anyhow::Result<()> {
                 global_proxy,
                 stealth,
                 obey_robots,
+                &args.font_dirs,
+                args.no_system_fonts,
             )
             .await?;
         }
         Some(Command::Mcp {
-            font_dirs,
             http,
             host,
             port,
             proxy,
             user_agent,
         }) => {
-            configure_font_directories(&font_dirs)?;
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             // `obscura mcp` builds its BrowserContext from the environment, so
             // the global profile flag has to be handed over explicitly.
@@ -905,6 +912,7 @@ async fn run_multi_worker_serve(
     stealth: bool,
     user_agent: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
+    no_system_fonts: bool,
     max_connections: usize,
     policy: pool::RecyclePolicy,
     drain_timeout: Duration,
@@ -954,6 +962,9 @@ async fn run_multi_worker_serve(
         }
         for directory in &font_dirs {
             cmd.arg("--font-dir").arg(directory);
+        }
+        if no_system_fonts {
+            cmd.arg("--no-system-fonts");
         }
         if stealth {
             cmd.arg("--stealth");
@@ -2075,6 +2086,8 @@ async fn run_parallel_scrape(
     proxy: Option<String>,
     stealth: bool,
     obey_robots: bool,
+    font_dirs: &[std::path::PathBuf],
+    no_system_fonts: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     let start = Instant::now();
@@ -2107,6 +2120,12 @@ async fn run_parallel_scrape(
         );
     }
 
+    // Workers are separate processes, so the font policy travels through the
+    // environment: a JSON array of directories plus the system-font switch.
+    // The parent already validated every directory; the worker re-validates
+    // before creating its first page and rejects a malformed value.
+    let font_dirs_env = Arc::new(serde_json::to_string(font_dirs)?);
+
     let eval = Arc::new(eval);
     let worker_path = Arc::new(worker_path);
     let worker_timeout = Duration::from_secs(timeout_secs);
@@ -2117,6 +2136,7 @@ async fn run_parallel_scrape(
         let eval = eval.clone();
         let worker_path = worker_path.clone();
         let proxy = proxy.clone();
+        let font_dirs_env = font_dirs_env.clone();
 
         async move {
             let task_start = Instant::now();
@@ -2128,6 +2148,11 @@ async fn run_parallel_scrape(
                 .env("OBSCURA_PROXY", proxy.as_deref().unwrap_or(""))
                 .env("OBSCURA_STEALTH", if stealth { "1" } else { "" })
                 .env("OBSCURA_OBEY_ROBOTS", if obey_robots { "1" } else { "" })
+                .env(fonts::FONT_DIRS_ENV, font_dirs_env.as_str())
+                .env(
+                    fonts::NO_SYSTEM_FONTS_ENV,
+                    if no_system_fonts { "1" } else { "0" },
+                )
                 .spawn()
             {
                 Ok(c) => c,
@@ -2717,41 +2742,46 @@ mod tests {
         assert!(!is_quiet_command(&args.command));
     }
 
+    /// Every command shares one font policy, whether the flags come before or
+    /// after the subcommand.
     #[test]
-    fn parsed_serve_accepts_repeated_font_directories() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "serve",
+    fn font_options_are_global_before_and_after_every_subcommand() {
+        const NO_SUBCOMMAND: &[&str] = &[];
+        let commands: [&[&str]; 5] = [
+            NO_SUBCOMMAND,
+            &["fetch", "https://example.com"],
+            &["scrape", "https://example.com"],
+            &["serve"],
+            &["mcp"],
+        ];
+        const FONT_OPTIONS: [&str; 5] = [
             "--font-dir",
             "/fonts/cjk",
             "--font-dir",
             "/fonts/brand",
-        ])
-        .expect("clap should accept repeatable --font-dir");
-        match args.command {
-            Some(Command::Serve { font_dirs, .. }) => assert_eq!(
-                font_dirs,
-                [
-                    std::path::PathBuf::from("/fonts/cjk"),
-                    std::path::PathBuf::from("/fonts/brand"),
-                ]
-            ),
-            _ => panic!("expected Serve command"),
-        }
-    }
-
-    #[test]
-    fn parsed_mcp_accepts_repeated_font_directories() {
-        let args = Args::try_parse_from([
-            "obscura", "mcp", "--font-dir", "/fonts/cjk", "--font-dir", "/fonts/brand",
-        ])
-        .expect("clap should accept MCP font directories");
-        match args.command {
-            Some(Command::Mcp { font_dirs, .. }) => assert_eq!(
-                font_dirs,
-                [std::path::PathBuf::from("/fonts/cjk"), std::path::PathBuf::from("/fonts/brand")]
-            ),
-            _ => panic!("expected Mcp command"),
+            "--no-system-fonts",
+        ];
+        for command in commands {
+            for options_first in [true, false] {
+                let mut argv = vec!["obscura"];
+                if options_first {
+                    argv.extend_from_slice(&FONT_OPTIONS);
+                }
+                argv.extend_from_slice(command);
+                if !options_first {
+                    argv.extend_from_slice(&FONT_OPTIONS);
+                }
+                let args = Args::try_parse_from(argv)
+                    .expect("clap should accept global font options on every command");
+                assert_eq!(
+                    args.font_dirs,
+                    [
+                        std::path::PathBuf::from("/fonts/cjk"),
+                        std::path::PathBuf::from("/fonts/brand"),
+                    ]
+                );
+                assert!(args.no_system_fonts);
+            }
         }
     }
 

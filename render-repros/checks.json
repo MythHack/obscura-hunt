@@ -131,7 +131,7 @@
   ],
   "form-control-geometry": [
     {"name": "standards form contributes only native control height", "color": "#087f5b", "x": 0, "y": 21, "width": 100, "height": 20},
-    {"name": "text input size attribute sets intrinsic inline width", "color": "#1971c2", "x": 503, "y": 0, "width": 20, "height": 21},
+    {"name": "text input size attribute sets intrinsic inline width", "color": "#1971c2", "x": 487, "y": 0, "width": 20, "height": 21},
     {"name": "standards author dimensions use content box", "color": "#e8590c", "x": 808, "y": 0, "width": 20, "height": 30},
     {"name": "checkbox uses native intrinsic border box and margins", "color": "#7048e8", "x": 20, "y": 100, "width": 20, "height": 13},
     {"name": "range uses native intrinsic border box and margins", "color": "#c2255c", "x": 333, "y": 100, "width": 20, "height": 16},

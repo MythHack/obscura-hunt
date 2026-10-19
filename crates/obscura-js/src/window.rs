@@ -9,6 +9,48 @@ use crate::ops::{ObscuraState, RealmStates, SharedState};
 use crate::module_loader::ObscuraModuleLoader;
 use crate::storage::{SharedStorage, StorageNamespace};
 
+#[path = "native_window.rs"]
+pub(crate) mod native_window;
+
+/// Creates (or restores) the V8 context for one browsing context and world.
+///
+/// The first creation captures the context's native global proxy.  Later
+/// navigations detach that proxy from the retired document and reuse it with
+/// the same snapshot index, so retained Window references keep their identity
+/// across same-origin and cross-origin navigations.  Isolated worlds pass a
+/// distinct `world_id`, so they never share a proxy with the author world.
+pub(crate) fn create_realm_context<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    realms: &Rc<RefCell<RealmStates>>,
+    frame_id: u32,
+    world_id: Option<u64>,
+    previous: Option<&v8::Global<v8::Context>>,
+) -> Option<v8::Global<v8::Context>> {
+    let existing = realms.borrow().proxy_record(frame_id, world_id);
+    let (index, proxy) = match existing {
+        Some((proxy, index)) => {
+            if let Some(previous) = previous {
+                let context = v8::Local::new(&*scope, previous);
+                let pointer = &*context as *const v8::Context as *mut std::ffi::c_void;
+                obscura_v8_native::detach_global(pointer);
+            }
+            (index, Some(proxy))
+        }
+        None => (native_window::SNAPSHOT_INDEX, None),
+    };
+    let options = v8::ContextOptions {
+        global_object: proxy.as_ref().map(|proxy| v8::Local::new(&*scope, proxy).into()),
+        ..Default::default()
+    };
+    let context = v8::Context::from_snapshot(&*scope, index, options)?;
+    if proxy.is_none() {
+        let global = context.global(scope);
+        realms.borrow_mut().remember_proxy(frame_id, world_id,
+            v8::Global::new(scope, global), index);
+    }
+    Some(v8::Global::new(scope, context))
+}
+
 unsafe extern "C" {
     fn obscura_v8_incumbent_context(isolate: v8::UnsafeRawIsolatePtr) -> *const v8::Context;
 }
@@ -45,6 +87,8 @@ pub struct WindowNavigation {
     pub url: String,
     pub method: String,
     pub body: String,
+    /// Native frame id of the document that queued the navigation (0 root).
+    pub origin_frame_id: u32,
     pub source_url: String,
     pub noreferrer: bool,
     pub generation: u64,
@@ -63,11 +107,15 @@ pub(crate) struct WindowRecord {
     pub debugger_wait: bool,
     pub popup_debugger_wait: bool,
     pub state: SharedState,
-    pub context: v8::Global<v8::Context>,
+    /// Strong handle to the current document's context while the browsing
+    /// context is live; taken on close so a retired context is collected once
+    /// author JavaScript stops holding its global proxy. Operations issued by
+    /// a retained closed proxy read their document from the context-owned
+    /// `DocumentStateSlot`, never from this registry.
+    pub context: Option<v8::Global<v8::Context>>,
     pub module_realm: deno_core::BrowserRealm,
     pub session_storage: SharedStorage,
     pub loader: Rc<ObscuraModuleLoader>,
-    pub main_realm: bool,
     pub navigation_generation: u64,
 }
 
@@ -92,7 +140,6 @@ pub struct WindowRegistry {
     pub(crate) engine_id: WindowId,
     pub(crate) local_storage: SharedStorage,
     pub(crate) callbacks: HashMap<u32, WindowCallbacks>,
-    pub(crate) root_realms: HashMap<u32, WindowId>,
 }
 
 pub(crate) fn allocate_navigable_id() -> Option<u32> {
@@ -109,13 +156,12 @@ impl WindowRegistry {
         windows.insert(id, WindowRecord { id, realm_id: 0, target_id: format!("window-{id}"),
             group: id, opener: None, opener_frame: None, name: String::new(),
             created_by_script: false, closed: false, debugger_wait: false,
-            popup_debugger_wait: false, state, context, module_realm,
-            session_storage: empty_storage(), loader, main_realm: true,
+            popup_debugger_wait: false, state, context: Some(context), module_realm,
+            session_storage: empty_storage(), loader,
             navigation_generation: 0 });
         Self { windows, events: VecDeque::new(), created: VecDeque::new(),
             navigations: VecDeque::new(), messages: VecDeque::new(), message_bytes: 0,
-            engine_id: id, local_storage: empty_storage(), callbacks: HashMap::new(),
-            root_realms: HashMap::from([(0, id)]) }
+            engine_id: id, local_storage: empty_storage(), callbacks: HashMap::new() }
     }
 
     pub fn info(&self, id: WindowId) -> Option<WindowInfo> {
@@ -144,14 +190,16 @@ impl WindowRegistry {
         // exactly once; iframe-owned pending navigations stay on their states.
         for window in self.windows.values_mut().filter(|window| !window.closed) {
             let mut document = window.state.borrow_mut();
-            let Some((url, method, body)) = document.pending_navigation.take() else { continue };
+            let Some(navigation) = document.pending_navigation.take() else { continue };
             let source_url = document.url.clone();
             drop(document);
             window.navigation_generation = window.navigation_generation.wrapping_add(1);
             let id = window.id;
             self.navigations.retain(|job| job.id != id);
-            self.navigations.push_back(WindowNavigation { id, url, method, body,
-                source_url, noreferrer: false, generation: window.navigation_generation });
+            self.navigations.push_back(WindowNavigation { id, url: navigation.url,
+                method: navigation.method, body: navigation.body,
+                origin_frame_id: navigation.origin_frame_id, source_url,
+                noreferrer: false, generation: window.navigation_generation });
         }
         let mut ready = Vec::new();
         let count = self.navigations.len();
@@ -217,13 +265,30 @@ pub(crate) fn origin(state: &ObscuraState) -> String {
         .map(|url| url.origin().ascii_serialization()).unwrap_or_else(|_| "null".to_string()))
 }
 
+/// Opaque principal a document can hand to about:blank/srcdoc descendants.
+///
+/// A creator whose URL serializes to a null origin (data:, file:, empty URL)
+/// owns an opaque principal even when navigation never minted one. Mint it on
+/// first inheritance so children share that exact principal instead of both
+/// sides having no principal (which would make them cross-origin to each
+/// other).
+pub(crate) fn inherited_opaque_principal(state: &SharedState) -> Option<Rc<()>> {
+    let opaque = state.borrow().opaque_origin.clone();
+    if opaque.is_some() {
+        return opaque;
+    }
+    if origin(&state.borrow()) != "null" {
+        return None;
+    }
+    state.borrow_mut().opaque_origin.get_or_insert_with(|| Rc::new(())).clone().into()
+}
+
 pub type SharedWindows = Rc<RefCell<WindowRegistry>>;
 
 #[derive(Clone)]
 pub(crate) struct WindowCallbacks {
     pub context: v8::Global<v8::Context>,
     pub initialize: v8::Global<v8::Function>,
-    pub proxy: v8::Global<v8::Function>,
 }
 
 fn empty_storage() -> SharedStorage {
@@ -265,20 +330,32 @@ pub(crate) fn context_document(state: &OpState, context: &v8::Global<v8::Context
     Ok((shared.clone(), root, document))
 }
 
-pub(crate) fn caller_context(scope: &mut v8::PinScope)
-    -> Result<v8::Global<v8::Context>, JsErrorBox>
+/// The isolate's incumbent context as a local in `scope`.
+///
+/// V8's incumbent is the realm of the topmost JavaScript frame: the code that
+/// called into the host, not the realm a shared op function was bound to and
+/// not a context an outer host entry left on the entered-context stack.
+fn incumbent_context_local<'s>(scope: &v8::PinScope<'s, '_>)
+    -> Option<v8::Local<'s, v8::Context>>
 {
     // Shared ops' creation and entered host contexts are not the incumbent
     // principal, including when popup.eval runs inside an opener task.
     // UnsafeRawIsolatePtr is transparent over the C++ isolate pointer, unlike
     // a pointer to Rust's Isolate wrapper, which addresses a pointer holder.
     let raw = unsafe { obscura_v8_incumbent_context(scope.as_raw_isolate_ptr()) };
-    let context = std::ptr::NonNull::new(raw.cast_mut()).ok_or_else(security_error)?;
+    let context = std::ptr::NonNull::new(raw.cast_mut())?;
     // SAFETY: rusty_v8 150.4.0's Local is repr(C), containing NonNull<T>
     // followed only by PhantomData. The shim returns a V8 local in this
     // scope, without opening a nested HandleScope. Its lifetime cannot escape
-    // this conversion to a persistent handle. A missing context is rejected.
-    let context: v8::Local<v8::Context> = unsafe { std::mem::transmute(context) };
+    // this scope. A missing context is rejected by the caller.
+    let context: v8::Local<'s, v8::Context> = unsafe { std::mem::transmute(context) };
+    Some(context)
+}
+
+pub(crate) fn caller_context(scope: &mut v8::PinScope)
+    -> Result<v8::Global<v8::Context>, JsErrorBox>
+{
+    let context = incumbent_context_local(scope).ok_or_else(security_error)?;
     Ok(v8::Global::new(scope, context))
 }
 
@@ -302,12 +379,15 @@ pub(crate) fn caller_dom_window(scope: &mut v8::PinScope, state: &OpState)
 pub(crate) fn close_window(scope: &mut v8::PinScope, state: &OpState, id: WindowId) {
     let shared = state.borrow::<SharedWindows>();
     let realms = state.borrow::<Rc<RefCell<RealmStates>>>();
-    let (context, module_realm) = {
+    let (context, module_realm, realm_id) = {
         let mut windows = shared.borrow_mut();
-        let Some(window) = windows.windows.get(&id).filter(|window| !window.closed) else { return };
+        let Some(window) = windows.windows.get_mut(&id).filter(|window| !window.closed) else { return };
         let realm_id = window.realm_id;
-        let context = window.context.clone();
-        let module_realm = (!window.main_realm).then(|| window.module_realm.clone());
+        // Move the only registry-owned context handle out. Author references
+        // to the global proxy keep the context alive for as long as script can
+        // reach it; an unreferenced retired context is left to V8's collector.
+        let context = window.context.take();
+        let module_realm = window.module_realm.clone();
         let registry = realms.borrow();
         let max_frames = crate::ops::max_live_frames();
         windows.callbacks.retain(|realm, _| {
@@ -321,12 +401,15 @@ pub(crate) fn close_window(scope: &mut v8::PinScope, state: &OpState, id: Window
         });
         drop(registry);
         windows.close(id);
-        (context, module_realm)
+        (context, module_realm, realm_id)
     };
-    realms.borrow_mut().forget(&context);
-    // The engine's base module map also serves live sibling windows. Only
-    // attached document maps can be retired by a window close.
-    if let Some(module_realm) = module_realm { module_realm.retire(scope); }
+    if let Some(context) = context {
+        realms.borrow_mut().forget(&context);
+    }
+    realms.borrow_mut().forget_proxies(realm_id);
+    // Each window owns an attached document map; the engine control context
+    // remains alive for asynchronous work in sibling windows.
+    module_realm.retire(scope);
     realms.borrow_mut().retire_modules(scope);
     state.waker.wake();
 }
@@ -339,8 +422,31 @@ pub(crate) fn document_access(windows: &WindowRegistry, source_root: WindowId, s
     if a.closed || b.closed || a.group != b.group { return false; }
     // An isolated grant bypasses only the origin comparison, never reachability.
     if Rc::ptr_eq(source, target) || universal_access { return true; }
-    let a = origin(&source.borrow());
-    a != "null" && a == origin(&target.borrow())
+    same_principal(&source.borrow(), &target.borrow())
+}
+
+/// Same-origin check that keeps opaque origins unique.
+///
+/// Serialized origins cannot compare `"null" == "null"`: a data: document and
+/// a sandboxed frame must stay isolated from each other and from their parent.
+/// A child that inherited an opaque origin (initial about:blank, srcdoc) shares
+/// its creator's token instead of minting a new one.
+pub(crate) fn same_principal(source: &ObscuraState, target: &ObscuraState) -> bool {
+    let source_origin = origin(source);
+    if source_origin != "null" { return source_origin == origin(target); }
+    match (&source.opaque_origin, &target.opaque_origin) {
+        (Some(source), Some(target)) => Rc::ptr_eq(source, target),
+        _ => false,
+    }
+}
+
+/// Fresh opaque principal for a document URL, or `None` for tuple origins.
+/// `file:` is treated as a storage origin, not as an access principal.
+pub(crate) fn opaque_origin_for_url(url: &str) -> Option<Rc<()>> {
+    match url::Url::parse(url) {
+        Ok(url) if url.scheme() == "file" || url.origin().is_tuple() => None,
+        _ => Some(Rc::new(())),
+    }
 }
 
 pub(crate) fn storage_window(scope: &mut v8::PinScope, state: &OpState,
@@ -604,12 +710,21 @@ fn op_world_event_dispatch(scope: &mut v8::PinScope, state: &OpState,
         }
         path
     };
-    let invoke = |scope: &mut v8::PinScope, current: u32, capture: bool, phase: u32, status: &mut u32| {
+    // A phase callback returns None when it could not run to completion. The
+    // JS dispatcher catches author listener errors per listener, so None here
+    // means the invocation itself failed - notably a watchdog termination,
+    // which must not be reported to the caller as a completed dispatch.
+    let mut interrupted = false;
+    let mut invoke = |scope: &mut v8::PinScope, current: u32, capture: bool, phase: u32, status: &mut u32| {
         for callbacks in &callbacks {
             if *status & 4 != 0 { break; }
             if callbacks.event.is_none() || !world_is_live(state, &callbacks.context, &document) { continue; }
-            if let Some(flags) = event_phase(scope, callbacks, current, capture, phase, *status) {
-                *status |= flags & 7;
+            match event_phase(scope, callbacks, current, capture, phase, *status) {
+                Some(flags) => *status |= flags & 7,
+                None => {
+                    interrupted = true;
+                    break;
+                }
             }
         }
     };
@@ -626,6 +741,9 @@ fn op_world_event_dispatch(scope: &mut v8::PinScope, state: &OpState,
             invoke(scope, *current, false, 3, &mut status);
             if status & 2 != 0 { break; }
         }
+    }
+    if interrupted {
+        return Err(JsErrorBox::generic("Event dispatch was interrupted"));
     }
     for callbacks in &callbacks {
         if callbacks.event.is_none() || !world_is_live(state, &callbacks.context, &document) { continue; }
@@ -647,11 +765,11 @@ fn op_window_current(scope: &mut v8::PinScope, state: &OpState) -> Result<u32, J
 
 #[op2(nofast, reentrant)]
 fn op_window_register(scope: &mut v8::PinScope, state: &OpState,
-    initialize: v8::Local<v8::Function>, proxy: v8::Local<v8::Function>,
-    deliver: v8::Local<v8::Function>) -> Result<bool, JsErrorBox>
+    initialize: v8::Local<v8::Function>,
+    deliver: v8::Local<v8::Function>) -> Result<(), JsErrorBox>
 {
     let context = initialize.get_creation_context(scope).ok_or_else(security_error)?;
-    if proxy.get_creation_context(scope) != Some(context) || deliver.get_creation_context(scope) != Some(context) {
+    if deliver.get_creation_context(scope) != Some(context) {
         return Err(security_error());
     }
     let context = v8::Global::new(scope, context);
@@ -659,11 +777,16 @@ fn op_window_register(scope: &mut v8::PinScope, state: &OpState,
     let realm = document.borrow().frame_id;
     let mut windows = shared.borrow_mut();
     if windows.callbacks.contains_key(&realm) { return Err(JsErrorBox::type_error("Window realm is already registered")); }
-    let main_realm = windows.windows.values().any(|window|
-        !window.closed && window.main_realm && window.context == context);
+    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+    if registry.borrow().proxy_record(realm, None).is_none() {
+        let local = v8::Local::new(scope, &context);
+        let global = local.global(scope);
+        registry.borrow_mut().remember_proxy(realm, None,
+            v8::Global::new(scope, global), native_window::SNAPSHOT_INDEX);
+    }
     windows.callbacks.insert(realm, WindowCallbacks { context,
-        initialize: v8::Global::new(scope, initialize), proxy: v8::Global::new(scope, proxy) });
-    Ok(main_realm)
+        initialize: v8::Global::new(scope, initialize) });
+    Ok(())
 }
 
 fn resolve_url(document: &ObscuraState, value: &str) -> Result<String, JsErrorBox> {
@@ -675,7 +798,7 @@ fn resolve_url(document: &ObscuraState, value: &str) -> Result<String, JsErrorBo
 }
 
 fn queue_navigation(windows: &mut WindowRegistry, id: WindowId, url: String,
-    source_url: String, noreferrer: bool) -> bool
+    source_url: String, noreferrer: bool, method: &str, body: &str, origin_frame_id: u32) -> bool
 {
     let Some(window) = windows.windows.get_mut(&id) else { return false };
     if window.closed { return false; }
@@ -684,18 +807,27 @@ fn queue_navigation(windows: &mut WindowRegistry, id: WindowId, url: String,
     window.navigation_generation = window.navigation_generation.wrapping_add(1);
     let generation = window.navigation_generation;
     windows.navigations.retain(|job| job.id != id);
-    windows.navigations.push_back(WindowNavigation { id, url, method: "GET".to_string(),
-        body: String::new(), source_url, noreferrer, generation });
+    windows.navigations.push_back(WindowNavigation { id, url, method: method.to_string(),
+        body: body.to_string(), origin_frame_id, source_url, noreferrer, generation });
     true
 }
 
 #[op2(nofast, reentrant)]
 fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
-    #[string] url: &str, #[string] target: &str, #[string] features: &str) -> Result<u32, JsErrorBox>
+    #[string] url: &str, #[string] target: &str, #[string] features: &str,
+    #[string] method: &str, #[string] body: &str) -> Result<u32, JsErrorBox>
 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (shared, source, source_state) = caller_window(scope, state)?;
         let source_realm = source_state.borrow().frame_id;
+        let origin_frame_id = {
+            let windows = shared.borrow();
+            if windows.windows.get(&source).is_some_and(|window| Rc::ptr_eq(&window.state, &source_state)) {
+                0
+            } else {
+                source_state.borrow().frame_id
+            }
+        };
         let resolved = resolve_url(&source_state.borrow(), url)?;
         let feature_list: Vec<String> = features.split(',').map(str::trim)
             .filter(|value| !value.is_empty()).map(str::to_string).collect();
@@ -717,7 +849,10 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
                 windows.windows.values().find(|window| !window.closed && window.group == owner.group && window.name == name).map(|window| window.id)
             } else { None };
             if let Some(id) = existing {
-                if !url.is_empty() { queue_navigation(&mut windows, id, resolved, source_state.borrow().url.clone(), noreferrer); }
+                if !url.is_empty() {
+                    queue_navigation(&mut windows, id, resolved, source_state.borrow().url.clone(),
+                        noreferrer, method, body, origin_frame_id);
+                }
                 return Ok(if noopener { 0 } else { id });
             }
             if windows.windows.values().filter(|window| !window.closed).count() >= 64 { return Ok(0); }
@@ -730,11 +865,17 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
         };
         let id = allocate_navigable_id().ok_or_else(|| JsErrorBox::generic("Window id space exhausted"))?;
         let realm_id = allocate_navigable_id().ok_or_else(|| JsErrorBox::generic("Realm id space exhausted"))?;
-        let context = v8::Context::from_snapshot(scope, 1, Default::default())
-            .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
+        let realms = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+        let context = create_realm_context(scope, &realms, realm_id, None, None)
             .ok_or_else(|| JsErrorBox::generic("Window context creation failed"))?;
+        // A context handle cannot call Local-only APIs; keep the live handle
+        // for token/global/attach work and re-root it only when storing.
+        let context = v8::Local::new(scope, &context);
         let undefined = v8::undefined(scope);
         crate::ops::initialize_document_realm_slots(context, undefined.into());
+        let parent_opaque = if noopener { None } else {
+            crate::window::inherited_opaque_principal(&source_state)
+        };
         let mut child = ObscuraState::new();
         child.dom = Some(obscura_dom::parse_html("<html><head></head><body></body></html>"));
         child.frame_id = realm_id;
@@ -750,6 +891,7 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
             child.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             child.about_base_url = crate::ops::document_base_url(&parent);
             child.inherited_origin = Some(if noopener { "null".to_string() } else { origin(&parent) });
+            child.opaque_origin = if noopener { Some(Rc::new(())) } else { parent_opaque.clone() };
             child.referrer = if noreferrer { String::new() } else { parent.url.clone() };
             #[cfg(feature = "render")]
             child.set_viewport(parent.viewport.0 as f64, parent.viewport.1 as f64);
@@ -769,9 +911,8 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
             group: if noopener { id } else { group }, opener: (!noopener).then_some(source),
             opener_frame: (!noopener).then_some(source_realm), name: if name.eq_ignore_ascii_case("_blank") { String::new() } else { name.to_string() },
             created_by_script: true, closed: false, debugger_wait, popup_debugger_wait: debugger_wait,
-            state: child, context: handle.clone(), module_realm, session_storage, loader,
-            main_realm: false, navigation_generation: 0 });
-        shared.borrow_mut().root_realms.insert(realm_id, id);
+            state: child, context: Some(handle.clone()), module_realm, session_storage, loader,
+            navigation_generation: 0 });
         let callback = v8::Local::new(scope, callbacks.initialize);
         let window = context.global(scope);
         let window_id = v8::Integer::new_from_unsigned(scope, id);
@@ -790,7 +931,8 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
         if let Some(info) = windows.info(id) { windows.events.push_back(WindowEvent::Created(info)); }
         windows.created.push_back(id);
         if !url.is_empty() && resolved != "about:blank" {
-            queue_navigation(&mut windows, id, resolved, source_state.borrow().url.clone(), noreferrer);
+            queue_navigation(&mut windows, id, resolved, source_state.borrow().url.clone(),
+                noreferrer, method, body, origin_frame_id);
         }
         Ok(if noopener { 0 } else { id })
     })).unwrap_or_else(|_| Err(JsErrorBox::generic("Window creation failed")))
@@ -806,30 +948,29 @@ fn op_window_same_origin(scope: &mut v8::PinScope, state: &OpState, id: u32) -> 
 #[op2(reentrant)]
 fn op_window_target<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
     id: u32, realm: u32) -> v8::Local<'s, v8::Value> {
-    let target = caller_dom_window(scope, state).ok().and_then(|(shared, source, document, universal_access)| {
+    let caller = caller_context(scope).ok();
+    let target = caller.as_ref().and_then(|caller| {
+        let (shared, source, _document, _universal_access) = caller_dom_window(scope, state).ok()?;
         let windows = shared.borrow();
-        windows.windows.get(&id).filter(|target| !target.closed)?;
+        let target_window = windows.windows.get(&id).filter(|target| !target.closed)?;
+        let source_window = windows.windows.get(&source)?;
+        if source_window.closed || source_window.group != target_window.group { return None; }
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
         let target = registry.by_frame_id(realm)?;
         let context = registry.context(realm)?;
+        let caller_world = registry.world_id_of_context(caller)?;
+        let target_world = registry.world_id_of_context(&context)?;
         drop(registry);
-        if root_for_document(state, &windows, &target) != Some(id)
-            || !document_access(&windows, source, &document, id, &target, universal_access) {
-            return None;
-        }
-        let callbacks = windows.callbacks.get(&realm)?;
-        (callbacks.context == context).then(|| callbacks.clone())
+        if root_for_document(state, &windows, &target) != Some(id) { return None; }
+        // A raw native proxy is only handed to the same browsing-context world.
+        // Isolated worlds have their own proxy and must use the facade path;
+        // V8's token check would otherwise let a same-token isolated world
+        // read the author global.
+        (caller_world == target_world).then_some(context)
     });
-    let Some(callbacks) = target else { return v8::undefined(scope).into() };
-    let context = v8::Local::new(scope, callbacks.context);
-    let scope = &mut v8::ContextScope::new(scope, context);
-    let callback = v8::Local::new(scope, callbacks.proxy);
-    let window = v8::Integer::new_from_unsigned(scope, id);
-    let realm = v8::Integer::new_from_unsigned(scope, realm);
-    let backing = v8::Boolean::new(scope, true);
-    let receiver = v8::undefined(scope);
-    callback.call(scope, receiver.into(), &[window.into(), realm.into(), backing.into()])
-        .unwrap_or_else(|| v8::undefined(scope).into())
+    let Some(context) = target else { return v8::undefined(scope).into() };
+    let context = v8::Local::new(scope, context);
+    context.global(scope).into()
 }
 
 #[op2(fast)]
@@ -884,8 +1025,8 @@ fn op_window_relation(scope: &mut v8::PinScope, state: &OpState, id: u32,
             .map(|opener| serde_json::json!({"windowId": opener.id, "realmId": window.opener_frame.unwrap_or(opener.realm_id)})))
             .unwrap_or_else(|| serde_json::json!({"windowId": 0, "realmId": 0})).to_string(),
         "length" => {
-            let count = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().live_frame_owners().iter()
-                .filter(|(_, parent, _)| *parent == target_realm).count();
+            let count = state.borrow::<Rc<RefCell<RealmStates>>>().borrow()
+                .document_iframe_count(target_realm);
             serde_json::json!({"length": count}).to_string()
         }
         _ => "{}".to_string(),
@@ -903,29 +1044,42 @@ fn op_window_source(scope: &mut v8::PinScope, state: &OpState, realm: u32) -> u3
         drop(registry);
         let root = root_for_document(state, &windows, &document)?;
         let target = windows.windows.get(&root)?;
-        (!target.closed && windows.windows.get(&source)?.group == target.group).then_some(root)
+        let source_window = windows.windows.get(&source)?;
+        (!target.closed && !source_window.closed
+            && source_window.group == target.group).then_some(root)
     })().unwrap_or(0)
 }
 
 #[op2(fast)]
 fn op_window_navigate(scope: &mut v8::PinScope, state: &OpState, id: u32,
-    #[string] url: &str, _replace: bool, realm: u32) -> Result<bool, JsErrorBox>
+    #[string] url: &str, _replace: bool, realm: u32,
+    #[string] method: &str, #[string] body: &str) -> Result<bool, JsErrorBox>
 {
     let (shared, source, document) = caller_window(scope, state)?;
+    let origin_frame_id = {
+        let windows = shared.borrow();
+        if windows.windows.get(&source).is_some_and(|window| Rc::ptr_eq(&window.state, &document)) {
+            0
+        } else {
+            document.borrow().frame_id
+        }
+    };
     let resolved = resolve_url(&document.borrow(), url)?;
     let mut windows = shared.borrow_mut();
     if windows.windows.get(&id).is_none_or(|target| target.closed || windows.windows.get(&source)
         .is_none_or(|source| source.group != target.group)) { return Err(security_error()); }
     let source_url = document.borrow().url.clone();
     if windows.windows.get(&id).is_some_and(|window| window.realm_id == realm) {
-        return Ok(queue_navigation(&mut windows, id, resolved, source_url, false));
+        return Ok(queue_navigation(&mut windows, id, resolved, source_url, false, method, body, origin_frame_id));
     }
     let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
     let target = registry.by_frame_id(realm).filter(|_| registry.context(realm).is_some())
         .ok_or_else(security_error)?;
     drop(registry);
     if root_for_document(state, &windows, &target) != Some(id) { return Err(security_error()); }
-    target.borrow_mut().pending_navigation = Some((resolved, "GET".to_string(), String::new()));
+    target.borrow_mut().pending_navigation = Some(crate::ops::PendingNavigation {
+        url: resolved, method: method.to_string(), body: body.to_string(), origin_frame_id,
+    });
     state.waker.wake();
     Ok(true)
 }
@@ -1044,36 +1198,36 @@ fn op_window_realm_same_origin(scope: &mut v8::PinScope, state: &OpState, realm:
 
 #[op2(reentrant)]
 fn op_window_realm_proxy<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
-    id: u32, realm: u32, factory: v8::Local<v8::Function>) -> v8::Local<'s, v8::Value>
+    id: u32, realm: u32) -> v8::Local<'s, v8::Value>
 {
     let resolved = (|| {
         let source_context = caller_context(scope).ok()?;
-        let factory_context = factory.get_creation_context(scope)?;
-        if v8::Global::new(scope, factory_context) != source_context { return None; }
         let (shared, source, source_document) = context_document(state, &source_context).ok()?;
         let windows = shared.borrow();
         let target = windows.windows.get(&id)?;
-        if target.closed || windows.windows.get(&source)?.group != target.group { return None; }
+        let source_window = windows.windows.get(&source)?;
+        // Both ends of a relationship must still be live browsing contexts.
+        // A closed window's retained proxy and a realm whose document was
+        // replaced must never be handed out through the native fast path.
+        if source_window.closed || target.closed
+            || source_window.group != target.group { return None; }
         let realms = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
         let document = realms.by_frame_id(realm)?;
-        realms.context(realm)?;
+        let target_context = realms.context(realm)?;
         drop(realms);
         if root_for_document(state, &windows, &document)? != id { return None; }
         // A relationship back to the calling document retains that world's
-        // global identity. Every foreign document goes through its live proxy.
-        if Rc::ptr_eq(&source_document, &document) { return Some((source_context, None)); }
-        Some((source_context, Some(v8::Global::new(scope, factory))))
+        // identity. Other documents always expose their stable native proxy;
+        // the native access handlers enforce world separation and DOM grants.
+        Some(if Rc::ptr_eq(&source_document, &document) {
+            source_context
+        } else {
+            target_context
+        })
     })();
-    let Some((context, callback)) = resolved else { return v8::undefined(scope).into() };
+    let Some(context) = resolved else { return v8::undefined(scope).into() };
     let context = v8::Local::new(scope, context);
-    let Some(callback) = callback else { return context.global(scope).into() };
-    let scope = &mut v8::ContextScope::new(scope, context);
-    let callback = v8::Local::new(scope, callback);
-    let window = v8::Integer::new_from_unsigned(scope, id);
-    let realm = v8::Integer::new_from_unsigned(scope, realm);
-    let receiver = v8::undefined(scope);
-    callback.call(scope, receiver.into(), &[window.into(), realm.into()])
-        .unwrap_or_else(|| v8::undefined(scope).into())
+    context.global(scope).into()
 }
 
 pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows,
@@ -1134,10 +1288,101 @@ pub(crate) fn deliver_messages(scope: &mut v8::PinScope, shared: &SharedWindows,
     Ok(())
 }
 
+// Values shared only with the native shim's WindowAccess enum. Keeping this
+// callback in a private internal field avoids snapshotting a runtime callback
+// or exposing a script-callable authority query.
+fn native_window_access(scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments, mut result: v8::ReturnValue) {
+    let access = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source = args.get(0).to_object(scope)?.get_creation_context(scope)?;
+        let target = args.get(1).to_object(scope)?.get_creation_context(scope)?;
+        let source = v8::Global::new(scope, source);
+        let target = v8::Global::new(scope, target);
+        let op_state = deno_core::JsRuntime::op_state_from(scope);
+        let state = op_state.try_borrow().ok()?;
+        let windows = state.try_borrow::<SharedWindows>()?.try_borrow().ok()?;
+        let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.try_borrow().ok()?;
+        // Every query requires entry_active: a retained function from a
+        // disposed world cannot recover its former document's grant.
+        let source_world = registry.world_id_of_context(&source)?;
+        let target_world = registry.world_id_of_context(&target)?;
+        let universal_access = registry.context_universal_access(&source);
+        let source = registry.by_context(&source)?;
+        let target = registry.by_context(&target)?;
+        drop(registry);
+        let source_window = root_for_document(&state, &windows, &source)?;
+        let target_window = root_for_document(&state, &windows, &target)?;
+        if source_world == target_world && document_access(&windows, source_window,
+            &source, target_window, &target, false) {
+            Some(1)
+        } else if source_world.is_some() && target_world.is_none() && universal_access
+            && document_access(&windows, source_window, &source, target_window, &target, true) {
+            Some(2)
+        } else {
+            None
+        }
+    })).ok().flatten().unwrap_or(0);
+    result.set_int32(access);
+}
+
+/// Installs the target world's cross-origin Window bundle and its live native
+/// authorization callback in private global internal fields. Both are bound
+/// after snapshot restoration, never serialized as runtime external references.
+#[op2(nofast, reentrant)]
+fn op_install_window_bundle(scope: &mut v8::PinScope,
+    bundle: v8::Local<v8::Object>) -> Result<(), JsErrorBox> {
+    let Some(context) = bundle.get_creation_context(scope) else {
+        return Err(security_error());
+    };
+    // The bundle is created by the realm running __obscura_init. A shared op
+    // executes with the op function's binding realm as V8's current context,
+    // and an outer host entry may have the creator's realm entered; only the
+    // incumbent names the JavaScript frame that actually built this bundle.
+    let incumbent = incumbent_context_local(scope).ok_or_else(security_error)?;
+    if context != incumbent { return Err(security_error()); }
+    let global = context.global(scope);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let access = v8::Function::new(scope, native_window_access).ok_or_else(security_error)?;
+    if !global.set_internal_field(0, bundle.into())
+        || !global.set_internal_field(1, access.into()) { return Err(security_error()); }
+    Ok(())
+}
+
+/// Returns a member function from a foreign world's document bundle without
+/// exposing that world's raw global. Used by isolated-world bootstrap for
+/// native state that must stay shared with the canonical document.
+#[op2(reentrant)]
+fn op_window_realm_member<'s>(scope: &mut v8::PinScope<'s, '_>, state: &OpState,
+    id: u32, realm: u32, #[string] name: &str) -> v8::Local<'s, v8::Value> {
+    let resolved = (|| {
+        let source_context = caller_context(scope).ok()?;
+        let (shared, source, _document) = context_document(state, &source_context).ok()?;
+        let windows = shared.borrow();
+        let target_window = windows.windows.get(&id).filter(|target| !target.closed)?;
+        if windows.windows.get(&source)?.group != target_window.group { return None; }
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        let target_document = registry.by_frame_id(realm)?;
+        let context = registry.context(realm)?;
+        drop(registry);
+        if root_for_document(state, &windows, &target_document)? != id { return None; }
+        Some(context)
+    })();
+    let Some(context) = resolved else { return v8::undefined(scope).into() };
+    let context = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let Some(members) = context.get_embedder_data(scope, crate::ops::DOCUMENT_MEMBERS_SLOT)
+        .and_then(|value| value.to_object(scope)) else {
+        return v8::undefined(scope).into();
+    };
+    let Some(key) = v8::String::new(scope, name) else { return v8::undefined(scope).into() };
+    members.get(scope, key.into()).unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+
 pub(crate) fn ops() -> Vec<OpDecl> {
     vec![op_window_current(), op_window_register(), op_window_open(), op_window_target(),
         op_window_same_origin(), op_window_closed(), op_window_relation(), op_window_source(),
         op_window_navigate(), op_window_close(), op_window_command(), op_window_post_message(),
-        op_window_realm_proxy(), op_window_realm_same_origin(), op_world_register(),
+        op_window_realm_proxy(), op_window_realm_same_origin(), op_install_window_bundle(), op_window_realm_member(), op_world_register(),
         op_world_dom_generation(), op_world_node_id(), op_world_focus(), op_world_event_dispatch()]
 }

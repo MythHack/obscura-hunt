@@ -5,7 +5,6 @@
 //! are later enhancements. Pure Rust (tiny-skia, CPU), deterministic, no system
 //! dependencies, so a screenshot is reproducible across hosts.
 
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use obscura_dom::tree::DomTree;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -731,7 +730,8 @@ impl RenderResourceCache {
 
     /// Seed a prior stable `content:url(...)` selection into the ordinary
     /// intrinsic and selected-image maps before cascade. Node ids are scoped
-    /// to this page cache; removed/non-image ids are pruned eagerly.
+    /// to this page cache; removed ids are pruned eagerly, and a cascade that
+    /// no longer selects the image drops the entry in the same prepare.
     fn seed_content_image_intrinsics(
         &mut self,
         tree: &DomTree,
@@ -745,11 +745,8 @@ impl RenderResourceCache {
             .collect::<Vec<_>>();
         let mut seeded = HashSet::with_capacity(remembered.len());
         for (nid, value) in remembered {
-            let is_live_image = tree.get_node(nid).is_some_and(|node| {
-                node.as_element()
-                    .is_some_and(|element| &*element.local == "img")
-            });
-            if !is_live_image {
+            let is_live_element = tree.get_node(nid).is_some_and(|node| node.is_element());
+            if !is_live_element {
                 self.forget_content_image_intrinsic(nid);
                 continue;
             }
@@ -4561,6 +4558,11 @@ fn paint_laid_dom_scrolled(
     // `<text>` element must not also paint its glyphs on top of the raster).
     let mut svg_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> =
         std::collections::HashSet::new();
+    // Authored children of a `content:url()` element are replaced by the
+    // generated image. Layout keeps the element an atomic leaf; the DOM
+    // traversal still visits those children, so skip them in both passes.
+    let mut replaced_subtree_skip: std::collections::HashSet<obscura_dom::tree::NodeId> =
+        std::collections::HashSet::new();
     // Text is painted in a second pass, after the box-order loop. Remember
     // every subtree already painted into an opacity layer so its shaped text
     // is not drawn a second time at full opacity in the outer pass.
@@ -4608,6 +4610,20 @@ fn paint_laid_dom_scrolled(
     ));
     if let Some(excluded) = excluded_planes {
         retain_plane_nodes(tree, &mut paint_nodes, paint_root, excluded);
+    }
+    // Establish replaced-content suppression before any paint band is built:
+    // a negative-z child of a `content:url()` element is ordered ahead of its
+    // parent's normal-band paint, so the skip set cannot be populated lazily.
+    for &nid in &paint_nodes {
+        if laid
+            .styles
+            .get(&nid)
+            .is_some_and(|style| style.content_image.is_some())
+        {
+            // The generated image still paints; only the replaced contents do
+            // not.
+            replaced_subtree_skip.extend(crate::dom::rendered_descendants(tree, nid));
+        }
     }
     for nid in paint_nodes.iter().copied() {
         if consumed.contains(&nid) {
@@ -4723,7 +4739,7 @@ fn paint_laid_dom_scrolled(
     }
 
     for (paint_index, nid) in paint_order.into_iter().enumerate() {
-        if svg_subtree_skip.contains(&nid) {
+        if svg_subtree_skip.contains(&nid) || replaced_subtree_skip.contains(&nid) {
             continue;
         }
         if suppress_stacking_for != Some(nid) && stacking_z_index(tree, laid, nid).is_some() {
@@ -4931,40 +4947,54 @@ fn paint_laid_dom_scrolled(
                 }
             }
             if crate::dom::backface_culled(tree,laid,nid,root_font_size,viewport) { continue; }
-            if transform.is_translation() {
-                // Translation-only transforms retain the direct offset path:
-                // no surface allocation and no resampling for carousels and
-                // centering utilities.
-                pixmap = paint_laid_dom_scrolled(
-                    tree,
-                    viewport,
-                    base_url,
-                    scroll,
-                    resolved_scroll,
-                    Some(&scroll_state),
-                    pixmap,
-                    image_cache,
-                    selected_images,
-                    canvas_surfaces,
-                    svg_fonts,
-                    content_size,
-                    viewport_fixed,
-                    sticky,
-                    scroll_tree,
-                    laid,
-                    Some(nid),
-                    suppress_opacity_for,
-                    suppress_stacking_for,
-                    Some(nid),
-                    clip_scope_root,
-                    surface_extent,
-                    surface_offset,
-                    raster_scale,
-                    print_economy,
-                    canvas_background,
-                    excluded_planes,
-                )?;
-                continue;
+            if let Some(plane_translation) = transform.flat_plane_translation() {
+                // A perspective camera leaves flat content unchanged, but an
+                // own projective transform (for example
+                // `perspective(...) translateX(50px)`) is not accumulated in
+                // layout coordinates: `translates` only carries affine
+                // translations, and the precomputed screen-space clips would
+                // not follow a residual offset. Such transforms fall through
+                // to the layered projective path, which applies the full
+                // matrix (and its clips) together. The direct path is safe
+                // when layout already applied the own translation, or when
+                // the plane map itself is the identity.
+                let own_translation_applied = crate::dom::resolved_transform_matrix(
+                    style, &rect, root_font_size, viewport,
+                )
+                .affine()
+                .is_some();
+                if own_translation_applied || plane_translation == (0.0, 0.0) {
+                    pixmap = paint_laid_dom_scrolled(
+                        tree,
+                        viewport,
+                        base_url,
+                        scroll,
+                        resolved_scroll,
+                        Some(&scroll_state),
+                        pixmap,
+                        image_cache,
+                        selected_images,
+                        canvas_surfaces,
+                        svg_fonts,
+                        content_size,
+                        viewport_fixed,
+                        sticky,
+                        scroll_tree,
+                        laid,
+                        Some(nid),
+                        suppress_opacity_for,
+                        suppress_stacking_for,
+                        Some(nid),
+                        clip_scope_root,
+                        surface_extent,
+                        surface_offset,
+                        raster_scale,
+                        print_economy,
+                        canvas_background,
+                        excluded_planes,
+                    )?;
+                    continue;
+                }
             }
 
             // A transform wraps the complete atomic child display list. Paint
@@ -5546,6 +5576,45 @@ fn paint_laid_dom_scrolled(
         }
         paint_css_outline(&mut pixmap, &rect, style, element_clip_mask, raster_scale);
 
+        // Ordinary-element `content:url()` replacement paints through the
+        // same image pipeline as HTML replaced tags, but inside the content
+        // box so the element's own background, border, and padding remain
+        // visible around the generated image.
+        if box_on_surface
+            && style.content_image.is_some()
+            && !matches!(&*name.local, "img" | "video")
+        {
+            if let Some(source) = selected_images.get(&nid) {
+                let content_insets = crate::Sides {
+                    top: style.border.top + style.padding.top,
+                    right: style.border.right + style.padding.right,
+                    bottom: style.border.bottom + style.padding.bottom,
+                    left: style.border.left + style.padding.left,
+                };
+                let content_rect = crate::Rect {
+                    x: rect.x + content_insets.left,
+                    y: rect.y + content_insets.top,
+                    width: (rect.width - content_insets.left - content_insets.right).max(0.0),
+                    height: (rect.height - content_insets.top - content_insets.bottom).max(0.0),
+                };
+                let content_visible = content_rect.intersect(&visible_rect).unwrap_or_default();
+                paint_image(
+                    &source.resolved_url,
+                    None,
+                    &content_rect,
+                    &content_visible,
+                    style.object_fit,
+                    style.object_position,
+                    &mut pixmap,
+                    image_cache,
+                    Some(source.profile),
+                    None,
+                    radius.inset(content_insets),
+                    element_clip_mask,
+                );
+            }
+        }
+
         if box_on_surface && matches!(&*name.local, "img" | "video") {
             if let Some(source) = selected_images.get(&nid) {
                 // `visible_rect` is the border box already intersected with the
@@ -5578,6 +5647,8 @@ fn paint_laid_dom_scrolled(
                     match node.get_attribute("alt") {
                         Some(alt) if !alt.trim().is_empty() => {
                             draw_text(
+                                &mut laid.text_engine,
+                                style,
                                 &mut pixmap,
                                 &alt,
                                 rect.x,
@@ -5708,10 +5779,23 @@ fn paint_laid_dom_scrolled(
             if let Some(marker) = list_marker_text(tree, nid, style.list_style) {
                 let fsize = style.font_size.unwrap_or(16.0);
                 let color = style.color.unwrap_or([0, 0, 0, 255]);
-                let mw = measure_text(&marker, fsize, false, style.font_family.as_deref());
+                let mw = laid.text_engine.measure_plain_text_with_axes(
+                    &marker,
+                    fsize,
+                    400,
+                    false,
+                    style.font_family.as_deref(),
+                    style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
+                    crate::inline::resolved_font_variations(style).as_deref(),
+                    style.font_optical_sizing.unwrap_or_default()
+                        == crate::FontOpticalSizing::Auto,
+                );
                 let mx = rect.x + style.padding.left - mw - 6.0;
                 let my = rect.y + style.border.top + style.padding.top;
                 draw_text(
+                    &mut laid.text_engine,
+                    style,
                     &mut pixmap,
                     &marker,
                     mx,
@@ -5752,6 +5836,8 @@ fn paint_laid_dom_scrolled(
             let is_bold = crate::style::used_font_weight(style) >= 600;
             for (word_rect, word) in runs {
                 draw_text(
+                    &mut laid.text_engine,
+                    style,
                     &mut pixmap,
                     word,
                     word_rect.x + ox,
@@ -5779,6 +5865,8 @@ fn paint_laid_dom_scrolled(
                 let text_x = rect.x + style.border.left + style.padding.left;
                 let text_y = rect.y + (rect.height - line_height) / 2.0;
                 draw_text(
+                    &mut laid.text_engine,
+                    style,
                     &mut pixmap,
                     &label,
                     text_x,
@@ -5960,6 +6048,8 @@ fn paint_laid_dom_scrolled(
                         };
                         if color[3] != 0 {
                             draw_text(
+                                &mut laid.text_engine,
+                                style,
                                 &mut pixmap,
                                 shown,
                                 text_x,
@@ -5995,6 +6085,8 @@ fn paint_laid_dom_scrolled(
                         color[3] = ((color[3] as f32) * opacity).round() as u8;
                         if color[3] != 0 {
                             draw_text(
+                                &mut laid.text_engine,
+                                style,
                                 &mut pixmap,
                                 placeholder,
                                 text_x,
@@ -6034,7 +6126,10 @@ fn paint_laid_dom_scrolled(
     // box backgrounds/borders painted in the loop above. Each item already
     // carries its final origin and clip from `TextEngine::finalize`.
     for nid in paint_nodes {
-        if svg_subtree_skip.contains(&nid) || opacity_subtree_skip.contains(&nid) {
+        if svg_subtree_skip.contains(&nid)
+            || replaced_subtree_skip.contains(&nid)
+            || opacity_subtree_skip.contains(&nid)
+        {
             continue;
         }
         let whole = laid.ifc_items.get(&nid).copied();
@@ -7913,7 +8008,7 @@ fn clip_text_fill_color(style: &crate::LayoutStyle) -> Option<[u8; 4]> {
 fn paint_text_node(
     tree: &DomTree,
     nid: obscura_dom::tree::NodeId,
-    laid: &crate::DomLayout,
+    laid: &mut crate::DomLayout,
     scroll_state: &ScrollPaintState,
     pixmap: &mut Pixmap,
     raster_scale: f32,
@@ -7948,6 +8043,8 @@ fn paint_text_node(
 
     for (rect, word) in runs {
         draw_text(
+            &mut laid.text_engine,
+            style,
             pixmap,
             word,
             rect.x + ox,
@@ -7966,74 +8063,17 @@ fn paint_text_node(
     Some(())
 }
 
-fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
-    let Some(family) = family else {
-        return FONT_BYTES;
-    };
-    for token in family.split(',') {
-        let token = token
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_lowercase();
-        if token == "system-ui" || token == "ui-sans-serif" {
-            return SYSTEM_FONT_BYTES;
-        }
-        if token == "monospace"
-            || token.contains("mono")
-            || token.contains("courier")
-            || token.contains("consol")
-            || token == "menlo"
-            || token == "monaco"
-            || token == "code"
-        {
-            return MONO_FONT_BYTES;
-        }
-        if token == "serif"
-            || token == "georgia"
-            || token.contains("times")
-            || token == "cambria"
-            || token.contains("garamond")
-            || token.contains("liberation serif")
-            || token == "roman"
-        {
-            return SERIF_FONT_BYTES;
-        }
-        if token == "sans-serif"
-            || token.contains("sans")
-            || token == "arial"
-            || token == "helvetica"
-            || token == "helvetica neue"
-            || token == "-apple-system"
-            || token == "roboto"
-            || token == "segoe ui"
-            || token == "inter"
-            || token == "verdana"
-            || token == "tahoma"
-        {
-            return FONT_BYTES;
-        }
-    }
-    FONT_BYTES
-}
-
-pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size);
-    let scaled_font = font.as_scaled(scale);
-    let mut width = 0.0;
-    for c in text.chars() {
-        if c.is_control() {
-            continue;
-        }
-        width += scaled_font.h_advance(font.glyph_id(c));
-    }
-    if is_bold {
-        width += text.chars().filter(|c| !c.is_control()).count() as f32;
-    }
-    width
-}
-
+/// Draw a plain text fragment with the *page's* text engine.
+///
+/// Control labels, values, placeholders, list markers, and broken-image alt
+/// text are not part of a shaped inline formatting context, but they must
+/// still use the same database as the document: page `@font-face` families
+/// and installed faces only exist in `DomLayout::text_engine`. Resolving the
+/// family through a process-global base engine would paint a different face
+/// than layout measured.
 fn draw_text(
+    engine: &mut crate::inline::TextEngine,
+    style: &crate::LayoutStyle,
     pixmap: &mut Pixmap,
     text: &str,
     x: f32,
@@ -8055,110 +8095,24 @@ fn draw_text(
             return;
         }
     }
-    let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
-    let scale = PxScale::from(size * raster_scale);
-    let scaled_font = font.as_scaled(scale);
-    let mut caret = ab_glyph::point(x * raster_scale, y * raster_scale + scaled_font.ascent());
-
-    let width = pixmap.width() as i32;
-    let height = pixmap.height() as i32;
-    let clip_bounds = clip.map(|c| {
-        (
-            c.x * raster_scale,
-            c.y * raster_scale,
-            (c.x + c.width) * raster_scale,
-            (c.y + c.height) * raster_scale,
-        )
-    });
-    let pixels = pixmap.pixels_mut();
-    let (r, g, b, a_full) = (color[0], color[1], color[2], color[3]);
-
-    for c in text.chars() {
-        if c.is_control() {
-            continue;
-        }
-        let glyph_id = font.glyph_id(c);
-        let id = glyph_id;
-        let glyph = glyph_id.with_scale_and_position(scale, caret);
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            outlined.draw(|gx, gy, c| {
-                let px = (bounds.min.x + gx as f32) as i32;
-                let py = (bounds.min.y + gy as f32) as i32;
-                if let Some((cx0, cy0, cx1, cy1)) = clip_bounds {
-                    if (px as f32) < cx0
-                        || (px as f32) >= cx1
-                        || (py as f32) < cy0
-                        || (py as f32) >= cy1
-                    {
-                        return;
-                    }
-                }
-                if px >= 0 && px < width && py >= 0 && py < height {
-                    let alpha = (a_full as f32 * c) as u8;
-                    if alpha > 0 {
-                        let mut px_indices = vec![(py * width + px) as usize];
-                        if is_bold {
-                            for dx in 1..raster_scale.ceil().max(1.0) as i32 {
-                                if px + dx < width {
-                                    px_indices.push((py * width + px + dx) as usize);
-                                }
-                            }
-                        }
-                        for idx in px_indices {
-                            let mask_alpha = clip_mask
-                                .and_then(|mask| mask.data().get(idx))
-                                .copied()
-                                .unwrap_or(255) as u32;
-                            let alpha = alpha as u32 * mask_alpha / 255;
-                            if alpha == 0 {
-                                continue;
-                            }
-                            let dst = pixels[idx];
-
-                            let src_a = alpha;
-                            let src_r = (r as u32 * src_a) / 255;
-                            let src_g = (g as u32 * src_a) / 255;
-                            let src_b = (b as u32 * src_a) / 255;
-
-                            let dst_a = dst.alpha() as u32;
-                            let out_a = src_a + (dst_a * (255 - src_a) / 255);
-
-                            if out_a > 0 {
-                                let out_r = src_r + (dst.red() as u32 * (255 - src_a) / 255);
-                                let out_g = src_g + (dst.green() as u32 * (255 - src_a) / 255);
-                                let out_b = src_b + (dst.blue() as u32 * (255 - src_a) / 255);
-
-                                pixels[idx] = tiny_skia::PremultipliedColorU8::from_rgba(
-                                    out_r as u8,
-                                    out_g as u8,
-                                    out_b as u8,
-                                    out_a as u8,
-                                )
-                                .unwrap_or_else(|| {
-                                    tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, 0).unwrap()
-                                });
-                            }
-                        }
-                    }
-                }
-            });
-            // Matches measure_text's +1px-per-character bold compensation:
-            // without it, a word's reserved layout width (from measure_text)
-            // is wider than what draw_text actually advances through, and
-            // the difference shows up as a visible gap after every word once
-            // each word is its own independently-positioned box.
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
-        } else {
-            caret.x += scaled_font.h_advance(id)
-                + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale
-                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
-        }
-    }
+    engine.paint_plain_text_with_axes(
+        pixmap,
+        text,
+        x,
+        y,
+        color,
+        size,
+        if is_bold { 700 } else { 400 },
+        false,
+        family,
+        letter_spacing,
+        word_spacing,
+        clip,
+        clip_mask,
+        raster_scale,
+        crate::inline::resolved_font_variations(style).as_deref(),
+        style.font_optical_sizing.unwrap_or_default() == crate::FontOpticalSizing::Auto,
+    );
 }
 
 /// Resolve `src` (a `data:` URI, or an absolute/relative URL against
@@ -10674,6 +10628,17 @@ fn paint_positioned_pseudo(
     let right = style.inset[1].and_then(|value| resolve(value, containing_block.width));
     let bottom = style.inset[2].and_then(|value| resolve(value, containing_block.height));
     let left = style.inset[3].and_then(|value| resolve(value, containing_block.width));
+    let margin = |index: usize, value: f32| {
+        if style.margin_auto[index] {
+            0.0
+        } else {
+            value
+        }
+    };
+    let margin_top = margin(0, style.margin.top);
+    let margin_right = margin(1, style.margin.right);
+    let margin_bottom = margin(2, style.margin.bottom);
+    let margin_left = margin(3, style.margin.left);
     // Generated text supplies the shrink-to-fit dimensions of an absolutely
     // positioned pseudo whose width and/or height is auto. Tailwind's code
     // gutters use exactly this shape (`width` plus auto height); requiring two
@@ -10685,10 +10650,26 @@ fn paint_positioned_pseudo(
         .and_then(|content| text_engine.push_generated_text(content, style));
     let generated_intrinsic = generated_item.map(|item| text_engine.measure(item, None));
     let width = resolve(style.width, containing_block.width)
-        .or_else(|| Some(containing_block.width - left? - right?))
+        .or_else(|| {
+            Some(
+                containing_block.width
+                    - left?
+                    - right?
+                    - margin_left
+                    - margin_right,
+            )
+        })
         .or_else(|| generated_intrinsic.map(|size| size.0));
     let height = resolve(style.height, containing_block.height)
-        .or_else(|| Some(containing_block.height - top? - bottom?))
+        .or_else(|| {
+            Some(
+                containing_block.height
+                    - top?
+                    - bottom?
+                    - margin_top
+                    - margin_bottom,
+            )
+        })
         .or_else(|| generated_intrinsic.map(|size| size.1));
     let (Some(width), Some(height)) = (width, height) else {
         return;
@@ -10697,15 +10678,21 @@ fn paint_positioned_pseudo(
         return;
     }
     let x = left
-        .map(|value| containing_block.x + value)
-        .or_else(|| right.map(|value| containing_block.x + containing_block.width - value - width))
-        .unwrap_or(static_position_rect.x);
-    let y = top
-        .map(|value| containing_block.y + value)
+        .map(|value| containing_block.x + value + margin_left)
         .or_else(|| {
-            bottom.map(|value| containing_block.y + containing_block.height - value - height)
+            right.map(|value| {
+                containing_block.x + containing_block.width - value - width - margin_right
+            })
         })
-        .unwrap_or(static_position_rect.y);
+        .unwrap_or(static_position_rect.x + margin_left);
+    let y = top
+        .map(|value| containing_block.y + value + margin_top)
+        .or_else(|| {
+            bottom.map(|value| {
+                containing_block.y + containing_block.height - value - height - margin_bottom
+            })
+        })
+        .unwrap_or(static_position_rect.y + margin_top);
     let rect = crate::Rect {
         x,
         y,
@@ -11005,14 +10992,15 @@ fn collect_content_image_intrinsics(
     let mut changed = false;
     let mut active = HashSet::new();
     for (&nid, style) in styles {
-        if !tree.with_node(nid, |node| {
-            node.as_element().is_some_and(|name| &*name.local == "img")
-        }).unwrap_or(false) {
-            continue;
-        }
         let Some(url) = style.content_image.as_deref() else {
             continue;
         };
+        // `content:url()` replaces the contents of replaced and ordinary
+        // elements alike (CSS Content 3); both need the image's intrinsic
+        // metadata and, before that, a transport request.
+        if !tree.get_node(nid).is_some_and(|node| node.is_element()) {
+            continue;
+        }
         active.insert(nid);
         let resolved_url = resolve_resource_url(url, base_url).unwrap_or_else(|| url.to_string());
         let remembered_url_changed = cache
@@ -12040,6 +12028,69 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
     render_svg_with_font_database(bytes, width, height, &fonts)
 }
 
+/// Resolve SVG `font-family` names with the same installed-before-bundled
+/// policy as the HTML text engine. `usvg`'s default resolver has no bundled
+/// aliases, so `font-family: Arial` fell back to Liberation Serif even though
+/// the HTML document renders it as Liberation Sans.
+fn svg_font_resolver() -> usvg::FontResolver<'static> {
+    let system_ui = crate::inline::system_ui_family().to_string();
+    usvg::FontResolver {
+        select_font: Box::new(move |font, database| {
+            let mut families = Vec::new();
+            for family in font.families() {
+                families.push(match family {
+                    usvg::FontFamily::Serif => usvg::fontdb::Family::Serif,
+                    usvg::FontFamily::SansSerif => usvg::fontdb::Family::SansSerif,
+                    usvg::FontFamily::Cursive => usvg::fontdb::Family::Cursive,
+                    usvg::FontFamily::Fantasy => usvg::fontdb::Family::Fantasy,
+                    usvg::FontFamily::Monospace => usvg::fontdb::Family::Monospace,
+                    usvg::FontFamily::Named(name) => {
+                        if database.faces().any(|face| {
+                            face.families
+                                .iter()
+                                .any(|(family, _)| family.eq_ignore_ascii_case(name))
+                        }) {
+                            usvg::fontdb::Family::Name(name)
+                        } else if crate::inline::is_system_ui_family_token(name) {
+                            usvg::fontdb::Family::Name(&system_ui)
+                        } else if let Some(alias) = crate::inline::bundled_family_alias(name) {
+                            usvg::fontdb::Family::Name(alias)
+                        } else {
+                            usvg::fontdb::Family::Name(name)
+                        }
+                    }
+                });
+            }
+            // Unknown families must reach the browser default sans face, not
+            // a serif face that cannot render the requested script.
+            families.push(usvg::fontdb::Family::SansSerif);
+            let stretch = match font.stretch() {
+                usvg::FontStretch::UltraCondensed => usvg::fontdb::Stretch::UltraCondensed,
+                usvg::FontStretch::ExtraCondensed => usvg::fontdb::Stretch::ExtraCondensed,
+                usvg::FontStretch::Condensed => usvg::fontdb::Stretch::Condensed,
+                usvg::FontStretch::SemiCondensed => usvg::fontdb::Stretch::SemiCondensed,
+                usvg::FontStretch::Normal => usvg::fontdb::Stretch::Normal,
+                usvg::FontStretch::SemiExpanded => usvg::fontdb::Stretch::SemiExpanded,
+                usvg::FontStretch::Expanded => usvg::fontdb::Stretch::Expanded,
+                usvg::FontStretch::ExtraExpanded => usvg::fontdb::Stretch::ExtraExpanded,
+                usvg::FontStretch::UltraExpanded => usvg::fontdb::Stretch::UltraExpanded,
+            };
+            let style = match font.style() {
+                usvg::FontStyle::Normal => usvg::fontdb::Style::Normal,
+                usvg::FontStyle::Italic => usvg::fontdb::Style::Italic,
+                usvg::FontStyle::Oblique => usvg::fontdb::Style::Oblique,
+            };
+            database.query(&usvg::fontdb::Query {
+                families: &families,
+                weight: usvg::fontdb::Weight(font.weight()),
+                stretch,
+                style,
+            })
+        }),
+        select_fallback: usvg::FontResolver::default_fallback_selector(),
+    }
+}
+
 fn render_svg_with_font_database(
     bytes: &[u8],
     width: u32,
@@ -12063,6 +12114,7 @@ fn render_svg_with_font_database(
     opts.default_size = usvg::Size::from_wh(width as f32, height as f32)?;
     opts.font_family = "Liberation Serif".to_string();
     opts.fontdb = std::sync::Arc::clone(fonts);
+    opts.font_resolver = svg_font_resolver();
     let tree = usvg::Tree::from_data(&viewport_svg, &opts).ok()?;
     let size = tree.size();
     if size.width() <= 0.0 || size.height() <= 0.0 {
@@ -12075,38 +12127,58 @@ fn render_svg_with_font_database(
     Some(svg_pixmap)
 }
 
-/// A deterministic font database shared by every SVG raster in the process.
-/// Constructing/scanning a database per icon is far too expensive for pages
-/// with SVG-heavy navigation and would be prohibitive for future repeated
-/// frame capture. The embedded faces are the same stable browser-generic
-/// families used by the HTML text engine.
+/// A font database shared by every SVG raster in the process. Constructing or
+/// scanning one per icon is far too expensive for pages with SVG-heavy
+/// navigation. The bundled faces match the HTML text engine's deterministic
+/// generic families; configured font directories and, unless disabled,
+/// installed faces are added once for authored and non-Latin text.
+fn bundled_svg_font_database() -> usvg::fontdb::Database {
+    let mut database = usvg::fontdb::Database::new();
+    for bytes in [
+        FONT_BYTES,
+        FONT_BOLD_BYTES,
+        FONT_OBLIQUE_BYTES,
+        FONT_BOLD_OBLIQUE_BYTES,
+        SERIF_FONT_BYTES,
+        MONO_FONT_BYTES,
+        // The Liberation families stop at Latin/Greek/Cyrillic: an SVG
+        // text run with a symbol glyph (★/U+2605 and friends) had no face
+        // covering it anywhere in the database, so usvg's per-glyph
+        // fallback dropped the glyph and warned per character (#701).
+        // DejaVu Sans is the same embedded broad-coverage face the HTML
+        // engine already keeps for `system-ui`; family selection is
+        // unchanged (Liberation stays the sans/serif/mono default), it
+        // only extends what the fallback search can find.
+        SYSTEM_FONT_BYTES,
+    ] {
+        database.load_font_data(bytes.to_vec());
+    }
+    database.set_sans_serif_family("Liberation Sans");
+    database.set_serif_family("Liberation Serif");
+    database.set_monospace_family("Liberation Mono");
+    database
+}
+
 fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
     static DATABASE: std::sync::OnceLock<std::sync::Arc<usvg::fontdb::Database>> =
         std::sync::OnceLock::new();
     std::sync::Arc::clone(DATABASE.get_or_init(|| {
-        let mut database = usvg::fontdb::Database::new();
-        for bytes in [
-            FONT_BYTES,
-            FONT_BOLD_BYTES,
-            FONT_OBLIQUE_BYTES,
-            FONT_BOLD_OBLIQUE_BYTES,
-            SERIF_FONT_BYTES,
-            MONO_FONT_BYTES,
-            // The Liberation families stop at Latin/Greek/Cyrillic: an SVG
-            // text run with a symbol glyph (★/U+2605 and friends) had no face
-            // covering it anywhere in the database, so usvg's per-glyph
-            // fallback dropped the glyph and warned per character (#701).
-            // DejaVu Sans is the same embedded broad-coverage face the HTML
-            // engine already keeps for `system-ui`; family selection is
-            // unchanged (Liberation stays the sans/serif/mono default), it
-            // only extends what the fallback search can find.
-            SYSTEM_FONT_BYTES,
-        ] {
-            database.load_font_data(bytes.to_vec());
+        let mut database = bundled_svg_font_database();
+        for directory in crate::inline::configured_font_directories() {
+            if directory.is_dir() {
+                database.load_fonts_dir(directory);
+            }
         }
-        database.set_sans_serif_family("Liberation Sans");
-        database.set_serif_family("Liberation Serif");
-        database.set_monospace_family("Liberation Mono");
+        if crate::inline::effective_system_fonts() {
+            database.load_system_fonts();
+            // `load_system_fonts` updates the platform generic families via
+            // fontconfig. Keep the generics on the same bundled faces as HTML
+            // shaping; installed faces remain reachable by exact name and
+            // through per-glyph fallback.
+            database.set_sans_serif_family("Liberation Sans");
+            database.set_serif_family("Liberation Serif");
+            database.set_monospace_family("Liberation Mono");
+        }
         std::sync::Arc::new(database)
     }))
 }
@@ -16629,6 +16701,41 @@ mod tests {
     }
 
     #[test]
+    fn positioned_pseudo_margins_offset_its_painted_box() {
+        // An absolutely positioned pseudo is offset by its used margins, just
+        // like a real element. `margin-left:5%` resolves against the 200px
+        // containing block, so the red 20x20 box starts at (10, 6).
+        let tree = parse_html(
+            r#"<html><head><style>
+               html, body { margin:0 }
+               #host { position:relative; width:200px; height:100px; background:#00f }
+               #host::before {
+                 content:"";
+                 position:absolute;
+                 left:0;
+                 top:0;
+                 width:20px;
+                 height:20px;
+                 margin-left:5%;
+                 margin-top:6px;
+                 background:#f00;
+               }
+               </style></head><body><div id="host"></div></body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (220.0, 120.0), None).expect("pixmap");
+        let pixel = |x: u32, y: u32| pixmap.pixel(x, y).expect("pixel");
+        let red = |p: &tiny_skia::PremultipliedColorU8| {
+            p.red() > 200 && p.green() < 60 && p.blue() < 60
+        };
+        let blue = |p: &tiny_skia::PremultipliedColorU8| {
+            p.blue() > 200 && p.red() < 60 && p.green() < 60
+        };
+        assert!(red(&pixel(10, 6)), "pseudo must start after its margins");
+        assert!(blue(&pixel(0, 0)), "top-left must remain host background");
+        assert!(blue(&pixel(9, 5)), "margins must not be painted over");
+    }
+
+    #[test]
     fn polygon_clip_path_paints_responsive_geometry_on_elements_and_pseudos() {
         let tree = parse_html(
             r#"<html><head><style>
@@ -16834,6 +16941,167 @@ mod tests {
         assert!(
             green.green() > 220 && green.red() < 40 && green.blue() < 40,
             "content:url image must paint through the replaced-image path: {green:?}"
+        );
+    }
+
+    #[test]
+    fn content_url_on_an_ordinary_element_records_the_transport_miss() {
+        let tree = parse_html(r#"<html><body style="margin:0">
+            <div id="icon" style="display:inline-block;width:20px;height:10px;
+                content:url(https://assets.test/icon.svg)"></div></body></html>"#);
+        let mut resources = RenderResourceCache::with_loader(|_url: &str| None);
+        resources.set_sync_loading_enabled(false);
+        let prepared = prepare_dom(&tree, (100.0, 50.0), None, &mut resources)
+            .expect("prepare with a cache-only content image");
+        let icon = tree.get_element_by_id("icon").unwrap();
+        assert_eq!(
+            prepared.layout.styles[&icon].content_image.as_deref(),
+            Some("https://assets.test/icon.svg"),
+            "the cascade must keep content:url on a non-replaced element"
+        );
+        assert_eq!(
+            resources.take_sync_misses(usize::MAX),
+            vec![("https://assets.test/icon.svg".to_string(), None, false)],
+            "content images on ordinary elements must reach the page transport"
+        );
+        assert!(!resources.has_sync_misses(), "the miss report is drained");
+    }
+
+    #[test]
+    fn content_url_on_an_ordinary_element_is_atomic_paints_and_restores() {
+        const CONTENT: &str = "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2230%22%20height=%2220%22%3E%3Crect%20width=%2230%22%20height=%2220%22%20fill=%22lime%22/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><head><style>
+            html,body {{ margin:0; background:white }}
+            #content-image {{
+                display:block; box-sizing:border-box;
+                width:30px; height:20px; padding:2px;
+                border:1px solid rgb(255,0,0);
+                content:url("{CONTENT}");
+            }}
+            #child {{ display:block; width:20px; height:10px; background:rgb(0,0,255); }}
+            </style></head><body>
+            <div id="content-image"><span id="child"></span></div></body></html>"#
+        ));
+        let mut resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (120.0, 80.0), None, &mut resources).expect("first prepare");
+        let host = tree.get_element_by_id("content-image").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        assert!(
+            !prepared.layout.rects.contains_key(&child),
+            "replaced content must not lay out authored children"
+        );
+        let rect = prepared.layout.rects[&host];
+        assert_eq!(
+            (rect.width, rect.height),
+            (30.0, 20.0),
+            "the element keeps its border box around the replaced content"
+        );
+
+        let image = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("content image paint");
+        let lime = image.pixel(15, 10).expect("content image");
+        assert!(
+            lime.green() > 220 && lime.red() < 40 && lime.blue() < 40,
+            "content:url must paint the selected image: {lime:?}"
+        );
+        let padding = image.pixel(18, 1).expect("padding");
+        assert_eq!(
+            (padding.red(), padding.green(), padding.blue()),
+            (255, 255, 255),
+            "the generated image belongs to the content box, not the border box"
+        );
+        let border = image.pixel(0, 10).expect("border");
+        assert!(
+            border.red() > 220 && border.green() < 40 && border.blue() < 40,
+            "the element's own border stays visible: {border:?}"
+        );
+        let child_area = image.pixel(10, 8).expect("replaced child area");
+        assert!(
+            child_area.green() > 220 && child_area.blue() < 40,
+            "authored children must not paint through replaced content: {child_area:?}"
+        );
+
+        // `content: normal` is the computed-value reset for a regular element.
+        // It wins over the author rule and restores the ordinary children; the
+        // authored box metrics survive because they are separate declarations.
+        tree.with_node_mut(host, |node| {
+            node.set_attribute(
+                "style",
+                "display:block;box-sizing:border-box;width:30px;height:20px;\
+                 padding:2px;border:1px solid rgb(255,0,0);content:normal"
+                    .into(),
+            );
+        });
+        let mut restored =
+            prepare_dom(&tree, (120.0, 80.0), None, &mut resources).expect("restored prepare");
+        let restored_rect = restored.layout.rects[&host];
+        assert_eq!(
+            (restored_rect.width, restored_rect.height),
+            (30.0, 20.0),
+            "resetting content must keep the element's authored border box"
+        );
+        let child_rect = restored
+            .layout
+            .rects
+            .get(&child)
+            .copied()
+            .expect("resetting content:url restores authored child boxes");
+        assert_eq!(
+            (child_rect.width, child_rect.height),
+            (20.0, 10.0),
+            "the authored child keeps its own box after replacement ends"
+        );
+        let image = paint_prepared(&tree, &mut restored, &mut resources, (0.0, 0.0))
+            .expect("restored paint");
+        let blue = image.pixel(10, 8).expect("restored child");
+        assert!(
+            blue.blue() > 220 && blue.red() < 40 && blue.green() < 40,
+            "the original child must paint after content:url removal: {blue:?}"
+        );
+        let released = image.pixel(25, 10).expect("released content area");
+        assert_eq!(
+            (released.red(), released.green(), released.blue()),
+            (255, 255, 255),
+            "content:normal must stop painting the replaced image"
+        );
+        let border = image.pixel(0, 10).expect("restored border");
+        assert!(
+            border.red() > 220 && border.green() < 40 && border.blue() < 40,
+            "the element's own border survives the content reset: {border:?}"
+        );
+    }
+
+    #[test]
+    fn content_url_on_an_inline_element_stays_an_atomic_box() {
+        const CONTENT: &str = "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2212%22%20height=%228%22%3E%3Crect%20width=%2212%22%20height=%228%22%20fill=%22lime%22/%3E%3C/svg%3E";
+        let tree = parse_html(&format!(
+            r#"<html><body style="margin:0;background:white"><p style="margin:0;font-size:16px;font-family:monospace;line-height:0">before<span id='icon' style='content:url("{CONTENT}")'></span>after</p></body></html>"#
+        ));
+        let mut resources = RenderResourceCache::default();
+        let mut prepared =
+            prepare_dom(&tree, (120.0, 60.0), None, &mut resources).expect("prepare");
+        let icon = tree.get_element_by_id("icon").unwrap();
+        let rect = prepared.layout.rects.get(&icon).copied().expect(
+            "an inline content image must stay a real atomic box instead of folding into the text run",
+        );
+        assert_eq!(
+            (rect.width, rect.height),
+            (12.0, 8.0),
+            "the inline content image uses its intrinsic replaced size"
+        );
+        let image = paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0))
+            .expect("paint");
+        let lime = image
+            .pixel(
+                (rect.x + rect.width / 2.0) as u32,
+                (rect.y + rect.height / 2.0) as u32,
+            )
+            .expect("inline content image pixel");
+        assert!(
+            lime.green() > 220 && lime.red() < 40 && lime.blue() < 40,
+            "the inline generated image must paint: {lime:?}"
         );
     }
 
@@ -18088,19 +18356,30 @@ mod tests {
 
     #[test]
     fn word_measurement_honors_generic_font_family() {
-        let sans = measure_text("iiiiiiii", 16.0, false, Some("sans-serif"));
-        let mono = measure_text("iiiiiiii", 16.0, false, Some("monospace"));
+        // Fixed fixtures use the explicit bundled-only factory; the process
+        // default intentionally follows the host's installed faces.
+        let mut engine = crate::inline::TextEngine::bundled_test_engine();
+        let measure = |engine: &mut crate::inline::TextEngine, text: &str, size: f32, family| {
+            engine.measure_plain_text(text, size, 400, false, family, 0.0, 0.0)
+        };
+        let sans = measure(&mut engine, "iiiiiiii", 16.0, Some("sans-serif"));
+        let mono = measure(&mut engine, "iiiiiiii", 16.0, Some("monospace"));
         assert!(
             mono > sans * 1.5,
             "monospace advances must be used for code text: sans={sans}, mono={mono}"
         );
 
         let sample = "Build fast, responsive sites with Bootstrap";
-        let system = measure_text(sample, 64.0, false, Some("system-ui, sans-serif"));
-        let arial = measure_text(sample, 64.0, false, Some("Arial, sans-serif"));
+        let system = measure(
+            &mut engine,
+            sample,
+            64.0,
+            Some("system-ui, sans-serif"),
+        );
+        let arial = measure(&mut engine, sample, 64.0, Some("Arial, sans-serif"));
         assert!(
             system > arial * 1.08,
-            "Chromium's Linux system-ui face is DejaVu Sans, not the narrower \
+            "in bundled-only mode system-ui is DejaVu Sans, not the narrower \
              Liberation Sans used for Arial: system={system}, arial={arial}"
         );
     }
@@ -18229,56 +18508,69 @@ mod tests {
 
     #[test]
     fn svg_text_symbol_glyphs_resolve_in_the_font_database() {
-        // The Liberation faces stop at Latin/Greek/Cyrillic: without a
-        // broad-coverage face in the SVG database, usvg's per-glyph fallback
-        // finds nothing for ★/U+2605, renders the .notdef tofu, and warns per
-        // character (#701). Pixel presence cannot distinguish a real glyph
-        // from tofu, so capture usvg's warnings while rasterizing a
-        // symbol-bearing SVG text run through the same database the page
-        // pipeline uses.
-        static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        struct SymbolWarningLogger;
-        impl log::Log for SymbolWarningLogger {
-            fn enabled(&self, _metadata: &log::Metadata) -> bool {
-                true
-            }
-            fn log(&self, record: &log::Record) {
-                if record.level() == log::Level::Warn {
-                    WARNINGS.lock().unwrap().push(record.args().to_string());
+        // Deterministic bundled-only database: installed Windows symbol faces
+        // must not influence which face serves ★. DejaVu Sans is the bundled
+        // broad-coverage face; Liberation Serif (the default) stops at
+        // Latin/Greek/Cyrillic.
+        let database = std::sync::Arc::new(bundled_svg_font_database());
+        let render = |markup: String| {
+            render_svg_with_font_database(markup.as_bytes(), 60, 50, &database).expect("raster")
+        };
+        let star_svg = |family: &str| {
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"50\">\
+                 <text x=\"8\" y=\"34\" font-size=\"24\" fill=\"#00cc55\"{family}>★</text>\
+                 </svg>"
+            )
+        };
+        let default_star = render(star_svg(""));
+        let explicit_star = render(star_svg(" font-family=\"DejaVu Sans\""));
+        let missing = render(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"50\">\
+             <text x=\"8\" y=\"34\" font-size=\"24\" fill=\"#00cc55\">&#x378;</text>\
+             </svg>"
+            .to_string(),
+        );
+        let ink = |pixmap: &Pixmap| -> Vec<u8> {
+            pixmap.pixels().iter().map(|pixel| pixel.alpha()).collect()
+        };
+        let star_ink = ink(&default_star);
+        assert!(
+            star_ink.iter().any(|alpha| *alpha != 0),
+            "the ★ text run should rasterize visible ink"
+        );
+        assert_eq!(
+            star_ink,
+            ink(&explicit_star),
+            "default fallback must resolve ★ to the explicit covering face, not tofu"
+        );
+        assert_ne!(
+            star_ink,
+            ink(&missing),
+            "the unassigned-codepoint control must differ from the real star glyph"
+        );
+
+        // A solid U+2605 covers the centre of its ink bounds; .notdef tofu is
+        // a hollow box, so this distinguishes a resolved glyph from a missing
+        // one on ink shape rather than mere pixel difference.
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0, 0);
+        for y in 0..default_star.height() {
+            for x in 0..default_star.width() {
+                if default_star.pixel(x, y).unwrap().alpha() != 0 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
                 }
             }
-            fn flush(&self) {}
         }
-        let _ = log::set_boxed_logger(Box::new(SymbolWarningLogger));
-        log::set_max_level(log::LevelFilter::Warn);
-        WARNINGS.lock().unwrap().clear();
-
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="50">
-            <text x="8" y="34" font-size="24" fill="#00cc55">★</text>
-            <text x="8" y="4" font-size="24" fill="#00cc55">&#x378;</text>
-        </svg>"##;
-        let pixmap = render_svg_with_font_database(svg.as_bytes(), 60, 50, &svg_font_database())
-            .expect("raster");
+        assert!(min_x <= max_x && min_y <= max_y, "star ink bounds");
+        let center = default_star
+            .pixel((min_x + max_x) / 2, (min_y + max_y) / 2)
+            .unwrap();
         assert!(
-            pixmap
-                .pixels()
-                .iter()
-                .any(|pixel| pixel.green() > 150 && pixel.red() < 80 && pixel.blue() < 120),
-            "the ★ text run should rasterize"
-        );
-        let warnings = WARNINGS.lock().unwrap();
-        // Positive control first: an unassigned codepoint must still warn, so
-        // the test fails loudly if the logger wiring breaks instead of
-        // vacuously passing.
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("U+378 character")),
-            "the unassigned-codepoint control must warn: {warnings:?}"
-        );
-        assert!(
-            !warnings.iter().any(|warning| warning.contains("U+2605")),
-            "the SVG font database must cover ★ instead of dropping to .notdef: {warnings:?}"
+            center.alpha() != 0,
+            "a solid star must cover its ink-bounds centre"
         );
     }
 

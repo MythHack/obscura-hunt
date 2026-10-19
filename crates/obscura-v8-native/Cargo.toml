@@ -1,0 +1,18 @@
+[package]
+name = "obscura-v8-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[features]
+# Mirror deno_core's supported V8 pointer-compression configuration into the
+# native helper compile. Sandbox is not exposed by deno_core 0.412, so it is
+# reported from the helper's compiled macros but has no forwarding feature.
+v8_enable_pointer_compression = []
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]

@@ -12,8 +12,9 @@ use std::sync::Arc;
 use obscura_dom::tree::{DomTree, NodeId};
 use taffy::prelude::*;
 
-use crate::{Rect, to_taffy_style};
+use crate::{Rect, TextTransform, to_taffy_style};
 
+#[cfg(not(feature = "paint"))]
 pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
     if spacing == 0.0 { return 0.0; }
     text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
@@ -28,6 +29,7 @@ pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
 /// (default)" mode.
 #[cfg(feature = "paint")]
 fn text_width(
+    engine: &mut crate::inline::TextEngine,
     text: &str,
     size: f32,
     is_bold: bool,
@@ -35,13 +37,23 @@ fn text_width(
     letter_spacing: f32,
     word_spacing: f32,
 ) -> f32 {
-    crate::paint::measure_text(text, size, is_bold, family)
-        + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
-        + word_spacing_advance(text, word_spacing)
+    // Measure through the render pass's page engine, not paint's base-font
+    // thread-local: a `@font-face` or installed family used for the control /
+    // word leaf must have exactly the metrics that will be painted.
+    engine.measure_plain_text(
+        text,
+        size,
+        if is_bold { 700 } else { 400 },
+        false,
+        family,
+        letter_spacing,
+        word_spacing,
+    )
 }
 
 #[cfg(not(feature = "paint"))]
 fn text_width(
+    _engine: &mut crate::inline::TextEngine,
     text: &str,
     size: f32,
     is_bold: bool,
@@ -119,7 +131,7 @@ fn native_button_intrinsic_content(
         let is_atomic = matches!(
             &*element.local,
             "svg" | "img" | "video" | "canvas" | "iframe" | "embed" | "object"
-        );
+        ) || style.is_some_and(|style| style.content_image.is_some());
         if is_atomic {
             if let Some(style) = style {
                 if let Some(width) = definite_inline_size(style.width, font_size) {
@@ -508,6 +520,7 @@ pub fn retained_attribute_mutation_kind(
             | "color"
             | "height"
             | "hidden"
+            | "popover"
             | "valign"
             | "viewbox"
             | "width"
@@ -1867,6 +1880,104 @@ struct GeneratedBoxBuild {
     node: taffy::NodeId,
 }
 
+fn edge_at(edges: &crate::Edges, index: usize) -> f32 {
+    match index {
+        0 => edges.top,
+        1 => edges.right,
+        2 => edges.bottom,
+        _ => edges.left,
+    }
+}
+
+/// Best-effort used padding side before Taffy has produced a layout. Pure
+/// percentage padding remains typed for Taffy; this value only feeds the
+/// top-down containing-block estimate for descendants.
+fn estimated_padding_side(style: &crate::LayoutStyle, index: usize, basis: f32) -> f32 {
+    match style.padding_percent[index] {
+        Some(percent) => percent * basis,
+        None => edge_at(&style.padding, index),
+    }
+}
+
+/// Best-effort used margin side before Taffy has produced a layout. The f32
+/// `margin` edge holds the top-down estimate; a retained `margin_percent`
+/// resolves against the exact basis available at this call site instead of
+/// the (possibly older) basis used for that estimate. Auto resolves to zero
+/// for width arithmetic.
+fn estimated_margin_side(style: &crate::LayoutStyle, index: usize, basis: f32) -> f32 {
+    if style.margin_auto[index] {
+        0.0
+    } else if let Some(percent) = style.margin_percent[index] {
+        percent * basis
+    } else {
+        edge_at(&style.margin, index)
+    }
+}
+
+fn estimated_inline_non_content(style: &crate::LayoutStyle, basis: f32) -> f32 {
+    estimated_padding_side(style, 1, basis)
+        + estimated_padding_side(style, 3, basis)
+        + style.border.left
+        + style.border.right
+}
+
+/// Pre-layout content-box width used to resolve em/rem/viewport lengths and
+/// functional sizes in descendants. Width percentages, padding, margins, and
+/// min/max constraints are evaluated against the containing-block width the
+/// caller knows at this point, including the max-width clamp that a flex/grid
+/// parent will eventually apply. Authoritative percentage lengths still stay
+/// typed through Taffy; this estimate never replaces the final used geometry.
+fn estimated_content_box_width(style: &crate::LayoutStyle, basis: f32) -> f32 {
+    let edges = estimated_inline_non_content(style, basis);
+    let margins = estimated_margin_side(style, 3, basis) + estimated_margin_side(style, 1, basis);
+    let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    let content = match style.width {
+        crate::Dimension::Px(width) => {
+            if content_box {
+                width.max(0.0)
+            } else {
+                (width - edges).max(0.0)
+            }
+        }
+        crate::Dimension::Percent(percent) => {
+            let width = percent * basis;
+            if content_box {
+                width.max(0.0)
+            } else {
+                (width - edges).max(0.0)
+            }
+        }
+        _ => (basis - margins - edges).max(0.0),
+    };
+    let to_declared_box = |value: f32| {
+        if content_box {
+            value
+        } else {
+            value + edges
+        }
+    };
+    let from_declared_box = |value: f32| {
+        if content_box {
+            value.max(0.0)
+        } else {
+            (value - edges).max(0.0)
+        }
+    };
+    let constraint = |dimension: crate::Dimension| match dimension {
+        crate::Dimension::Px(value) => Some(value),
+        crate::Dimension::Percent(percent) => Some(percent * basis),
+        _ => None,
+    };
+    let mut declared = to_declared_box(content);
+    if let Some(maximum) = constraint(style.max_width) {
+        declared = declared.min(maximum);
+    }
+    if let Some(minimum) = constraint(style.min_width) {
+        declared = declared.max(minimum);
+    }
+    from_declared_box(declared)
+}
+
 fn sync_resolved_percentage_padding(
     taffy_tree: &TaffyTree<usize>,
     taffy_root: taffy::NodeId,
@@ -1875,22 +1986,58 @@ fn sync_resolved_percentage_padding(
     generated: &[GeneratedBoxBuild],
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
 ) {
-    let has_percentage_padding = styles.values().any(|style| {
+    fn has_late_edges(style: &crate::LayoutStyle) -> bool {
         style.padding_percent.iter().any(Option::is_some)
+            || style.margin_percent.iter().any(Option::is_some)
+            || style.margin_calc_expressions.iter().any(Option::is_some)
+    }
+    let has_late_edges = styles.values().any(|style| {
+        has_late_edges(style)
             || style
                 .before_pseudo
                 .as_deref()
-                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some))
+                .is_some_and(has_late_edges)
             || style
                 .after_pseudo
                 .as_deref()
-                .is_some_and(|pseudo| pseudo.padding_percent.iter().any(Option::is_some))
+                .is_some_and(has_late_edges)
     });
-    if !has_percentage_padding {
+    if !has_late_edges {
         return;
     }
 
-    fn sync(style: &mut crate::LayoutStyle, containing_block_width: f32) {
+    fn set_margin(style: &mut crate::LayoutStyle, index: usize, value: f32) {
+        match index {
+            0 => style.margin.top = value,
+            1 => style.margin.right = value,
+            2 => style.margin.bottom = value,
+            _ => style.margin.left = value,
+        }
+    }
+
+    fn typed_margin_against(
+        style: &crate::LayoutStyle,
+        index: usize,
+        basis: f32,
+    ) -> Option<f32> {
+        if let Some(percent) = style.margin_percent[index] {
+            Some(percent * basis)
+        } else if let Some(handle) = style.margin_calc_expressions[index].as_ref() {
+            Some(crate::style::resolve_grid_calc(
+                std::sync::Arc::as_ptr(handle).cast::<()>(),
+                basis,
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn sync(
+        style: &mut crate::LayoutStyle,
+        containing_block_width: f32,
+        layout: &taffy::Layout,
+        parent_uses_block_margin_basis: bool,
+    ) {
         if let Some(percent) = style.padding_percent[0] {
             style.padding.top = percent * containing_block_width;
         }
@@ -1903,22 +2050,61 @@ fn sync_resolved_percentage_padding(
         if let Some(percent) = style.padding_percent[3] {
             style.padding.left = percent * containing_block_width;
         }
+        // Percentage margins resolve against their true containing block. See
+        // the per-side basis choice below: block-flow own margins are
+        // re-resolved against the parent content box, while flex/grid/absolute
+        // consumers use Taffy's exact (grid-area/padding-box) Layout.margin.
+        for index in 0..4 {
+            let Some(computed) = typed_margin_against(style, index, containing_block_width)
+            else {
+                continue;
+            };
+            let vertical = index == 0 || index == 2;
+            // Taffy's block algorithm stores the collapsed top/bottom margin
+            // set in Layout.margin, which includes descendants' margins. The
+            // element's own computed margin must not absorb a child's larger
+            // collapsing margin (parent 10% = 20px, child 50px: own stays 20,
+            // positions collapse to 50). Re-resolve the typed side against the
+            // final containing-block width for block-flow children and for
+            // inline top/bottom, which the atomic inline surrogate zeroes.
+            // Flex/grid/absolute layouts do not collapse, so their exact used
+            // value in Layout.margin (grid-area/padding-box basis) wins.
+            let own_basis = vertical
+                && style.position != Some(taffy::Position::Absolute)
+                && (parent_uses_block_margin_basis || style.ignores_used_box_sizes());
+            let used = if own_basis {
+                computed
+            } else {
+                match index {
+                    0 => layout.margin.top,
+                    1 => layout.margin.right,
+                    2 => layout.margin.bottom,
+                    _ => layout.margin.left,
+                }
+            };
+            set_margin(style, index, used);
+        }
     }
 
     fn visit(
         taffy_tree: &TaffyTree<usize>,
         node: taffy::NodeId,
         containing_block_width: f32,
+        parent_uses_block_margin_basis: bool,
         id_map: &HashMap<taffy::NodeId, NodeId>,
         generated: &HashMap<taffy::NodeId, (NodeId, GeneratedBoxKind)>,
         styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     ) {
-        let Ok(layout) = taffy_tree.layout(node) else {
-            return;
-        };
+        // CSSOM exposes used lengths with their real fractional value even
+        // though paint geometry is snapped to device pixels. `layout()`
+        // returns Taffy's final_layout when rounding is enabled, which would
+        // turn an 8.333% margin of 1312px into 109 rather than 109.333.
+        // Read the unrounded layout for style sync and for the containing
+        // inline basis of descendants; rect geometry keeps its rounded path.
+        let layout = taffy_tree.unrounded_layout(node);
         if let Some(dom_id) = id_map.get(&node) {
             if let Some(style) = styles.get_mut(dom_id) {
-                sync(style, containing_block_width);
+                sync(style, containing_block_width, &layout, parent_uses_block_margin_basis);
             }
         } else if let Some((host, kind)) = generated.get(&node) {
             if let Some(host_style) = styles.get_mut(host) {
@@ -1927,18 +2113,22 @@ fn sync_resolved_percentage_padding(
                     GeneratedBoxKind::After => host_style.after_pseudo.as_deref_mut(),
                 };
                 if let Some(pseudo) = pseudo {
-                    sync(pseudo, containing_block_width);
+                    sync(pseudo, containing_block_width, &layout, parent_uses_block_margin_basis);
                 }
             }
         }
 
         let child_containing_block_width = layout.content_box_width().max(0.0);
+        let child_uses_block_margin_basis = taffy_tree
+            .style(node)
+            .is_ok_and(|style| style.display == taffy::style::Display::Block);
         if let Ok(children) = taffy_tree.children(node) {
             for child in children {
                 visit(
                     taffy_tree,
                     child,
                     child_containing_block_width,
+                    child_uses_block_margin_basis,
                     id_map,
                     generated,
                     styles,
@@ -1955,6 +2145,7 @@ fn sync_resolved_percentage_padding(
         taffy_tree,
         taffy_root,
         initial_containing_block_width,
+        false,
         id_map,
         &generated,
         styles,
@@ -2084,7 +2275,8 @@ fn sync_positioned_pseudo_percentage_padding(
         .flatten()
         .any(|pseudo| {
             pseudo.position == Some(taffy::Position::Absolute)
-                && pseudo.padding_percent.iter().any(Option::is_some)
+                && (pseudo.padding_percent.iter().any(Option::is_some)
+                    || pseudo.margin_percent.iter().any(Option::is_some))
         })
     });
     if !has_positioned_percentage_padding {
@@ -2103,6 +2295,16 @@ fn sync_positioned_pseudo_percentage_padding(
                 1 => pseudo.padding.right = value,
                 2 => pseudo.padding.bottom = value,
                 _ => pseudo.padding.left = value,
+            }
+        }
+        for (index, percent) in pseudo.margin_percent.into_iter().enumerate() {
+            let Some(percent) = percent else { continue };
+            let value = percent * containing_block_width;
+            match index {
+                0 => pseudo.margin.top = value,
+                1 => pseudo.margin.right = value,
+                2 => pseudo.margin.bottom = value,
+                _ => pseudo.margin.left = value,
             }
         }
     }
@@ -2131,6 +2333,10 @@ struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
+    /// The fallback word/box stream shares whitespace state across ordinary
+    /// inline wrappers, but not across atomic boxes or formatting contexts.
+    fallback_last_was_space: Option<bool>,
+    fallback_inline_end: Option<NodeId>,
     /// Zero-sized inline placeholders retain out-of-flow source positions
     /// without changing the real box's percentage containing block.
     static_positions: HashMap<NodeId, taffy::NodeId>,
@@ -2750,6 +2956,24 @@ fn cascade_node_style(
                 .filter(|value| value.is_finite() && *value >= 0.0);
         }
         let mut style = crate::style::ua_style(elem.local.as_ref());
+        // Popovers keep ordinary DOM ancestry, but their UA box is fixed and
+        // closed popovers generate no box. Author CSS may override these UA
+        // declarations, including display, just as it can override [hidden].
+        if &*elem.ns == "http://www.w3.org/1999/xhtml"
+            && node.attrs().is_some_and(|attrs| attrs.iter().any(|attr| {
+                attr.name.ns.is_empty() && attr.name.prefix.is_none()
+                    && (&*attr.name.local).eq_ignore_ascii_case("popover")
+            }))
+        {
+            crate::style::apply_inline(&mut style,
+                "position:fixed;inset:0;width:fit-content;height:fit-content;margin:auto;\
+                 border:solid;padding:0.25em;overflow:auto;color:canvastext;background-color:canvas");
+            if !tree.is_popover_open(id)
+                && !(&*elem.local == "dialog" && node.get_attribute("open").is_some())
+            {
+                style.display = crate::Display::None;
+            }
+        }
         style.is_replaced_box = crate::inline::is_replaced(elem.local.as_ref());
         style.has_replaced_sizing = crate::inline::has_replaced_sizing(elem.local.as_ref())
             || (&*elem.local == "input"
@@ -5716,27 +5940,8 @@ fn layout_dom_once(
                     if child_cb_height_definite {
                         definite_height_nodes.insert(id);
                     }
-                    let cb_w = inh.cb_width;
-                    let used_w = match style.width {
-                        crate::Dimension::Px(width) => width,
-                        crate::Dimension::Percent(percent) => percent * cb_w,
-                        _ => (cb_w - style.margin.left - style.margin.right).max(0.0),
-                    };
-                    let definite_content_box = matches!(
-                        style.width,
-                        crate::Dimension::Px(_) | crate::Dimension::Percent(_)
-                    ) && style.box_sizing
-                        == crate::BoxSizing::ContentBox;
-                    child_cb_width = if definite_content_box {
-                        used_w.max(0.0)
-                    } else {
-                        (used_w
-                            - style.padding.left
-                            - style.padding.right
-                            - style.border.left
-                            - style.border.right)
-                            .max(0.0)
-                    };
+                    child_cb_width =
+                        estimated_content_box_width(style, inh.cb_width);
                 }
                 inh.cb_width = child_cb_width;
                 inh.cb_height = child_cb_height;
@@ -6212,11 +6417,13 @@ fn layout_dom_once(
                 }
 
                 // Resolve font/viewport-relative box edges now that their
-                // reference sizes are known. Percentage margins still use the
-                // estimated containing-block width here. Pure percentage
-                // padding stays typed until Taffy knows the final flex/grid
-                // containing-block inline size; its used pixels are synced
-                // back into `LayoutStyle` after the final layout.
+                // reference sizes are known. Percentage margins and padding
+                // stay typed through Taffy so flex/grid/max-width constraints
+                // can establish the real containing-block inline size; the
+                // estimates written to the f32 edges below only serve
+                // consumers that run before layout (inline shaping, float
+                // bands, intrinsic native-control sizing). The final used
+                // values are synced back into `LayoutStyle` after layout.
                 for i in 0..4 {
                     if let Some(expression) = style.padding_expressions[i].as_deref() {
                         if let Some(px) = crate::style::resolve_contextual_length(
@@ -6241,6 +6448,15 @@ fn layout_dom_once(
                                 _ => style.margin.left = px,
                             }
                         }
+                        // The opaque calc handle was created when the
+                        // declaration was parsed and received this element's
+                        // font/viewport context above. Taffy resolves it
+                        // against the real containing-block width. Do not
+                        // reparse here (that would drop the contextualized
+                        // em/rem/vw/vh bases) and do not infer a linear
+                        // percentage factor from sampled results: min()/max()/
+                        // clamp() are nonlinear and must stay general calc
+                        // handles.
                     }
                     if let Some(relative) = style.padding_relative[i] {
                         if let crate::Dimension::Px(px) = relative.resolve(em_px, root_fs, vw, vh) {
@@ -6444,6 +6660,23 @@ fn layout_dom_once(
                                 }
                             }
                         }
+                        if let Some(expression) = pseudo.margin_expressions[index].as_deref() {
+                            if let Some(px) = crate::style::resolve_contextual_length(
+                                expression, pseudo_em, root_fs, vw, vh, cb_w,
+                            ) {
+                                match index {
+                                    0 => pseudo.margin.top = px,
+                                    1 => pseudo.margin.right = px,
+                                    2 => pseudo.margin.bottom = px,
+                                    _ => pseudo.margin.left = px,
+                                }
+                            }
+                            // Keep the cascade-created handle, already given
+                            // the pseudo's font/viewport context above. Never
+                            // replace it with a freshly parsed, uninitialized
+                            // handle or with a sampled linear percentage.
+
+                        }
                         if let Some(relative) = pseudo.margin_relative[index] {
                             if let crate::Dimension::Px(px) =
                                 relative.resolve(pseudo_em, root_fs, vw, vh)
@@ -6546,28 +6779,11 @@ fn layout_dom_once(
                 }
 
                 // Containing-block width handed to this element's children is
-                // its own content-box width. A definite content-box width is
-                // already that value; a border-box or auto width includes
-                // padding and border, which must be removed.
-                let used_w = match style.width {
-                    crate::Dimension::Px(w) => w,
-                    crate::Dimension::Percent(p) => p * cb_w,
-                    _ => (cb_w - style.margin.left - style.margin.right).max(0.0),
-                };
-                let definite_content_box = matches!(
-                    style.width,
-                    crate::Dimension::Px(_) | crate::Dimension::Percent(_)
-                ) && style.box_sizing == crate::BoxSizing::ContentBox;
-                child_cb_width = if definite_content_box {
-                    used_w.max(0.0)
-                } else {
-                    (used_w
-                        - style.padding.left
-                        - style.padding.right
-                        - style.border.left
-                        - style.border.right)
-                        .max(0.0)
-                };
+                // its own content-box width. This estimate mirrors the used
+                // width rules, including the max-width clamp and percentage
+                // padding/margins, so descendants' em/rem/calc lengths use
+                // the same basis a real flex/grid pass establishes.
+                child_cb_width = estimated_content_box_width(style, cb_w);
                 if child_cb_height_definite {
                     let used_height = match style.height {
                         crate::Dimension::Px(height) => height,
@@ -6673,6 +6889,7 @@ fn layout_dom_once(
                     .collect::<Vec<_>>()
                     .join(" ");
                 let mut content_width = text_width(
+                    &mut engine,
                     &label,
                     font_size,
                     bold,
@@ -6744,6 +6961,7 @@ fn layout_dom_once(
                     .iter()
                     .map(|label| {
                         text_width(
+                            &mut engine,
                             label,
                             font_size,
                             bold,
@@ -6872,10 +7090,19 @@ fn layout_dom_once(
                         .and_then(|value| value.parse::<u32>().ok())
                         .filter(|&value| value > 0)
                         .unwrap_or(20) as f32;
-                    (
-                        size * font_size * 0.6 + font_size * 0.675 + horizontal_edges,
-                        default_height,
-                    )
+                    // Blink sizes a text field from its primary face rather
+                    // than from a fixed per-character constant: the average
+                    // character width contributes once per `size` unit and
+                    // the maximum character width replaces the leading one
+                    // (HTML's "converting a character width to pixels"). Both
+                    // come from the selected face at the control's used font
+                    // size so a pinned webfont produces the same border box
+                    // as Chromium.
+                    let (average_char_width, max_char_width) =
+                        engine.text_control_char_widths(style);
+                    let content_width =
+                        average_char_width * size + (max_char_width - average_char_width).max(0.0);
+                    (content_width.ceil() + horizontal_edges, default_height)
                 }
             };
             assign_native_control_size(
@@ -7049,9 +7276,10 @@ fn layout_dom_once(
                 {
                     if let Ok(current) = taffy_tree.style(taffy_root) {
                         let mut adjusted = current.clone();
-                        let outer =
-                            (initial_cb_width - root_style.margin.left - root_style.margin.right)
-                                .max(0.0);
+                        let outer = (initial_cb_width
+                            - estimated_margin_side(root_style, 3, initial_cb_width)
+                            - estimated_margin_side(root_style, 1, initial_cb_width))
+                            .max(0.0);
                         let declared = if root_style.box_sizing == crate::BoxSizing::ContentBox {
                             (outer
                                 - root_style.padding.left
@@ -7944,7 +8172,7 @@ fn layout_dom_once(
     // the second clip-tree walk.
     #[cfg(feature = "paint")]
     if engine.has_inline_owners() {
-        let canonical = synthesize_shaped_inline_fragments(tree, &mut rects, &styles, &engine);
+        let canonical = synthesize_shaped_inline_fragments(tree, &mut rects, &mut styles, &engine);
         if !canonical.is_empty() {
             let relative_offsets = canonical
                 .keys()
@@ -8112,48 +8340,61 @@ fn shaped_item_clip(
 fn synthesize_shaped_inline_fragments(
     tree: &DomTree,
     rects: &mut HashMap<NodeId, Rect>,
-    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    styles: &mut HashMap<NodeId, crate::LayoutStyle>,
     engine: &crate::inline::TextEngine,
 ) -> HashMap<NodeId, Vec<Rect>> {
-    let mut fragments: HashMap<NodeId, Vec<((usize, usize), Rect)>> = HashMap::new();
+    let mut fragments: HashMap<NodeId, Vec<crate::inline::InlineOwnerLineFragment>> = HashMap::new();
     for shaped in engine.inline_owner_line_fragments() {
-        let Some(style) = styles.get(&shaped.owner) else {
-            continue;
-        };
-        let (ascent, descent) = engine.inline_font_box_metrics(style);
-        let Some((relative_x, relative_y)) =
-            folded_inline_relative_offset(tree, shaped.owner, rects, styles)
-        else {
-            // Keep the pre-existing Taffy surrogate geometry when an inset
-            // cannot be resolved faithfully. Installing a knowingly wrong
-            // shaped fragment would make the DOM geometry canonical.
-            continue;
-        };
-        let rect = Rect {
-            x: shaped.x + relative_x,
-            y: shaped.baseline_y - ascent - style.padding.top - style.border.top + relative_y,
-            width: shaped.width,
-            height: ascent
-                + descent
-                + style.padding.top
-                + style.padding.bottom
-                + style.border.top
-                + style.border.bottom,
-        };
-        fragments
-            .entry(shaped.owner)
-            .or_default()
-            .push(((shaped.item_index, shaped.line_index), rect));
+        let Some(style) = styles.get_mut(&shaped.owner) else { continue; };
+        let pieces = fragments.entry(shaped.owner).or_default();
+        if pieces.is_empty() {
+            // Folded owners have no Taffy node. Publish the same final basis
+            // used by their shaped edges before resolving relative offsets
+            // and font-box decorations in any descendant.
+            for side in 0..4 {
+                if let Some(percent) = style.padding_percent[side] {
+                    let value = percent * shaped.containing_width;
+                    match side {
+                        0 => style.padding.top = value,
+                        1 => style.padding.right = value,
+                        2 => style.padding.bottom = value,
+                        _ => style.padding.left = value,
+                    }
+                }
+                let margin = style.margin_percent[side].map(|percent| percent * shaped.containing_width)
+                    .or_else(|| style.margin_calc_expressions[side].as_ref().map(|handle|
+                        crate::style::resolve_grid_calc(std::sync::Arc::as_ptr(handle).cast::<()>(), shaped.containing_width)));
+                if let Some(value) = margin {
+                    match side {
+                        0 => style.margin.top = value,
+                        1 => style.margin.right = value,
+                        2 => style.margin.bottom = value,
+                        _ => style.margin.left = value,
+                    }
+                }
+            }
+        }
+        pieces.push(shaped);
     }
 
     let mut canonical = HashMap::with_capacity(fragments.len());
     for (owner, mut pieces) in fragments {
-        pieces.sort_by(|(order_a, rect_a), (order_b, rect_b)| {
-            order_a
-                .cmp(order_b)
-                .then_with(|| rect_a.x.total_cmp(&rect_b.x))
-        });
-        let fragments = pieces.into_iter().map(|(_, rect)| rect).collect::<Vec<_>>();
+        let Some((relative_x, relative_y)) = folded_inline_relative_offset(tree, owner, rects, styles)
+        else {
+            // An unresolved inset keeps the existing Taffy surrogate geometry.
+            continue;
+        };
+        let style = &styles[&owner];
+        let (ascent, descent) = engine.inline_font_box_metrics(style);
+        pieces.sort_by(|a, b| (a.item_index, a.line_index).cmp(&(b.item_index, b.line_index))
+            .then_with(|| a.x.total_cmp(&b.x)));
+        let fragments = pieces.into_iter().map(|shaped| Rect {
+            x: shaped.x + relative_x,
+            y: shaped.baseline_y - ascent - style.padding.top - style.border.top + relative_y,
+            width: shaped.width,
+            height: ascent + descent + style.padding.top + style.padding.bottom
+                + style.border.top + style.border.bottom,
+        }).collect::<Vec<_>>();
         let mut union = fragments[0];
         for fragment in &fragments[1..] {
             let left = union.x.min(fragment.x);
@@ -10294,11 +10535,33 @@ fn build_any(
             })
             .collect();
     }
-    let Some(inner) = build(
+    let style = styles.get(&id);
+    let out_of_flow = style.is_some_and(|style| {
+        style.float.is_some() || matches!(style.position, Some(taffy::Position::Absolute))
+    });
+    let forced_break = tree.with_node(id, |node| {
+        node.as_element().is_some_and(|element| &*element.local == "br")
+    }).unwrap_or(false);
+    let continues_inline = !out_of_flow && !forced_break && style.is_some_and(|style| {
+        style.display == crate::Display::Inline && !style.is_inline_block && !style.is_replaced_box
+    });
+    let outer_whitespace = (!continues_inline).then(|| (
+        ifc_items.fallback_last_was_space.take(), ifc_items.fallback_inline_end.take(),
+    ));
+    let inner = build(
         tree, id, taffy_tree, id_map, words, engine, ifc_items, styles,
-    ) else {
-        return Vec::new();
-    };
+    );
+    if let Some((last_was_space, inline_end)) = outer_whitespace {
+        ifc_items.fallback_last_was_space = last_was_space;
+        ifc_items.fallback_inline_end = inline_end;
+        if inner.is_some() && !out_of_flow {
+            if let Some(last_was_space) = &mut ifc_items.fallback_last_was_space {
+                *last_was_space = forced_break || inline_end == Some(id)
+                    || !style.is_some_and(crate::is_inline_level_box);
+            }
+        }
+    }
+    let Some(inner) = inner else { return Vec::new(); };
     let inline_align = styles.get(&id).and_then(|style| {
         if !crate::is_inline_level_box(style) {
             return None;
@@ -10512,6 +10775,123 @@ fn is_flattenable_inline(
         && style.position.is_none()
         && !style.overflow_hidden
         && style.float.is_none()
+        && !inline_has_horizontal_margin(style)
+}
+
+/// Whether an inline box contributes outer horizontal spacing that would be
+/// lost if the box were spliced into its parent's run. A box with only
+/// `margin-left`/`margin-right: auto` keeps flattening: auto margins on a
+/// non-replaced inline box resolve to zero in CSS, unlike a flex item.
+fn inline_has_horizontal_margin(style: &crate::LayoutStyle) -> bool {
+    style.margin.left != 0.0
+        || style.margin.right != 0.0
+        || style.margin_percent[1].is_some()
+        || style.margin_percent[3].is_some()
+        || style.margin_relative[1].is_some()
+        || style.margin_relative[3].is_some()
+        || style.margin_expressions[1].is_some()
+        || style.margin_expressions[3].is_some()
+        || style.margin_calc_expressions[1].is_some()
+        || style.margin_calc_expressions[3].is_some()
+}
+
+/// Extra space below a baseline-aligned atomic inline replaced box.
+///
+/// The replaced box's baseline is its bottom margin edge, but the containing
+/// line box also has the parent font's descent below that baseline. A flex
+/// line does not know about baselines, so the descent is carried as the
+/// replaced item's bottom margin: every flex line that contains the item then
+/// reserves it, including after wrapping. `vertical-align: top|middle|bottom`
+/// boxes do not contribute a font strut (Chromium: 27px SVG baseline line is
+/// 31px, the same SVG top/middle/bottom line is 27px), so they keep their
+/// existing per-item cross-axis alignment and receive no extra margin.
+fn inline_replaced_baseline_descent(
+    tree: &DomTree,
+    id: NodeId,
+    style: &crate::LayoutStyle,
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+    engine: &crate::inline::TextEngine,
+) -> Option<f32> {
+    if !crate::is_inline_level_box(style)
+        || style.vertical_align.is_some()
+        || style.float.is_some()
+        || matches!(style.position, Some(taffy::Position::Absolute))
+    {
+        return None;
+    }
+    // Only a real inline formatting context creates a line box. A direct
+    // flex/grid item has been blockified by CSS even if its computed display
+    // string still says inline.
+    let mut parent = rendered_parent(tree, id);
+    let parent_style = loop {
+        let parent_id = parent?;
+        let parent_style = styles.get(&parent_id)?;
+        if parent_style.display_contents {
+            parent = rendered_parent(tree, parent_id);
+            continue;
+        }
+        break parent_style;
+    };
+    if !matches!(
+        parent_style.display,
+        crate::Display::Inline | crate::Display::Block
+    ) {
+        return None;
+    }
+    // The strut belongs to the containing inline formatting context's font
+    // and line-height. The replaced element's own `line-height` does not
+    // resize the surrounding line box (`vertical-align` still applies to it).
+    let (ascent, descent) = engine.inline_font_box_metrics(parent_style);
+    let line_height = engine.selected_line_height(parent_style).max(0.0);
+    // Fit the baseline, not each row's outer edges independently. Odd and
+    // fractional leading belongs below that baseline; negative leading must
+    // still allow a zero-line-height strut to fit inside the replaced box.
+    let baseline = (ascent + (line_height - ascent - descent) * 0.5).floor();
+    Some((line_height - baseline).max(0.0))
+}
+
+pub(crate) fn normalize_text(
+    raw: &str,
+    transform: TextTransform,
+    white_space: crate::WhiteSpace,
+    last_was_space: &mut bool,
+    mut boundary: impl FnMut(usize, usize),
+) -> String {
+    let mut buf = String::new();
+    let mut at_word_start = *last_was_space;
+    let mut offset = 0;
+    boundary(0, 0);
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            match white_space {
+                crate::WhiteSpace::Pre
+                | crate::WhiteSpace::PreWrap
+                | crate::WhiteSpace::BreakSpaces => buf.push(ch),
+                crate::WhiteSpace::PreLine if ch == '\n' => {
+                    if buf.ends_with(' ') {
+                        buf.pop();
+                    }
+                    buf.push('\n');
+                }
+                _ if !*last_was_space => buf.push(' '),
+                _ => {}
+            }
+            *last_was_space = true;
+            at_word_start = true;
+        } else {
+            match transform {
+                TextTransform::Uppercase => buf.extend(ch.to_uppercase()),
+                TextTransform::Lowercase => buf.extend(ch.to_lowercase()),
+                TextTransform::Capitalize if at_word_start => buf.extend(ch.to_uppercase()),
+                _ => buf.push(ch),
+            }
+            *last_was_space = false;
+            at_word_start = false;
+        }
+        offset += ch.len_utf16();
+        boundary(buf.len(), offset);
+    }
+    buf
 }
 
 /// Split a text node into one taffy leaf per word (a whitespace-delimited
@@ -10539,18 +10919,26 @@ fn build_text_words(
         return Vec::new();
     };
 
-    let mut display_text = String::new();
-    let mut in_space = false;
-    for c in contents.chars() {
-        if c.is_whitespace() {
-            if !in_space {
-                display_text.push(' ');
-                in_space = true;
-            }
-        } else {
-            display_text.push(c);
-            in_space = false;
+    let parent_style = rendered_parent(tree, id).and_then(|parent| styles.get(&parent));
+    let white_space = parent_style.and_then(|style| style.white_space).unwrap_or_default();
+    let mut local_last_was_space = false;
+    let last_was_space = ifc_items
+        .fallback_last_was_space
+        .as_mut()
+        .unwrap_or(&mut local_last_was_space);
+    let mut display_text = normalize_text(
+        contents, crate::TextTransform::None, white_space, last_was_space, |_, _| {},
+    );
+    if ifc_items.fallback_inline_end == Some(id) {
+        if matches!(white_space,
+            crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+            && display_text.ends_with(' ')
+        {
+            display_text.pop();
         }
+        // Later whitespace-only nodes are the same trailing collapsed run,
+        // including those inside the final non-atomic anchor or span.
+        *last_was_space = true;
     }
 
     let mut fsize = 16.0;
@@ -10560,18 +10948,16 @@ fn build_text_words(
     let mut transform = crate::TextTransform::None;
     let mut letter_spacing = 0.0;
     let mut word_spacing = 0.0;
-    if let Some(parent_id) = rendered_parent(tree, id) {
-        if let Some(p_style) = styles.get(&parent_id) {
-            fsize = p_style.font_size.unwrap_or(16.0);
-            is_bold = crate::style::used_font_weight(p_style) >= 600;
-            family = p_style.font_family.as_deref();
-            line_height = crate::inline::used_line_height(p_style);
-            transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
-            letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
-            word_spacing = p_style.word_spacing.unwrap_or(0.0);
-        }
+    if let Some(p_style) = parent_style {
+        fsize = p_style.font_size.unwrap_or(16.0);
+        is_bold = crate::style::used_font_weight(p_style) >= 600;
+        family = p_style.font_family.as_deref();
+        line_height = crate::inline::used_line_height(p_style);
+        transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
+        letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
+        word_spacing = p_style.word_spacing.unwrap_or(0.0);
     }
-    if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
+    if let Some(style) = parent_style {
         let shaped = build_shaped_word_leaves(
             id,
             &display_text,
@@ -10598,6 +10984,7 @@ fn build_text_words(
         word_spacing,
         taffy_tree,
         words,
+        engine,
     )
 }
 
@@ -10619,9 +11006,6 @@ fn build_shaped_word_leaves(
 ) -> Vec<taffy::NodeId> {
     let mut leaves = Vec::new();
     for token in tokenize_with_spaces(text) {
-        if token.trim().is_empty() {
-            continue;
-        }
         // A token normally retains one trailing collapsed space. Shape it as
         // preformatted content so the item keeps that advance instead of the
         // paragraph path trimming collapsible trailing whitespace.
@@ -10636,7 +11020,7 @@ fn build_shaped_word_leaves(
         let taffy_style = taffy::Style {
             size: taffy::Size {
                 width: taffy::Dimension::length(width.max(0.0)),
-                height: taffy::Dimension::length(height.max(0.0)),
+                height: taffy::Dimension::length(if token.trim().is_empty() { 0.0 } else { height.max(0.0) }),
             },
             ..Default::default()
         };
@@ -10702,11 +11086,20 @@ fn build_word_leaves(
     word_spacing: f32,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
+    engine: &mut crate::inline::TextEngine,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family, letter_spacing, word_spacing);
+            let width = text_width(
+                engine,
+                &token,
+                fsize,
+                is_bold,
+                family,
+                letter_spacing,
+                word_spacing,
+            );
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -10764,6 +11157,7 @@ fn build_pseudo_content(
         style.word_spacing.unwrap_or(0.0),
         taffy_tree,
         words,
+        engine,
     )
 }
 
@@ -10775,6 +11169,10 @@ fn pseudo_requires_generated_box(style: &crate::LayoutStyle, content: Option<&st
         || style.position.is_some()
         || style.margin != crate::Edges::default()
         || style.margin_auto.iter().any(|value| *value)
+        || style.margin_percent.iter().any(Option::is_some)
+        || style.margin_calc_expressions.iter().any(Option::is_some)
+        || style.margin_relative.iter().any(Option::is_some)
+        || style.margin_expressions.iter().any(Option::is_some)
         || style.padding != crate::Edges::default()
         || style.padding_percent.iter().any(|value| value.is_some())
         || style.border != crate::Edges::default()
@@ -11086,8 +11484,7 @@ fn reliable_normal_flow_content_width(
         initial_cb_width
     };
 
-    let horizontal_edges =
-        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    let horizontal_edges = estimated_inline_non_content(style, containing_width);
     let declared_content = |dimension: crate::Dimension| match dimension {
         crate::Dimension::Px(value) => Some(if style.box_sizing == crate::BoxSizing::ContentBox {
             value
@@ -11105,7 +11502,11 @@ fn reliable_normal_flow_content_width(
         _ => None,
     };
     let mut content_width = declared_content(style.width).unwrap_or_else(|| {
-        (containing_width - style.margin.left - style.margin.right - horizontal_edges).max(0.0)
+        (containing_width
+            - estimated_margin_side(style, 3, containing_width)
+            - estimated_margin_side(style, 1, containing_width)
+            - horizontal_edges)
+            .max(0.0)
     });
     if let Some(minimum) = declared_content(style.min_width) {
         content_width = content_width.max(minimum);
@@ -11173,8 +11574,10 @@ fn reliable_declared_content_width(
         None => None,
     };
 
-    let horizontal_edges =
-        style.padding.left + style.padding.right + style.border.left + style.border.right;
+    let horizontal_edges = match containing_width {
+        Some(basis) => estimated_inline_non_content(style, basis),
+        None => style.padding.left + style.padding.right + style.border.left + style.border.right,
+    };
     let declared_content = |dimension: crate::Dimension| match dimension {
         crate::Dimension::Px(value) => Some(if style.box_sizing == crate::BoxSizing::ContentBox {
             value
@@ -11236,9 +11639,14 @@ fn reliable_ratio_only_available_width(
     } else {
         initial_cb_width
     };
-    let horizontal_edges =
-        image.padding.left + image.padding.right + image.border.left + image.border.right;
-    Some((containing_width - image.margin.left - image.margin.right - horizontal_edges).max(0.0))
+    let horizontal_edges = estimated_inline_non_content(image, containing_width);
+    Some(
+        (containing_width
+            - estimated_margin_side(image, 3, containing_width)
+            - estimated_margin_side(image, 1, containing_width)
+            - horizontal_edges)
+            .max(0.0),
+    )
 }
 
 fn reliable_table_available_width(
@@ -11277,7 +11685,12 @@ fn reliable_table_available_width(
         }
         _ => initial_cb_width,
     };
-    Some((containing_width - table_style.margin.left - table_style.margin.right).max(0.0))
+    Some(
+        (containing_width
+            - estimated_margin_side(table_style, 3, containing_width)
+            - estimated_margin_side(table_style, 1, containing_width))
+            .max(0.0),
+    )
 }
 
 /// Resolve the `width: fit-content` keyword after the containing inline space
@@ -13228,22 +13641,164 @@ fn build(
             .aspect_ratio
             .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
         {
-            // A 100% inline size inside an auto grid track is cyclic
-            // during intrinsic sizing: it behaves as auto for the contribution
-            // pass, then fills the final track. Taffy 0.12 keeps the intrinsic
-            // fallback width instead of revisiting that percentage. Express
-            // the final fill as grid self-stretch so the known content width
-            // reaches the replaced-item measure callback. This substitution is
-            // only equivalent for an in-flow grid item at exactly 100%; an
-            // abs-pos SVG or a smaller percentage must keep its containing-
-            // block-relative authored size.
+            // An inline SVG is an atomic replaced leaf. Taffy has no inline
+            // display, and an empty flex container drops the measure callback;
+            // Block keeps the adopted leaf measurable in the surrounding
+            // inline row approximation (Chromium's computed display remains
+            // inline). The authored outer display is unchanged in LayoutStyle.
+            taffy_style.display = taffy::style::Display::Block;
+
+            // Give the auto axis its ratio-derived preferred size from a
+            // definite Px author axis before dropping Taffy's ratio. Taffy's
+            // block/flex sizing would otherwise stretch the auto inline size
+            // to the containing block (200x20 instead of 40x20 for a 2:1
+            // viewBox at height:20px), while leaving the ratio active made
+            // min/max clamp the definite axis instead (height:27px +
+            // max-width:64px became height:17px). Seeding the auto axis keeps
+            // the definite axis and lets Taffy's own min/max constraints clamp
+            // only the derived auto axis, binding or not. When both axes are
+            // definite, drop the ratio entirely: a max-width clamp applies to
+            // the inline axis alone and must not rewrite the authored height.
+            let clamp_px = |value: f32, min: crate::Dimension, max: crate::Dimension| {
+                let value = match max {
+                    crate::Dimension::Px(max) => value.min(max.max(0.0)),
+                    _ => value,
+                };
+                match min {
+                    crate::Dimension::Px(min) => value.max(min.max(0.0)),
+                    _ => value,
+                }
+            };
+            let border_box = style.box_sizing == crate::BoxSizing::BorderBox;
+            let horizontal_edges =
+                style.padding.left + style.padding.right + style.border.left + style.border.right;
+            let vertical_edges =
+                style.padding.top + style.padding.bottom + style.border.top + style.border.bottom;
+            // Percentage padding is resolved against the containing width and
+            // is still typed through Taffy at this point. Without its used
+            // value the content box cannot be recovered, so leave the ratio to
+            // Taffy rather than seeding from a partial border box.
+            let border_box_edges_resolved = !border_box
+                || (!style.padding_percent.iter().any(|padding| padding.is_some())
+                    && !style
+                        .padding_expressions
+                        .iter()
+                        .any(|expression| expression.is_some()));
+            match (style.width, style.height) {
+                (crate::Dimension::Auto, crate::Dimension::Px(height))
+                    if border_box_edges_resolved =>
+                {
+                    // The ratio is an intrinsic content-box ratio. With
+                    // border-box sizing the specified height includes the
+                    // padding/border edges, so strip them before transferring
+                    // the ratio and add the horizontal edges back to the
+                    // auto inline size. Verified against Chromium:
+                    // box-sizing:border-box;height:20px + 10px padding +
+                    // 5px border yields 30x30, not 0/20.
+                    let height = clamp_px(height, style.min_height, style.max_height);
+                    let content_height = if border_box {
+                        (height - vertical_edges).max(0.0)
+                    } else {
+                        height.max(0.0)
+                    };
+                    let content_width = (content_height * ratio).max(0.0);
+                    let width = if border_box {
+                        content_width + horizontal_edges
+                    } else {
+                        content_width
+                    };
+                    taffy_style.size.width = taffy::Dimension::length(clamp_px(width, style.min_width, style.max_width));
+                    taffy_style.aspect_ratio = None;
+                }
+                (crate::Dimension::Px(width), crate::Dimension::Auto)
+                    if border_box_edges_resolved =>
+                {
+                    // Chromium oracle for the border-box path:
+                    // width:120px + 10px padding + 5px border on a 2:1 SVG
+                    // is 120x75: content width 90, content height 45, plus
+                    // 30px vertical edges.
+                    let width = clamp_px(width, style.min_width, style.max_width);
+                    let content_width = if border_box {
+                        (width - horizontal_edges).max(0.0)
+                    } else {
+                        width.max(0.0)
+                    };
+                    let content_height = (content_width / ratio).max(0.0);
+                    let height = if border_box {
+                        content_height + vertical_edges
+                    } else {
+                        content_height
+                    };
+                    taffy_style.size.height = taffy::Dimension::length(clamp_px(height, style.min_height, style.max_height));
+                    taffy_style.aspect_ratio = None;
+                }
+                // Both axes are definite: CSS uses them as specified and the
+                // intrinsic ratio must not re-derive one from the other when
+                // max-width clamps the inline axis (height:27px +
+                // max-width:64px keeps 27px, it does not shrink to 19px).
+                // Apply the authored min/max to Taffy's preferred size too:
+                // Taffy's max constraint does not rewrite a preferred width
+                // used for intrinsic contribution, so an uncapped 268px
+                // `width` would otherwise widen the row to 268px and shift its
+                // content left even though the painted box was 64px.
+                (crate::Dimension::Px(width), crate::Dimension::Px(height)) => {
+                    taffy_style.size.width = taffy::Dimension::length(clamp_px(
+                        width,
+                        style.min_width,
+                        style.max_width,
+                    ));
+                    taffy_style.size.height = taffy::Dimension::length(clamp_px(
+                        height,
+                        style.min_height,
+                        style.max_height,
+                    ));
+                    taffy_style.aspect_ratio = None;
+                }
+                _ => {}
+            }
+            // A 100% inline size inside an auto grid track is cyclic during
+            // intrinsic sizing: it behaves as auto for the contribution pass,
+            // then resolves against the final grid area. Keep the authored
+            // percentage typed for that final pass, but let the replaced-item
+            // measure callback own the ratio transfer. Leaving Taffy's
+            // aspect_ratio enabled lets its intrinsic pass turn a zero
+            // provisional grid area into a cached 0x0 leaf before the final
+            // area exists. Grid self-stretch is not equivalent either: it
+            // supplies that same provisional zero as a known inline size.
+            // This substitution is only for an in-flow grid item at exactly
+            // 100%; an abs-pos SVG or a smaller percentage must keep its
+            // containing-block-relative authored size.
             if matches!(style.width, crate::Dimension::Percent(percent) if percent == 1.0)
                 && matches!(style.height, crate::Dimension::Auto)
                 && is_in_flow_grid_item(tree, id, style, styles)
             {
-                taffy_style.size.width = taffy::Dimension::auto();
-                taffy_style.min_size.width = taffy::Dimension::length(0.0);
-                taffy_style.justify_self = Some(taffy::AlignSelf::STRETCH);
+                taffy_style.size.width = taffy::Dimension::percent(1.0);
+                // Remove only the automatic minimum that would make the
+                // percentage cyclic; an authored min-width still applies.
+                if matches!(style.min_width, crate::Dimension::Auto)
+                    && style.size_expressions[2].is_none()
+                {
+                    taffy_style.min_size.width = taffy::Dimension::length(0.0);
+                }
+                taffy_style.aspect_ratio = None;
+            }
+            // A baseline-aligned replaced atom sits on the parent's text
+            // baseline, leaving room for the font descent below it. Taffy flex
+            // lines align tops and have no baseline protocol, so express that
+            // descent as the item's bottom margin. Only untyped bottom margins
+            // can be augmented in one Taffy length; a percentage/calc margin
+            // remains typed for its final basis and keeps its own semantics.
+            if !style.margin_auto[2]
+                && style.margin_percent[2].is_none()
+                && style.margin_relative[2].is_none()
+                && style.margin_expressions[2].is_none()
+            {
+                if let Some(descent) =
+                    inline_replaced_baseline_descent(tree, id, style, styles, engine)
+                {
+                    taffy_style.margin.bottom =
+                        taffy::style::LengthPercentageAuto::length(style.margin.bottom + descent);
+                }
             }
             // A viewBox supplies a ratio but no intrinsic dimensions. The
             // 300px default inline size is CSS Images' default object size;
@@ -13283,7 +13838,10 @@ fn build(
     // width. Its intrinsic dimensions participate in an auto-sized ancestor's
     // max-content measurement; once the percentage axis becomes definite, the
     // measure callback derives the other axis through the intrinsic ratio.
-    if matches!(&*_name.local, "img" | "video") {
+    // `content:url()` makes any element replaced content, so the same atomic
+    // box applies beyond the HTML image/video tags.
+    let content_replacement = style.content_image.is_some();
+    if matches!(&*_name.local, "img" | "video") || content_replacement {
         if let Some(intrinsic) = style.replaced_intrinsic.or_else(|| {
             style
                 .intrinsic_size
@@ -13402,6 +13960,18 @@ fn build(
             id_map.insert(leaf, id);
             return Some(leaf);
         }
+        if content_replacement {
+            // The image bytes may not be available yet (a miss was just
+            // queued). The element is still replaced content: keep it an
+            // empty measured leaf instead of laying out and painting authored
+            // children that `content:url()` replaced.
+            let context = engine.register_replaced(0.0, 0.0, style);
+            let leaf = taffy_tree
+                .new_leaf_with_context(taffy_style, context)
+                .ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
     }
 
     // If this container is a pure-text inline formatting context, collapse its
@@ -13496,21 +14066,29 @@ fn build(
         // it the correctly ordered item sequence is the missing translation.
         dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
     } else if style.display == crate::Display::Block
+        || internal_mixed_block_flow
         || (style.display == crate::Display::Inline && style.is_inline_block && !has_inline_ish_content)
     {
-        // An inline-block's inner display is flow-root, so the same applies
-        // to formatting whitespace around its block children.
+        // Inline-blocks and native block-flow stand-ins have block children,
+        // not flex items, so formatting whitespace follows block-flow rules.
         //
         // Formatting whitespace between block lines does not generate an
         // inline line box. Keeping a zero-height taffy leaf here still breaks
         // sibling margin adjacency, turning `margin-bottom:30px` followed by
-        // `margin-top:40px` into 70px instead of the collapsed 40px. Preserve
-        // whitespace only when this parent actually has inline content, where
-        // the inter-element space belongs to the inline formatting context.
+        // `margin-top:40px` into 70px instead of the collapsed 40px. Shaped
+        // whitespace leaves can also contribute line-height overflow. Preserve
+        // inline separators and authored non-collapsing whitespace.
         if !has_inline_ish_content {
             dom_children.retain(|&cid| {
-                tree.with_node(cid, |node| node.is_element()).unwrap_or(false)
-                    || !tree.text_content(cid).trim().is_empty()
+                let Some(node) = tree.borrow_node(cid) else { return false };
+                let obscura_dom::tree::NodeData::Text { contents } = &node.data else {
+                    return node.is_element();
+                };
+                let white_space = rendered_parent(tree, cid).and_then(|parent| styles.get(&parent))
+                    .and_then(|style| style.white_space).unwrap_or_default();
+                !contents.trim().is_empty()
+                    || matches!(white_space, crate::WhiteSpace::Pre | crate::WhiteSpace::PreWrap | crate::WhiteSpace::BreakSpaces)
+                    || (white_space == crate::WhiteSpace::PreLine && contents.contains('\n'))
             });
         }
         // A float nested directly in a transparent inline wrapper (the common
@@ -13620,7 +14198,7 @@ fn build(
         // table cell (Bootstrap input groups, segmented controls, toolbars)
         // must keep adjacent atomic inline children on one line; wrapping
         // them here doubles the table row and stretches every sibling cell.
-        taffy_style.flex_wrap = if style.white_space == Some(crate::WhiteSpace::NoWrap) {
+        taffy_style.flex_wrap = if matches!(style.white_space, Some(crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre)) {
             taffy::FlexWrap::NoWrap
         } else {
             taffy::FlexWrap::Wrap
@@ -13637,6 +14215,11 @@ fn build(
             };
         }
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
+    }
+    if style.display == crate::Display::Inline && !style.is_replaced_box
+        && matches!(style.white_space, Some(crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre))
+    {
+        taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
     }
 
     // An inline-block is a flow-root inside. With only block-level in-flow
@@ -13660,6 +14243,14 @@ fn build(
         taffy_style.display = taffy::style::Display::Block;
     }
 
+    let owns_whitespace = ifc_items.fallback_last_was_space.is_none()
+        && has_inline_ish_content && !has_float_child
+        && (!matches!(style.display, crate::Display::Flex | crate::Display::Grid)
+            || style.internal_flex_container);
+    if owns_whitespace {
+        ifc_items.fallback_last_was_space = Some(true);
+        ifc_items.fallback_inline_end = last_inline_content(tree, &dom_children, styles);
+    }
     let mut child_ids: Vec<taffy::NodeId> = if native_float_band {
         build_children_with_native_float_band(
             tree,
@@ -13701,6 +14292,10 @@ fn build(
             })
             .collect()
     };
+    if owns_whitespace {
+        ifc_items.fallback_last_was_space = None;
+        ifc_items.fallback_inline_end = None;
+    }
     if !native_float_band {
         if let Some((mut before, _)) = build_in_flow_pseudo(
             id,
@@ -13872,6 +14467,52 @@ fn inline_wrapper_float(
         .get(child)
         .and_then(|style| style.float)
         .map(|_| *child)
+}
+
+/// Find the last content in the same inline stream, looking through ordinary
+/// inline boxes but never inside an atomic/replaced box. Trailing collapsible
+/// text after this endpoint must not widen an anonymous line or its owners.
+fn last_inline_content(
+    tree: &DomTree,
+    children: &[NodeId],
+    styles: &HashMap<NodeId, crate::LayoutStyle>,
+) -> Option<NodeId> {
+    for &id in children.iter().rev() {
+        let Some(node) = tree.borrow_node(id) else { continue };
+        if let obscura_dom::tree::NodeData::Text { contents } = &node.data {
+            let white_space = rendered_parent(tree, id).and_then(|parent| styles.get(&parent))
+                .and_then(|style| style.white_space).unwrap_or_default();
+            if contents.is_empty() || (contents.trim().is_empty()
+                && matches!(white_space, crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+                && (white_space != crate::WhiteSpace::PreLine || !contents.contains('\n')))
+            {
+                continue;
+            }
+            return Some(id);
+        }
+        let Some(element) = node.as_element() else { continue };
+        let Some(style) = styles.get(&id) else { continue };
+        if style.display == crate::Display::None || style.float.is_some()
+            || matches!(style.position, Some(taffy::Position::Absolute))
+        {
+            continue;
+        }
+        if &*element.local != "br" && (style.display_contents
+            || style.display == crate::Display::Inline && !style.is_inline_block && !style.is_replaced_box)
+        {
+            if has_in_flow_generated_pseudo(style.after_pseudo.as_deref()) {
+                return Some(id);
+            }
+            if let Some(end) = last_inline_content(tree, &rendered_children(tree, id), styles) {
+                return Some(end);
+            }
+            if !has_in_flow_generated_pseudo(style.before_pseudo.as_deref()) {
+                continue;
+            }
+        }
+        return Some(id);
+    }
+    None
 }
 
 /// Build a block container whose children mix inline-level and block-level
@@ -14053,8 +14694,14 @@ fn build_mixed_block(
                 // boundaries so pretty-printed markup starts at the line edge.
                 let is_whitespace_text = |cid: NodeId| {
                     tree.borrow_node(cid).map_or(false, |node| {
-                        matches!(node.data, obscura_dom::tree::NodeData::Text { .. })
-                            && tree.text_content(cid).trim().is_empty()
+                        let obscura_dom::tree::NodeData::Text { contents } = &node.data else {
+                            return false;
+                        };
+                        let white_space = rendered_parent(tree, cid).and_then(|parent| styles.get(&parent))
+                            .and_then(|style| style.white_space).unwrap_or_default();
+                        contents.trim().is_empty()
+                            && matches!(white_space, crate::WhiteSpace::Normal | crate::WhiteSpace::NoWrap | crate::WhiteSpace::PreLine)
+                            && (white_space != crate::WhiteSpace::PreLine || !contents.contains('\n'))
                     })
                 };
                 let start = run
@@ -14081,6 +14728,10 @@ fn build_mixed_block(
                         continue;
                     }
                 }
+                let outer_last_was_space = ifc_items.fallback_last_was_space.replace(!join_before);
+                let outer_inline_end = ifc_items.fallback_inline_end;
+                ifc_items.fallback_inline_end = if join_after { None }
+                    else { last_inline_content(tree, run, styles) };
                 let mut atoms: Vec<taffy::NodeId> = Vec::new();
                 if join_before {
                     atoms.extend(before_leaves.iter().copied());
@@ -14138,6 +14789,8 @@ fn build_mixed_block(
                     atoms.extend(after_leaves.iter().copied());
                     after_pending = false;
                 }
+                ifc_items.fallback_last_was_space = outer_last_was_space;
+                ifc_items.fallback_inline_end = outer_inline_end;
                 if atoms.is_empty() {
                     // Whitespace-only run between blocks: no anonymous box.
                     continue;
@@ -14304,6 +14957,10 @@ fn inline_wraps_only_in_flow_blocks(
     };
     if style.display != crate::Display::Inline
         || style.is_inline_block
+        // Replaced content is one atomic box. Its SVG children are paint
+        // primitives, not CSS boxes, so splicing them into the parent would
+        // delete the mapped replaced leaf (and its rect) entirely.
+        || style.is_replaced_box
         || style.before_pseudo.is_some()
         || style.after_pseudo.is_some()
         || style.float.is_some()
@@ -14421,7 +15078,11 @@ fn run_wrapper_style(parent: &crate::LayoutStyle, has_text_strut: bool) -> taffy
         direction: parent.direction.unwrap_or(taffy::Direction::Ltr),
         display: taffy::style::Display::Flex,
         flex_direction: taffy::FlexDirection::Row,
-        flex_wrap: taffy::FlexWrap::Wrap,
+        flex_wrap: if matches!(parent.white_space, Some(crate::WhiteSpace::NoWrap | crate::WhiteSpace::Pre)) {
+            taffy::FlexWrap::NoWrap
+        } else {
+            taffy::FlexWrap::Wrap
+        },
         align_items: Some(taffy::AlignItems::FLEX_START),
         justify_content: justify,
         size: taffy::Size {
@@ -21749,6 +22410,43 @@ mod tests {
         assert!(
             (percent.1 - base.1 - 2.0).abs() < 0.01,
             "{base:?} {percent:?}"
+        );
+    }
+
+    /// Chromium sizes `<input size=N>` from the primary face's control
+    /// metrics: the rounded 'x' advance times `N`, corrected by the rounded
+    /// font-wide glyph-box span. With Liberation Sans at 13.3333px those are
+    /// 7px and 17px, so `size=17` has 129px of content and 137px of border
+    /// box (2px border + 2px padding per side), matching Chromium 148 on the
+    /// same bytes. A missing pin or a constant per-character factor shifts
+    /// the marker by whole pixels.
+    #[cfg(feature = "paint")]
+    #[test]
+    fn input_size_attribute_uses_the_loaded_face_control_metrics() {
+        let tree = parse_html(
+            r#"<style>
+                html, body { margin: 0 }
+                input { font-family: Fixture, sans-serif; font-size: 13.3333px }
+            </style>
+            <input id="field" size="17">"#,
+        );
+        let field = tree.get_element_by_id("field").unwrap();
+        let laid = layout_dom_with_web_fonts(
+            &tree,
+            (400.0, 80.0),
+            &HashMap::new(),
+            &[crate::inline::WebFont {
+                data: std::sync::Arc::new(
+                    include_bytes!("../assets/liberation-sans.ttf").to_vec(),
+                ),
+                family: Some("Fixture".to_string()),
+                weight: Some((400, 400)),
+                italic: Some(false),
+            }],
+        );
+        assert_eq!(
+            laid.rects[&field].width, 137.0,
+            "size=17 must use the pinned face's control metrics"
         );
     }
 

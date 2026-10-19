@@ -34,15 +34,6 @@ const SHADOW_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</ti
 </script>
 </body></html>"#;
 
-const RESET_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
-<script>
-  var f = document.createElement('iframe');
-  f.src = '/child.html';
-  document.body.appendChild(f);
-  setTimeout(function () { f.src = 'about:blank'; }, 150);
-</script>
-</body></html>"#;
-
 const STATIC_PARENT_HTML: &str = r#"<!doctype html><html><head><title>parent</title></head><body>
 <iframe src="/child.html"></iframe>
 </body></html>"#;
@@ -330,18 +321,6 @@ async fn a_rejected_child_frame_does_not_leave_js_references() {
     page.settle(2000).await;
 
     assert!(page.frame_urls().is_empty(), "the frame cap was not applied");
-    for registry in [
-        "__obscura_frameObjects",
-        "__obscura_frameWindows",
-        "__obscura_frameElements",
-    ] {
-        assert_eq!(
-            page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))
-                .as_f64(),
-            Some(0.0),
-            "rejected frame stayed in {registry}",
-        );
-    }
 }
 
 #[tokio::test]
@@ -360,22 +339,48 @@ async fn navigating_blank_releases_child_realms() {
 }
 
 #[tokio::test]
-async fn changing_iframe_src_releases_the_previous_realm() {
+async fn changing_iframe_src_replaces_the_document_not_the_window() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    let base = spawn_server(RESET_PARENT_HTML);
-
+    let base = spawn_server(STATIC_PARENT_HTML);
+    let foreign = spawn_server(CHILD_HTML);
     let browser = Browser::new().unwrap();
     let mut page = browser.new_page().await.unwrap();
     page.goto(&base).await.unwrap();
-    page.settle(1000).await;
+    page.settle(2000).await;
+    page.evaluate("var retainedFrameWindow = document.querySelector('iframe').contentWindow; var retainedFrameDocument = retainedFrameWindow.document;");
 
-    assert!(page.frame_urls().is_empty(), "old src realm survived replacement");
-    for registry in ["__obscura_frameWindows", "__obscura_frameElements"] {
-        assert_eq!(
-            page.evaluate(&format!("Object.keys(globalThis.{registry}).length"))
-                .as_f64(),
-            Some(0.0),
-            "old iframe stayed in {registry}",
-        );
-    }
+    page.evaluate(&format!("document.querySelector('iframe').src = {}", serde_json::json!(format!("{foreign}/child.html"))));
+    page.settle(2000).await;
+    assert_eq!(page.evaluate(r#"(() => {
+        const frame = document.querySelector('iframe');
+        let denied;
+        try { retainedFrameWindow.document; denied = false; }
+        catch (error) { denied = error.name === 'SecurityError'; }
+        return [frame.contentWindow === retainedFrameWindow, denied,
+            retainedFrameDocument.title, typeof retainedFrameWindow.postMessage];
+    })()"#), serde_json::json!([true, true, "RAN-IN-CHILD", "function"]));
+
+    page.evaluate(&format!("document.querySelector('iframe').setAttribute('src', {})", serde_json::json!(format!("{base}/child.html"))));
+    page.settle(2000).await;
+    assert_eq!(page.evaluate(r#"(() => {
+        const frame = document.querySelector('iframe');
+        return [frame.contentWindow === retainedFrameWindow,
+            retainedFrameWindow.document !== retainedFrameDocument,
+            retainedFrameWindow.document === frame.contentDocument,
+            retainedFrameWindow.document.title];
+    })()"#), serde_json::json!([true, true, true, "RAN-IN-CHILD"]));
+
+    page.evaluate("document.querySelector('iframe').srcdoc = '<title>srcdoc replacement</title><p>inline document</p>'");
+    page.settle(2000).await;
+    assert_eq!(page.evaluate("[document.querySelector('iframe').contentWindow === retainedFrameWindow, retainedFrameWindow.document.title, retainedFrameWindow.document.URL]"),
+        serde_json::json!([true, "srcdoc replacement", "about:srcdoc"]));
+
+    page.evaluate("var frame = document.querySelector('iframe'); frame.src = 'about:blank'; frame.removeAttribute('srcdoc');");
+    page.settle(2000).await;
+    assert_eq!(page.evaluate("[frame.contentWindow === retainedFrameWindow, retainedFrameWindow.document.URL, typeof retainedFrameWindow.__ran, retainedFrameWindow.document.body.textContent]"),
+        serde_json::json!([true, "about:blank", "undefined", ""]));
+
+    page.evaluate("frame.remove(); document.body.appendChild(frame);");
+    page.settle(2000).await;
+    assert_eq!(page.evaluate("[frame.contentWindow !== retainedFrameWindow, retainedFrameWindow.closed]"), serde_json::json!([true, true]));
 }

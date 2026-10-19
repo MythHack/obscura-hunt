@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Inline SVG row and constrained-height sizing</title>
+<!--
+  Regression fixture for Chromium-compatible default SVG flow.
+
+  The three anchors are inline siblings inside a plain block. No author
+  `display` is set on the SVG elements, so the UA default must be inline and
+  the three logos must form one horizontal run. Each logo has an authored
+  height of 27px and max-width:64px; capping the ratio-derived width must not
+  re-derive (and shrink) the authored height. Chromium keeps 27px and one row.
+
+  Acceptance geometry (1000x600 viewport, 16px Arial, one collapsed source
+  space between anchors):
+    - .logos outer width 247.671875, starting at x 572.328125
+    - approximately 20.453px visual gaps (16px margins + the collapsed space)
+    - footer line box height 31px (27px SVG ascent + 4px font descent)
+    - the second footer starts at y 81 (20px body margin + 31px line + 30px
+      margin-bottom)
+-->
+<style>
+  html { margin: 0 }
+  body { margin: 20px; font: 16px Arial, sans-serif }
+  .footer { display: flex; align-items: center; justify-content: space-between; width: 800px; margin-bottom: 30px }
+  .logos a { margin-right: 16px }
+  .logo { height: 27px; line-height: 27px; max-width: 64px }
+</style>
+<div class="footer" id="footer1">
+  <span>Supported by</span>
+  <div class="logos" id="logos">
+    <a href="#"><svg id="logo1" class="logo" viewBox="0 0 147 40" xmlns="http://www.w3.org/2000/svg"><rect width="147" height="40" fill="#d44"/></svg></a>
+    <a href="#"><svg id="logo2" class="logo" width="268" height="80" viewBox="0 0 268 80" xmlns="http://www.w3.org/2000/svg"><rect width="268" height="80" fill="#4a4"/></svg></a>
+    <a href="#"><svg id="logo3" class="logo" viewBox="0 0 1709 735" xmlns="http://www.w3.org/2000/svg"><rect width="1709" height="735" fill="#44d"/></svg></a>
+  </div>
+</div>
+<div class="footer" id="footer2">
+  <span>Supported by</span>
+  <div class="logos">
+    <a href="#"><svg id="logo4" class="logo" viewBox="0 0 147 40" xmlns="http://www.w3.org/2000/svg"><rect width="147" height="40" fill="#d44"/></svg></a>
+    <a href="#"><svg id="logo5" class="logo" width="268" height="80" viewBox="0 0 268 80" xmlns="http://www.w3.org/2000/svg"><rect width="268" height="80" fill="#4a4"/></svg></a>
+    <a href="#"><svg id="logo6" class="logo" viewBox="0 0 1709 735" xmlns="http://www.w3.org/2000/svg"><rect width="1709" height="735" fill="#44d"/></svg></a>
+  </div>
+</div>

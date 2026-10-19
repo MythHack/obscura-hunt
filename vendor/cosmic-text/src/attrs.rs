@@ -378,6 +378,15 @@ pub struct Attrs<'a> {
     //TODO: should this be an option?
     pub color_opt: Option<Color>,
     pub family: Family<'a>,
+    /// Ordered authored family fallbacks after `family`. Per-cluster shaping
+    /// tries these before the platform fallback lists, mirroring CSS
+    /// `font-family` order when the primary family lacks a glyph.
+    pub fallback_families: &'a [FamilyOwned],
+    /// Face selected for each entry in `fallback_families`. Keeping the
+    /// caller-resolved face id preserves `@font-face` resource identity and
+    /// descriptors when an authored fallback family is reached; `None` falls
+    /// back to ordinary family matching.
+    pub fallback_font_ids: &'a [Option<fontdb::ID>],
     /// A specific database face selected by the caller. Font fallback remains
     /// available when that face does not contain a requested glyph.
     pub font_id_opt: Option<fontdb::ID>,
@@ -413,6 +422,8 @@ impl<'a> Attrs<'a> {
         Self {
             color_opt: None,
             family: Family::SansSerif,
+            fallback_families: &[],
+            fallback_font_ids: &[],
             font_id_opt: None,
             font_weight_axis_opt: None,
             font_optical_size_opt: None,
@@ -440,6 +451,18 @@ impl<'a> Attrs<'a> {
     /// Set [Family]
     pub fn family(mut self, family: Family<'a>) -> Self {
         self.family = family;
+        self
+    }
+
+    /// Set ordered authored family fallbacks after the primary family.
+    pub fn fallback_families(mut self, families: &'a [FamilyOwned]) -> Self {
+        self.fallback_families = families;
+        self
+    }
+
+    /// Set the resolved face for each authored fallback family.
+    pub fn fallback_font_ids(mut self, font_ids: &'a [Option<fontdb::ID>]) -> Self {
+        self.fallback_font_ids = font_ids;
         self
     }
 
@@ -547,6 +570,8 @@ impl<'a> Attrs<'a> {
     /// Check if this set of attributes can be shaped with another
     pub fn compatible(&self, other: &Self) -> bool {
         self.family == other.family
+            && self.fallback_families == other.fallback_families
+            && self.fallback_font_ids == other.fallback_font_ids
             && self.font_id_opt == other.font_id_opt
             && self.font_weight_axis_opt == other.font_weight_axis_opt
             && self.font_optical_size_opt == other.font_optical_size_opt
@@ -584,6 +609,8 @@ pub struct AttrsOwned {
     //TODO: should this be an option?
     pub color_opt: Option<Color>,
     pub family_owned: FamilyOwned,
+    pub fallback_families: Vec<FamilyOwned>,
+    pub fallback_font_ids: Vec<Option<fontdb::ID>>,
     pub font_id_opt: Option<fontdb::ID>,
     pub font_weight_axis_opt: Option<VariationValue>,
     pub font_optical_size_opt: Option<VariationValue>,
@@ -608,6 +635,8 @@ impl AttrsOwned {
         Self {
             color_opt: attrs.color_opt,
             family_owned: FamilyOwned::new(attrs.family),
+            fallback_families: attrs.fallback_families.to_vec(),
+            fallback_font_ids: attrs.fallback_font_ids.to_vec(),
             font_id_opt: attrs.font_id_opt,
             font_weight_axis_opt: attrs.font_weight_axis_opt,
             font_optical_size_opt: attrs.font_optical_size_opt,
@@ -630,6 +659,8 @@ impl AttrsOwned {
         Attrs {
             color_opt: self.color_opt,
             family: self.family_owned.as_family(),
+            fallback_families: &self.fallback_families,
+            fallback_font_ids: &self.fallback_font_ids,
             font_id_opt: self.font_id_opt,
             font_weight_axis_opt: self.font_weight_axis_opt,
             font_optical_size_opt: self.font_optical_size_opt,

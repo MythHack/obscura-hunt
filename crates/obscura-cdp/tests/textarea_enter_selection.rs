@@ -132,13 +132,39 @@ async fn readonly_fields_reject_deletion_and_newlines_but_keep_keyboard_events()
                 cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
                     "type": "keyUp", "key": key, "windowsVirtualKeyCode": virtual_key,
                 })).await;
-                let expected = match (readonly, key) {
-                    (true, "Enter") => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keypress","keyup"]}),
-                    (true, _) => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keyup"]}),
-                    (false, "Enter") => json!({"value":"a\nD", "start":2, "end":2, "changes":["keydown","keypress","input","keyup"]}),
-                    (false, _) => json!({"value":"aD", "start":1, "end":1, "changes":["keydown","input","keyup"]}),
-                };
-                assert_eq!(state(&mut ctx).await, expected, "{tag} {key} readonly={readonly}");
+                // Chromium reference: an editable Backspace/Delete fires
+                // keydown, beforeinput(deleteContent*), input, keyup; Enter
+                // adds keypress and beforeinput(insertLineBreak). Readonly
+                // controls deliver only the keyboard events and keep value
+                // and range. Assert those semantics instead of pinning an
+                // incidental whole-event list.
+                let result = state(&mut ctx).await;
+                let events: Vec<&str> = result["changes"]
+                    .as_array()
+                    .expect("changes array")
+                    .iter()
+                    .map(|event| event.as_str().expect("event type"))
+                    .collect();
+                assert_eq!(events.first().copied(), Some("keydown"), "{tag} {key} readonly={readonly}");
+                assert_eq!(events.last().copied(), Some("keyup"), "{tag} {key} readonly={readonly}");
+                assert_eq!(events.contains(&"keypress"), key == "Enter", "{tag} {key} readonly={readonly}");
+                let beforeinput = events.iter().position(|event| *event == "beforeinput");
+                let input = events.iter().position(|event| *event == "input");
+                if readonly {
+                    assert_eq!(result["value"], "abCD", "{tag} {key} readonly={readonly}");
+                    assert_eq!(result["start"], json!(1), "{tag} {key} readonly={readonly}");
+                    assert_eq!(result["end"], json!(3), "{tag} {key} readonly={readonly}");
+                    assert!(beforeinput.is_none(), "{tag} {key} readonly={readonly}");
+                    assert!(input.is_none(), "{tag} {key} readonly={readonly}");
+                } else {
+                    let (value, caret) = if key == "Enter" { ("a\nD", 2) } else { ("aD", 1) };
+                    assert_eq!(result["value"], value, "{tag} {key} readonly={readonly}");
+                    assert_eq!(result["start"], json!(caret), "{tag} {key} readonly={readonly}");
+                    assert_eq!(result["end"], json!(caret), "{tag} {key} readonly={readonly}");
+                    assert_eq!(beforeinput.map(|index| index + 1), input,
+                        "beforeinput must directly precede input: {events:?}");
+                    assert_eq!(events.iter().filter(|event| **event == "input").count(), 1);
+                }
             }
         }
     }

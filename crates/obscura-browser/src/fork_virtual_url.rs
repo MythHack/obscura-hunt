@@ -1,11 +1,11 @@
 //! Fork-only: adopt a URL the page routed to itself.
 //!
 //! A single page app answers a click by calling `history.pushState` and
-//! rendering the next view in place. `bootstrap.js` tracks that in
-//! `__virtualUrl` so `location.href` reads correctly, but nothing on the Rust
-//! side ever looked at it, so the page had moved on while `page.url()` still
-//! reported the old document. To a CDP client that is a click that did nothing,
-//! and `tools/ab/clicklocal.mjs` reports it as `spa route: FAILED`.
+//! rendering the next view in place. `bootstrap.js` (and history/location
+//! glue) writes the reflected URL through the native `op_set_reflected_url`;
+//! no JS global remains on the Rust side. `sync_virtual_url` reads it directly
+//! through `js.reflected_url(0)`, so the page no longer reports the old
+//! document URL after an in-place route.
 //!
 //! Ported from fork commit `d7dca7a`. Kept out of `page.rs` so an upstream
 //! rewrite of that file does not touch it; Rust allows an inherent impl in any
@@ -21,15 +21,15 @@ impl Page {
     ///
     /// Returns whether the URL changed.
     pub fn sync_virtual_url(&mut self) -> bool {
-        let Some(js) = self.js.as_mut() else {
+        let Some(js) = self.js.as_ref() else {
             return false;
         };
-        let Ok(virtual_url) = js.evaluate("globalThis.__virtualUrl || ''") else {
+        // The reflected URL lives in native state now. Reading it through a
+        // script would let a page-defined getter change what the host sees.
+        let Some(virtual_url) = js.reflected_url(0) else {
             return false;
         };
-        let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
-            return false;
-        };
+        let virtual_url = virtual_url.as_str();
         let Ok(parsed) = Url::parse(virtual_url) else {
             return false;
         };

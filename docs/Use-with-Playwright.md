@@ -139,7 +139,7 @@ Legacy `performance.timing` records main-document navigation start, fetch start,
 response completion and DOM/load milestones. Event-end values remain zero until
 their handlers finish. These read-only, integer epoch timestamps use a native
 monotonic clock and share the real origin with `performance.timeOrigin`; they
-survive runtime suspension and are not replaced by synthetic events or
+survive page parking and are not replaced by synthetic events or
 `document.open()`/`close()`. Named User Timing measures can use these milestones.
 Transport response completion is observed when the buffered fetch returns.
 DNS, connection, TLS, first-byte, redirect and previous-document unload timings

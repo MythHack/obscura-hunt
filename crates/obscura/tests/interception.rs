@@ -220,10 +220,11 @@ async fn page_rewrites_request_url_via_interception() {
 }
 
 /// A Continue rewrite that is not a URL must be refused like a forbidden one.
-/// Before the fix the SSRF re-validation was skipped when the override failed
-/// to parse and the raw string went on to the transport, which reported it as
-/// an ordinary transport failure (an opaque status-0 response) instead of a
-/// blocked request.
+/// The page's `fetch()` rejects with the TypeError a browser reports for a
+/// failed network request, and the raw string never reaches the transport.
+/// (Before the fix the SSRF re-validation was skipped when the override failed
+/// to parse, and the unparsable rewrite went out as an ordinary transport
+/// failure.)
 #[tokio::test]
 async fn unparsable_continue_rewrite_is_blocked() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
@@ -231,6 +232,14 @@ async fn unparsable_continue_rewrite_is_blocked() {
 
     let browser = Browser::new().unwrap();
     let mut page = browser.new_page().await.unwrap();
+
+    let fetch_requests = Arc::new(AtomicU32::new(0));
+    let counter = fetch_requests.clone();
+    page.on_request(Arc::new(move |info| {
+        if info.resource_type == ResourceType::Fetch {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
 
     let mut rx = page.enable_interception();
     tokio::spawn(async move {
@@ -268,8 +277,13 @@ async fn unparsable_continue_rewrite_is_blocked() {
         }
     }
     assert_eq!(
-        outcome, "rejected:AbortError",
-        "an unparsable Continue rewrite must be blocked, not attempted"
+        outcome, "rejected:TypeError",
+        "a blocked interception URL must fail the fetch with the browser's TypeError"
+    );
+    assert_eq!(
+        fetch_requests.load(Ordering::SeqCst),
+        0,
+        "a blocked interception rewrite must not issue an outbound fetch"
     );
 }
 

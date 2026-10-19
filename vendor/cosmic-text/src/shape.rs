@@ -438,12 +438,13 @@ fn shape_run(
         .and_then(|font_id| font_system.get_font(font_id));
     let fonts = font_system.get_font_matches(&attrs);
 
-    let default_families = [&attrs.family];
     let mut font_iter = FontFallbackIter::new(
         font_system,
         &fonts,
         attrs.font_id_opt,
-        &default_families,
+        &attrs.family,
+        attrs.fallback_families,
+        attrs.fallback_font_ids,
         &scripts,
         &line[start_run..end_run],
     );
@@ -642,12 +643,13 @@ fn shape_skip(
         .and_then(|font_id| font_system.get_font(font_id));
     let fonts = font_system.get_font_matches(&attrs);
 
-    let default_families = [&attrs.family];
     let mut font_iter = FontFallbackIter::new(
         font_system,
         &fonts,
         attrs.font_id_opt,
-        &default_families,
+        &attrs.family,
+        attrs.fallback_families,
+        attrs.fallback_font_ids,
         &[],
         "",
     );

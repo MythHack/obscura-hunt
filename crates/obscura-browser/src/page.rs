@@ -130,6 +130,16 @@ pub(crate) fn cross_scheme_to_file(from: &str, to: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Compare two navigation URLs the way the location setter stores them, so a
+/// reflected URL that differs only in normalization still matches the blocked
+/// target. Falls back to the literal text when either side is not a URL.
+fn same_navigation_url(left: &str, right: &str) -> bool {
+    match (Url::parse(left), Url::parse(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Whether a navigation target is a local file, including spellings the URL
 /// parser rejects (a bare `file:` prefix) so they cannot slip past the gate.
 fn url_is_file_scheme(raw: &str) -> bool {
@@ -356,19 +366,11 @@ pub struct Page {
     runtime_events_enabled: std::cell::Cell<bool>,
     console_messages_enabled: std::cell::Cell<bool>,
     pending_frame_work: std::collections::VecDeque<PendingFrameWork>,
-    /// Document-owned HTML script preparation flags saved while the V8 realm
-    /// is suspended for CDP/MCP tab switching.  These are restored only when
-    /// the same surviving DomTree is resumed; navigation clears them.
-    suspended_started_script_ids: Vec<u32>,
-    /// Re-creatable CDP handles retained while tab switching replaces this
-    /// page's V8 runtime. Chromium keeps these handles alive with the target;
-    /// preserving them avoids order-dependent failures in concurrent clients.
-    suspended_cdp_object_state: obscura_js::runtime::CdpObjectState,
-    /// Console messages drained from the runtime when the page is suspended for
-    /// tab switching, so they are not lost when the runtime is dropped (#971).
-    /// Retrieved (and cleared) alongside the live messages by
-    /// `take_pending_console_messages`.
-    suspended_console_messages: Vec<String>,
+    /// A suspended tab keeps its live runtime, frames and window identity;
+    /// autonomous background work (settle pumping, resource scans and capture
+    /// preparation) is parked until `resume_js`. This is what a background tab
+    /// means for a native page that shares its isolate with other windows.
+    suspended: bool,
     /// Passive on_request/on_response callbacks, scoped to this page (issue
     /// #408): they fire only for requests this page drives and die with it.
     /// Arc because the JS runtime state holds a second handle for fetch()/XHR.
@@ -1235,9 +1237,7 @@ impl Page {
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
             pending_frame_work: std::collections::VecDeque::new(),
-            suspended_started_script_ids: Vec::new(),
-            suspended_cdp_object_state: obscura_js::runtime::CdpObjectState::default(),
-            suspended_console_messages: Vec::new(),
+            suspended: false,
             callbacks: Arc::new(CallbackRegistry::new()),
             #[cfg(feature = "stealth")]
             stealth_client,
@@ -1499,6 +1499,18 @@ impl Page {
                     page.push_history(page.url_string());
                 } else {
                     page.lifecycle = LifecycleState::Failed;
+                    // The Location setter mirrors the requested URL into the
+                    // realm before the navigation runs, so a same-task read
+                    // observes it. A refused or failed navigation leaves the
+                    // committed document selected, so take the mirror back:
+                    // otherwise a blocked file:// assignment (or any failed
+                    // window navigation) keeps advertising a document that
+                    // was never installed, while document.body still shows
+                    // the old one.
+                    if let Some(js) = page.js.as_ref() {
+                        let committed = page.url_string();
+                        js.set_reflected_url(0, Some(&committed));
+                    }
                 }
                 page.window_navigation = None;
                 (page, result)
@@ -1562,6 +1574,12 @@ impl Page {
     }
 
     pub fn has_window_work(&self) -> bool {
+        // A parked tab runs no autonomous work, including native window jobs.
+        // Its group jobs are still drained by an active peer sharing the
+        // window; reporting work here would make the owner tick a parked page.
+        if self.suspended {
+            return false;
+        }
         self.js.as_ref().is_some_and(ObscuraJsRuntime::has_window_work)
             || self.window_group.as_ref().is_some_and(|group| {
                 let group = group.borrow();
@@ -1611,6 +1629,19 @@ impl Page {
         self.collect_native_windows();
     }
 
+    /// Awaits a CDP evaluation while the tab's browsing contexts keep
+    /// progressing.
+    ///
+    /// `Runtime.evaluate`/`callFunctionOn` with `awaitPromise` can only settle
+    /// after the page itself finishes work: an accepted `iframe` document
+    /// request must be adopted, its author scripts run and its single `load`
+    /// dispatched (then `contentDocument`/`contentWindow` readers resolve), and
+    /// a form that targeted a named frame must commit before its `load`
+    /// listener can observe the response. The processor cannot pump that work
+    /// while this future is pending — it is awaiting this very reply — so the
+    /// page drives its own frame queue here, using the window-driver runtime
+    /// that shares the same engine, realm registry and pending-document queue.
+    /// This is the tab's main-thread step, not a second pump.
     async fn await_with_window_work<T>(&mut self, future: impl Future<Output = T>) -> T {
         tokio::pin!(future);
         loop {
@@ -1620,6 +1651,11 @@ impl Page {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
                     if let Err(error) = self.drive_windows(5).await {
                         tracing::debug!("Native window navigation failed: {}", error);
+                    }
+                    if let Err(error) = self.process_pending_frame_navigations().await {
+                        tracing::warn!(
+                            "frame work failed while an evaluation was awaited: {error}"
+                        );
                     }
                 }
             }
@@ -1704,8 +1740,9 @@ impl Page {
             // is replaced, so a page that churns iframes would otherwise grow
             // the process without bound. Refuse past the cap rather than let a
             // page decide how much memory to take.
+            let existing = self.frames.iter().position(|realm| realm.frame_id() == frame.frame_id);
             let cap = max_live_frames();
-            if self.frames.len() >= cap {
+            if existing.is_none() && self.frames.len() >= cap {
                 tracing::warn!(
                     "refusing a realm for frame {}: already at the {} live frame cap",
                     frame.url,
@@ -1714,16 +1751,31 @@ impl Page {
                 self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
                 return true;
             }
-            let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
-            }) {
-                Some(realm) => realm,
-                None => {
-                    tracing::warn!("could not build a realm for frame {}", frame.url);
-                    self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
-                    return true;
-                }
+            let index = if let Some(index) = existing {
+                index
+            } else {
+                let realm = match self.js.as_mut().and_then(|js| {
+                    FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+                }) {
+                    Some(realm) => realm,
+                    None => {
+                        tracing::warn!("could not build a realm for frame {}", frame.url);
+                        self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                        return true;
+                    }
+                };
+                self.frames.push(realm);
+                self.frames.len() - 1
             };
+            let realm = &mut self.frames[index];
+            if frame.replace_document {
+                if let Some(js) = self.js.as_mut() {
+                    if let Err(error) = realm.replace_document(js, &frame.url, "GET", "", &frame.html) {
+                        tracing::warn!("frame {} document replacement failed: {error}", frame.url);
+                        return true;
+                    }
+                }
+            }
             // Discover author scripts before preload code can mutate the frame
             // DOM, preserving the existing preparation order.
             let urls = match self.js.as_mut() {
@@ -1759,7 +1811,6 @@ impl Page {
             let frame_id = frame.frame_id;
             let parent_frame_id = frame.parent_frame_id;
             let frame_url = frame.url;
-            self.frames.push(realm);
             self.pending_frame_work.push_front(PendingFrameWork::Attached {
                 frame_id,
                 parent_frame_id,
@@ -1972,60 +2023,26 @@ impl Page {
         if self.frames.is_empty() && self.pending_frame_work.is_empty() {
             return;
         }
-        // Each realm reports its own frames whose element is still connected.
-        // Liveness is asked of the element rather than of a document query,
-        // because an iframe inside a shadow root is absent from
-        // `document.querySelectorAll('iframe')` — the shape a challenge widget
-        // uses — and treating it as detached tears down a live frame.
-        const LIVE_FRAME_IDS: &str = "__obscura_liveFrameIds()";
-
-        let mut live: Vec<u32> = Vec::new();
-        let Some(js) = self.js.as_mut() else { return };
-        match js.evaluate(LIVE_FRAME_IDS) {
-            Ok(value) => live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default()),
-            // A query that did not run says nothing about which frames are
-            // gone, and an empty answer here reads as "all of them". Holding
-            // them is bounded by the live-frame cap; discarding a live frame
-            // is not recoverable, so leave the tree alone.
-            Err(error) => {
-                tracing::debug!("could not list the page's live frames: {error}");
-                return;
-            }
-        }
-        // A frame's own children are in that frame's document, not the page's.
-        for index in 0..self.frames.len() {
-            let Some(js) = self.js.as_mut() else { return };
-            match self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
-                Ok(value) => {
-                    live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default())
-                }
-                Err(error) => {
-                    tracing::debug!("could not list a frame's live frames: {error}");
-                    return;
-                }
-            }
-        }
-        // A parent initialized synchronously may not be adopted yet.
-        // Keep its children only while their native owner chain is connected.
-        if let Some(js) = &self.js {
-            for pending in &self.pending_frame_work {
-                if js.live_frame_owner(pending.frame_id()).is_some() {
-                    live.push(pending.frame_id());
-                }
-            }
-        }
+        // Native owner topology is the authority for liveness. An iframe
+        // inside a shadow root is absent from `document.querySelectorAll`
+        // (a shape challenge widgets use) but its element is connected, and a
+        // removed parent takes every descendant browsing context with it. The
+        // registry knows the owner node of each frame, so asking it avoids
+        // re-deriving liveness from a document query that cannot see shadow
+        // trees and from dispatching JS queries into realms that may already
+        // be closing.
+        let Some(js) = self.js.as_ref() else { return };
         let mut discarded_ids: std::collections::HashSet<u32> = self
             .frames
             .iter()
             .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
-            .filter(|(id, _)| !live.contains(id))
-            .map(|(id, _)| id)
             .chain(
                 self.pending_frame_work
                     .iter()
-                    .filter(|pending| !live.contains(&pending.frame_id()))
-                    .map(PendingFrameWork::frame_id),
+                    .map(|pending| (pending.frame_id(), pending.parent_frame_id())),
             )
+            .filter(|(id, _)| js.live_frame_owner(*id).is_none())
+            .map(|(id, _)| id)
             .collect();
         loop {
             let before = discarded_ids.len();
@@ -2472,12 +2489,6 @@ impl Page {
         if self.window_closed {
             return Err(PageError::NetworkError("Native window is closed".to_string()));
         }
-        // init_js is also the new-document path.  Only resume_js explicitly
-        // takes these IDs out before entering here and restores them after the
-        // same DomTree is installed; a navigation must never inherit IDs from
-        // a suspended prior document whose allocator may reuse them.
-        self.suspended_started_script_ids.clear();
-        self.suspended_cdp_object_state = obscura_js::runtime::CdpObjectState::default();
         // Navigation replaces this root's document, not its native window or
         // shared isolate. Related windows retain their globals and handles.
         self.pending_frame_work.clear();
@@ -2971,7 +2982,7 @@ impl Page {
         // can interrupt a page that burns the budget across many synchronous
         // scripts (the real-world SPA / anti-bot busy-loop hang). This watchdog
         // terminates the isolate if cumulative synchronous script work overruns.
-        let exec_wd = self
+        let mut exec_wd = self
             .js
             .as_mut()
             .map(|js| js.arm_watchdog(std::time::Duration::from_millis(script_deadline_ms + 1000)));
@@ -3138,6 +3149,11 @@ impl Page {
             }
         }
 
+        // Entries begin pending. Ready responses replace them; failures remove
+        // them so an ordered script never waits for unrelated outstanding work.
+        let mut fetched: std::collections::HashMap<usize, Option<(String, obscura_net::Response)>> =
+            fetch_tasks.iter().map(|(index, _)| (*index, None)).collect();
+
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
@@ -3177,17 +3193,17 @@ impl Page {
                             body,
                             redirected_from: Vec::new(),
                         };
-                        return Some((idx, url, resp));
+                        return (idx, Some((url, resp)));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
                     match client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
                         .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => (idx, Some((url, resp))),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
-                            None
+                            (idx, None)
                         }
                     }
                 }
@@ -3199,50 +3215,8 @@ impl Page {
         // pool / ephemeral ports and triggering OS-level backpressure.
         // 16 is well above the per-host pool ceiling most browsers use
         // and matches what real Chrome does for a given origin.
-        use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
-            }
-        };
-
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
-        for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
-                if !script_response_is_executable(resp.status) {
-                    self.record_network_event_with_body(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        &resp.body,
-                        false,
-                    );
-                    tracing::warn!(
-                        "Refusing to execute script {} after HTTP {}",
-                        url,
-                        resp.status
-                    );
-                    continue;
-                }
-                // Script bodies: only the HTTP Content-Type charset matters
-                // (no in-band meta-charset for JS).
-                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
-            }
-        }
+        use futures::{FutureExt as _, StreamExt as _};
+        let mut fetch_stream = Some(futures::stream::iter(fetch_futures).buffer_unordered(16));
 
         // Spec: readyState is "loading" while parser-discovered scripts execute.
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
@@ -3354,9 +3328,29 @@ impl Page {
         let execute_classic =
             |page: &mut Self,
              script: &ScriptInfo,
-             fetched_script: Option<(String, String, obscura_net::Response)>| {
+             fetched_script: Option<(String, obscura_net::Response)>| {
                 if script.src.is_some() {
-                    if let Some((url, code, resp)) = fetched_script {
+                    if let Some((url, resp)) = fetched_script {
+                        if !script_response_is_executable(resp.status) {
+                            page.record_network_event_with_body(
+                                &url,
+                                "GET",
+                                "Script",
+                                resp.status,
+                                &resp.headers,
+                                &resp.body,
+                                false,
+                            );
+                            tracing::warn!(
+                                "Refusing to execute script {} after HTTP {}", url, resp.status,
+                            );
+                            return;
+                        }
+                        // Only the HTTP Content-Type charset applies to JS.
+                        let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                        if tokio::time::Instant::now() >= script_deadline {
+                            return;
+                        }
                         tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                         let execution_url = resp.url.to_string();
                         page.record_network_event_with_body(
@@ -3399,17 +3393,55 @@ impl Page {
                 }
             };
 
+        let receive_classic =
+            |page: &mut Self,
+             fetched: &mut std::collections::HashMap<usize, Option<(String, obscura_net::Response)>>,
+             parsed_until: usize,
+             (index, result): (usize, Option<(String, obscura_net::Response)>)| {
+                if let Some(result) = result {
+                    if index < parsed_until && all_scripts[index].is_async
+                        && tokio::time::Instant::now() < script_deadline
+                    {
+                        fetched.remove(&index);
+                        execute_classic(page, &all_scripts[index], Some(result));
+                    } else {
+                        fetched.insert(index, Some(result));
+                    }
+                } else {
+                    fetched.remove(&index);
+                }
+            };
+
         let mut post_parse = Vec::new();
+        // Module preparation borrows the runtime exclusively. Buffer classic
+        // completions while it runs, then use the ordinary execution path.
+        let mut ready_during_prepare = Vec::new();
 
         // Process parser-discovered scripts in encounter order. Import maps
         // register at their exact position; module graphs start there too, but
         // evaluation of non-async modules remains post-parse.
         for (index, script) in all_scripts.iter().enumerate() {
+            if let Some(stream) = fetch_stream.as_mut() {
+                while tokio::time::Instant::now() < script_deadline {
+                    let Some(Some(result)) = stream.next().now_or_never() else { break };
+                    receive_classic(self, &mut fetched, index, result);
+                }
+            }
+            if let Some(js) = &mut self.js {
+                if js.take_document_write_inserted_script()
+                    && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                {
+                    tracing::warn!(
+                        "script deadline reached with a parser-blocking document.write script pending"
+                    );
+                }
+            }
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!(
                     "execute_scripts: deadline reached, skipping {} remaining scripts",
                     all_scripts.len() - index,
                 );
+                drop(fetch_stream.take());
                 break;
             }
 
@@ -3429,7 +3461,35 @@ impl Page {
                     if script.is_defer && !script.is_async && script.src.is_some() {
                         post_parse.push(ScheduledScript::Classic(index));
                     } else {
-                        let fetched_script = fetched.remove(&index);
+                        if !script.is_async {
+                            while tokio::time::Instant::now() < script_deadline
+                                && fetched.get(&index).is_some_and(Option::is_none)
+                            {
+                                let Some(stream) = fetch_stream.as_mut() else { break };
+                                match tokio::time::timeout_at(script_deadline, stream.next()).await {
+                                    Ok(Some(result)) => receive_classic(self, &mut fetched, index, result),
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        tracing::warn!("execute_scripts: ordered script fetch deadline reached");
+                                        break;
+                                    }
+                                }
+                                if let Some(js) = &mut self.js {
+                                    if js.take_document_write_inserted_script()
+                                        && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                                    {
+                                        tracing::warn!(
+                                            "script deadline reached with a parser-blocking document.write script pending"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if tokio::time::Instant::now() >= script_deadline {
+                            drop(fetch_stream.take());
+                            break;
+                        }
+                        let fetched_script = fetched.remove(&index).flatten();
                         execute_classic(self, script, fetched_script);
                         if let Some(js) = &mut self.js {
                             if js.take_document_write_inserted_script()
@@ -3452,7 +3512,7 @@ impl Page {
                     };
                     let prepare_budget_ms = module_budget_ms.min(remaining_page_ms);
                     let prepare_started = std::time::Instant::now();
-                    let (prepared, module_url) = if let Some(src) = &script.src {
+                    let (result, module_url) = if let Some(src) = &script.src {
                         let full_url = if src.starts_with("http://")
                             || src.starts_with("https://")
                             || src.starts_with("data:")
@@ -3467,7 +3527,21 @@ impl Page {
                         };
                         tracing::info!("Preparing ES module graph: {}", full_url);
                         let result = match &mut self.js {
-                            Some(js) => js.prepare_module(&full_url, prepare_budget_ms).await,
+                            Some(js) => {
+                                let prepare = js.prepare_module(&full_url, prepare_budget_ms);
+                                tokio::pin!(prepare);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut prepare => break result,
+                                        Some(result) = async {
+                                            match fetch_stream.as_mut() {
+                                                Some(stream) => stream.next().await,
+                                                None => None,
+                                            }
+                                        } => ready_during_prepare.push(result),
+                                    }
+                                }
+                            }
                             None => continue,
                         };
                         tracing::debug!(
@@ -3478,22 +3552,27 @@ impl Page {
                             success = result.is_ok(),
                             "ES module phase complete",
                         );
-                        match result {
-                            Ok(prepared) => (prepared, Some(full_url)),
-                            Err(error) => {
-                                tracing::warn!("ES module error ({}): {}", full_url, error);
-                                continue;
-                            }
-                        }
+                        (result, Some(full_url))
                     } else {
                         let result = match &mut self.js {
                             Some(js) => {
-                                js.prepare_inline_module(
+                                let prepare = js.prepare_inline_module(
                                     &script.inline,
                                     &script.base_url,
                                     prepare_budget_ms,
-                                )
-                                .await
+                                );
+                                tokio::pin!(prepare);
+                                loop {
+                                    tokio::select! {
+                                        result = &mut prepare => break result,
+                                        Some(result) = async {
+                                            match fetch_stream.as_mut() {
+                                                Some(stream) => stream.next().await,
+                                                None => None,
+                                            }
+                                        } => ready_during_prepare.push(result),
+                                    }
+                                }
                             }
                             None => continue,
                         };
@@ -3505,15 +3584,34 @@ impl Page {
                             success = result.is_ok(),
                             "ES module phase complete",
                         );
-                        match result {
-                            Ok(prepared) => (prepared, None),
-                            Err(error) => {
-                                tracing::warn!("Inline ES module error: {}", error);
-                                continue;
-                            }
-                        }
+                        (result, None)
                     };
                     let graph_elapsed_ms = elapsed_ms_ceil(prepare_started.elapsed());
+                    // Count only graph preparation, never classic execution or
+                    // document.write work performed after it releases the runtime.
+                    for result in ready_during_prepare.drain(..) {
+                        receive_classic(self, &mut fetched, index, result);
+                    }
+                    if let Some(js) = &mut self.js {
+                        if js.take_document_write_inserted_script()
+                            && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                        {
+                            tracing::warn!(
+                                "script deadline reached with a parser-blocking document.write script pending"
+                            );
+                        }
+                    }
+                    let prepared = match result {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            if let Some(url) = &module_url {
+                                tracing::warn!("ES module error ({}): {}", url, error);
+                            } else {
+                                tracing::warn!("Inline ES module error: {}", error);
+                            }
+                            continue;
+                        }
+                    };
                     let remaining_active_ms = module_budget_ms.saturating_sub(graph_elapsed_ms);
                     if remaining_active_ms == 0 {
                         tracing::warn!(
@@ -3598,12 +3696,39 @@ impl Page {
         for scheduled in post_parse {
             if tokio::time::Instant::now() >= script_deadline {
                 tracing::warn!("execute_scripts: deadline reached during post-parse scripts");
+                drop(fetch_stream.take());
                 break;
             }
             match scheduled {
                 ScheduledScript::Classic(index) => {
                     let script = &all_scripts[index];
-                    let fetched_script = fetched.remove(&index);
+                    while tokio::time::Instant::now() < script_deadline
+                        && fetched.get(&index).is_some_and(Option::is_none)
+                    {
+                        let Some(stream) = fetch_stream.as_mut() else { break };
+                        match tokio::time::timeout_at(script_deadline, stream.next()).await {
+                            Ok(Some(result)) => receive_classic(self, &mut fetched, all_scripts.len(), result),
+                            Ok(None) => break,
+                            Err(_) => {
+                                tracing::warn!("execute_scripts: deferred script fetch deadline reached");
+                                break;
+                            }
+                        }
+                        if let Some(js) = &mut self.js {
+                            if js.take_document_write_inserted_script()
+                                && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                            {
+                                tracing::warn!(
+                                    "script deadline reached with a parser-blocking document.write script pending"
+                                );
+                            }
+                        }
+                    }
+                    if tokio::time::Instant::now() >= script_deadline {
+                        drop(fetch_stream.take());
+                        break;
+                    }
+                    let fetched_script = fetched.remove(&index).flatten();
                     execute_classic(self, script, fetched_script);
                     if let Some(js) = &mut self.js {
                         if js.take_document_write_inserted_script()
@@ -3661,44 +3786,125 @@ impl Page {
             }
         }
 
-        if let Some(js) = &mut self.js {
+        if tokio::time::Instant::now() >= script_deadline {
+            drop(fetch_stream.take());
+        }
+
+        let mut phase_terminated = if let Some(js) = &mut self.js {
             // DOMContentLoaded follows parser/defer/module work, but async
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
             js.record_navigation_timing("domContentLoadedEventStart");
+            // V8 delivers termination as an exception and the bootstrap's
+            // event dispatch catches listener exceptions, so the synchronous
+            // dispatch script can return normally after a handler was killed.
+            // The phase watchdog is the native evidence: `disarm_watchdog`
+            // reports whether it fired during this dispatch and clears the
+            // termination so the isolate is usable again. No author-visible
+            // marker is involved, so a throwing setter on any global cannot
+            // stop the dispatch.
             let completed = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
-            );
-            if completed.is_ok() {
-                js.record_navigation_timing("domContentLoadedEventEnd");
-            }
-
-            let load_blockers_finished =
-                Self::drive_load_delaying_scripts(js, script_deadline).await;
-            if !load_blockers_finished {
-                tracing::warn!(
-                    "script deadline reached with load-delaying dynamic scripts still pending"
-                );
-            }
-
-            // readyState becomes complete before the load event. A script
-            // inserted by an onload handler is therefore post-load work and
-            // remains pending until an explicit caller settle/wait.
-            js.record_navigation_timing("domComplete");
-            js.record_navigation_timing("loadEventStart");
-            let completed = js.execute_script(
-                "<load-event>",
-                "globalThis.__documentReadyState__ = 'complete';\n\
-                 try {\n\
-                   const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
-                   try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
+                "try {\n\
+                   document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false}));\n\
+                   window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false}));\n\
                  } catch(e) {}",
             );
-            if completed.is_ok() {
-                js.record_navigation_timing("loadEventEnd");
+            let dcl_terminated = match exec_wd.take() {
+                Some(token) => js.disarm_watchdog(token),
+                None => false,
+            };
+            if completed.is_ok() && !dcl_terminated {
+                js.record_navigation_timing("domContentLoadedEventEnd");
+            }
+            dcl_terminated
+        } else {
+            false
+        };
+        if phase_terminated {
+            // The hard phase budget is spent. Do not record lifecycle
+            // completion after a DOMContentLoaded handler was terminated.
+            tracing::warn!("script phase terminated during DOMContentLoaded");
+        } else if let Some(stream) = fetch_stream.as_mut() {
+            // Parser async classics delay load, not parser/defer/module work
+            // or DOMContentLoaded. Keep every wait on the original deadline.
+            while tokio::time::Instant::now() < script_deadline {
+                let result = match tokio::time::timeout_at(script_deadline, stream.next()).await {
+                    Ok(Some(result)) => result,
+                    Ok(None) => break,
+                    Err(_) => {
+                        tracing::warn!("execute_scripts: async script fetch deadline reached");
+                        break;
+                    }
+                };
+                let remaining = script_deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                // Guard ready async execution, not idle network waiting, so
+                // expiry still permits the existing bounded load cleanup.
+                if result.1.is_some() {
+                    exec_wd = self.js.as_mut().map(|js| js.arm_watchdog(remaining));
+                }
+                receive_classic(self, &mut fetched, all_scripts.len(), result);
+                if let Some(js) = &mut self.js {
+                    if js.take_document_write_inserted_script()
+                        && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                    {
+                        tracing::warn!(
+                            "script deadline reached with a parser-blocking document.write script pending"
+                        );
+                    }
+                    if let Some(token) = exec_wd.take() {
+                        if js.disarm_watchdog(token) {
+                            phase_terminated = true;
+                            tracing::warn!("script phase terminated during async script execution");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Dropping the bounded stream cancels any body still pending, before
+        // the load event and without extending the script phase's budget.
+        drop(fetch_stream.take());
+        if !phase_terminated {
+            if let Some(js) = &mut self.js {
+                let remaining = script_deadline
+                    .saturating_duration_since(tokio::time::Instant::now());
+                if !remaining.is_zero() {
+                    exec_wd = Some(js.arm_watchdog(remaining));
+                }
+                let load_blockers_finished =
+                    Self::drive_load_delaying_scripts(js, script_deadline).await;
+                if !load_blockers_finished {
+                    tracing::warn!(
+                        "script deadline reached with load-delaying dynamic scripts still pending"
+                    );
+                }
+
+                // readyState becomes complete before the load event. A script
+                // inserted by an onload handler is therefore post-load work and
+                // remains pending until an explicit caller settle/wait.
+                js.record_navigation_timing("domComplete");
+                js.record_navigation_timing("loadEventStart");
+                let completed = js.execute_script(
+                    "<load-event>",
+                    "globalThis.__documentReadyState__ = 'complete';\n\
+                     try {\n\
+                       const loadEvent = new Event('load', {bubbles:false,cancelable:false});\n\
+                       window.dispatchEvent(loadEvent);\n\
+                     } catch(e) {}",
+                );
+                let load_terminated = match exec_wd.take() {
+                    Some(token) => js.disarm_watchdog(token),
+                    None => false,
+                };
+                if completed.is_ok() && !load_terminated {
+                    js.record_navigation_timing("loadEventEnd");
+                }
             }
         }
         if let Some(token) = exec_wd {
@@ -3776,7 +3982,7 @@ impl Page {
     /// the load event, before any async work settles, which silently strands
     /// timer-driven tests and dynamic pages.
     pub async fn settle(&mut self, max_ms: u64) {
-        if max_ms == 0 {
+        if max_ms == 0 || self.suspended {
             return;
         }
         let settle_started = std::time::Instant::now();
@@ -3836,7 +4042,7 @@ impl Page {
     /// for a fixed capture delay should not be silently shortened by adaptive
     /// readiness heuristics.
     pub async fn settle_for_duration(&mut self, duration_ms: u64) {
-        if duration_ms == 0 {
+        if duration_ms == 0 || self.suspended {
             return;
         }
         if let Some(js) = &mut self.js {
@@ -3850,11 +4056,16 @@ impl Page {
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
-    /// `true` means deno_core reached full idle; `false` means one wake/task was
-    /// delivered and the owner should offer another turn after servicing any
-    /// higher-priority automation commands.
+    /// `true` means deno_core reached full idle and no navigation is queued;
+    /// `false` means one wake/task was delivered or a navigation became ready,
+    /// and the owner should service that work before parking the page.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
+        // A suspended tab retains its runtime but does not get autonomous
+        // turns; its owner resumes it before issuing commands.
+        if self.suspended {
+            return Ok(true);
+        }
         #[cfg(feature = "render")]
         {
             self.queue_pending_render_resources();
@@ -3891,9 +4102,17 @@ impl Page {
         // pump on the same generic frame path as settle(), so a client that
         // stays attached can observe and run child documents as they arrive.
         let frame_work = self.advance_frames().await;
+        // A navigation queued during this turn is ready work, not idle state.
+        // If the owner is told the page is idle it disarms the autonomous
+        // pump before taking the pending navigation; the load then proceeds
+        // with no pump left to service its timers or intercepted requests.
+        let navigation_ready = self
+            .js
+            .as_ref()
+            .is_some_and(ObscuraJsRuntime::has_pending_navigation);
         #[cfg(feature = "render")]
         {
-            if reached_idle && !frame_work && self.js.is_some() {
+            if reached_idle && !frame_work && !navigation_ready && self.js.is_some() {
                 // The runtime may have nothing to do until a resource lands.
                 // Park on the next result instead of reporting "busy" (which
                 // would spin the connection pump). `notified` is cancel-safe,
@@ -3911,15 +4130,15 @@ impl Page {
                     self.drain_render_resource_results();
                     return Ok(false);
                 }
-                return Ok(true);
+                return Ok(!navigation_ready);
             }
             // Geometry this turn produced may have missed resources; start
             // their loads now.
             self.queue_pending_render_resources();
-            return Ok(reached_idle && !frame_work);
+            return Ok(reached_idle && !frame_work && !navigation_ready);
         }
         #[cfg(not(feature = "render"))]
-        Ok(reached_idle && !frame_work)
+        Ok(reached_idle && !frame_work && !navigation_ready)
     }
 
     async fn settle_runtime_for_duration(js: &mut ObscuraJsRuntime, duration_ms: u64) {
@@ -4052,7 +4271,13 @@ impl Page {
                 &document_referrer,
             )
             .await?;
-            if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
+            if let Some(navigation) = self.take_pending_navigation() {
+                let obscura_js::ops::PendingNavigation {
+                    url: next_url,
+                    method: next_method,
+                    body: next_body,
+                    origin_frame_id,
+                } = navigation;
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
                     // a navigation to file:// and then read the loaded
@@ -4065,6 +4290,11 @@ impl Page {
                         current_url,
                         next_url,
                     );
+                    // Reflect the committed address again without running
+                    // author JS (a getter/setter trap cannot observe this).
+                    if let Some(js) = self.js.as_ref() {
+                        js.set_reflected_url(origin_frame_id, Some(&current_url));
+                    }
                     break;
                 }
                 tracing::info!(
@@ -4692,6 +4922,9 @@ impl Page {
     /// loads that stored usable bytes.
     #[cfg(feature = "render")]
     pub fn queue_pending_render_resources(&mut self) -> usize {
+        if self.suspended {
+            return 0;
+        }
         let Some(js) = self.js.as_mut() else {
             return 0;
         };
@@ -4709,6 +4942,9 @@ impl Page {
     /// navigation warmups before any layout has run.
     #[cfg(feature = "render")]
     pub fn spawn_pending_render_resources(&mut self) -> usize {
+        if self.suspended {
+            return 0;
+        }
         if let Some(js) = &self.js {
             // A runtime attached without `init_js` loads through the page
             // transport all the same.
@@ -4756,7 +4992,7 @@ impl Page {
     #[cfg(feature = "render")]
     pub async fn prepare_screenshot_resources(&mut self, max_ms: u64) -> usize {
         let started = std::time::Instant::now();
-        if max_ms == 0 || self.js.is_none() {
+        if max_ms == 0 || self.js.is_none() || self.suspended {
             return 0;
         }
         let mut loaded = 0;
@@ -5489,78 +5725,38 @@ impl Page {
     }
 
     pub fn suspend_js(&mut self) {
-        // Native roots share an isolate and must survive automation tab switches.
-        // Dropping/reinitializing one destroys script state and remote handles.
-        if self.window_group.is_some() {
-            return;
-        }
-        if self.js.is_none() {
-            return;
-        }
-        // Event synchronization already transfers completed request bodies.
-        // Retain any bodies whose event was evicted before the realm is dropped.
-        self.sync_js_network_events();
-        let max_entries = response_body_entry_limit();
-        for (id, body) in self.js.as_ref().unwrap().take_network_response_bodies() {
-            self.response_bodies.insert(id.clone(), StoredResponseBody {
-                body: body.body,
-                base64_encoded: body.base64_encoded,
-            });
-            self.response_body_order.push_back(id);
-        }
-        while self.response_body_order.len() > max_entries {
-            if let Some(oldest) = self.response_body_order.pop_front() {
-                self.response_bodies.remove(&oldest);
-            }
-        }
-        // Suspension rebuilds the renderer cache on resume (`take_dom`), so
-        // results for the suspended realm would have nowhere to go.
-        self.retire_render_resources();
-        let Some(js) = &mut self.js else {
-            return;
-        };
-        let started_script_ids = js.started_script_ids();
-        self.navigation_timing = js.navigation_timing();
-        // Preserve console messages logged before suspension: dropping the
-        // runtime below would otherwise lose any not yet drained (#971).
-        let pending_console = js.take_pending_console_messages();
-        self.suspended_cdp_object_state = js.take_cdp_object_state();
-        let dom = js.take_dom();
-        if let Some(dom) = dom {
-            self.dom = Some(dom);
-            self.suspended_started_script_ids = started_script_ids;
-        } else {
-            self.suspended_started_script_ids.clear();
-        }
-        // Every frame realm holds a V8 handle into this isolate, so the frames
-        // go before the runtime does — the same order init_js keeps on a new
-        // document. Suspending is a teardown of the realm the frames live in,
-        // and a realm cannot be suspended and resumed the way the page's DOM
-        // can, so they are rebuilt when the page next loads a document.
-        self.pending_frame_work.clear();
-        self.frames.clear();
-        self.suspended_console_messages.extend(pending_console);
-        self.js = None;
+        // A native page's JavaScript heap, globals, live frame realms and CDP
+        // object handles are the tab's identity. Dropping them to "suspend" a
+        // tab and rebuilding a fresh isolate on resume loses timers, window
+        // identity and remote handles — and a frame realm outliving the
+        // isolate it holds a handle into is exactly the dangling-context crash
+        // this used to cause when several native windows share an isolate.
+        // Park the page instead: keep the runtime untouched and stop only the
+        // autonomous work a hidden tab would not start (settle pumping and
+        // render-resource scans/capture preparation).
+        self.suspended = true;
     }
 
+    /// Clear the park set by [`Self::suspend_js`]. A parked page kept its live
+    /// runtime, so this only initializes a page that never had one.
     pub fn resume_js(&mut self) {
+        self.suspended = false;
         if self.js.is_some() {
             return;
         }
-        let started_script_ids = std::mem::take(&mut self.suspended_started_script_ids);
-        let cdp_object_state = std::mem::take(&mut self.suspended_cdp_object_state);
         if let Err(error) = self.init_js() {
             tracing::error!("Cannot initialize native window document: {}", error);
-            return;
-        }
-        if let Some(js) = &mut self.js {
-            js.restore_started_script_ids(&started_script_ids);
-            js.restore_cdp_object_state(cdp_object_state);
         }
     }
 
     pub fn has_js(&self) -> bool {
         self.js.is_some()
+    }
+
+    /// Whether this tab is parked by `suspend_js`/`resume_js`. A parked tab
+    /// keeps its runtime and frames; only autonomous work is stopped.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
     }
 
     /// Origin-scoped sessionStorage for this tab, including inactive origins.
@@ -5580,13 +5776,32 @@ impl Page {
         }
     }
 
-    pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+    pub fn take_pending_navigation(
+        &self,
+    ) -> Option<obscura_js::ops::PendingNavigation> {
         let js = self.js.as_ref()?;
         let navigation = js.take_pending_navigation()?;
         if let Ok(mut traversal) = self.pending_history_traversal.lock() {
             *traversal = js.take_pending_history_traversal();
         }
         Some(navigation)
+    }
+
+    /// Drain document navigations requested by live child frames, paired with
+    /// the frame whose document must be replaced.
+    ///
+    /// The pair's frame id is the browsing context the navigation targets: a
+    /// frame that moved itself and a form/window navigation aimed at another
+    /// frame both land in the target realm's queue. The navigation's own
+    /// `origin_frame_id` names the document that initiated it and is kept for
+    /// referrer/source policy; it is not the replacement target.
+    pub fn take_pending_frame_navigations(
+        &self,
+    ) -> Vec<(u32, obscura_js::ops::PendingNavigation)> {
+        self.js
+            .as_ref()
+            .map(ObscuraJsRuntime::take_pending_frame_navigations)
+            .unwrap_or_default()
     }
 
     pub fn has_pending_navigation(&self) -> bool {
@@ -5619,13 +5834,10 @@ impl Page {
     }
 
     pub fn take_pending_console_messages(&mut self) -> Vec<String> {
-        // Buffered messages from any suspended runtime come first, then the
-        // live runtime's messages (#971).
-        let mut messages = std::mem::take(&mut self.suspended_console_messages);
-        if let Some(js) = &self.js {
-            messages.extend(js.take_pending_console_messages());
-        }
-        messages
+        self.js
+            .as_ref()
+            .map(ObscuraJsRuntime::take_pending_console_messages)
+            .unwrap_or_default()
     }
 
     pub fn set_runtime_events_enabled(&self, enabled: bool) {
@@ -5719,14 +5931,36 @@ impl Page {
             current_url,
             target,
         );
-        if let Some(js) = self.js.as_mut() {
-            let _ = js.execute_script(
-                "<blocked-navigation>",
-                &format!(
-                    "globalThis.__virtualUrl = {};",
-                    serde_json::to_string(&current_url).unwrap_or_else(|_| "null".into())
-                ),
-            );
+        let Some(js) = self.js.as_ref() else { return true };
+        // The location setter records the reflected URL in the realm whose
+        // document set it — the page itself or a child frame. Restoring the
+        // root's address into every realm would leave the document that
+        // actually queued the jump reporting a file:// URL it never loaded
+        // (and the root would adopt another document's URL via
+        // sync_virtual_url). Reset only realms whose reflected URL is the
+        // blocked target, each to its own committed address, through the
+        // native reflected-URL state: no author JS runs and a page-defined
+        // getter/setter cannot observe or abort the restore.
+        if js
+            .reflected_url(0)
+            .as_deref()
+            .is_some_and(|value| same_navigation_url(value, target))
+        {
+            js.set_reflected_url(0, Some(&current_url));
+        }
+        let frame_urls: Vec<(u32, String)> = self
+            .frames
+            .iter()
+            .map(|frame| (frame.frame_id(), frame.url().to_string()))
+            .collect();
+        for (frame_id, committed) in frame_urls {
+            if js
+                .reflected_url(frame_id)
+                .as_deref()
+                .is_some_and(|value| same_navigation_url(value, target))
+            {
+                js.set_reflected_url(frame_id, Some(&committed));
+            }
         }
         true
     }
@@ -5734,7 +5968,8 @@ impl Page {
     pub async fn process_pending_navigation_outcome(
         &mut self,
     ) -> Result<PendingNavigationOutcome, PageError> {
-        if let Some((url, method, body)) = self.take_pending_navigation() {
+        if let Some(navigation) = self.take_pending_navigation() {
+            let (url, method, body) = (navigation.url, navigation.method, navigation.body);
             // SOP gate for navigations the page queued itself (a timer or
             // handler assigning location, a link click, a form submit). They
             // arrive here as a fresh first URL, so the chain gate in
@@ -5745,6 +5980,11 @@ impl Page {
                 return Ok(PendingNavigationOutcome::None);
             }
             self.navigate_from_document(&url, &method, &body).await?;
+            // A root document replacement owns the frame tree from here; any
+            // child navigation still queued refers to the document that is
+            // going away. The frame queue is drained by
+            // `process_pending_frame_navigations` only while those realms are
+            // still live; stale ids find no frame and are skipped.
             Ok(PendingNavigationOutcome::Document)
         } else {
             // Fork: a page that routed itself through history has still
@@ -5755,6 +5995,144 @@ impl Page {
                 PendingNavigationOutcome::None
             })
         }
+    }
+
+    /// Drain and commit document navigations requested by child frames.
+    ///
+    /// This is the frame-only counterpart to
+    /// [`Self::process_pending_navigation_outcome`]: that outcome never takes
+    /// a child navigation, because a child navigating is not a navigation of
+    /// the page. Server-mode CDP never calls the outcome path for page-managed
+    /// navigations (interception owns it), so its processor drives this at
+    /// command/pump boundaries; the MCP turn consumer calls it after every
+    /// turn. A root navigation replaces the frame tree, so queued child
+    /// navigations whose realm is gone are skipped by id lookup.
+    pub async fn process_pending_frame_navigations(&mut self) -> Result<(), PageError> {
+        // A script can create an iframe and submit into it in the same task.
+        // The runtime queues the navigation against a realm that Page has not
+        // adopted yet, so drain the pending-frame queue first; otherwise the
+        // navigation would be taken below and dropped when no `self.frames`
+        // entry matches its id.
+        self.advance_frames().await;
+        let navigations = self.take_pending_frame_navigations();
+        let mut first_error = None;
+        for (frame_id, navigation) in navigations {
+            // One frame's failed fetch must not strand navigations already
+            // queued by its siblings; the queue was drained as a batch.
+            if let Err(error) = self.navigate_frame_from_document(frame_id, navigation).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Commit a navigation requested for a live child browsing context.
+    async fn navigate_frame_from_document(
+        &mut self,
+        frame_id: u32,
+        navigation: obscura_js::ops::PendingNavigation,
+    ) -> Result<(), PageError> {
+        let Some(index) = self
+            .frames
+            .iter()
+            .position(|frame| frame.frame_id() == frame_id)
+        else {
+            tracing::debug!("frame {frame_id} navigated after its realm was released");
+            return Ok(());
+        };
+        let frame_url = self.frames[index].url().to_string();
+        // SOP gate for a jump the child queued itself. Restore its committed
+        // address through the native reflected-URL state: no author JS runs
+        // (a page-defined getter/setter cannot observe or abort this).
+        if cross_scheme_to_file(&frame_url, &navigation.url) {
+            tracing::warn!(
+                "blocking child-frame navigation to file: {} -> {}",
+                frame_url,
+                navigation.url
+            );
+            if let Some(js) = self.js.as_ref() {
+                js.set_reflected_url(frame_id, Some(&frame_url));
+            }
+            return Ok(());
+        }
+        if self.should_block_url(&navigation.url) {
+            if let Some(js) = self.js.as_ref() {
+                js.set_reflected_url(frame_id, Some(&frame_url));
+            }
+            return Ok(());
+        }
+        let Ok(target) = Url::parse(&navigation.url) else {
+            return Ok(());
+        };
+        let response = if navigation.method == "POST" {
+            self.http_client
+                .post_form_with_callbacks(&target, &navigation.body, Some(&self.callbacks))
+                .await
+        } else {
+            self.do_fetch(&target).await
+        }
+        .map_err(|error| {
+            PageError::NetworkError(format!(
+                "frame {} navigation to {} failed: {error}",
+                frame_id, navigation.url
+            ))
+        })?;
+        let (body_text, _) =
+            obscura_net::decode_response_with_name(&response.body, response.content_type());
+        let committed_url = response.url.to_string();
+        let html = body_text;
+        let Some(js) = self.js.as_mut() else { return Ok(()) };
+        let frame = &mut self.frames[index];
+        let parent_frame_id = frame.parent_frame_id();
+        frame
+            .replace_document(
+                js,
+                &committed_url,
+                &navigation.method,
+                &navigation.body,
+                &html,
+            )
+            .map_err(PageError::NetworkError)?;
+        let urls = frame.external_script_urls(js);
+        let mut sources = std::collections::HashMap::new();
+        for url in urls {
+            if self.should_block_url(&url) {
+                continue;
+            }
+            let Ok(parsed) = Url::parse(&url) else { continue };
+            match self.do_fetch(&parsed).await {
+                Ok(response) => {
+                    sources.insert(
+                        url,
+                        String::from_utf8_lossy(&response.body).into_owned(),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!("frame script {url} failed: {error}");
+                }
+            }
+        }
+        let Some(js) = self.js.as_mut() else { return Ok(()) };
+        for problem in self.frames[index]
+            .run_document_scripts(js, |url| sources.get(url).cloned())
+        {
+            tracing::debug!("frame {}: {}", navigation.url, problem);
+        }
+        if let Err(error) = self.frames[index].dispatch_load_events(js) {
+            tracing::debug!("frame {} load events failed: {error}", navigation.url);
+        }
+        self.execute_frame_owner_script(
+            parent_frame_id,
+            &format!(
+                "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+                 if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+                   frame.dispatchEvent(new Event('load')); }})()"
+            ),
+        );
+        Ok(())
     }
 
     /// Follow an in-document navigation, retaining its referrer and deadline
@@ -6685,8 +7063,8 @@ mod tests {
         );
     }
 
-    // #971: a tab switch suspends other tabs (drops their runtime). Console
-    // messages logged before suspension must be preserved, not lost.
+    // #971: a tab switch parks other tabs without dropping their runtime.
+    // Console messages logged before suspension must be preserved, not lost.
     #[tokio::test(flavor = "current_thread")]
     async fn suspend_js_preserves_pending_console_messages() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
@@ -6709,7 +7087,7 @@ mod tests {
             .evaluate("console.log('important-message')")
             .unwrap();
 
-        // Switching away suspends this tab and drops its runtime.
+        // Switching away parks this tab; its live runtime keeps the messages.
         page.suspend_js();
 
         let messages = page.take_pending_console_messages();
@@ -7186,8 +7564,7 @@ mod tests {
             .as_mut()
             .expect("page runtime")
             .evaluate(
-                r#"
-                var clientReplacementCheck = true;
+                r#"(() => {
                 const button = document.getElementById('client');
                 if (button) button.dispatchEvent(new Event('click'));
                 return {
@@ -7197,7 +7574,7 @@ mod tests {
                     clicks: button ? button.getAttribute('data-clicks') : null,
                     bodyElements: document.querySelectorAll('body *').length
                 };
-                "#,
+                })()"#,
             )
             .expect("inspect client replacement");
         assert_eq!(
@@ -7735,10 +8112,14 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let read = socket.read(&mut buf).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..read]).to_string();
-                    let body = if request.starts_with("GET /child.html ") {
+                    let path = request.split_ascii_whitespace().nth(1).unwrap_or("/");
+                    let path = path.split('?').next().unwrap_or("/");
+                    let body = if path == "/child.html" {
                         "<html><body><script>window.__ran = 'YES';</script></body></html>"
-                    } else if request.starts_with("GET /plain.html ") {
+                    } else if path == "/plain.html" {
                         "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    } else if path == "/missing-frame-document" {
+                        "<html><body>missing</body></html>"
                     } else {
                         "<html><body><div id=\"host\"></div><script>\
                          var r = document.getElementById('host').attachShadow({mode:'closed'});\
@@ -7747,8 +8128,9 @@ mod tests {
                          r.appendChild(f);\
                          </script></body></html>"
                     };
+                    let status = if path == "/missing-frame-document" { "404 Not Found" } else { "200 OK" };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
@@ -7883,12 +8265,211 @@ mod tests {
         (format!("http://{addr}"), requests)
     }
 
+    /// Serves a form response and records the method, path and urlencoded body
+    /// of POST submissions so a target-frame navigation can be asserted
+    /// end-to-end rather than through the pending-tuple shape.
+    async fn spawn_form_post_server() -> (
+        String,
+        std::sync::mpsc::Receiver<(String, String, String)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (posts_tx, posts_rx) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let posts_tx = posts_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let read = socket.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some(header_end) = text.find("\r\n\r\n") {
+                            let headers = &text[..header_end];
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())?
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= header_end + 4 + length {
+                                break;
+                            }
+                        }
+                        if buf.len() > 64 * 1024 {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf).into_owned();
+                    let mut lines = request.split("\r\n");
+                    let mut request_line = lines.next().unwrap_or("").split_ascii_whitespace();
+                    let method = request_line.next().unwrap_or("").to_string();
+                    let path = request_line.next().unwrap_or("/").to_string();
+                    let body = request
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body.to_string())
+                        .unwrap_or_default();
+                    let (content_type, response_body) = if path == "/submit" {
+                        posts_tx.send((method, path, body)).ok();
+                        (
+                            "text/html",
+                            "<html><body><p id=\"posted\">posted</p></body></html>".to_string(),
+                        )
+                    } else {
+                        ("text/html", "<html><body></body></html>".to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                        response_body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), posts_rx)
+    }
+
     async fn pump_srcdoc_frames(page: &mut super::Page) {
         for _ in 0..4 {
             tokio::time::timeout(std::time::Duration::from_secs(2),
                 page.js.as_mut().unwrap().run_event_loop()).await.unwrap().unwrap();
             if !page.advance_frames().await { break; }
         }
+    }
+
+    /// A non-self form target must submit method+body to the endpoint, render
+    /// the response document in the named iframe, and leave the submitting
+    /// document and its URL untouched. Asserted against the real endpoint
+    /// request, not the pending-navigation tuple.
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_form_target_named_iframe_receives_document_without_navigating_parent() {
+        let (base, posts) = spawn_form_post_server().await;
+        let html = format!(
+            r#"<html><body>
+            <p id="parent-marker">parent</p>
+            <form id="f" method="post" action="{base}/submit" target="sink">
+              <input name="field" value="value">
+            </form>
+            <iframe name="sink" id="sink"></iframe>
+            <script>
+              const sink = document.getElementById('sink');
+              globalThis.sinkLoads = [];
+              sink.addEventListener('load', () => {{
+                try {{
+                  globalThis.sinkLoads.push([
+                    sink.contentDocument?.URL ?? null,
+                    sink.contentDocument?.getElementById('posted')?.textContent ?? null,
+                    sink.contentWindow?.location?.href ?? null,
+                  ]);
+                }} catch (_) {{ globalThis.sinkLoads.push(null); }}
+              }});
+              document.getElementById('f').submit();
+            </script>
+            </body></html>"#
+        );
+        let mut page = import_map_test_page("post-target-named-iframe", &base, &html);
+        page.execute_scripts().await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut post = None;
+        let rendered = loop {
+            if post.is_none() {
+                post = posts.try_recv().ok();
+            }
+            let target_index = page
+                .frames
+                .iter()
+                .position(|frame| frame.url().ends_with("/submit"));
+            let ready = target_index
+                .and_then(|index| {
+                    page.evaluate_in_frame(
+                        index,
+                        "document.getElementById('posted')?.textContent === 'posted'",
+                    )
+                    .ok()
+                })
+                .is_some_and(|value| value == serde_json::json!(true));
+            if post.is_some() && ready {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            if let Some(js) = page.js.as_mut() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    js.run_event_loop(),
+                )
+                .await;
+            }
+            page.advance_frames().await;
+            let _ = page.process_pending_frame_navigations().await;
+        };
+
+        let (method, path, body) = post.unwrap_or_else(|| {
+            panic!(
+                "the named-iframe form POST never reached the endpoint; frames={:?}",
+                page.frame_urls()
+            )
+        });
+        assert_eq!(method, "POST", "the form method was not preserved");
+        assert_eq!(path, "/submit");
+        assert_eq!(body, "field=value", "the urlencoded body was not submitted");
+        assert!(
+            rendered,
+            "the response document did not render in the named iframe; frames={:?}",
+            page.frame_urls()
+        );
+        // The consumer observes the frame through the parent realm. The
+        // committed response must be the document `contentDocument` returns,
+        // and `contentWindow.location` must be the response URL — not the
+        // about:blank placeholder the frame was created with.
+        let observed = page.evaluate(r#"(() => {
+            const sink = document.getElementById('sink');
+            return [sink.contentDocument.URL,
+                sink.contentDocument.getElementById('posted').textContent,
+                sink.contentWindow.location.href,
+                globalThis.sinkLoads];
+        })()"#);
+        let submitted = format!("{base}/submit");
+        assert_eq!(
+            observed[0].as_str(),
+            Some(submitted.as_str()),
+            "the parent-facing contentDocument must expose the committed response document"
+        );
+        assert_eq!(
+            observed[1],
+            serde_json::json!("posted"),
+            "the parent-facing document must contain the response body"
+        );
+        assert_eq!(
+            observed[2].as_str(),
+            Some(submitted.as_str()),
+            "the parent-facing contentWindow must expose the committed location"
+        );
+        assert_eq!(
+            observed[3].as_array().and_then(|loads| loads.last()).cloned(),
+            Some(serde_json::json!([submitted.clone(), "posted", submitted.clone()])),
+            "the load observed through the parent must fire after the response document commits: {}",
+            observed[3],
+        );
+        assert_eq!(
+            page.url_string(),
+            format!("{base}/app/index.html"),
+            "the submitting document navigated instead of the target frame"
+        );
+        assert_eq!(
+            page.evaluate("document.getElementById('parent-marker').textContent"),
+            serde_json::json!("parent"),
+            "the submitting document's DOM was replaced"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8143,6 +8724,98 @@ mod tests {
         assert_eq!(called.value.unwrap(), serde_json::json!(["function", true]));
     }
 
+    /// A second real src request must replace the native document without
+    /// rebuilding a parent-arena shim through the old cross-origin Window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_src_network_navigation_retains_the_native_window() {
+        let base = spawn_shadow_frame_server().await;
+        let own = format!("{base}child.html");
+        let foreign = own.replace("127.0.0.1", "localhost");
+        let mut page = import_map_test_page("frame-src-network-navigation",
+            base.trim_end_matches('/'), "<html><body></body></html>");
+        page.evaluate_script(r#"
+            globalThis.iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            globalThis.frameEvents = [];
+            iframe.addEventListener('load', () => frameEvents.push('load'));
+            iframe.addEventListener('error', () => frameEvents.push('error'));
+            globalThis.navigateFrame = url => new Promise(resolve => {
+                iframe.onload = () => resolve('load');
+                iframe.onerror = () => resolve('error');
+                iframe.src = url;
+            });
+            1;
+        "#).unwrap();
+        let loaded = page.evaluate_for_cdp_with_timeout(
+            &format!("navigateFrame({})", serde_json::to_string(&foreign).unwrap()),
+            true, true, 2_000).await.unwrap();
+        assert_eq!(loaded.value, Some(serde_json::json!("load")));
+        page.evaluate_script("globalThis.retainedWindow = iframe.contentWindow; 1").unwrap();
+
+        for (url, same_origin) in [
+            (format!("{foreign}?next-document"), false),
+            (own.clone(), true),
+            (own.clone(), true),
+        ] {
+            page.evaluate_script(r#"
+                globalThis.previousDocument = iframe.contentDocument;
+                globalThis.previousPost = retainedWindow.postMessage;
+                1;
+            "#).unwrap();
+            let loaded = page.evaluate_for_cdp_with_timeout(
+                &format!("navigateFrame({})", serde_json::to_string(&url).unwrap()),
+                true, true, 2_000).await.unwrap();
+            assert_eq!(loaded.value, Some(serde_json::json!("load")),
+                "the src request for {url} failed after its HTTP response");
+            assert_eq!(page.frame_urls(), vec![url.clone()]);
+            assert_eq!(page.evaluate_in_frame(0, "[document.URL, __ran]").unwrap(),
+                serde_json::json!([url, "YES"]));
+            assert_eq!(page.evaluate_script(r#"(() => {
+                const child = iframe.contentWindow;
+                let access;
+                try { access = child.document.URL; }
+                catch (error) { access = error.name; }
+                return [child === retainedWindow, child.window === child,
+                    child.postMessage === child.postMessage,
+                    child.postMessage !== previousPost,
+                    iframe.contentDocument !== previousDocument, access];
+            })()"#).unwrap(), serde_json::json!([
+                true, true, true, true, same_origin,
+                if same_origin { url.as_str() } else { "SecurityError" },
+            ]));
+        }
+
+        // An HTTP failure keeps the last committed document.
+        page.evaluate_script("globalThis.beforeFailure = retainedWindow.document; 1").unwrap();
+        let failed = page.evaluate_for_cdp_with_timeout(
+            &format!("navigateFrame({})", serde_json::to_string(
+                &format!("{base}missing-frame-document")).unwrap()),
+            true, true, 2_000).await.unwrap();
+        assert_eq!(failed.value, Some(serde_json::json!("error")));
+        assert_eq!(page.evaluate_script(
+            "iframe.contentWindow === retainedWindow && retainedWindow.document === beforeFailure"
+        ).unwrap(), serde_json::json!(true));
+
+        let superseded = page.evaluate_for_cdp_with_timeout(&format!(r#"
+            new Promise(resolve => {{
+                iframe.onload = () => resolve('load');
+                iframe.onerror = () => resolve('error');
+                iframe.src = {};
+                iframe.src = {};
+            }})
+        "#, serde_json::to_string(&format!("{foreign}?superseded")).unwrap(),
+            serde_json::to_string(&own).unwrap()), true, true, 2_000).await.unwrap();
+        assert_eq!(superseded.value, Some(serde_json::json!("load")));
+        assert_eq!(page.evaluate_script(r#"[
+            iframe.contentWindow === retainedWindow,
+            retainedWindow.document !== beforeFailure,
+            retainedWindow.document.URL,
+            frameEvents,
+        ]"#).unwrap(), serde_json::json!([
+            true, true, own, ["load", "load", "load", "load", "error", "load"],
+        ]));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_frame_script_fetch_keeps_all_siblings_resumable() {
         let (mut page, requests, slow_seen) =
@@ -8247,16 +8920,19 @@ mod tests {
             }
         }
         drop(advance);
+        let attached_frame_id = page.frames[0].frame_id();
         page.js
             .as_mut()
             .unwrap()
-            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .evaluate(&format!(
+                "(globalThis.__obscura_frameElements[{attached_frame_id}].remove(), 1)"
+            ))
             .unwrap();
-
         page.release_detached_frames();
-        assert!(page.frames.is_empty());
+
         assert_eq!(page.pending_frame_work.len(), 1);
         assert!(matches!(page.pending_frame_work[0], PendingFrameWork::Unattached(_)));
+
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8332,13 +9008,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn runtime_teardown_discards_queued_frame_script_work() {
-        let (mut suspended, _, _) = page_with_fetched_slow_frames("suspend-frame-scripts", 1).await;
-        assert!(suspended.queue_pending_frames());
-        suspended.suspend_js();
-        assert!(suspended.frames.is_empty());
-        assert!(suspended.pending_frame_work.is_empty());
-
+    async fn navigation_teardown_discards_queued_frame_script_work() {
+        // Suspension parks the runtime and keeps its frame realms; only a
+        // replacement document tears them down (see init_js/navigate_blank).
         let (mut replaced, _, _) = page_with_fetched_slow_frames("replace-frame-scripts", 1).await;
         assert!(replaced.queue_pending_frames());
         replaced.navigate_blank();
@@ -8392,45 +9064,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|path| path == "/grandchild-slow.js"));
-    }
-
-    /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
-    /// why `init_js` clears the frames before it drops the runtime. `suspend_js`
-    /// drops the same runtime and has to honour the same order, otherwise the
-    /// realms of a suspended page outlive the isolate they point into and the
-    /// next navigation drops those handles against a different one.
-    #[tokio::test]
-    async fn suspending_the_runtime_releases_the_frame_realms_it_owns() {
-        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-        let base = spawn_shadow_frame_server().await;
-        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
-            "suspend-frames".to_string(),
-            None,
-            false,
-            None,
-            None,
-            true,
-        ));
-        let mut page = super::Page::new("suspend-frames".to_string(), context);
-        page.navigate(&format!("{base}plain.html")).await.unwrap();
-        assert_eq!(
-            page.frame_urls().len(),
-            1,
-            "the page never built its child frame, so this proves nothing"
-        );
-
-        page.suspend_js();
-        assert!(
-            page.frame_urls().is_empty(),
-            "the frame realms outlived the isolate they hold a handle into: {:?}",
-            page.frame_urls()
-        );
-
-        // The page still works afterwards: resuming rebuilds the runtime, and
-        // navigating again builds the frames of the new document.
-        page.resume_js();
-        page.navigate(&format!("{base}plain.html")).await.unwrap();
-        assert_eq!(page.frame_urls().len(), 1);
     }
 
     fn frame_page(name: &str) -> super::Page {
@@ -8537,8 +9170,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                r#"
-                var scriptStateSetup = true;
+                r#"(() => {
                 const dynamic = document.createElement("script");
                 dynamic.id = "dynamic";
                 dynamic.textContent =
@@ -8554,7 +9186,7 @@ mod tests {
                   document.body.getAttribute("data-dynamic-runs"),
                   document.body.getAttribute("data-inert-runs")
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(before, serde_json::json!(["1", "1", "0"]));
@@ -8568,8 +9200,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                r#"
-                var scriptStateCheck = true;
+                r#"(() => {
                 for (const id of ["parser", "dynamic", "inert"]) {
                   const script = document.getElementById(id);
                   document.head.appendChild(script);
@@ -8580,7 +9211,7 @@ mod tests {
                   document.body.getAttribute("data-dynamic-runs"),
                   document.body.getAttribute("data-inert-runs")
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(after, serde_json::json!(["1", "1", "0"]));
@@ -8625,7 +9256,7 @@ mod tests {
     }
 
     #[test]
-    fn new_document_does_not_inherit_suspended_script_ids() {
+    fn new_document_does_not_inherit_started_script_ids() {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             "script-state-navigation".to_string(),
             None,
@@ -8644,7 +9275,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                "var setup = true; const old = document.getElementById('old'); globalThis.__markParserScripts([old._nid]); return old._nid;",
+                "(() => { const old = document.getElementById('old'); globalThis.__markParserScripts([old._nid]); return old._nid; })()",
             )
             .unwrap();
         page.suspend_js();
@@ -8659,7 +9290,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .evaluate(
-                "var check = true; document.head.appendChild(document.getElementById('fresh')); return document.body.getAttribute('data-fresh-runs');",
+                "(() => { document.head.appendChild(document.getElementById('fresh')); return document.body.getAttribute('data-fresh-runs'); })()",
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("1"));
@@ -8725,6 +9356,148 @@ mod tests {
         page.dom = Some(parse_html(html));
         page.init_js().unwrap();
         page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_async_classic_does_not_block_ready_parser_and_deferred_scripts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "1000");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let held_headers_sent = std::sync::Arc::new(tokio::sync::Notify::new());
+        let second_body_sent = std::sync::Arc::new(tokio::sync::Notify::new());
+        let held_cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_cancelled = held_cancelled.clone();
+        let server = tokio::spawn(async move {
+            let mut cancelled_tx = Some(cancelled_tx);
+            let mut handlers = Vec::new();
+            for _ in 0..7 {
+                let (mut socket, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5), listener.accept(),
+                ).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = socket.read(&mut bytes).await.unwrap();
+                    assert!(read > 0 && request.len() < 16_384);
+                    request.extend_from_slice(&bytes[..read]);
+                }
+                let path = String::from_utf8_lossy(&request)
+                    .lines().next().unwrap()
+                    .split_ascii_whitespace().nth(1).unwrap().to_string();
+                request_tx.send(path.clone()).unwrap();
+                let held_headers_sent = held_headers_sent.clone();
+                let second_body_sent = second_body_sent.clone();
+                let held_cancelled = server_cancelled.clone();
+                let cancelled_tx = if path == "/held.js" { cancelled_tx.take() } else { None };
+                handlers.push(tokio::spawn(async move {
+                    if path == "/held.js" {
+                        socket.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: 4096\r\nConnection: close\r\n\r\nglobalThis.heldExecuted = true;",
+                        ).await.unwrap();
+                        held_headers_sent.notify_one();
+                        let closed = match tokio::time::timeout(
+                            std::time::Duration::from_secs(3), socket.read(&mut [0u8; 1]),
+                        ).await {
+                            Ok(Ok(0)) => true,
+                            Ok(Err(error)) => matches!(error.kind(),
+                                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted),
+                            _ => false,
+                        };
+                        held_cancelled.store(closed, std::sync::atomic::Ordering::SeqCst);
+                        cancelled_tx.unwrap().send(closed).unwrap();
+                        return;
+                    }
+                    let (content_type, body) = match path.as_str() {
+                        "/" => ("text/html", r#"<html><head></head><body data-state="pending">
+                            <script>
+                                globalThis.order = ['inline-before'];
+                                document.addEventListener('DOMContentLoaded', () => order.push('dcl'));
+                                window.addEventListener('load', () => order.push('load'));
+                            </script>
+                            <script async src="/ready-async.js"></script>
+                            <script src="/first.js"></script>
+                            <script async src="/held.js"></script>
+                            <script src="/second.js"></script>
+                            <script>
+                                order.push('inline-after');
+                                document.body.setAttribute('data-state', 'ready');
+                            </script>
+                            <script defer src="/deferred.js"></script>
+                            <script type="module" src="/module.js"></script>
+                        </body></html>"#),
+                        "/ready-async.js" => ("application/javascript", "order.push('async-ready');"),
+                        "/first.js" => {
+                            // Let a later classic response become ready while the
+                            // current parser-blocking script is still pending.
+                            tokio::join!(held_headers_sent.notified(), second_body_sent.notified());
+                            ("application/javascript", "order.push('first');")
+                        }
+                        "/second.js" => ("application/javascript", "order.push('second');"),
+                        "/deferred.js" => ("application/javascript",
+                            "order.push('defer');globalThis.deferState = document.readyState;"),
+                        "/module.js" => {
+                            assert!(!held_cancelled.load(std::sync::atomic::Ordering::SeqCst),
+                                "the independent module must load before the held async body is cancelled");
+                            ("application/javascript",
+                                "order.push('module');globalThis.moduleReady = true;globalThis.moduleState = document.readyState;")
+                        }
+                        _ => panic!("unexpected fixture request: {path}"),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                    if path == "/second.js" {
+                        second_body_sent.notify_one();
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "classic-script-readiness".to_string(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("classic-script-readiness".to_string(), context);
+        let started = std::time::Instant::now();
+        page.navigate(&format!("http://{address}/")).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3),
+            "a held async body must remain bounded by the original script-phase deadline");
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await.unwrap().unwrap(), "the expired async body must close before Page is dropped");
+        let state = page.js.as_mut().unwrap().evaluate(r#"({
+            order: (globalThis.order || []).filter(value => value !== 'async-ready'),
+            readyAsyncRuns: (globalThis.order || []).filter(value => value === 'async-ready').length,
+            state: document.body.getAttribute('data-state'),
+            moduleReady: globalThis.moduleReady === true,
+            heldExecuted: globalThis.heldExecuted === true,
+            deferState: globalThis.deferState,
+            moduleState: globalThis.moduleState
+        })"#).unwrap();
+        assert_eq!(state, serde_json::json!({
+            "order": ["inline-before", "first", "second", "inline-after", "defer", "module", "dcl", "load"],
+            "readyAsyncRuns": 1,
+            "state": "ready",
+            "moduleReady": true,
+            "heldExecuted": false,
+            "deferState": "interactive",
+            "moduleState": "interactive",
+        }));
+        let mut requests = Vec::new();
+        while let Ok(path) = request_rx.try_recv() {
+            requests.push(path);
+        }
+        requests.sort();
+        assert_eq!(requests, ["/", "/deferred.js", "/first.js", "/held.js", "/module.js", "/ready-async.js", "/second.js"]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), server).await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8953,36 +9726,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ready_async_classic_script_runs_before_a_later_parser_import_map() {
-        let (base, requests) = spawn_parser_import_map_server(2);
-        let mut page = import_map_test_page(
-            "async-classic-before-map",
-            &base,
-            r#"<html><head>
-            <script async src="./async.js"></script>
-            <script type="importmap">{"imports":{"too-late":"./later.js"}}</script>
-        </head><body></body></html>"#,
-        );
-        page.execute_scripts().await;
-        page.settle_for_duration(500).await;
-        assert_eq!(
-            page.js
-                .as_mut()
-                .unwrap()
-                .evaluate("globalThis.__async_before_map")
-                .unwrap(),
-            serde_json::json!("rejected"),
-        );
-        assert_eq!(
-            requests
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap(),
-            "/app/async.js"
-        );
-        assert!(requests.try_recv().is_err());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn dynamically_inserted_import_map_controls_later_dynamic_import() {
         let (base, requests) = spawn_parser_import_map_server(1);
         let mut page = import_map_test_page(
@@ -9143,6 +9886,44 @@ mod tests {
         let after = page.js.as_mut().unwrap().evaluate(expression).unwrap();
         assert!(after[0].as_f64().unwrap() > before[0].as_f64().unwrap());
         assert!(after[1].as_f64().unwrap() >= before[2].as_f64().unwrap());
+    }
+
+    /// The completion probe used to be an author-writable global assigned at
+    /// the top of the dispatch script. A page that defined a throwing setter
+    /// for that name could abort the script before either event was
+    /// dispatched, so DOMContentLoaded/load never fired. Completion is now
+    /// observed through the private watchdog, and dispatch must not touch any
+    /// author-visible name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn author_setter_for_old_completion_marker_cannot_block_lifecycle_events() {
+        let html = r#"<html><body><script>
+            Object.defineProperty(globalThis, '__obscura_lifecycleCompleted__', {
+                configurable: false,
+                get() { return false; },
+                set(_) { throw new Error('lifecycle probe must not be author-writable'); }
+            });
+            globalThis.__lifecycleOrder = [];
+            document.addEventListener('DOMContentLoaded', () => {
+                globalThis.__lifecycleOrder.push('dom-content-loaded');
+            });
+            window.addEventListener('load', () => {
+                globalThis.__lifecycleOrder.push('load');
+            });
+        </script></body></html>"#;
+        let mut page =
+            import_map_test_page("throwing-lifecycle-marker", "http://127.0.0.1:9", html);
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.evaluate("globalThis.__lifecycleOrder"),
+            serde_json::json!(["dom-content-loaded", "load"]),
+            "a throwing setter for the old probe name blocked real lifecycle events"
+        );
+        assert_eq!(
+            page.evaluate("document.readyState"),
+            serde_json::json!("complete")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9708,14 +10489,15 @@ mod tests {
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_accepted = accepted.clone();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = accepted_tx.send(());
             let mut request = [0u8; 2048];
             let length = stream.read(&mut request).unwrap();
             assert!(String::from_utf8_lossy(&request[..length])
                 .starts_with("GET /app/analytics "));
+            server_accepted.store(true, std::sync::atomic::Ordering::Release);
             std::thread::sleep(std::time::Duration::from_secs(2));
             let body = "{}";
             let response = format!(
@@ -9743,12 +10525,23 @@ mod tests {
         page.execute_scripts().await;
         let elapsed = started.elapsed();
 
-        assert!(
-            accepted_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_ok(),
-            "ordinary fetch fixture must actually start its network request",
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if accepted.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                if let Some(js) = page.js.as_mut() {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        js.run_event_loop(),
+                    )
+                    .await;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary fetch fixture must actually start its network request");
         assert!(
             elapsed < std::time::Duration::from_millis(1_500),
             "ordinary fetch/XHR must retain the fast settle path; elapsed={elapsed:?}",
@@ -10211,7 +11004,11 @@ mod tests {
         );
         page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
         page.suspend_js();
-        assert!(page.js.is_none());
+        assert!(page.is_suspended());
+        assert!(
+            page.has_js(),
+            "suspension parks the native runtime instead of tearing it down"
+        );
         let png = page.screenshot(page.viewport).expect("DOM-only capture");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
@@ -10395,14 +11192,17 @@ mod tests {
             }
         });
         let mut page = page_with_transport_and_body("child-late", &format!("{origin}/page"), "<iframe id=child></iframe>");
+        // CSS geometry is a number; serde's integer/float distinction is an
+        // encoding detail, not a browser value.
         assert_eq!(page.evaluate(r#"(() => {
             const d = document.getElementById('child').contentDocument;
-            d.body.innerHTML = '<style>#box{width:10px}</style><div id=box></div><span id=text>iiiiiiiiii</span><img id=icon>';
+            d.head.innerHTML = '<style>#box{width:10px}</style>';
+            d.body.innerHTML = '<div id=box></div><span id=text>iiiiiiiiii</span><img id=icon>';
             const before = d.getElementById('box').getBoundingClientRect().width;
             const link = d.createElement('link'); link.rel='stylesheet'; link.href='/child.css';
             link.onload=()=>{globalThis.childSheetReady=true}; d.head.appendChild(link);
             return before;
-        })()"#), serde_json::json!(10));
+        })()"#).as_f64(), Some(10.0));
         assert!(page.js.as_mut().unwrap().resolve_promises_until(|js|
             js.evaluate("globalThis.childSheetReady === true").unwrap() == serde_json::json!(true), 2_000).await);
         let before_font = page.evaluate("document.getElementById('child').contentDocument.getElementById('text').getBoundingClientRect().width").as_f64().unwrap();
@@ -10454,6 +11254,125 @@ mod tests {
         page.drain_render_resource_results();
         assert!(!page.network_events.iter().any(|event| event.url == format!("{origin}/retire.svg")),
             "retired child bytes must not become a main-document receipt");
+        server.abort();
+    }
+
+    /// Dynamic scripts inserted into a native about:blank child must claim the
+    /// appending realm's document, execute there, and resolve a relative src
+    /// against the inherited creator base. Inline classics run during
+    /// insertion; the relative external classic fetches once over the page
+    /// transport and fires load after executing.
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_child_dynamic_inline_and_relative_script_execute_in_child_realm() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let size = socket.read(&mut buffer).await.unwrap_or(0);
+                        if size == 0 || request.len() > 16_384 { return; }
+                        request.extend_from_slice(&buffer[..size]);
+                    }
+                    let path = String::from_utf8_lossy(&request).split_whitespace()
+                        .nth(1).unwrap_or("").to_string();
+                    let _ = observed.send(path.clone());
+                    let (mime, body): (&str, &[u8]) = if path == "/child-script.js" {
+                        ("text/javascript", br#"globalThis.__childExternalSaw = 'served';
+                            globalThis.__childExternalCount = (globalThis.__childExternalCount || 0) + 1;
+                            globalThis.__childExternalRealm = globalThis.__realmTag;"#)
+                    } else {
+                        ("text/plain", b"")
+                    };
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let page_url = format!("{origin}/page");
+        let mut page = page_with_transport_and_body(
+            "child-dynamic-script",
+            &page_url,
+            "<iframe id=child></iframe>",
+        );
+        let inserted = page.evaluate(r#"(() => {
+            window.__realmTag = 'root';
+            const frame = document.getElementById('child');
+            const win = frame.contentWindow;
+            const d = frame.contentDocument;
+            win.__realmTag = 'child';
+            const inline = d.createElement('script');
+            inline.textContent = "globalThis.__childInlineSaw = 41;"
+                + "globalThis.__childInlineCount = (globalThis.__childInlineCount || 0) + 1;"
+                + "globalThis.__childInlineRealm = globalThis.__realmTag;";
+            d.head.appendChild(inline);
+            const external = d.createElement('script');
+            external.src = 'child-script.js';
+            external.onload = () => { win.__childScriptEvent = 'load'; };
+            external.onerror = () => { win.__childScriptEvent = 'error'; };
+            d.head.appendChild(external);
+            return JSON.stringify({
+                inline: win.__childInlineSaw ?? null,
+                inlineCount: win.__childInlineCount ?? null,
+                inlineRealm: win.__childInlineRealm ?? null,
+                childBase: d.baseURI,
+                childUrl: d.URL,
+                externalConnected: external.isConnected,
+            });
+        })()"#);
+        let inserted: serde_json::Value = serde_json::from_str(inserted.as_str().unwrap()).unwrap();
+        assert_eq!(inserted["inline"], serde_json::json!(41),
+            "an inline classic inserted into a live child runs during insertion");
+        assert_eq!(inserted["inlineCount"], serde_json::json!(1),
+            "insertion claims the script exactly once");
+        assert_eq!(inserted["inlineRealm"], serde_json::json!("child"));
+        assert_eq!(inserted["childBase"], serde_json::json!(page_url));
+        assert_eq!(inserted["childUrl"], serde_json::json!("about:blank"));
+        assert_eq!(inserted["externalConnected"], serde_json::json!(true));
+        assert!(page.js.as_mut().unwrap().resolve_promises_until(|js| {
+            js.evaluate(r#"(() => {
+                const w = document.getElementById('child').contentWindow;
+                return w.__childScriptEvent === 'load'
+                    && w.__childExternalSaw === 'served';
+            })()"#).unwrap() == serde_json::json!(true)
+        }, 2_000).await, "relative child script must fetch and execute, then fire load");
+        let executed = page.evaluate(r#"(() => {
+            const win = document.getElementById('child').contentWindow;
+            return JSON.stringify({
+                inlineRealm: win.__childInlineRealm,
+                externalRealm: win.__childExternalRealm,
+                event: win.__childScriptEvent,
+                external: win.__childExternalSaw,
+                externalCount: win.__childExternalCount ?? null,
+                inlineCount: win.__childInlineCount ?? null,
+                leakedInline: Object.prototype.hasOwnProperty.call(globalThis, '__childInlineSaw'),
+                leakedExternal: Object.prototype.hasOwnProperty.call(globalThis, '__childExternalSaw'),
+            });
+        })()"#);
+        let executed: serde_json::Value = serde_json::from_str(executed.as_str().unwrap()).unwrap();
+        assert_eq!(executed["inlineRealm"], serde_json::json!("child"));
+        assert_eq!(executed["externalRealm"], serde_json::json!("child"));
+        assert_eq!(executed["event"], serde_json::json!("load"));
+        assert_eq!(executed["external"], serde_json::json!("served"));
+        assert_eq!(executed["externalCount"], serde_json::json!(1),
+            "one fetched response executes once");
+        assert_eq!(executed["inlineCount"], serde_json::json!(1),
+            "the inline script is not re-activated asynchronously");
+        assert_eq!(executed["leakedInline"], serde_json::json!(false),
+            "child inline code must not execute against the page global");
+        assert_eq!(executed["leakedExternal"], serde_json::json!(false),
+            "child external code must not execute against the page global");
+        let mut served = Vec::new();
+        while let Ok(path) = requests.try_recv() { served.push(path); }
+        assert_eq!(served.iter().filter(|path| path.as_str() == "/child-script.js").count(), 1,
+            "the relative child script resolves through the inherited base and uses one request");
         server.abort();
     }
 
@@ -11158,7 +12077,7 @@ mod tests {
         let before = page.screenshot(page.viewport).expect("top screenshot");
         assert_eq!(
             page.evaluate(
-                "return (document.getElementById('second').scrollIntoView(), window.scrollY)"
+                "(document.getElementById('second').scrollIntoView(), window.scrollY)"
             )
             .as_f64(),
             Some(80.0)
@@ -11677,7 +12596,7 @@ mod tests {
             .as_mut()
             .expect("page runtime")
             .evaluate(
-                "var scheduleClientReplacement = true; window.dispatchEvent(new Event('mount-client')); return !!document.getElementById('ssr');",
+                "(() => { window.dispatchEvent(new Event('mount-client')); return !!document.getElementById('ssr'); })()",
             )
             .expect("schedule client replacement");
         assert_eq!(before_timer, serde_json::json!(true));

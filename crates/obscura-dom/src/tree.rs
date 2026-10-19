@@ -276,6 +276,7 @@ pub(crate) struct DomTreeInner {
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
+    open_popovers: HashSet<NodeId>,
     external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     external_stylesheet_generation: u64,
     /// Successful native topology changes, including detached subtrees.
@@ -313,6 +314,7 @@ impl DomTree {
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
+                open_popovers: HashSet::new(),
                 external_stylesheets: HashMap::new(),
                 external_stylesheet_generation: 0,
                 topology_generation: 0,
@@ -495,6 +497,25 @@ impl DomTree {
             .form_controls
             .get(&node)
             .is_some_and(|control| control.indeterminate)
+    }
+
+    pub fn is_popover_open(&self, node: NodeId) -> bool {
+        self.inner.borrow().open_popovers.contains(&node)
+    }
+
+    /// The native state is shared by selectors, rendering, and every JS world.
+    /// Event dispatch and popover validity checks happen before committing it.
+    pub fn set_popover_open(&self, node: NodeId, open: bool) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if open {
+            if !inner.nodes.get(node.index()).and_then(Option::as_ref)
+                .is_some_and(|node| node.connected && node.is_element()) {
+                return false;
+            }
+            inner.open_popovers.insert(node)
+        } else {
+            inner.open_popovers.remove(&node)
+        }
     }
 
     pub fn set_hovered(&self, node: Option<NodeId>) -> bool {
@@ -713,7 +734,10 @@ impl DomTree {
             .is_some_and(|node| node.first_child.is_none())
             && !inner.shadow_roots_by_host.contains_key(&root);
         if is_leaf {
-            if !connected { Self::clear_cssom_stylesheet_inner(inner, root); }
+            if !connected {
+                Self::clear_cssom_stylesheet_inner(inner, root);
+                inner.open_popovers.remove(&root);
+            }
             if let Some(Some(node)) = inner.nodes.get_mut(root.index()) {
                 node.connected = connected;
             }
@@ -726,7 +750,10 @@ impl DomTree {
             if !seen.insert(node_id) {
                 continue;
             }
-            if !connected { Self::clear_cssom_stylesheet_inner(inner, node_id); }
+            if !connected {
+                Self::clear_cssom_stylesheet_inner(inner, node_id);
+                inner.open_popovers.remove(&node_id);
+            }
             let (mut child, shadow_root) = match inner
                 .nodes
                 .get_mut(node_id.index())
@@ -1198,6 +1225,7 @@ impl DomTree {
         for id in nodes_to_remove {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
+                inner.open_popovers.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }

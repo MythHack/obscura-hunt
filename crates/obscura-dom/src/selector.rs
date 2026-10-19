@@ -106,6 +106,7 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    PopoverOpen,
     /// `:link` / `:any-link`: an `<a>`/`<area>` with an `href`. Extremely
     /// common (`a:link { color: ... }` is the standard way sites set their
     /// base link color), so treating it as unsupported silently drops the
@@ -145,6 +146,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::PopoverOpen => dest.write_str(":popover-open"),
             PseudoClass::Link => dest.write_str(":link"),
             PseudoClass::Visited => dest.write_str(":visited"),
         }
@@ -221,6 +223,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            "popover-open" => Ok(PseudoClass::PopoverOpen),
             "link" | "any-link" => Ok(PseudoClass::Link),
             "visited" => Ok(PseudoClass::Visited),
             _ => Err(cssparser::ParseError::custom(
@@ -490,6 +493,7 @@ impl<'a> Element for DomElement<'a> {
                     .unwrap_or_else(|| self.has_boolean_attr("checked") || self.has_boolean_attr("selected"))
             }
             PseudoClass::Hover => self.tree.is_hovered(self.node_id),
+            PseudoClass::PopoverOpen => self.tree.is_popover_open(self.node_id),
             // These dynamic states are not tracked yet.
             PseudoClass::Active
             | PseudoClass::Focus

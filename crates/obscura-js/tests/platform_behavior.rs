@@ -97,6 +97,63 @@ fn check_visibility_uses_boxes_and_requested_css_checks_not_area() {
     assert_eq!(rt.evaluate("document.getElementById('inherited').checkVisibility({visibilityProperty:true})").unwrap(), json!(true));
 }
 
+#[cfg(feature = "render")]
+#[test]
+fn popover_transitions_share_native_selectors_styles_and_header_layout() {
+    let mut rt = page(r#"<!doctype html><style>
+        body { margin:0 }
+        header { display:flex; align-items:flex-start }
+        button { width:20px; height:24px; padding:0; border:0 }
+        .menu { width:80px; height:80px; margin:0; padding:0; border:0 }
+        .menu:popover-open { display:flex }
+        #override { display:block; width:36px; height:40px; margin:0; padding:0; border:0 }
+        </style><header id="header"><button></button><div id="menu" class="menu" popover></div>
+        <div id="override" popover></div><menu-widget id="widget"></menu-widget></header>"#);
+    assert_eq!(rt.evaluate(r#"(() => {
+        const menu = document.getElementById('menu'), header = document.getElementById('header');
+        const snapshot = () => {
+            const rect = menu.getBoundingClientRect();
+            return [menu.matches(':popover-open'), document.querySelector('header > .menu:popover-open') === menu,
+                document.querySelectorAll(':is(.menu:popover-open, #missing)').length,
+                menu.matches('.menu:not(:popover-open)'), getComputedStyle(menu).display,
+                rect.width, rect.height, header.getBoundingClientRect().height];
+        };
+        const before = [];
+        menu.addEventListener('beforetoggle', event => before.push([event.oldState,event.newState,event.cancelable,snapshot()]));
+        const closed = snapshot();
+        menu.addEventListener('beforetoggle', event => event.preventDefault(), {once:true});
+        menu.showPopover(); const cancelled = snapshot(); before.length = 0;
+        menu.showPopover(); const shown = snapshot();
+        menu.hidePopover(); const hidden = snapshot();
+        const override = document.getElementById('override'), overrideRect = override.getBoundingClientRect();
+        const author = [override.matches(':popover-open'),getComputedStyle(override).display,
+            getComputedStyle(override).position,overrideRect.width,overrideRect.height,header.getBoundingClientRect().height];
+        const shadow = document.getElementById('widget').attachShadow({mode:'open'});
+        shadow.innerHTML = '<style>[popover]{width:28px;height:32px;margin:0;padding:0;border:0}</style><div popover></div>';
+        const nested = shadow.querySelector('[popover]');
+        const nestedClosed = [getComputedStyle(nested).display,nested.getBoundingClientRect().height];
+        nested.addEventListener('beforetoggle', () => nested.showPopover(), {once:true});
+        const toggled = nested.togglePopover(true);
+        const nestedShown = [shadow.querySelector(':popover-open') === nested,nested.getBoundingClientRect().width,
+            nested.getBoundingClientRect().height,header.getBoundingClientRect().height];
+        nested.hidePopover();
+        nested.showPopover(); nested.popover = 'manual';
+        const typeChanged = [nested.matches(':popover-open'),getComputedStyle(nested).display,nested.getBoundingClientRect().height];
+        nested.showPopover(); nested.remove(); shadow.appendChild(nested);
+        const reconnected = [nested.matches(':popover-open'),getComputedStyle(nested).display,nested.getBoundingClientRect().height];
+        return [closed,cancelled,shown,hidden,before,author,nestedClosed,nestedShown,toggled,typeChanged,reconnected,
+            shadow.querySelectorAll(':popover-open').length,nested.getClientRects().length,menu.getAttribute('style')];
+    })()"#).unwrap(), json!([
+        [false,false,0,true,"none",0,0,24], [false,false,0,true,"none",0,0,24], [true,true,1,false,"flex",80,80,24],
+        [false,false,0,true,"none",0,0,24],
+        [["closed","open",true,[false,false,0,true,"none",0,0,24]],
+         ["open","closed",false,[true,true,1,false,"flex",80,80,24]]],
+        [false,"block","fixed",36,40,24], ["none",0], [true,28,32,24], true,
+        [false,"none",0], [false,"none",0], 0,0,null
+    ]));
+}
+
+
 #[cfg(not(feature = "render"))]
 #[test]
 fn check_visibility_does_not_claim_an_unavailable_layout_box() {
@@ -625,7 +682,7 @@ async fn mutation_observers_keep_original_values_filters_and_removed_subtrees_un
     ]]]));
     rt.evaluate("child.setAttribute('data-x','after'); observer.disconnect(); root.appendChild(child);").unwrap();
     rt.run_event_loop().await.unwrap();
-    assert_eq!(rt.evaluate("deliveries.length").unwrap(),json!(1));
+    assert_eq!(rt.evaluate("deliveries.length").unwrap().as_f64(), Some(1.0));
     assert_eq!(rt.evaluate(r#"(() => {
         const fails = f => { try { f(); return ''; } catch(e) { return e.name; } };
         const o = new MutationObserver(()=>{}); o.observe(root,{attributes:true,attributeOldValue:true});
@@ -796,6 +853,41 @@ fn native_frame_documents_keep_owner_and_reject_cross_arena_adoption_before_remo
             [position & 1,position & 6,reverse & 1,reverse & 6],fails(()=>range.comparePoint(childDoc.body,0))];
     })()"#).unwrap(),json!([true,true,true,true,["NotSupportedError","NotSupportedError","NotSupportedError","NotSupportedError"],
         true,"child",true,true,[1,4,1,2],"WrongDocumentError"]));
+}
+
+#[test]
+fn iframe_sandbox_assignment_forwards_to_the_cached_token_list() {
+    let mut rt = page("<body></body>");
+    assert_eq!(rt.evaluate(r#"(() => {
+        const frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        const list = frame.sandbox;
+        const sameObject = frame.sandbox === list;
+        frame.sandbox = 'allow-scripts allow-same-origin';
+        const assigned = [frame.getAttribute('sandbox'), frame.hasAttribute('sandbox'),
+            frame.sandbox === list, frame.sandbox.value, String(frame.sandbox),
+            frame.sandbox.contains('allow-scripts'), frame.sandbox.length];
+        list.add('allow-forms'); list.remove('allow-same-origin');
+        const mutated = [frame.getAttribute('sandbox'), frame.sandbox.contains('allow-forms'),
+            frame.sandbox.contains('allow-same-origin')];
+        const strictAssignment = (() => { 'use strict'; frame.sandbox = 'allow-popups';
+            return frame.getAttribute('sandbox'); })();
+        frame.sandbox = '';
+        const empty = [frame.hasAttribute('sandbox'), frame.sandbox.length, frame.getAttribute('sandbox')];
+        const plain = document.createElement('div');
+        plain.sandbox = 'allow-scripts';
+        return [sameObject, assigned, mutated, strictAssignment, empty,
+            plain.hasAttribute('sandbox'), plain.sandbox];
+    })()"#).unwrap(), json!([
+        true,
+        ["allow-scripts allow-same-origin", true, true, "allow-scripts allow-same-origin",
+         "allow-scripts allow-same-origin", true, 2],
+        ["allow-scripts allow-forms", true, false],
+        "allow-popups",
+        [true, 0, ""],
+        false,
+        null,
+    ]));
 }
 
 #[test]

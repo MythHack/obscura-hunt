@@ -8,7 +8,7 @@ use core::{mem, ops::Range};
 use fontdb::Family;
 use unicode_script::Script;
 
-use crate::{BuildHasher, Font, FontMatchKey, FontSystem, HashMap, ShapeBuffer};
+use crate::{BuildHasher, FamilyOwned, Font, FontMatchKey, FontSystem, HashMap, ShapeBuffer};
 
 #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
 #[path = "other.rs"]
@@ -185,7 +185,9 @@ pub struct FontFallbackIter<'a> {
     font_system: &'a mut FontSystem,
     font_match_keys: &'a [FontMatchKey],
     skip_font_id: Option<fontdb::ID>,
-    default_families: &'a [&'a Family<'a>],
+    primary_family: &'a Family<'a>,
+    fallback_families: &'a [FamilyOwned],
+    fallback_font_ids: &'a [Option<fontdb::ID>],
     default_i: usize,
     scripts: &'a [Script],
     word: &'a str,
@@ -200,7 +202,9 @@ impl<'a> FontFallbackIter<'a> {
         font_system: &'a mut FontSystem,
         font_match_keys: &'a [FontMatchKey],
         skip_font_id: Option<fontdb::ID>,
-        default_families: &'a [&'a Family<'a>],
+        primary_family: &'a Family<'a>,
+        fallback_families: &'a [FamilyOwned],
+        fallback_font_ids: &'a [Option<fontdb::ID>],
         scripts: &'a [Script],
         word: &'a str,
     ) -> Self {
@@ -212,7 +216,9 @@ impl<'a> FontFallbackIter<'a> {
             font_system,
             font_match_keys,
             skip_font_id,
-            default_families,
+            primary_family,
+            fallback_families,
+            fallback_font_ids,
             default_i: 0,
             scripts,
             word,
@@ -275,15 +281,49 @@ impl<'a> FontFallbackIter<'a> {
         }
     }
 
-    fn default_font_match_key(&self) -> Option<&FontMatchKey> {
-        let default_family = self.default_families[self.default_i - 1];
-        let default_family_name = self.font_system.db().family_name(default_family);
+    fn default_family_count(&self) -> usize {
+        1 + self.fallback_families.len()
+    }
+
+    fn default_family(&self, index: usize) -> Family<'_> {
+        if index == 0 {
+            *self.primary_family
+        } else {
+            self.fallback_families[index - 1].as_family()
+        }
+    }
+
+    /// Best face of one default family for the requested weight/style. The
+    /// match keys are sorted by weight distance, so the first face that
+    /// belongs to the family is the CSS nearest-weight match. Previously this
+    /// only accepted an exact weight, which skipped authored fallback
+    /// families that lacked the requested weight entirely.
+    fn default_font_match_key(&self, family: &Family<'_>) -> Option<&FontMatchKey> {
+        let default_family_name = self.font_system.db().family_name(family);
 
         self.font_match_keys
             .iter()
-            .filter(|m_key| m_key.font_weight_diff == 0)
             .filter(|m_key| Some(m_key.id) != self.skip_font_id)
             .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+    }
+
+    fn any_face_for_family(&self, family: &Family<'_>) -> Option<fontdb::ID> {
+        let default_family_name = self.font_system.db().family_name(family);
+        let target_weight = self
+            .font_match_keys
+            .first()
+            .map_or(400, |m_key| m_key.font_weight);
+        self.font_system
+            .db()
+            .faces()
+            .filter(|face| Some(face.id) != self.skip_font_id)
+            .filter(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _)| name == default_family_name)
+            })
+            .min_by_key(|face| face.weight.0.abs_diff(target_weight))
+            .map(|face| face.id)
     }
 
     fn next_item(&mut self, fallbacks: &Fallbacks) -> Option<<Self as Iterator>::Item> {
@@ -300,10 +340,33 @@ impl<'a> FontFallbackIter<'a> {
                 .filter(|m_key| Some(m_key.id) != self.skip_font_id)
         };
 
-        'DEF_FAM: while self.default_i < self.default_families.len() {
+        'DEF_FAM: while self.default_i < self.default_family_count() {
             self.default_i += 1;
-            let is_mono = self.default_families[self.default_i - 1] == &Family::Monospace;
-            let default_font_match_key = self.default_font_match_key().cloned();
+            // Authored stacks carry the face selected for each fallback
+            // family. Returning it here preserves `@font-face` resource
+            // identity and descriptors instead of rematching by internal
+            // family name (which may pick a different font).
+            let fallback_index = self.default_i.saturating_sub(2);
+            let pinned = (self.default_i > 1)
+                .then(|| self.fallback_font_ids.get(fallback_index).copied().flatten())
+                .flatten()
+                .filter(|id| Some(*id) != self.skip_font_id);
+            if let Some(id) = pinned {
+                if let Some(font) = self.font_system.get_font(id) {
+                    return Some(font);
+                }
+            }
+            let (is_mono, default_font_match_key, any_face_id) = {
+                let family = self.default_family(self.default_i - 1);
+                let is_mono = family == Family::Monospace;
+                let key = self.default_font_match_key(&family).cloned();
+                let any_face_id = if key.is_none() {
+                    self.any_face_for_family(&family)
+                } else {
+                    None
+                };
+                (is_mono, key, any_face_id)
+            };
             let word_chars_count = self.word.chars().count();
 
             macro_rules! mk_mono_fallback_info {
@@ -326,12 +389,19 @@ impl<'a> FontFallbackIter<'a> {
             }
 
             match (is_mono, default_font_match_key.as_ref()) {
-                (false, None) => break 'DEF_FAM,
+                (false, None) => {
+                    if let Some(id) = any_face_id {
+                        if let Some(font) = self.font_system.get_font(id) {
+                            return Some(font);
+                        }
+                    }
+                    continue 'DEF_FAM;
+                }
                 (false, Some(m_key)) => {
                     if let Some(font) = self.font_system.get_font(m_key.id) {
                         return Some(font);
                     } else {
-                        break 'DEF_FAM;
+                        continue 'DEF_FAM;
                     }
                 }
                 (true, None) => (),

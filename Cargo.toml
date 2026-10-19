@@ -7,6 +7,8 @@ members = [
     "crates/obscura-browser",
     "crates/obscura-cdp",
     "crates/obscura-js",
+    "crates/obscura-v8-native",
+    "crates/obscura-js-snapshot",
     "crates/obscura-mcp",
     "crates/obscura-render",
     "crates/obscura-cli",
@@ -38,8 +40,6 @@ cssparser = "0.38"
 taffy = "0.12"
 # CPU-only pure-Rust 2D rasterizer for the render layer's paint step.
 tiny-skia = "0.12"
-# Pure-Rust glyph rasterizer for the render layer's text step.
-ab_glyph = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.30"
 # No "cookies" feature: obscura manages cookies through its own CookieJar

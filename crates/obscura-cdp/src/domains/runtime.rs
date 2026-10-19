@@ -779,7 +779,7 @@ mod tests {
         let result = handle("evaluate", &json!({
             "expression":"1+1","contextId":created["executionContextId"],"returnByValue":true,
         }), &mut ctx, &session).await.unwrap();
-        assert_eq!(result["result"]["value"], 2);
+        assert_eq!(result["result"]["value"].as_f64(), Some(2.0));
     }
 
     /// Regression for #122 item 7: puppeteer-extra's FrameManager.initialize
@@ -823,9 +823,9 @@ mod tests {
             .unwrap()
             .evaluate("globalThis.__pwned = 0");
 
-        // The generated code is `delete globalThis['{name}']`, which the runtime
-        // wraps as `return ( ... )`. A comma-expression payload stays a single
-        // valid expression through that wrapper and runs the assignment:
+        // The generated code deletes a named global property. Without binding
+        // name validation, this comma-expression payload is a valid script
+        // that also runs the assignment:
         //   delete globalThis['x'] , (globalThis.__pwned = 1) , globalThis['y']
         handle(
             "removeBinding",

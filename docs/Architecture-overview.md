@@ -56,6 +56,12 @@ viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
 
+Whitespace collapse belongs to the inline formatting context, not an individual
+text node. Mixed text/SVG fallback layout shares that state through ordinary
+inline wrappers, including margin-bearing links, and trims the same stream's
+leading and trailing spaces. Atomic descendants have separate state, while
+preserved-whitespace modes retain their authored spacing.
+
 Page-owned layout and paint never fetch resources synchronously. Missing
 resources load through the page transport, with URL blocking checked both
 for navigation/screenshot warmup and for later renderer misses. The DOM-only
@@ -79,7 +85,7 @@ All pages in a process share one V8 isolate. The isolate is single-threaded by d
 
 ```rust
 let _guard = obscura_js::v8_lock::global().lock().await;
-page.evaluate(expr).await
+page.evaluate(script)
 ```
 
 The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
@@ -98,6 +104,14 @@ can run. The iframe's `load` event follows classic author scripts.
 Navigation runs as a posted task, after microtasks. Parsing uses srcdoc
 standards mode without requiring a doctype and honors script-disabled
 `noscript` content.
+
+A connected iframe retains its browsing-context identity and native WindowProxy
+when `src` or `srcdoc` replaces the document. Provisional network loads keep the
+last committed document available; failed and superseded loads do not publish
+a replacement. The loading shim reserves and queues the response, while the
+host commits the native realm, publishes the window and dispatches one `load`
+event. It does not reconstruct a second document in the parent realm. Removing
+and reinserting the iframe creates a new browsing context.
 
 Sandboxed `srcdoc` enforces opaque document access and script disabling,
 including inherited restrictions on nested frames. This does not implement

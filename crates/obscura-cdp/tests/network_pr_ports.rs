@@ -109,8 +109,8 @@ async fn module_receipts(stealth: bool) {
     let server = fixture(None).await;
     let (mut ctx, session) = context(stealth);
     cdp(&mut ctx, &session, "Page.navigate", json!({"url": format!("{}module.html", server.base)})).await;
-    assert_eq!(evaluate(&mut ctx, &session, "moduleValue").await, json!(42));
-    assert_eq!(evaluate(&mut ctx, &session, "import('/lazy.js').then(m => m.default)").await, json!(73));
+    assert_eq!(evaluate(&mut ctx, &session, "moduleValue").await.as_f64(), Some(42.0));
+    assert_eq!(evaluate(&mut ctx, &session, "import('/lazy.js').then(m => m.default)").await.as_f64(), Some(73.0));
     assert_eq!(evaluate(&mut ctx, &session, "import('/bad.js').then(() => false, () => true)").await, json!(true));
     for (path, status, body) in [
         ("/entry.js", 201, "import {value} from './dep.js'; globalThis.moduleValue = value;"),
@@ -131,7 +131,7 @@ async fn module_receipts(stealth: bool) {
     assert_eq!(response(&ctx, "/entry.js")["response"]["headers"]["x-receipt"], "entry");
     ctx.pending_events.clear();
     evaluate(&mut ctx, &session, "new Promise(resolve => { const f = document.createElement('iframe'); f.onload = () => resolve(true); f.src = '/child'; document.body.append(f); })").await;
-    assert_eq!(evaluate(&mut ctx, &session, "document.querySelector('iframe').contentWindow.eval(\"import('/lazy.js').then(m => m.default)\")").await, json!(73));
+    assert_eq!(evaluate(&mut ctx, &session, "document.querySelector('iframe').contentWindow.eval(\"import('/lazy.js').then(m => m.default)\")").await.as_f64(), Some(73.0));
     let child = response(&ctx, "/lazy-dep.js");
     assert_eq!(child["frameId"], response(&ctx, "/child")["frameId"]);
     let root_frame = ctx.get_session_page(&Some(session.clone())).unwrap().frame_id.clone();
@@ -146,7 +146,7 @@ async fn module_receipts(stealth: bool) {
         "returnByValue": true, "awaitPromise": true,
     })).await;
     assert!(imported.get("exceptionDetails").is_none(), "{imported}");
-    assert_eq!(imported["result"]["value"], 42);
+    assert_eq!(imported["result"]["value"].as_f64(), Some(42.0));
     let request = server.requests.lock().await.last().unwrap().clone();
     assert_eq!(header(&request, "origin").as_deref(), Some("null"));
     assert_eq!(header(&request, "cookie"), None);
@@ -228,7 +228,7 @@ async fn headers_and_referrer(stealth: bool) {
     evaluate(&mut ctx, &session, "fetch('/echo').then(r => r.text())").await;
     assert_eq!(header(server.requests.lock().await.last().unwrap(), "x-page").as_deref(), Some("private"));
     evaluate(&mut ctx, popup_session, "fetch('/echo').then(r => r.text())").await;
-    assert_eq!(evaluate(&mut ctx, popup_session, "import('/dep.js').then(m => m.value)").await, 42);
+    assert_eq!(evaluate(&mut ctx, popup_session, "import('/dep.js').then(m => m.value)").await.as_f64(), Some(42.0));
     let popup_frame = ctx.get_session_page(&Some(popup_session.to_string())).unwrap().frame_id.clone();
     let popup_response = ctx.pending_events.iter().rev().find(|event| event.method == "Network.responseReceived"
         && event.session_id.as_deref() == Some(popup_session)

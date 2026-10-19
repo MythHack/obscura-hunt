@@ -190,7 +190,7 @@ mod tests {
             {"name": "prefers-reduced-motion", "value": "reduce"}
         ]});
         handle("setEmulatedMedia", &both, &mut ctx, &session).await.unwrap();
-        let script = "return [matchMedia('(prefers-color-scheme:dark)').matches, matchMedia('(prefers-reduced-motion:reduce)').matches];";
+        let script = "[matchMedia('(prefers-color-scheme:dark)').matches, matchMedia('(prefers-reduced-motion:reduce)').matches];";
         for _ in 0..2 {
             let page = ctx.get_session_page_mut(&session).unwrap();
             page.navigate("data:text/html,<body>probe</body>").await.unwrap();
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(page.device_scale_factor, 2.0);
         assert_eq!(
             page.evaluate(
-                "return [innerWidth, innerHeight, visualViewport.width,\
+                "[innerWidth, innerHeight, visualViewport.width,\
                          visualViewport.height, screen.width, screen.height,\
                          screen.availWidth, screen.availHeight, devicePixelRatio];"
             ),
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(page.viewport, (800.0, 600.0));
         assert_eq!(
             page.evaluate(
-                "return [innerWidth, innerHeight, screen.width !== 1111,\
+                "[innerWidth, innerHeight, screen.width !== 1111,\
                          screen.height !== 777];"
             ),
             json!([800, 600, true, true])
@@ -407,7 +407,7 @@ mod tests {
         page.set_viewport((1111.0, 777.0));
         page.set_device_scale_factor(1.5);
         let baseline_screen = page.evaluate(
-            "return [screen.width, screen.height, screen.availWidth, screen.availHeight];",
+            "[screen.width, screen.height, screen.availWidth, screen.availHeight];",
         );
 
         handle(
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(page.device_scale_factor, 1.5);
         assert_eq!(
             page.evaluate(
-                "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
+                "[screen.width, screen.height, screen.availWidth, screen.availHeight];"
             ),
             baseline_screen
         );
@@ -522,7 +522,7 @@ mod tests {
         let page = ctx.get_session_page_mut(&session_id).unwrap();
         assert_eq!(
             page.evaluate(
-                "return [screen.width, screen.height, screen.availWidth, screen.availHeight];"
+                "[screen.width, screen.height, screen.availWidth, screen.availHeight];"
             ),
             json!([700, 500, 700, 500])
         );

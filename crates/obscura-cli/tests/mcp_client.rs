@@ -13,14 +13,21 @@ fn mcp_font_directory_is_validated_before_either_transport_starts() {
     let missing = std::env::temp_dir().join(format!("obscura-missing-fonts-{}", std::process::id()));
     assert!(!missing.exists());
     for http in [false, true] {
-        let mut command = Command::new(OBSCURA);
-        command.args(["mcp", "--font-dir"]).arg(&missing).stdin(Stdio::null());
-        if http {
-            command.args(["--http", "--port", "0"]);
+        for options_before_subcommand in [false, true] {
+            let mut command = Command::new(OBSCURA);
+            if options_before_subcommand {
+                command.arg("--font-dir").arg(&missing).arg("mcp");
+            } else {
+                command.args(["mcp", "--font-dir"]).arg(&missing);
+            }
+            command.stdin(Stdio::null());
+            if http {
+                command.args(["--http", "--port", "0"]);
+            }
+            let output = command.output().expect("start MCP with invalid font directory");
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
         }
-        let output = command.output().expect("start MCP with invalid font directory");
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Font directory does not exist"));
     }
 }
 

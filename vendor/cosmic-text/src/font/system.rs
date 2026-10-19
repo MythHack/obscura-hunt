@@ -232,6 +232,13 @@ impl FontSystem {
         &self.locale
     }
 
+    /// Detect the host UI locale with the same platform support used by
+    /// [`FontSystem::new`]. Integrations that build their own database can
+    /// pass the result to [`FontSystem::new_with_locale_and_db`].
+    pub fn system_locale() -> String {
+        Self::get_locale()
+    }
+
     /// Get the database.
     pub fn db(&self) -> &fontdb::Database {
         &self.db

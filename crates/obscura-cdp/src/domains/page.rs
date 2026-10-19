@@ -2652,7 +2652,7 @@ mod tests {
             .expect("top capture");
         ctx.get_session_page_mut(&session)
             .expect("page")
-            .evaluate("return (window.scrollTo(0, 80), window.scrollY)");
+            .evaluate("(window.scrollTo(0, 80), window.scrollY)");
 
         let metrics = handle("getLayoutMetrics", &json!({}), &mut ctx, &session)
             .await
@@ -3138,15 +3138,20 @@ mod tests {
         handle("startScreencast", &json!({}), &mut ctx, &session)
             .await
             .expect("start screencast");
-        let initial = ctx
+        let initial_event = ctx
             .pending_events
             .iter()
             .find(|event| event.method == "Page.screencastFrame")
-            .expect("initial frame")
-            .params["data"]
+            .expect("initial frame");
+        let initial = initial_event.params["data"]
             .as_str()
             .unwrap()
             .to_string();
+        let initial_session_id = initial_event.params["sessionId"].as_i64().unwrap();
+        let (_, initial_raster) = decode_capture(&initial_event.params);
+        let initial_pixel = initial_raster.get_pixel(40, 30).0;
+        let final_pixel = [0, 255, 0, 255];
+        assert_ne!(initial_pixel, final_pixel, "initial capture must precede the CSS final state");
         let generation = ctx
             .get_session_page_mut(&session)
             .unwrap()
@@ -3154,22 +3159,75 @@ mod tests {
             .as_ref()
             .unwrap()
             .activity_generation();
+        assert!(
+            ctx.get_session_page_mut(&session)
+                .unwrap()
+                .prepared_has_active_css_animations(),
+            "the initial frame must retain the active CSS timeline"
+        );
 
-        ctx.pending_events.clear();
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        pump_screencast_frames(&mut ctx).await;
-        let (animated, frame_session_id) = {
-            let event = ctx
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": initial_session_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack initial frame");
+
+        let mut saw_changed_frame = false;
+        let mut saw_final_frame = false;
+        let mut active = true;
+        for attempt in 0..128 {
+            if attempt != 0 && active {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            ctx.pending_events.clear();
+            pump_screencast_frames(&mut ctx).await;
+            let frames = ctx
                 .pending_events
                 .iter()
-                .find(|event| event.method == "Page.screencastFrame")
-                .expect("CSS-only animation frame");
-            (
-                event.params["data"].as_str().unwrap().to_string(),
-                event.params["sessionId"].as_u64().unwrap(),
-            )
-        };
-        assert_ne!(animated, initial);
+                .filter(|event| event.method == "Page.screencastFrame")
+                .map(|event| {
+                    let (_, raster) = decode_capture(&event.params);
+                    (
+                        event.params["data"].as_str().unwrap().to_string(),
+                        event.params["sessionId"].as_i64().unwrap(),
+                        raster.get_pixel(40, 30).0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(!frames.is_empty(), "CSS-only animation must drive a screencast frame");
+            for (data, frame_session_id, pixel) in frames {
+                saw_changed_frame |= data != initial || pixel != initial_pixel;
+                saw_final_frame |= pixel == final_pixel;
+                handle(
+                    "screencastFrameAck",
+                    &json!({"sessionId": frame_session_id}),
+                    &mut ctx,
+                    &session,
+                )
+                .await
+                .expect("ack animation frame");
+            }
+            active = ctx
+                .get_session_page_mut(&session)
+                .unwrap()
+                .prepared_has_active_css_animations();
+            if !active {
+                break;
+            }
+        }
+
+        assert!(
+            saw_changed_frame,
+            "the autonomous frame must show a CSS-only pixel transition"
+        );
+        assert!(
+            saw_final_frame,
+            "the stream must deliver the finite animation's final appearance"
+        );
+        assert!(!active, "the finite CSS animation must eventually become inactive");
         assert_eq!(
             ctx.get_session_page_mut(&session)
                 .unwrap()
@@ -3181,38 +3239,6 @@ mod tests {
             "CSS timeline damage must not depend on DOM or task activity"
         );
 
-        for _ in 0..2 {
-            handle(
-                "screencastFrameAck",
-                &json!({"sessionId": frame_session_id}),
-                &mut ctx,
-                &session,
-            )
-            .await
-            .expect("ack frame");
-        }
-        ctx.pending_events.clear();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        pump_screencast_frames(&mut ctx).await;
-        assert!(
-            ctx.pending_events
-                .iter()
-                .any(|event| event.method == "Page.screencastFrame"),
-            "the stream must emit the finite animation's final frame"
-        );
-        assert!(!ctx
-            .get_session_page_mut(&session)
-            .unwrap()
-            .prepared_has_active_css_animations());
-
-        handle(
-            "screencastFrameAck",
-            &json!({"sessionId": frame_session_id}),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("ack final frame");
         ctx.pending_events.clear();
         pump_screencast_frames(&mut ctx).await;
         assert!(

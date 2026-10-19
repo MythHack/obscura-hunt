@@ -1315,22 +1315,37 @@ async fn cdp_processor(
                             tracing::warn!("autonomous page task failed: {error}");
                         }
                     }
+                    process_live_frame_navigations(&mut ctx).await;
+                    // The autonomous pump is the connection's only renderer
+                    // turn while the client is silent. Native popups it just
+                    // created must start loading here instead of waiting for
+                    // the low-frequency window tick, which the biased pump
+                    // branch would otherwise starve while page JS stays ready.
+                    if let Err(error) = ctx.drive_native_windows(1).await {
+                        tracing::warn!("native window task failed: {error}");
+                    }
                     ctx.sync_native_windows();
+                    ctx.publish_native_navigation_events();
                     service_live_page_render_resources(&mut ctx);
                     sync_live_page_background_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
-                    if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+                    if let (Some(reply_tx), Some(pending)) = (
                         connection_reply_tx.as_ref(),
                         take_live_pending_navigation(&ctx),
                     ) {
                         let navigation = json!({
                             "id": 0,
                             "method": "Page.navigate",
-                            "params": {"url": url, "__method": method, "__body": body},
-                            "sessionId": session_id,
+                            "params": {
+                                "url": pending.url,
+                                "__method": pending.method,
+                                "__body": pending.body,
+                                "__origin_frame_id": pending.origin_frame_id,
+                            },
+                            "sessionId": pending.session_id,
                         })
                         .to_string();
                         process_with_interception(
@@ -1356,6 +1371,8 @@ async fn cdp_processor(
                     if let Err(error) = ctx.drive_native_windows(1).await {
                         tracing::warn!("native window task failed: {error}");
                     }
+                    process_live_frame_navigations(&mut ctx).await;
+                    ctx.publish_native_navigation_events();
                     service_live_page_render_resources(&mut ctx);
                     sync_live_page_background_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
@@ -1455,28 +1472,49 @@ async fn cdp_processor(
             }
         }
 
-        if let (Some(reply_tx), Some((session_id, url, method, body))) = (
+        // Child frames move themselves independently of the page's root
+        // pending navigation; drive those before the root take so a root
+        // replacement does not strand a sibling frame's queued document.
+        process_live_frame_navigations(&mut ctx).await;
+
+        if let (Some(reply_tx), Some(pending)) = (
             connection_reply_tx.as_ref(),
             take_live_pending_navigation(&ctx),
         ) {
             let navigation = json!({
                 "id": 0,
                 "method": "Page.navigate",
-                "params": {"url": url, "__method": method, "__body": body},
-                "sessionId": session_id,
+                "params": {
+                    "url": pending.url,
+                    "__method": pending.method,
+                    "__body": pending.body,
+                    "__origin_frame_id": pending.origin_frame_id,
+                },
+                "sessionId": pending.session_id,
             }).to_string();
             process_with_interception(
                 &navigation, &mut ctx, reply_tx, &mut rx,
                 &mut intercept_rx, &mut intercepted_paused, &mut deferred, false,
             ).await;
         }
+        // Publish events produced by frame document commits. Command dispatch
+        // already flushed its own events with the response.
+        service_live_page_render_resources(&mut ctx);
+        sync_live_page_background_events(&mut ctx);
+        dispatch::drain_runtime_events(&mut ctx);
+        dispatch::drain_binding_calls(&mut ctx);
+        dispatch::drain_frame_events(&mut ctx);
+        forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
 
         // Dispatch may have created pages or scheduled work on an idle page.
         // Recheck after commands, then park on the runtimes' own wakers.
         idle_pages.clear();
         runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
         runtime_pump_error_streak = 0;
-
+        // A command reply was queued during dispatch. Let the writer task flush
+        // it before the pump can run a long renderer timer in this root task;
+        // otherwise replies stall behind unrelated page work.
+        tokio::task::yield_now().await;
     }
 
     // The connection thread merges this context's cookie delta into the
@@ -1647,13 +1685,17 @@ pub(crate) async fn pump_page_event_loops<'a>(
     // otherwise an idle peer would keep a waiting connection spinning.
     let mut groups = HashSet::new();
     let mut turns: Vec<_> = pages.filter_map(|page| {
+            // A parked tab does not run autonomous work at all. Exclude it
+            // before the window-group claim: a parked opener sharing a group
+            // with an active popup must not win the dedup slot and report the
+            // group idle, which would disarm the pump for the live popup.
+            if !page.has_js() || page.is_suspended() { return None; }
             // Pending IndexedDB notifications are work the page can emit
             // without a command, so wake it back up first.
             if page.has_pending_indexed_db_notifications() { idle_pages.remove(&page.id); }
             // Pages sharing a native window drive one turn: two turns in the
             // same poll would interleave one window's realms.
-            if !page.has_js() || idle_pages.contains(&page.id)
-                || !groups.insert(page.window_group_id()) { return None; }
+            if idle_pages.contains(&page.id) || !groups.insert(page.window_group_id()) { return None; }
             Some((page.id.clone(), Box::pin(page.run_autonomous_event_loop_turn())))
         })
         .collect();
@@ -1685,18 +1727,42 @@ pub(crate) async fn pump_page_event_loops<'a>(
 /// after a command (so its layout misses start loading immediately) and after
 /// each autonomous pump turn.
 fn service_live_page_render_resources(ctx: &mut CdpContext) {
-    for page in ctx.pages.iter_mut().filter(|page| page.has_js()) {
+    // A parked tab starts no autonomous resource work. The Page method also
+    // gates this, but the CDP boundary should not even ask for a parked page.
+    for page in ctx.pages.iter_mut().filter(|page| page.has_js() && !page.is_suspended()) {
         page.queue_pending_render_resources();
+    }
+}
+
+/// Drive document navigations queued by live child frames. The regular Page
+/// outcome path (`process_pending_navigation_outcome`) is bypassed whenever
+/// the connection owns an interception channel — that is every server-mode
+/// connection — so the processor must pump the frame-only queue at its
+/// command/pump boundaries. Parked pages keep the queue until activation.
+async fn process_live_frame_navigations(ctx: &mut CdpContext) {
+    let page_ids: Vec<String> = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js() && !page.is_suspended())
+        .map(|page| page.id.clone())
+        .collect();
+    for page_id in page_ids {
+        let Some(page) = ctx.get_page_mut(&page_id) else { continue };
+        if let Err(error) = page.process_pending_frame_navigations().await {
+            tracing::warn!("child frame navigation failed for {page_id}: {error}");
+        }
     }
 }
 
 fn sync_live_page_background_events(ctx: &mut CdpContext) {
     // Emit script-initiated network/history events for every live page, attributed
     // to its own session/frame — not just the first live page (#872).
+    // A parked tab keeps its queue but publishes nothing while another page's
+    // command keeps the processor awake; activation drains it.
     let live_ids: Vec<String> = ctx
         .pages
         .iter()
-        .filter(|page| page.has_js())
+        .filter(|page| page.has_js() && !page.is_suspended())
         .map(|page| page.id.clone())
         .collect();
     for page_id in live_ids {
@@ -1743,12 +1809,20 @@ fn sync_live_page_background_events(ctx: &mut CdpContext) {
     }
 }
 
-fn take_live_pending_navigation(
-    ctx: &CdpContext,
-) -> Option<(String, String, String, String)> {
+struct LivePendingNavigation {
+    session_id: String,
+    url: String,
+    method: String,
+    body: String,
+    origin_frame_id: u32,
+}
+
+fn take_live_pending_navigation(ctx: &CdpContext) -> Option<LivePendingNavigation> {
     // With several live pages, a pending navigation may belong to any of them,
     // not just the first live page — scan until one yields a navigation (#872).
-    for page in ctx.pages.iter().filter(|page| page.has_js()) {
+    // A parked page keeps its queue: its navigation runs when activation makes
+    // the page live, not while another page's traffic arms the processor.
+    for page in ctx.pages.iter().filter(|page| page.has_js() && !page.is_suspended()) {
         let Some(session_id) = ctx
             .sessions
             .iter()
@@ -1757,8 +1831,14 @@ fn take_live_pending_navigation(
         else {
             continue;
         };
-        if let Some((url, method, body)) = page.take_pending_navigation() {
-            return Some((session_id, url, method, body));
+        if let Some(navigation) = page.take_pending_navigation() {
+            return Some(LivePendingNavigation {
+                session_id,
+                url: navigation.url,
+                method: navigation.method,
+                body: navigation.body,
+                origin_frame_id: navigation.origin_frame_id,
+            });
         }
     }
     None
@@ -2003,6 +2083,13 @@ async fn process_with_interception(
     // was never resumed once the dispatch-path resume was removed in #872) is
     // therefore no longer needed and would strand concurrent pages.
 
+    // An explicit CDP navigation is activation: a parked tab must leave the
+    // parked state before the new document's scripts and timers run. The heap
+    // is already live, so this only clears the autonomous-work gate.
+    if page.is_suspended() {
+        page.resume_js();
+    }
+
     let is_reload = req.method == "Page.reload";
     let url_owned = if is_reload {
         page.url_string()
@@ -2058,7 +2145,14 @@ async fn process_with_interception(
         let (result, cancelled) = tokio::select! {
             result = async {
                 if !send_command_response {
-                    page.navigate_from_document(&url_owned, &nav_method, &nav_body).await
+                    // Document-initiated navigation still runs the document's
+                    // parser module graph to Load inside the nav task; its
+                    // fetches pause on the same interception channel this
+                    // function's select loop services. Browser-initiated work
+                    // after Load (timers, dynamic import) belongs to the
+                    // processor's autonomous pump, not to the nav task.
+                    page.navigate_from_document(&url_owned, &nav_method, &nav_body)
+                        .await
                 } else if nav_method == "POST" && !nav_body.is_empty() {
                     page.navigate_with_wait_post(&url_owned, wait_until, &nav_method, &nav_body).await
                 } else {
@@ -2079,12 +2173,10 @@ async fn process_with_interception(
     // While the spawned nav task is executing V8 (potentially parked on
     // `op_fetch_url`'s `resolve_rx.await` *with Isolate-N still entered*),
     // we must NOT let the parent's `select!` route foreign Cdp messages
-    // through `process_cdp_message → dispatch → page handlers`, because
-    // those handlers call `get_session_page_mut` which `suspend_js`'es
-    // OTHER pages (drops their `JsRuntime`, which calls
-    // `JsRealmInner::destroy`). That trips V8's
-    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts
-    // the process via `V8_Fatal`.
+    // through `process_cdp_message → dispatch → page handlers`: they may
+    // enter another page's isolate while the navigation isolate is active.
+    // That violates V8's `heap->isolate() == Isolate::TryGetCurrent()`
+    // invariant and aborts the process via `V8_Fatal`.
     //
     // This connection's `ctx.v8_lock` doesn't save us here: it's a
     // `tokio::sync::Mutex` that is released around `.await`s inside V8
@@ -2157,9 +2249,9 @@ async fn process_with_interception(
                             // the nav task's thread.
                             handle_fetch_resolution(&msg.text, &msg.reply_tx, intercepted_paused);
                         } else {
-                            // UNSAFE during nav: would route through dispatch,
-                            // which can `suspend_js` other pages and trip the
-                            // V8 invariant. Defer until nav completes —
+                            // Dispatch can enter another page's isolate while
+                            // the navigation isolate is active. Defer until
+                            // nav completes; messages are
                             // pushed to the outer `cdp_processor` queue so
                             // it's processed sequentially with no nav task
                             // in flight.
@@ -2289,6 +2381,10 @@ async fn process_with_interception(
         );
     }
     ctx.sync_native_windows();
+    // Native window commits observed during the navigation are asynchronous
+    // renderer results. The command reply (when this call owns one) was queued
+    // above, so these arrive after it.
+    ctx.publish_native_navigation_events();
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);
@@ -2378,7 +2474,7 @@ async fn process_cdp_message(
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
     service_live_page_render_resources(ctx);
-    let response = dispatch::dispatch(&req, ctx).await;
+    let response = dispatch::dispatch_command(&req, ctx).await;
     service_live_page_render_resources(ctx);
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
@@ -2397,6 +2493,43 @@ async fn process_cdp_message(
         let _ = reply_tx.send(json);
     }
 
+    // Only now does the renderer get its turn. A timer, microtask, native
+    // window job, or navigation the command armed runs here, and its events
+    // are pushed *after* the already-queued reply. Running this before the
+    // reply let a page's 600ms `setTimeout` block a completed
+    // `Runtime.evaluate` reply, and let a click's navigation events overtake
+    // the input ACK that started it.
+    //
+    // A document navigation the command queued (e.g. `location.reload()` from
+    // Runtime.evaluate/callFunctionOn) belongs to this connection's
+    // interception loop, which is the only owner that can keep servicing the
+    // destination's paused Fetch requests. The native-window pump also drains
+    // window-queued navigations and reports a renderer turn; running it first
+    // can take that request as a window job and start the document outside
+    // the interception loop, so its Fetch.requestPaused events are only seen
+    // if this root task happens to be selecting, and a later command can be
+    // left with zero paused requests. Hand the pending root navigation to
+    // `cdp_processor` first: it calls `take_live_pending_navigation` and then
+    // `process_with_interception` immediately after this function returns.
+    // Native-window receipts still publish after the reply.
+    let root_navigation_pending = ctx
+        .pages
+        .iter()
+        .any(|page| page.has_js() && page.has_pending_navigation());
+    if root_navigation_pending {
+        ctx.publish_native_navigation_events();
+    } else {
+        dispatch::finalize_command_after_reply(ctx, &req.method).await;
+    }
+    dispatch::drain_script_network_events(ctx, &req.session_id);
+    dispatch::drain_runtime_events(ctx);
+    dispatch::drain_binding_calls(ctx);
+    dispatch::drain_frame_events(ctx);
+    for event in ctx.pending_events.drain(..) {
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = reply_tx.send(json);
+        }
+    }
 }
 
 /// Lossy text view of a base64 CDP field, for the two callers that serve it
@@ -3106,10 +3239,12 @@ mod tests {
                         }))
                         .unwrap();
                 };
+                // A real loaded document, not about:blank: the click must go
+                // through the same hit-testing path an automation client gets.
                 send(json!({
                     "id": 1,
                     "method": "Target.createTarget",
-                    "params": {"url": "about:blank"},
+                    "params": {"url": "data:text/html,<a id=route href=\"data:text/html,navigated\">go</a>"},
                 }));
 
                 let mut session_id = None;
@@ -3130,13 +3265,21 @@ mod tests {
                 }
                 let session_id = session_id.expect("attached page session");
 
+                // Click the anchor's actual box, as an automation client does,
+                // so the test exercises real hit testing in both the retained
+                // layout and the synthetic compatibility geometry rather than
+                // pinning coordinates that only one build understands.
                 send(json!({
                     "id": 2,
                     "method": "Runtime.evaluate",
                     "sessionId": session_id,
-                    "params": {"expression": "document.body.innerHTML='<a id=route href=\"data:text/html,navigated\">go</a>';document.elementFromPoint=()=>route"},
+                    "params": {
+                        "expression": "(()=>{const r=document.getElementById('route').getBoundingClientRect();\
+                            return JSON.stringify({x:r.x+r.width/2,y:r.y+r.height/2})})()",
+                        "returnByValue": true,
+                    },
                 }));
-                loop {
+                let (click_x, click_y) = loop {
                     let value: serde_json::Value = serde_json::from_str(
                         &tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
                             .await
@@ -3145,16 +3288,23 @@ mod tests {
                     )
                     .unwrap();
                     if value["id"] == 2 {
-                        break;
+                        let rect: serde_json::Value = serde_json::from_str(
+                            value["result"]["result"]["value"].as_str().expect("route rect"),
+                        )
+                        .unwrap();
+                        break (
+                            rect["x"].as_f64().expect("route x"),
+                            rect["y"].as_f64().expect("route y"),
+                        );
                     }
-                }
+                };
 
                 for (id, event_type) in [(3, "mousePressed"), (4, "mouseReleased")] {
                     send(json!({
                         "id": id,
                         "method": "Input.dispatchMouseEvent",
                         "sessionId": session_id,
-                        "params": {"type": event_type, "x": 0, "y": 0, "button": "left"},
+                        "params": {"type": event_type, "x": click_x, "y": click_y, "button": "left"},
                     }));
                     if id == 3 {
                         loop {

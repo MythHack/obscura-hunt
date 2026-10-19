@@ -39,7 +39,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         "span" | "a" | "b" | "i" | "strong" | "em" | "font" | "code" | "small" | "sub" | "sup"
         | "mark" | "abbr" | "cite" | "var" | "dfn" | "kbd" | "samp" | "q" | "time" | "s" | "u"
         | "del" | "ins" | "tt" | "big" | "bdi" | "bdo" | "br" | "wbr" | "data" | "output"
-        | "label" | "ruby" | "rt" | "rp" => Display::Inline,
+        | "label" | "ruby" | "rt" | "rp" | "svg" => Display::Inline,
         "tr" => Display::Flex,
         _ => Display::Block,
     };
@@ -1225,9 +1225,9 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         "background-origin" => {
             style.background_origin = parse_background_origin(value).unwrap_or_default();
         }
-        // On replaced elements, an image-valued `content` replaces the
-        // ordinary source and participates in intrinsic sizing. String-valued
-        // generated content is handled separately for pseudo-elements.
+        // An image-valued `content` replaces any element's contents and
+        // participates in intrinsic sizing. String-valued generated content
+        // is handled separately for pseudo-elements.
         "content" => style.content_image = parse_url(value),
         "mask-image" | "-webkit-mask-image" => style.mask_image = parse_url(value),
         "mask-size" | "-webkit-mask-size" => style.mask_size = parse_background_size(value),
@@ -4099,10 +4099,17 @@ pub(crate) struct GridCalcExpression {
     vh: std::sync::atomic::AtomicU32,
     context_initialized: std::sync::atomic::AtomicBool,
     zoom: f32,
+    /// Grid tracks clamp negative mathematical results to zero. Margin
+    /// expressions are lengths and must retain a negative result.
+    clamp_negative: bool,
 }
 
 impl GridCalcExpression {
     fn parse(value: &str) -> Option<Self> {
+        Self::parse_with_clamp(value, true)
+    }
+
+    fn parse_with_clamp(value: &str, clamp_negative: bool) -> Option<Self> {
         let value = value.trim().to_ascii_lowercase();
         if !(value.starts_with("calc(")
             || value.starts_with("min(")
@@ -4168,6 +4175,7 @@ impl GridCalcExpression {
             vh: std::sync::atomic::AtomicU32::new(0.0f32.to_bits()),
             context_initialized: std::sync::atomic::AtomicBool::new(false),
             zoom: 1.0,
+            clamp_negative,
         })
     }
 
@@ -4189,6 +4197,15 @@ impl GridCalcExpression {
     }
 }
 
+/// Parse a deferred margin expression into the same opaque handle Taffy's
+/// calc resolver consumes for grid tracks. Unlike a track size, a margin may
+/// be negative, so the resolver must not clamp the mathematical result.
+pub(crate) fn parse_margin_calc(
+    value: &str,
+) -> Option<std::sync::Arc<GridCalcExpression>> {
+    GridCalcExpression::parse_with_clamp(value, false).map(std::sync::Arc::new)
+}
+
 pub(crate) fn set_grid_calc_context(
     style: &LayoutStyle,
     em_px: f32,
@@ -4197,6 +4214,9 @@ pub(crate) fn set_grid_calc_context(
     vh: f32,
 ) {
     for expression in style.grid_calc_expressions.iter().flatten() {
+        expression.set_context(em_px, rem_px, vw, vh);
+    }
+    for expression in style.margin_calc_expressions.iter().flatten() {
         expression.set_context(em_px, rem_px, vw, vh);
     }
 }
@@ -4228,20 +4248,27 @@ pub(crate) fn scale_grid_lengths(style: &mut LayoutStyle, factor: f32) {
     // Inherited calc handles share computed font context, but zoom is a used
     // value of this box. Give zoomed owners independent handles without cloning
     // the ordinary document's style maps or changing the shared computed value.
+    fn scaled_handle(
+        previous: &GridCalcExpression,
+        factor: f32,
+    ) -> std::sync::Arc<GridCalcExpression> {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        std::sync::Arc::new(GridCalcExpression {
+            expression: previous.expression.clone(),
+            em_px: AtomicU32::new(previous.em_px.load(Ordering::Relaxed)),
+            rem_px: AtomicU32::new(previous.rem_px.load(Ordering::Relaxed)),
+            vw: AtomicU32::new(previous.vw.load(Ordering::Relaxed)),
+            vh: AtomicU32::new(previous.vh.load(Ordering::Relaxed)),
+            context_initialized: AtomicBool::new(previous.context_initialized.load(Ordering::Relaxed)),
+            zoom: previous.zoom * factor,
+            clamp_negative: previous.clamp_negative,
+        })
+    }
     for axis in 0..4 {
         for index in 0..style.grid_calc_expressions[axis].len() {
             let previous = &style.grid_calc_expressions[axis][index];
             let old_ptr = std::sync::Arc::as_ptr(previous).cast::<()>();
-            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-            let scaled = std::sync::Arc::new(GridCalcExpression {
-                expression: previous.expression.clone(),
-                em_px: AtomicU32::new(previous.em_px.load(Ordering::Relaxed)),
-                rem_px: AtomicU32::new(previous.rem_px.load(Ordering::Relaxed)),
-                vw: AtomicU32::new(previous.vw.load(Ordering::Relaxed)),
-                vh: AtomicU32::new(previous.vh.load(Ordering::Relaxed)),
-                context_initialized: AtomicBool::new(previous.context_initialized.load(Ordering::Relaxed)),
-                zoom: previous.zoom * factor,
-            });
+            let scaled = scaled_handle(previous, factor);
             let new_ptr = std::sync::Arc::as_ptr(&scaled).cast::<()>();
             tracks(style, |track| {
                 let min = track.min.into_raw();
@@ -4255,6 +4282,12 @@ pub(crate) fn scale_grid_lengths(style: &mut LayoutStyle, factor: f32) {
             });
             style.grid_calc_expressions[axis][index] = scaled;
         }
+    }
+    for side in 0..4 {
+        let Some(previous) = style.margin_calc_expressions[side].clone() else {
+            continue;
+        };
+        style.margin_calc_expressions[side] = Some(scaled_handle(&previous, factor));
     }
 }
 
@@ -4270,7 +4303,7 @@ pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
     // `LayoutStyle::grid_calc_expressions`.
     let calc = unsafe { &*value.cast::<GridCalcExpression>() };
     use std::sync::atomic::Ordering;
-    resolve_contextual_length(
+    let resolved = resolve_contextual_length(
         &calc.expression,
         f32::from_bits(calc.em_px.load(Ordering::Relaxed)),
         f32::from_bits(calc.rem_px.load(Ordering::Relaxed)),
@@ -4278,10 +4311,13 @@ pub(crate) fn resolve_grid_calc(value: *const (), basis: f32) -> f32 {
         f32::from_bits(calc.vh.load(Ordering::Relaxed)),
         basis / calc.zoom,
     )
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0)
-        .max(0.0)
-        * calc.zoom
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.0);
+    if calc.clamp_negative {
+        resolved.max(0.0) * calc.zoom
+    } else {
+        resolved * calc.zoom
+    }
 }
 
 /// Parse a track list into taffy sizing functions plus the `[line-name]` map
@@ -7685,6 +7721,12 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
     let v = value.trim();
     let is_auto = v.eq_ignore_ascii_case("auto");
     if let Some(expression) = deferred_length_expression(v) {
+        // Taffy resolves the opaque handle inside its own layout pass, so a
+        // percentage in the expression uses the final containing-block width
+        // instead of the top-down estimate. The f32 edge still receives the
+        // estimate so pre-layout consumers (inline shaping, float bands) keep
+        // their previous approximation.
+        style.margin_calc_expressions[idx] = parse_margin_calc(&expression);
         style.margin_expressions[idx] = Some(expression);
         style.margin_percent[idx] = None;
         style.margin_relative[idx] = None;
@@ -7693,6 +7735,7 @@ fn set_margin_side(style: &mut LayoutStyle, idx: usize, value: &str) {
         return;
     }
     style.margin_expressions[idx] = None;
+    style.margin_calc_expressions[idx] = None;
     if let Some(frac) = percent_fraction(v) {
         style.margin_percent[idx] = Some(frac);
         style.margin_relative[idx] = None;
@@ -9025,7 +9068,6 @@ mod tests {
             assert!(supports_declaration(property, "none"), "{property}");
             assert!(!supports_declaration(property, "blur(2px)"), "{property}");
         }
-        assert!(!supports_declaration("perspective", "800px"));
         assert!(!supports_declaration("contain", "paint"));
         assert!(!supports_declaration("content-visibility", "auto"));
         for content in [
@@ -9060,7 +9102,6 @@ mod tests {
             "filter",
             "backdrop-filter",
             "-webkit-backdrop-filter",
-            "perspective",
             "contain",
             "content-visibility",
         ] {

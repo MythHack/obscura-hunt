@@ -1,4 +1,6 @@
 
+mod fonts;
+
 use std::sync::Arc;
 
 use obscura_browser::{BrowserContext, Page, WaitUntil};
@@ -86,6 +88,27 @@ async fn main() {
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    // The render layer caches fonts process-wide at the first render, so the
+    // policy forwarded by the scrape parent must be applied before the page
+    // exists. A failure is reported over the same line protocol the parent
+    // reads, so the affected URL carries the real cause instead of a generic
+    // read failure.
+    if let Err(error) = fonts::configure_from_env() {
+        let resp = WorkerResponse::error(format!("Worker font configuration failed: {}", error));
+        let mut out = serde_json::to_string(&resp).unwrap();
+        out.push('\n');
+        let mut stdout = tokio::io::stdout();
+        let _ = stdout.write_all(out.as_bytes()).await;
+        let _ = stdout.flush().await;
+        // Keep the command pipe open until the parent's first write lands so
+        // the parent records the error above instead of a broken-pipe failure.
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line).await;
+        std::process::exit(2);
+    }
+
     let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
     context.obey_robots = obey_robots;
     let context = Arc::new(context);

@@ -30,7 +30,7 @@ async fn serve_form() -> String {
                         r#"<html><body>
 <form id="f" action="/submitted">
   <input type="hidden" name="q" value="1">
-  <button id="b" type="submit">Go</button>
+  <button id="b" type="submit"><span id="inner">Go</span></button>
 </form>
 <script>
 document.getElementById('f').addEventListener('submit', function(e) { e.preventDefault(); });
@@ -202,19 +202,31 @@ async fn cdp_click_on_submit_button_content_activates_the_button() {
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
 
     navigate(&mut ctx, &url, session_id).await;
-    cdp(
+    // Click the descendant's actual box, as a client does, so the test
+    // exercises real hit testing instead of a position only one layout path
+    // understands.
+    let rect = cdp(
         &mut ctx,
         2,
         "Runtime.evaluate",
-        json!({"expression": "globalThis.__submits=0;var b=document.getElementById('b');b.innerHTML='<span id=inner>Go</span>';b.form.addEventListener('submit',()=>globalThis.__submits++);document.elementFromPoint=()=>document.getElementById('inner')"}),
+        json!({
+            "expression": "globalThis.__submits=0;\
+                document.getElementById('b').form.addEventListener('submit',()=>globalThis.__submits++);\
+                (()=>{const r=document.getElementById('inner').getBoundingClientRect();\
+                return JSON.stringify({x:r.x+r.width/2,y:r.y+r.height/2})})()",
+            "returnByValue": true,
+        }),
         session_id,
     )
     .await;
+    let rect: Value =
+        serde_json::from_str(rect["result"]["value"].as_str().expect("inner rect")).unwrap();
+    let (x, y) = (rect["x"].as_f64().unwrap(), rect["y"].as_f64().unwrap());
     cdp(
         &mut ctx,
         3,
         "Input.dispatchMouseEvent",
-        json!({"type": "mousePressed", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
         session_id,
     )
     .await;
@@ -222,7 +234,7 @@ async fn cdp_click_on_submit_button_content_activates_the_button() {
         &mut ctx,
         4,
         "Input.dispatchMouseEvent",
-        json!({"type": "mouseReleased", "x": 0.0, "y": 0.0, "button": "left", "clickCount": 1}),
+        json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}),
         session_id,
     )
     .await;
@@ -235,7 +247,11 @@ async fn cdp_click_on_submit_button_content_activates_the_button() {
     )
     .await;
 
-    assert_eq!(result["result"]["value"], json!(1.0), "button descendants share its activation behavior");
+    assert_eq!(
+        result["result"]["value"].as_f64(),
+        Some(1.0),
+        "button descendants share its activation behavior: {result}"
+    );
 }
 
 // requestSubmit(submitter) must validate its argument before doing anything

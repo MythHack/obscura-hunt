@@ -15,13 +15,22 @@ stealth = ["obscura-net/stealth"]
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
 render = ["dep:obscura-render", "obscura-render/paint"]
+# Mirror deno_core's supported V8 pointer-compression configuration into the
+# native helper compile. deno_core 0.412 does not expose a sandbox feature.
+v8_enable_pointer_compression = [
+    "deno_core/v8_enable_pointer_compression",
+    "obscura-v8-native/v8_enable_pointer_compression",
+]
 
 [build-dependencies]
 deno_core = "0.412"
-cc = "1"
+obscura-v8-native = { path = "../obscura-v8-native" }
+sha2 = "0.11.0"
+serde_json = { workspace = true }
 
 [dependencies]
 obscura-dom = { workspace = true }
+obscura-v8-native = { path = "../obscura-v8-native" }
 obscura-net = { workspace = true }
 deno_core = "0.412"
 tokio = { workspace = true }

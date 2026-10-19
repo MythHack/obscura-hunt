@@ -808,9 +808,14 @@ fn perform_final_layout_on_in_flow_children(
             };
             item.static_position = Point { x, y: y_offset_for_absolute }
         } else {
+            // CSS percentage margins resolve against the containing block's
+            // inline size, i.e. this container's content-box width. Using the
+            // outer width made a child margin include the container padding
+            // twice (200px content + 2*10px padding => 10% = 22px, not 20px).
+            // The same basis applies to vertical percentages and calc().
             let item_margin = item
                 .margin
-                .map(|margin| margin.resolve_to_option(container_outer_width, |val, basis| tree.calc(val, basis)));
+                .map(|margin| margin.resolve_to_option(container_inner_width, |val, basis| tree.calc(val, basis)));
             let item_non_auto_margin = item_margin.map(|m| m.unwrap_or(0.0));
             let item_non_auto_x_margin_sum = item_non_auto_margin.horizontal_axis_sum();
 

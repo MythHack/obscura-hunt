@@ -171,6 +171,16 @@ impl BrowserRealm {
       Rc::as_ptr(&runtime),
       true,
     );
+    // Keep a non-owning trace of every attached context. Retired realms leave
+    // `browser_realms` while JS may still retain their context (and the slot
+    // annex it owns), so isolate cleanup needs its own way to reach them.
+    // A plain weak handle does not extend the context's lifetime; collected
+    // entries are pruned on the next attach or retire.
+    {
+      let mut tracked = runtime.attached_contexts.borrow_mut();
+      tracked.retain(|tracked| !tracked.is_empty());
+      tracked.push(v8::Weak::new(&mut **scope, context));
+    }
     runtime.browser_realms.borrow_mut().push(realm.clone());
     runtime.notify_new_dynamic_import();
     realm
@@ -384,12 +394,55 @@ impl BrowserRealm {
   /// Cancel this document's module jobs and release its persistent context.
   /// Shared op state, callbacks and sibling contexts are deliberately untouched.
   /// Retained old JS contexts keep a retired, empty map whose imports reject.
+  /// The context-owned slot annex is deliberately not cleared here: it owns
+  /// the module map that `MODULE_MAP_SLOT_INDEX` borrows, and JS may still
+  /// retain and call this context. Cleanup drops every annex while the
+  /// isolate handle is still valid instead.
   /// The main-realm handle cannot be retired by the embedder.
   pub fn retire(&self, scope: &mut v8::PinScope) {
     self.assert_isolate(scope);
     assert!(self.0.attached, "the main browser realm is owned by JsRuntime");
     self.retire_inner();
-    JsRuntime::state_from(scope).notify_new_dynamic_import();
+    let state = JsRuntime::state_from(scope);
+    state
+      .attached_contexts
+      .borrow_mut()
+      .retain(|tracked| !tracked.is_empty());
+    state.notify_new_dynamic_import();
+  }
+
+  /// Whether `context` is owned by an attached browser realm.
+  ///
+  /// An attached context's slot annex owns browser storage (its module map is
+  /// borrowed by `MODULE_MAP_SLOT_INDEX`) that must stay valid until V8
+  /// collects the context. Embedders must not clear such a context's slots;
+  /// contexts that never attached may still be cleared directly.
+  pub fn has_attached_storage(context: v8::Local<v8::Context>) -> bool {
+    context.get_slot::<BrowserContextData>().is_some()
+  }
+
+  /// Drop deno_core's slot annex for a context that is still alive.
+  ///
+  /// Only call this when the isolate is guaranteed to stay usable for the
+  /// rest of the call (runtime cleanup or snapshotting). `Weak::drop` for the
+  /// annex then resets its V8 weak handle and removes the guaranteed
+  /// finalizer; during isolate disposal neither is possible and V8's teardown
+  /// GC would call through freed finalizer storage.
+  pub(crate) fn clear_context_slots(context: v8::Local<v8::Context>) {
+    // The annex owns the module-map `Rc` these raw pointers borrow. Null them
+    // before dropping their owner so nothing can reconstruct an `Rc` from a
+    // freed allocation afterwards.
+    unsafe {
+      context.set_aligned_pointer_in_embedder_data(
+        CONTEXT_STATE_SLOT_INDEX,
+        std::ptr::null_mut(),
+      );
+      context.set_aligned_pointer_in_embedder_data(
+        MODULE_MAP_SLOT_INDEX,
+        std::ptr::null_mut(),
+      );
+    }
+    context.clear_all_slots();
   }
 
   pub(crate) fn retire_inner(&self) {

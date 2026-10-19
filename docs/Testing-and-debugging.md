@@ -94,7 +94,171 @@ async fn my_test() {
 
 ### Upstream synchronization verification
 
-#### Latest update: upstream `bd95294`
+#### Closed popovers and independent script readiness
+
+Popover visibility is native DOM state shared by selectors, computed style and
+layout. Closed popovers receive the UA hidden default; existing show/hide
+transitions invalidate rendering, preserve cancelled `beforetoggle` events and
+respect author display overrides. This does not add a top-layer framework.
+
+Parser scripts no longer wait for every external classic fetch to finish.
+Already-ready work advances while unrelated async bodies remain pending, using
+the existing concurrency cap and absolute deadline. The same bounded fetch
+stream keeps progressing during module preparation without executing JavaScript
+through an already borrowed runtime. Pending bodies are cancelled at expiry.
+
+The focused consumer regressions are
+`popover_transitions_share_native_selectors_styles_and_header_layout` and
+`pending_async_classic_does_not_block_ready_parser_and_deferred_scripts`.
+An async script's earlier DOM position does not establish response readiness;
+the old import-map test that depended on global prefetch completion was removed,
+not changed to another timing-dependent expected result. Other real-site
+differences remain outside this bounded repair.
+
+Final release verification for these two fixes: 242/242 focused tests and
+2493/2493 workspace tests passed, with 5 skipped. Both `render` and
+`render,stealth` binaries passed the actual popover transition and held-body
+script-order scenarios, including native connection cancellation. The existing
+CDP window boundary smoke also passed with `--stealth`. The offline obstacle
+course passed 33/33; all 77 deterministic rendering fixtures passed the behavior
+checker and produced identical output to the pre-two-fix baseline. No new live
+site fidelity claims are made for this bounded change.
+
+#### Native WindowProxy, percentage margins and default fonts (October 18)
+
+Percentage margins retain their percentage/auto type through native layout and
+resolve against the actual containing block. Used values are shared with CSSOM
+and painting instead of freezing an estimated parent width before layout.
+
+Rendering discovers installed system fonts by default and caches the font
+database per process. Body text, measurement, form controls and SVG use the same
+policy. Global, repeatable `--font-dir` and `--no-system-fonts` options apply to
+`fetch`, `serve`, `scrape` workers and `mcp`; explicit font directories remain
+available in fixed-font mode. Default output is platform-dependent by design.
+
+Window identity now uses a stable native V8 global proxy, not a JavaScript
+facade that only normalizes direct return values. Snapshot-restored access
+handlers retain cross-origin restrictions, and DOM grants do not authorize
+foreign globals. The live root context owns evaluation and queued work after
+document replacement.
+
+Frame navigation coverage assigns `iframe.src` over real HTTP, rather than only
+calling native document replacement directly. It retains window identity across
+foreign documents, same-origin return and same-URL reload, and preserves the
+committed document after a failed or superseded load. The loading shim no longer
+constructs a redundant parent-realm document after queuing a native commit.
+
+Mixed inline SVG/text coverage includes adjacent links with leading and trailing
+whitespace, nested text nodes, inline margins and shrink-to-fit flex items. A
+six-case CLI comparison against Chromium catches duplicate collapsible spaces
+across node boundaries; all six cases pass after sharing formatting-context
+state instead of normalizing each text node independently.
+
+Nested-table coverage checks the parent cell's exact vertical extent and origin,
+not only a minimum height. Formatting-only indentation around block children
+must not add a shaped text line when an internal flex box represents block flow.
+The unchanged screenshot fixture verifies the 24px header and 15px following row.
+
+Fresh Windows x86_64 release processes passed the three original popup, margin
+and CJK counterexamples. The popup probe covers nested values, function returns,
+`defaultView`, Map keys, same-origin to cross-origin to same-origin navigation,
+message sources and retained references after close. Font-policy coverage spans
+CLI/CDP/MCP/scrape, two-worker propagation, custom fonts, CJK text, controls, SVG
+and invalid-directory rejection before target requests.
+
+| Earlier verification snapshot | Observed result |
+| --- | --- |
+| Release/render workspace nextest | 2492 passed, 0 failed, 5 skipped |
+| Focused window/frame/font/margin/whitespace/table/observer nextest | 298 passed |
+| CLI release binaries | `render` and `render,stealth` built successfully |
+| Native popup identity | 32/32 in each transport mode |
+| Actual CLI/CDP/MCP protocol scenarios | 11/11 in each transport mode |
+| Font-policy acceptance | 91/91 render; 92/92 with `--stealth` |
+| Offline obstacle course | 33/33 |
+| Deterministic rendering corpus | 77 current/baseline/Chromium triples captured, all nonblank; behavior checker passed |
+| Standalone native snapshot producer | Wrote the snapshot blob and metadata sidecar |
+
+Stealth acceptance runs explicitly pass `--stealth`. Rendering fixture results
+are behavior and geometry gates, not a claim of pixel-identical browser output.
+
+The final live footer captures show Bootstrap's five columns on one row, Ember's
+five sponsor SVGs on one row with at most 0.5px horizontal deviation from Chromium,
+and readable Korean, Japanese and Chinese labels on Angular. The live corpus is
+not an all-pass gate: failed requests, skipped scripts, blank pages, different
+menu/regional states and unstable capture boundaries are excluded from fidelity
+conclusions rather than counted as passes. Truncated subtrees are likewise not
+used for full-subtree geometry verdicts.
+
+Observer regression fixtures await callback/task completion with a bounded
+failure watchdog. They do not assume that first system-font layout completes
+inside a fixed wall-clock interval; pre-render and exact delivery-order
+assertions remain. CDP cancellation probes wait only for events after the
+current navigation's cursor, never an earlier blank-document completion.
+
+#### Earlier browser-repair validation after synchronization
+
+The pre-cutover October 17 worktree passed the release/render workspace gate:
+`cargo nextest run --release --features render --no-fail-fast` reports **2460
+passed, 0 failed, 5 skipped**. A focused frame, popup, script, font, sandbox,
+observer, interception and rendering selection passes **345/345** without
+changing the workspace feature combination. The merge-stage failures below
+are historical results, not the status of this repaired tree.
+
+The repairs retain parked V8 runtimes rather than reconstructing their state,
+use Script completion values for evaluation, preserve native frame ownership
+and resource bases, and keep script-triggered CDP navigation on the interception
+reply path. Sandbox property assignment reflects into the attribute; a
+script-disabled child cannot run an inline handler through a parent-initiated
+click. IntersectionObserver delivery remains asynchronous; regression tests
+wait for observable transitions instead of a fixed timer race.
+
+Window messaging captures its sender at a native entry before serialization.
+Each realm receives its own native function so bare calls use that Window and
+borrowed calls retain their explicit receiver. Isolated-world universal-access
+grants retain their authorized backing adapter; they do not expose a foreign
+raw V8 global. No initial-document identity cache or navigation fallback was
+added.
+
+Both exact release CLI builds completed with `--features render` and
+`--features render,stealth`. Fresh CLI/CDP/MCP processes exercised both binaries,
+with `--stealth` explicitly enabled for the latter:
+
+| Verification | Result |
+|---|---|
+| CLI/CDP/MCP consumer scenarios | 11/11 in each mode |
+| Native safety, file navigation, retained realms and GC | 17/17 in each mode |
+| DOM ownership and cross-origin boundaries | 12/12 in each mode |
+| Redirect modes and target request receipts | 5/5 in each mode |
+| Profile isolation and persistence | 23/23 checks in each mode |
+| Late child CSS, scripts, fonts and images | 7/7 in each mode; one HTTP hit per resource |
+| Sandbox/observer DOM scenarios | 4/4 in each mode |
+| Isolated-world grant upgrade and ordinary-world isolation | Passed in each mode |
+| Offline obstacle course | 33/33 |
+
+The CDP interception stress probe also completed five iterations of each of
+`Page.navigate`, `Page.reload`, `Runtime.evaluate` and `Runtime.callFunctionOn`,
+servicing 64 paused requests per command with collision-free request IDs.
+
+Rendering produced nonblank output for all 75 deterministic fixtures with no
+configured geometry-check failures. Seventy-two captures are pixel-identical
+to the retained pre-repair baseline; the three changed cases are form-control
+geometry, quirks controls and modern containing-block triggers. Native control
+appearance and quirks-mode input sizing are not pixel-identical to Chromium.
+The 15-site top/bottom suite used 1440x1000 viewports, 3000 ms settling and a
+fixed animation boundary. Of 30 pairs, 21 were eligible for comparison and 9
+were excluded for contentless images or incomparable page state. Visual review
+still shows real-site layout, text and footer differences. Capture eligibility
+and pixel-distance metrics are not a claim of complete rendering parity.
+
+At that stage, an additional messaging probe recorded a limitation: the stable
+facade returned by same-origin `window.open()` can differ from the popup's own
+Window object exposed through a nested value or a self-message. The same
+identity mismatch was observed in the pre-repair binary. Popup message data,
+sender attribution and realm-local self-messaging pass; full cross-world
+WindowProxy identity is not certified by this repair. Diagnostic artifacts
+and generated captures remain outside the repository.
+
+#### Merge-stage record: upstream `bd95294`
 
 The October 17 synchronization incorporates 69 upstream commits into fork
 `85f3d10`, retaining the fork's native window/frame ownership and cancellation
@@ -271,7 +435,7 @@ Playwright's local context counter diverged from the server's `valid_context_ids
 
 ### `V8_Fatal: heap->isolate() == Isolate::TryGetCurrent()`
 
-Two pages tried to use V8 concurrently. The `v8_lock` was bypassed, or a handler suspended a JS runtime while another isolate was entered. Search for direct `JsRuntime` access outside the lock.
+Two pages tried to use V8 concurrently. The `v8_lock` was bypassed, or direct `JsRuntime` access entered a different isolate while one was active. Parking a page retains its runtime and does not enter or drop the isolate. Search for direct `JsRuntime` access outside the lock.
 
 ### Test hangs
 

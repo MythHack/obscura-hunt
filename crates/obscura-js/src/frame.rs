@@ -44,6 +44,7 @@ pub struct FrameRealm {
 impl Drop for FrameRealm {
     fn drop(&mut self) {
         self.realms.borrow_mut().forget(&self.context);
+        self.realms.borrow_mut().forget_proxies(self.frame_id);
     }
 }
 
@@ -79,8 +80,9 @@ impl FrameRealm {
         if realms.borrow().live_count() >= crate::ops::max_live_frames() {
             return None;
         }
-        let context = parent.create_realm_context()?;
+        let context = parent.create_realm_context(frame_id, None, None)?;
         if !parent.share_ops_with_realm(&context) {
+            parent.discard_realm_context(&context);
             return None;
         }
         parent.copy_identity_to_realm(&context);
@@ -88,23 +90,45 @@ impl FrameRealm {
         // driver is attached natively without aliasing the main module map.
 
         // Only a same-origin frame is reachable from the page. Cross-origin
-        // keeps its own security token, so V8 answers `undefined` for any
-        // property the page tries to read out of it, and nothing about it is
-        // published below.
+        // keeps its own security token, so the native Window access-check
+        // handlers expose only the cross-origin surface (window/self/frames,
+        // closed, parent/top/opener, length, location, postMessage,
+        // close/focus/blur) and throw SecurityError for everything else.
+        // Nothing about it is published below.
         // A fetched sandbox document has an opaque principal captured when its
         // browsing context was reserved, even if author code removes sandbox.
-        let reserved_opaque = realms.borrow().live_frame_owner(frame_id).is_some()
+        let reserved_owner = realms.borrow().live_frame_owner(frame_id).is_some();
+        let reserved_opaque = reserved_owner
             && realms.borrow().frame_is_sandboxed_opaque(frame_id);
         // Sandbox flags also propagate to descendant browsing contexts, so the
         // creator realm's principal is part of this frame's own.
-        let (scripting_enabled, creator_opaque) = realms.borrow().by_frame_id(parent_frame_id)
+        let (scripting_enabled, creator_opaque, creator_origin, creator_base, creator_referrer, creator_token) =
+            realms.borrow().by_frame_id(parent_frame_id)
             .map(|creator| {
+                let token = crate::window::inherited_opaque_principal(&creator);
                 let creator = creator.borrow();
-                (creator.scripting_enabled, creator.sandbox_opaque_origin)
-            }).unwrap_or((true, false));
+                let origin = crate::window::origin(&creator);
+                let base = crate::ops::document_base_url(&creator).unwrap_or_else(|| creator.url.clone());
+                (creator.scripting_enabled, creator.sandbox_opaque_origin, origin, base,
+                    creator.url.clone(), token)
+            }).unwrap_or((true, false, parent.page_origin(), String::new(), String::new(), None));
         let sandbox_opaque_origin = creator_opaque || reserved_opaque;
-        let origin = if sandbox_opaque_origin { "null".to_string() } else { origin_of(url) };
-        let same_origin = origin != "null" && origin == parent.page_origin();
+        // about:blank/srcdoc documents inherit their creator's origin, including
+        // its opaque principal; a fetched document never does. A frame with no
+        // live creator reservation (a bare browsing context) has no creator to
+        // inherit from and stays opaque.
+        let inherits_creator = reserved_owner && !sandbox_opaque_origin
+            && (url.is_empty() || url == "about:blank" || url == "about:srcdoc");
+        let origin = if sandbox_opaque_origin {
+            "null".to_string()
+        } else if inherits_creator {
+            creator_origin.clone()
+        } else {
+            origin_of(url)
+        };
+        let same_origin = !sandbox_opaque_origin
+            && ((origin != "null" && origin == creator_origin)
+                || (origin == "null" && inherits_creator && creator_token.is_some()));
         if same_origin {
             parent.share_security_token_with_realm(&context);
         }
@@ -116,7 +140,20 @@ impl FrameRealm {
         state.frame_id = frame_id;
         state.scripting_enabled = scripting_enabled;
         state.sandbox_opaque_origin = sandbox_opaque_origin;
-        if sandbox_opaque_origin { state.inherited_origin = Some("null".to_string()); }
+        state.opaque_origin = if sandbox_opaque_origin {
+            Some(Rc::new(()))
+        } else if inherits_creator {
+            creator_token
+        } else {
+            (origin == "null").then(|| Rc::new(()))
+        };
+        if sandbox_opaque_origin || inherits_creator {
+            state.inherited_origin = Some(origin.clone());
+        }
+        if inherits_creator {
+            state.about_base_url = (!creator_base.is_empty()).then_some(creator_base);
+        }
+        state.referrer = creator_referrer;
         parent.share_resources_with(&mut state);
         state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
 
@@ -152,9 +189,115 @@ impl FrameRealm {
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
-            parent.publish_realm_objects(&realm.context, frame_id);
+            parent.publish_realm_objects(&realm.context, frame_id, parent_frame_id);
         }
         Some(realm)
+    }
+
+    /// Replace this frame's document in place, keeping its browsing-context
+    /// identity, owner node, parent binding and timer ownership.
+    ///
+    /// The caller fetched `html` with the frame's referrer and subresource
+    /// policy. This rebuilds the frame's realm around that document, retires
+    /// the old realm (retained JavaScript keeps its DOM), and runs the frame
+    /// bootstrap so the new document is ready for script.
+    pub fn replace_document(
+        &mut self,
+        parent: &mut ObscuraJsRuntime,
+        url: &str,
+        method: &str,
+        body: &str,
+        html: &str,
+    ) -> Result<(), String> {
+        let _ = (method, body);
+        let realms = self.realms.clone();
+        let frame_id = self.frame_id;
+        let parent_frame_id = self.parent_frame_id;
+        let referrer = self.url.clone();
+        let reserved_owner = realms.borrow().live_frame_owner(frame_id).is_some();
+        let reserved_opaque = realms.borrow().frame_is_sandboxed_opaque(frame_id);
+        let parent_state = parent.document_state_for_frame(parent_frame_id)?;
+        let (scripting_enabled, creator_opaque, creator_origin, creator_base, creator_token) = {
+            let token = crate::window::inherited_opaque_principal(&parent_state);
+            let creator = parent_state.borrow();
+            let origin = crate::window::origin(&creator);
+            (creator.scripting_enabled, creator.sandbox_opaque_origin, origin,
+                crate::ops::document_base_url(&creator).unwrap_or_else(|| creator.url.clone()),
+                token)
+        };
+        let sandbox_opaque_origin = creator_opaque || reserved_opaque;
+        let inherits_creator = reserved_owner && !sandbox_opaque_origin
+            && (url.is_empty() || url == "about:blank" || url == "about:srcdoc");
+        let origin = if sandbox_opaque_origin {
+            "null".to_string()
+        } else if inherits_creator {
+            creator_origin.clone()
+        } else {
+            origin_of(url)
+        };
+
+        let context = parent.create_realm_context(self.frame_id, None, Some(&self.context))
+            .ok_or("Frame context creation failed")?;
+        if !parent.share_ops_with_realm(&context) {
+            parent.discard_realm_context(&context);
+            return Err("Frame realm op sharing failed".to_string());
+        }
+        parent.copy_identity_to_realm(&context);
+        let same_origin = !sandbox_opaque_origin
+            && ((origin != "null" && origin == creator_origin)
+                || (origin == "null" && inherits_creator && creator_token.is_some()));
+        if same_origin {
+            parent.share_security_token_with_realm(&context);
+        }
+
+        let mut state = ObscuraState::new();
+        state.navigation_timing.record("domLoading");
+        state.dom = Some(parse_html(html));
+        state.url = url.to_string();
+        state.frame_id = frame_id;
+        state.scripting_enabled = scripting_enabled;
+        state.sandbox_opaque_origin = sandbox_opaque_origin;
+        state.opaque_origin = if sandbox_opaque_origin {
+            Some(Rc::new(()))
+        } else if inherits_creator {
+            creator_token
+        } else {
+            (origin == "null").then(|| Rc::new(()))
+        };
+        if sandbox_opaque_origin || inherits_creator {
+            state.inherited_origin = Some(origin.clone());
+        }
+        if inherits_creator {
+            state.about_base_url = (!creator_base.is_empty()).then_some(creator_base);
+        }
+        state.referrer = referrer;
+        parent.share_resources_with(&mut state);
+        state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
+        let state = Rc::new(std::cell::RefCell::new(state));
+
+        realms.borrow_mut().retire_frame_realm(&self.context, frame_id);
+        // The retired main world's registration must not block the new
+        // document from registering its own callbacks under the same frame id.
+        parent.retire_realm_callbacks(frame_id);
+        parent.retire_execution_world_modules();
+        let modules = parent.attach_document_module_realm(&context, &state);
+        realms.borrow_mut().register(context.clone(), frame_id, state);
+        realms.borrow_mut().bind_parent_document(frame_id, &parent_state);
+        realms.borrow_mut().attach_document_modules(&context, modules);
+
+        parent.eval_in_realm(&context, &format!(
+            "globalThis.__obscura_objects = {{}};\
+             globalThis.__obscura_frameId = {frame_id};\
+             globalThis.__obscura_parentFrameId = {parent_frame_id};\
+             globalThis.__obscura_init();"
+        ))?;
+        if same_origin {
+            parent.publish_realm_objects(&context, frame_id, parent_frame_id);
+        }
+        self.context = context;
+        self.url = url.to_string();
+        self.origin = origin;
+        Ok(())
     }
 
     /// Fires the frame document's lifecycle events, in spec order.
@@ -175,10 +318,10 @@ impl FrameRealm {
         self.execute_script(
             parent,
             "globalThis.__documentReadyState__ = 'interactive';\
-             try { document.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}",
+             document.dispatchEvent(new Event('DOMContentLoaded', \
+                 { bubbles: false, cancelable: false }));\
+             window.dispatchEvent(new Event('DOMContentLoaded', \
+                 { bubbles: false, cancelable: false }));",
         )?;
         {
             let mut state = state.borrow_mut();
@@ -189,11 +332,11 @@ impl FrameRealm {
         let result = self.execute_script(
             parent,
             "globalThis.__documentReadyState__ = 'complete';\
-             try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
-             try { const loadEvent = new Event('load', \
+             document.dispatchEvent(new Event('readystatechange'));\
+             const loadEvent = new Event('load', \
                  { bubbles: false, cancelable: false }); \
-                 if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
-                 try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
+             if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
+             window.dispatchEvent(loadEvent);",
         );
         if result.is_ok() {
             state.borrow_mut().navigation_timing.record("loadEventEnd");
@@ -556,6 +699,9 @@ mod tests {
     async fn initial_frame_messages_keep_the_calling_realm_as_sender() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         parent.execute_script("initial-frame", r#"
+            globalThis.parentReceived = [];
+            addEventListener('message', event => parentReceived.push([event.data, event.origin,
+                event.source === frameElementProbe.contentWindow]));
             globalThis.frameElementProbe = document.createElement('iframe');
             document.body.appendChild(frameElementProbe);
             globalThis.initialWindowProbe = frameElementProbe.contentWindow;
@@ -564,16 +710,33 @@ mod tests {
         let pending = parent.take_pending_frames().pop().unwrap();
         let frame = FrameRealm::new(&mut parent, pending.frame_id, 0,
             &pending.url, &pending.html).unwrap();
-        frame.execute_script(&mut parent,
-            "parent.postMessage('from-child', '*'); postMessage('to-self', '*');").unwrap();
-        let messages = parent.take_pending_frame_messages();
-        assert_eq!(messages.iter().map(|message| (
-            message.target_frame_id, message.source_frame_id, message.origin.as_str()
-        )).collect::<Vec<_>>(), vec![
-            (frame.frame_id(), 0, "https://parent.example"),
-            (0, frame.frame_id(), "https://parent.example"),
-            (frame.frame_id(), frame.frame_id(), "https://parent.example"),
-        ]);
+        frame.execute_script(&mut parent, r#"
+            globalThis.childReceived = [];
+            addEventListener('message', event => childReceived.push([event.data, event.origin,
+                event.source === window, event.source === parent]));
+            parent.postMessage('from-child', '*');
+            postMessage('to-self', '*');
+        "#).unwrap();
+        // Frame-addressed traffic is drained by the host. The reply to the
+        // page is a different consumer queue: the calling realm is the frame,
+        // and the page receives it through `event.source` like any browser
+        // message, so observe the delivered events rather than the queue
+        // shape.
+        for message in parent.take_pending_frame_messages() {
+            frame.deliver_message(&mut parent, &message.data_json, &message.origin,
+                message.source_frame_id, &message.target_origin).unwrap();
+        }
+        parent.run_event_loop_bounded(100).await.unwrap();
+        // Each message carries the identity of the window whose script called
+        // postMessage: the page for 'from-parent', the frame itself for a
+        // self-post. The parent sees the frame's window for its reply.
+        assert_eq!(frame.evaluate(&mut parent, "childReceived").unwrap(), serde_json::json!([
+            ["from-parent", "https://parent.example", false, true],
+            ["to-self", "https://parent.example", true, false],
+        ]));
+        assert_eq!(parent.evaluate("parentReceived").unwrap(), serde_json::json!([
+            ["from-child", "https://parent.example", true],
+        ]));
     }
 
     #[test]
@@ -1204,8 +1367,8 @@ mod tests {
     /// carry the frame's origin. Turnstile and every widget like it drop an
     /// untrusted message silently, so an untrusted delivery is not a cosmetic
     /// difference, it is the widget hanging forever.
-    #[test]
-    fn a_frame_posts_to_its_parent_as_a_trusted_message() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_posts_to_its_parent_as_a_trusted_message() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         parent
             .execute_script(
@@ -1227,13 +1390,11 @@ mod tests {
         frame
             .execute_script(&mut parent, "parent.postMessage({token: 'ok'}, '*');")
             .unwrap();
-        // The host is the transport, exactly as `Page` does between turns.
-        let queued = parent.take_pending_frame_messages();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].target_frame_id, 0);
-        assert_eq!(queued[0].source_frame_id, 1);
-        parent.deliver_frame_message(0, &queued[0].data_json, &queued[0].origin,
-            queued[0].source_frame_id, &queued[0].target_origin).unwrap();
+        // Root destinations advance through the native Window task consumer,
+        // independently of the host's child-frame delivery queue.
+        assert!(parent.take_pending_frame_messages().is_empty());
+        assert_eq!(parent.evaluate("globalThis.got").unwrap(), serde_json::json!([]));
+        parent.run_event_loop_until_quiescent(2_000, 30).await.unwrap();
 
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
@@ -1245,8 +1406,8 @@ mod tests {
     /// restricted to a specific origin must be dropped when the receiving realm
     /// has a different origin, and delivered when the origins match. Before the
     /// fix the argument was discarded end-to-end, so the first message leaked.
-    #[test]
-    fn post_message_honours_target_origin() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_message_honours_target_origin() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         parent
             .execute_script(
@@ -1264,12 +1425,6 @@ mod tests {
         )
         .expect("frame realm");
 
-        // Deliver the way `Page` does, now carrying the queued targetOrigin.
-        let deliver = |parent: &mut ObscuraJsRuntime, m: &crate::ops::PendingFrameMessage| {
-            parent.deliver_frame_message(0, &m.data_json, &m.origin,
-                m.source_frame_id, &m.target_origin).unwrap();
-        };
-
         // Restricted to an origin the parent does NOT have -> must be dropped.
         frame
             .execute_script(
@@ -1277,10 +1432,7 @@ mod tests {
                 "parent.postMessage({token: 'secret'}, 'https://attacker.example');",
             )
             .unwrap();
-        let queued = parent.take_pending_frame_messages();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].target_origin, "https://attacker.example");
-        deliver(&mut parent, &queued[0]);
+        parent.run_event_loop_until_quiescent(2_000, 30).await.unwrap();
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
             serde_json::json!([]),
@@ -1294,8 +1446,7 @@ mod tests {
                 "parent.postMessage({token: 'ok'}, 'https://parent.example');",
             )
             .unwrap();
-        let queued = parent.take_pending_frame_messages();
-        deliver(&mut parent, &queued[0]);
+        parent.run_event_loop_until_quiescent(2_000, 30).await.unwrap();
         assert_eq!(
             parent.evaluate("globalThis.got").unwrap(),
             serde_json::json!([[{"token": "ok"}, "https://child.example"]]),
@@ -1420,7 +1571,7 @@ mod tests {
         frame
             .execute_script(
                 &mut parent,
-                "for (let i = 0; i < 5000; i++) parent.postMessage(i, '*');",
+                "for (let i = 0; i < 5000; i++) postMessage(i, '*');",
             )
             .unwrap();
 
@@ -1432,12 +1583,15 @@ mod tests {
         std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
     }
 
-    /// A retained facade remains safe after native teardown, but no longer
-    /// exposes the discarded frame's document or globals.
-    #[test]
-    fn a_discarded_realm_leaves_the_page_safe_to_run() {
+    /// A retained same-origin Window keeps the committed document it already
+    /// had after its browsing context is discarded, exactly as Chrome does;
+    /// retirement alone is not a cross-origin boundary. New work that needs a
+    /// live browsing context - network authority in particular - is rejected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_discarded_realm_leaves_the_page_safe_to_run() {
         let mut parent = page("https://parent.example/", "<html><body><iframe></iframe></body></html>");
-        parent.execute_script("retain-child", "globalThis.child = document.querySelector('iframe').contentWindow;").unwrap();
+        parent.execute_script("retain-child", r#"globalThis.child = document.querySelector('iframe').contentWindow;
+            globalThis.savedChildDocument = child.document;"#).unwrap();
         let pending = parent.take_pending_frames().pop().unwrap();
         let frame = FrameRealm::new(&mut parent, pending.frame_id, pending.parent_frame_id,
             &pending.url, &pending.html).unwrap();
@@ -1445,14 +1599,34 @@ mod tests {
         assert_eq!(parent.evaluate("child.marker").unwrap(), serde_json::json!("child"));
         drop(frame);
 
-        assert_eq!(parent.evaluate(r#"(() => {
-            try { child.marker; return 'allowed'; } catch (error) { return error.name; }
-        })()"#).unwrap(), serde_json::json!("SecurityError"));
-        // The page's own DOM work still resolves against the page.
+        // The old document and its globals stay readable. `closed` reports the
+        // discarded browsing context, and the page's own DOM work still
+        // resolves against the page.
+        assert_eq!(parent.evaluate(r#"[
+            child.document === savedChildDocument,
+            child.marker,
+            child.closed,
+        ]"#).unwrap(), serde_json::json!([true, "child", true]));
         assert_eq!(
             parent.evaluate("document.querySelector('iframe') !== null").unwrap(),
             serde_json::json!(true),
         );
+        // A discarded realm has no live owner for network authority. The
+        // rejection must be observable and must not reach the network. Record
+        // the outcome *inside* the callbacks: assigning the `.then` return
+        // value would store an always-pending promise, not its result.
+        parent.execute_script("discarded-fetch",
+            r#"globalThis.__discardedFetch = 'pending';
+            child.fetch('https://example.com/').then(
+                () => { globalThis.__discardedFetch = 'allowed'; },
+                error => { globalThis.__discardedFetch = error.name; });"#).unwrap();
+        assert!(parent.resolve_promises_until(|js|
+            js.evaluate("globalThis.__discardedFetch !== 'pending'").unwrap()
+                == serde_json::json!(true), 500).await);
+        // Chrome reports a TypeError for calls on a window whose global scope
+        // is shutting down; the exact wording is not part of the contract.
+        assert_eq!(parent.evaluate("globalThis.__discardedFetch").unwrap(),
+            serde_json::json!("TypeError"));
         parent.execute_script("release-child", &format!("globalThis.__obscura_forgetFrame({});", pending.frame_id)).unwrap();
         assert_eq!(parent.evaluate("typeof globalThis.__obscura_frameObjects").unwrap(),
             serde_json::json!("undefined"));

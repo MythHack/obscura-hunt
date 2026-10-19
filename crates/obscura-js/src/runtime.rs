@@ -21,7 +21,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
     ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
-    begin_animation_task, build_extension, node_is_script,
+    begin_animation_task, build_extension,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
@@ -195,6 +195,61 @@ pub fn is_fatal_event_loop_error(error: &str) -> bool {
         || error.contains("task budget")
 }
 
+fn dispatch_promise_rejection(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut result: v8::ReturnValue,
+) {
+    // Browser rejection delivery is page-local, not an event-loop failure.
+    // Retired documents also must not interrupt the remaining rejection batch.
+    result.set_bool(true);
+    let Ok(promise) = args.get(0).try_cast::<v8::Promise>() else { return; };
+    let Some(context) = promise.get_creation_context(scope) else { return; };
+    let handle = v8::Global::new(scope, context);
+    let op_state = JsRuntime::op_state_from(scope);
+    {
+        let state = op_state.borrow();
+        let Ok((windows, window_id, _)) = crate::window::context_document(&state, &handle) else { return; };
+        if !windows.borrow().windows.get(&window_id).is_some_and(|window| !window.closed) { return; }
+    }
+    // BrowserRealm shares the control realm's exception queue, but the event's
+    // constructor, listener registry and Window belong to the promise's realm.
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    let Some(key) = v8::String::new(scope, "PromiseRejectionEvent") else { return; };
+    let Some(constructor) = global.get(scope, key.into()) else { return; };
+    let Ok(constructor) = constructor.try_cast::<v8::Function>() else {
+        if let Some(message) = v8::String::new(scope, "PromiseRejectionEvent is not a constructor") {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return;
+    };
+    let cancelable = args.data().boolean_value(scope);
+    let Some(event_type) = v8::String::new(scope,
+        if cancelable { "unhandledrejection" } else { "rejectionhandled" }) else { return; };
+    let init = v8::Object::new(scope);
+    for (name, value) in [
+        ("promise", promise.into()),
+        ("reason", args.get(1)),
+        ("cancelable", args.data()),
+    ] {
+        let Some(key) = v8::String::new(scope, name) else { return; };
+        if init.create_data_property(scope, key.into(), value) != Some(true) { return; }
+    }
+    let Some(event) = constructor.new_instance(scope, &[event_type.into(), init.into()]) else { return; };
+    let Some(key) = v8::String::new(scope, "dispatchEvent") else { return; };
+    let Some(dispatch) = global.get(scope, key.into()) else { return; };
+    let Ok(dispatch) = dispatch.try_cast::<v8::Function>() else {
+        if let Some(message) = v8::String::new(scope, "dispatchEvent is not a function") {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return;
+    };
+    let _ = dispatch.call(scope, global.into(), &[event.into()]);
+}
+
 #[cfg(feature = "render")]
 fn with_sync_render_loading_disabled<R>(
     state: &mut ObscuraState,
@@ -242,20 +297,6 @@ pub enum CdpEvaluation {
 pub struct PendingCdpEvaluation {
     object_id: String,
     recipe: Option<String>,
-}
-
-/// CDP remote objects that can be rebuilt when a page's V8 runtime is
-/// temporarily replaced during tab switching.
-///
-/// Obscura currently keeps one entered isolate per connection. Switching tabs
-/// therefore rebuilds the target page's runtime, but CDP clients reasonably
-/// expect handles returned by `Runtime.evaluate` to remain usable. Retaining
-/// the originating expressions lets the page restore a handle on demand under
-/// the same id without retaining a second isolate.
-#[derive(Default)]
-pub struct CdpObjectState {
-    object_counter: u64,
-    evaluation_recipes: HashMap<String, String>,
 }
 
 /// A CDP command selects an execution context, not a browsing context alias.
@@ -335,6 +376,28 @@ pub struct ObscuraJsRuntime {
     js_runtime: Rc<RefCell<JsRuntime>>,
 }
 
+/// Reject a helper/snapshot pair whose native V8 layouts differ before any
+/// isolate exists. The snapshot producer's `v8_abi` sidecar field is parsed by
+/// build.rs (which runs on the host even for cross builds) and exported as
+/// `OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI`; the linked helper reports the value it
+/// was actually compiled with. A missing env is a compile-time failure, not a
+/// silent fallback. Bits: 0 pointer compression, 1 31-bit Smis, 2 sandbox,
+/// 3 shared cage, 8..15 `sizeof(void*)`.
+fn verify_native_window_abi() {
+    let expected: u32 = match env!("OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI").parse() {
+        Ok(value) => value,
+        Err(_) => panic!(
+            "obscura-js build.rs emitted a non-decimal OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI"
+        ),
+    };
+    let actual = obscura_v8_native::native_window_abi();
+    if actual != expected {
+        panic!(
+            "native WindowProxy ABI mismatch: snapshot requires {expected:#010x}, linked helper reports {actual:#010x} (pointer compression bit0, 31-bit Smis bit1, sandbox bit2, shared cage bit3, sizeof(void*) bits 8..15)"
+        );
+    }
+}
+
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -374,6 +437,45 @@ fn is_cdp_unserializable_value(value: &str) -> bool {
         .strip_suffix('n')
         .map(|digits| digits.strip_prefix('-').unwrap_or(digits))
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+// ICU symbols keep their major-version suffix in the statically linked V8.
+#[cfg(windows)]
+unsafe extern "C" {
+    #[link_name = "ucal_setDefaultTimeZone_77"]
+    fn ucal_setDefaultTimeZone(zone: *const u16, status: *mut i32);
+}
+
+/// Pin the process timezone before the first isolate is created.
+///
+/// V8's Date and Intl read their zone from ICU, which on Windows does not
+/// follow the `TZ` environment variable. Only an explicitly configured zone
+/// is applied; without one the host default stays authoritative (the CLI's
+/// own Berlin fallback lives in the CLI, not in the embeddable runtime).
+fn configure_process_timezone() -> bool {
+    static CONFIGURED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let Some(zone) = std::env::var("OBSCURA_TIMEZONE").ok()
+            .map(|zone| zone.trim().to_string())
+            .filter(|zone| !zone.is_empty())
+            .or_else(|| std::env::var("TZ").ok()
+                .map(|zone| zone.trim().to_string())
+                .filter(|zone| !zone.is_empty())) else { return false; };
+        // Unix ICU honors TZ; set it before any isolate can read the zone.
+        // An already-present TZ is the host's choice and stays untouched.
+        if std::env::var_os("TZ").is_none() {
+            unsafe { std::env::set_var("TZ", &zone) };
+        }
+        #[cfg(windows)]
+        {
+            let mut utf16: Vec<u16> = zone.encode_utf16().collect();
+            utf16.push(0);
+            let mut status: i32 = 0;
+            unsafe { ucal_setDefaultTimeZone(utf16.as_ptr(), &mut status) };
+            if status > 0 { return false; }
+        }
+        true
+    });
+    *CONFIGURED
 }
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
@@ -570,9 +672,10 @@ impl ObscuraJsRuntime {
         let mut pending = Vec::new();
         for window in windows.windows.values_mut().filter(|window| !window.closed && window.id != self.window_id) {
             let mut state = window.state.borrow_mut();
-            if let Some((url, method, body)) = state.pending_navigation.take() {
+            if let Some(navigation) = state.pending_navigation.take() {
                 window.navigation_generation = window.navigation_generation.wrapping_add(1);
-                pending.push(crate::window::WindowNavigation { id: window.id, url, method, body,
+                pending.push(crate::window::WindowNavigation { id: window.id, url: navigation.url,
+                    method: navigation.method, body: navigation.body, origin_frame_id: navigation.origin_frame_id,
                     source_url: state.url.clone(), noreferrer: false, generation: window.navigation_generation });
             }
         }
@@ -612,7 +715,8 @@ impl ObscuraJsRuntime {
         let windows = self.windows.borrow();
         let window = windows.windows.get(&id).filter(|window| !window.closed).ok_or("Window is closed")?;
         let import_map = window.state.borrow().import_map.clone();
-        Ok(Self { state: window.state.clone(), window_id: id, root_context: window.context.clone(),
+        let root_context = window.context.clone().ok_or("Window is closed")?;
+        Ok(Self { state: window.state.clone(), window_id: id, root_context,
             module_realm: window.module_realm.clone(), windows: self.windows.clone(),
             object_store: HashMap::new(), evaluation_recipes: HashMap::new(), object_counter: 0,
             cdp_world: Rc::new(std::cell::Cell::new(CdpExecutionWorld::default())), import_map,
@@ -626,8 +730,10 @@ impl ObscuraJsRuntime {
     fn sync_window_document(&mut self) {
         let current = {
             let windows = self.windows.borrow();
-            windows.windows.get(&self.window_id).filter(|window| window.context != self.root_context)
-                .map(|window| (window.context.clone(), window.module_realm.clone(), window.loader.clone()))
+            windows.windows.get(&self.window_id)
+                .filter(|window| window.context.as_ref() != Some(&self.root_context))
+                .and_then(|window| window.context.as_ref()
+                    .map(|context| (context.clone(), window.module_realm.clone(), window.loader.clone())))
         };
         if let Some((context, realm, loader)) = current {
             self.root_context = context;
@@ -646,13 +752,18 @@ impl ObscuraJsRuntime {
     /// native navigable, engine, transport and storage namespaces.
     pub fn refresh_window_realm(&mut self) -> Result<(), String> {
         self.sync_window_document();
-        let (previous_realm, main_realm, proxy_url, realm_id) = {
+        let (previous_realm, proxy_url, realm_id) = {
             let windows = self.windows.borrow();
             let window = windows.windows.get(&self.window_id).filter(|window| !window.closed).ok_or("Window is closed")?;
-            (window.module_realm.clone(), window.main_realm,
-                window.loader.proxy_url.clone(), window.realm_id)
+            (window.module_realm.clone(), window.loader.proxy_url.clone(), window.realm_id)
         };
-        let context = self.create_realm_context().ok_or("Window context creation failed")?;
+        let previous_context = {
+            let windows = self.windows.borrow();
+            windows.windows.get(&self.window_id).ok_or("Window is closed")?
+                .context.clone().ok_or("Window is closed")?
+        };
+        let context = self.create_realm_context(realm_id, None, Some(&previous_context))
+            .ok_or("Window context creation failed")?;
         if !self.share_ops_with_realm(&context) { return Err("Window op binding failed".to_string()); }
         self.copy_identity_to_realm(&context);
         let base_url = {
@@ -661,6 +772,8 @@ impl ObscuraJsRuntime {
             state.document_generation = state.document_generation.wrapping_add(1);
             state.about_base_url = None;
             state.inherited_origin = None;
+            state.reflected_url = None;
+            state.opaque_origin = None;
             state.import_map = Rc::new(RefCell::new(ImportMap::default()));
             state.url.clone()
         };
@@ -671,7 +784,7 @@ impl ObscuraJsRuntime {
             windows.windows.values().find(|window| window.id != self.window_id
                 && !window.closed && window.group == group && origin != "null"
                 && crate::window::origin(&window.state.borrow()) == origin)
-                .map(|window| window.context.clone())
+                .and_then(|window| window.context.clone())
         };
         let import_map = self.state.borrow().import_map.clone();
         let loader = Rc::new(ObscuraModuleLoader::with_page_state(&base_url, proxy_url, &self.state, import_map));
@@ -679,7 +792,7 @@ impl ObscuraJsRuntime {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), main);
-            if !main_realm { previous_realm.retire(scope); }
+            previous_realm.retire(scope);
             let context = v8::Local::new(scope, &context);
             if let Some(peer) = peer_context {
                 let peer = v8::Local::new(scope, peer);
@@ -694,13 +807,11 @@ impl ObscuraJsRuntime {
             let mut windows = self.windows.borrow_mut();
             let window = windows.windows.get_mut(&self.window_id).ok_or("Window is closed")?;
             let old_realm = window.realm_id;
-            window.context = context;
+            window.context = Some(context);
             window.module_realm = module_realm;
             window.loader = loader;
             window.realm_id = realm_id;
-            window.main_realm = false;
             windows.callbacks.remove(&old_realm);
-            windows.root_realms.insert(realm_id, self.window_id);
         }
         self.sync_window_document();
         self.execute_runtime_script("<obscura:new-window-document>", format!(
@@ -795,6 +906,7 @@ impl ObscuraJsRuntime {
 
     /// Bind a root reserved by Page before its first document is initialized.
     pub fn with_window_id(base_url: &str, proxy_url: Option<String>, window_id: crate::window::WindowId) -> Self {
+        verify_native_window_abi();
         // A runtime is about to initialize the V8 platform; from here on a
         // set_v8_flags call must be refused rather than aborting the process.
         crate::v8_flags::mark_platform_started();
@@ -810,7 +922,7 @@ impl ObscuraJsRuntime {
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
-        let (runtime, isolate_handle, heap_limit_state) = {
+        let (runtime, root_context, module_realm, isolate_handle, heap_limit_state) = {
             // Keep the guard alive for the whole construction: deno_core
             // captures the current tokio handle at `JsRuntime::new` time and
             // aborts if a V8 delayed task is posted without one.
@@ -827,13 +939,23 @@ impl ObscuraJsRuntime {
             // idempotent; setting it under the create lock guarantees it
             // lands before the first isolate exists.
             deno_core::v8::icu::set_default_locale("en-US");
+            let timezone_configured = configure_process_timezone();
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: vec![build_extension()],
+                // deno_core verifies the startup snapshot's extension list as
+                // an exact prefix. The snapshot was captured with the native
+                // window extension first, so it must stay first here.
+                extensions: vec![crate::window::native_window::native_window_extension(),
+                    build_extension()],
                 module_loader: Some(module_loader.clone()),
                 startup_snapshot: Some(SNAPSHOT),
                 ..Default::default()
             });
+            crate::window::native_window::install_failed_access_check(runtime.v8_isolate());
+            if timezone_configured {
+                runtime.v8_isolate()
+                    .date_time_configuration_change_notification(v8::TimeZoneDetection::Skip);
+            }
             {
                 let context = runtime.main_context();
                 v8::scope!(let scope, runtime.v8_isolate());
@@ -842,15 +964,34 @@ impl ObscuraJsRuntime {
                 crate::ops::initialize_document_realm_slots(context, undefined.into());
             }
 
+            let realms = Rc::new(RefCell::new(crate::ops::RealmStates::default()));
+            realms.borrow_mut().set_main_context(runtime.main_context());
             {
                 let op_state = runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
                 op_state.put(state_clone.clone());
-                let mut realms = crate::ops::RealmStates::default();
-                realms.set_main_context(runtime.main_context());
-                realms.register(runtime.main_context(), 0, state_clone);
-                op_state.put(Rc::new(RefCell::new(realms)));
+                op_state.put(realms.clone());
             }
+            // deno_core owns the control context's async-op promise machinery.
+            // Detaching its global also disconnects those promise reactions.
+            // Every public document, including the first root, therefore owns
+            // an attached realm and a proxy independent of that control context.
+            let root_context = {
+                v8::scope!(let scope, runtime.v8_isolate());
+                let context = crate::window::create_realm_context(scope, &realms, 0, None, None)
+                    .expect("root document context creation failed");
+                let local = v8::Local::new(scope, &context);
+                let undefined = v8::undefined(scope);
+                crate::ops::initialize_document_realm_slots(local, undefined.into());
+                context
+            };
+            realms.borrow_mut().register(root_context.clone(), 0, state_clone);
+            let module_realm = {
+                let main = runtime.main_context();
+                v8::scope_with_context!(scope, runtime.v8_isolate(), main);
+                let context = v8::Local::new(scope, &root_context);
+                deno_core::BrowserRealm::attach(scope, context, module_loader.clone())
+            };
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
             let heap_limit_state = std::sync::Arc::new(HeapLimitState::default());
@@ -860,17 +1001,8 @@ impl ObscuraJsRuntime {
                 heap_limit_state.clone(),
             );
 
-            runtime
-                .execute_script(
-                    "<obscura:init>",
-                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; if (typeof _installWasmStreamingFallback === 'function') _installWasmStreamingFallback();".to_string(),
-                )
-                .expect("init should not fail");
-
-            (runtime, isolate_handle, heap_limit_state)
+            (runtime, root_context, module_realm, isolate_handle, heap_limit_state)
         };
-        let root_context = runtime.main_context();
-        let module_realm = runtime.browser_main_realm();
         let windows = Rc::new(RefCell::new(crate::window::WindowRegistry::new(
             window_id, root_context.clone(), state.clone(), module_realm.clone(), module_loader)));
         runtime.op_state().borrow_mut().put(windows.clone());
@@ -899,8 +1031,11 @@ impl ObscuraJsRuntime {
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
-        #[cfg(test)]
-        instance.expose_ops_for_tests();
+        let root_context = instance.root_context.clone();
+        assert!(instance.share_ops_with_realm(&root_context), "root document op binding failed");
+        instance.execute_runtime_script("<obscura:init>",
+            "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; if (typeof _installWasmStreamingFallback === 'function') _installWasmStreamingFallback();".to_string())
+            .expect("root document initialization should not fail");
 
         // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
         // entered for life. Leave the thread's entry stack empty instead; every
@@ -928,26 +1063,21 @@ impl ObscuraJsRuntime {
     /// between contexts of one isolate.
     pub(crate) fn create_realm_context(
         &mut self,
+        frame_id: u32,
+        world_id: Option<u64>,
+        previous: Option<&deno_core::v8::Global<deno_core::v8::Context>>,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let realms = self.realm_states();
         let context = {
             let mut entered = self.runtime();
             let isolate = entered.v8_isolate();
             deno_core::v8::scope!(let scope, isolate);
-            let context = deno_core::v8::Context::from_snapshot(
-                scope,
-                1,
-                deno_core::v8::ContextOptions::default(),
-            )
-            .or_else(|| {
-                deno_core::v8::Context::from_snapshot(
-                    scope,
-                    0,
-                    deno_core::v8::ContextOptions::default(),
-                )
-            })?;
+            let context = crate::window::create_realm_context(
+                scope, &realms, frame_id, world_id, previous)?;
+            let local = deno_core::v8::Local::new(scope, &context);
             let undefined = deno_core::v8::undefined(scope);
-            crate::ops::initialize_document_realm_slots(context, undefined.into());
-            deno_core::v8::Global::new(scope, context)
+            crate::ops::initialize_document_realm_slots(local, undefined.into());
+            context
         };
         Some(context)
     }
@@ -975,6 +1105,21 @@ impl ObscuraJsRuntime {
 
         let core = global.get(scope, handoff_key.into())?;
         let core = core.to_object(scope)?;
+        // Install only in the engine queue owner. A native entry can enter the
+        // originating promise's live context without a control-realm JS frame.
+        for (setter, cancelable) in [
+            ("setUnhandledPromiseRejectionHandler", true),
+            ("setHandledPromiseRejectionHandler", false),
+        ] {
+            let key = v8::String::new(scope, setter)?;
+            let setter = core.get(scope, key.into())?.try_cast::<v8::Function>().ok()?;
+            let data = v8::Boolean::new(scope, cancelable);
+            let callback = v8::Function::builder(dispatch_promise_rejection)
+                .data(data.into())
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope)?;
+            setter.call(scope, core.into(), &[callback.into()])?;
+        }
         let ops = core.get(scope, ops_key.into())?;
         if !ops.is_object() {
             return None;
@@ -985,27 +1130,6 @@ impl ObscuraJsRuntime {
         Some(ops)
     }
 
-    /// Test-only instrumentation seam for assertions about native-op batching.
-    /// Production builds do not compile this method or publish the op table.
-    #[cfg(test)]
-    fn expose_ops_for_tests(&mut self) {
-        use deno_core::v8;
-
-        let Some(ops) = self.ops_handoff.clone() else {
-            return;
-        };
-        let main = self.runtime().main_context();
-        let mut entered = self.runtime();
-        let isolate = entered.v8_isolate();
-        v8::scope!(let scope, isolate);
-        let context = v8::Local::new(scope, main);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let Some(key) = v8::String::new(scope, "__obscura_test_ops") else {
-            return;
-        };
-        let value = v8::Local::new(scope, ops);
-        let _ = context.global(scope).set(scope, key.into(), value);
-    }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
     ///
@@ -1029,54 +1153,66 @@ impl ObscuraJsRuntime {
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
 
-        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
-            return false;
-        };
-        let Some(ops_key) = v8::String::new(scope, "ops") else {
-            return false;
-        };
-        let Some(deno_key) = v8::String::new(scope, "Deno") else {
-            return false;
-        };
-        let global = context.global(scope);
-        let Some(core) = global.get(scope, handoff_key.into()) else {
-            return false;
-        };
-        let Some(core) = core.to_object(scope) else {
-            return false;
-        };
-        // `Deno.core.ops` is non-writable and non-configurable, so the table
-        // cannot be swapped wholesale: V8 reports success and changes nothing.
-        // Copy the bound op functions into the realm's existing table instead.
-        let Some(target) = core
-            .get(scope, ops_key.into())
-            .and_then(|value| value.to_object(scope))
-        else {
-            return false;
-        };
-        let source = v8::Local::new(scope, ops);
-        let Some(source) = source.to_object(scope) else {
-            return false;
-        };
-        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
-            return false;
-        };
-        let mut copied = 0;
-        for index in 0..names.length() {
-            let Some(key) = names.get_index(scope, index) else {
-                continue;
-            };
-            let Some(value) = source.get(scope, key) else {
-                continue;
-            };
-            if target.set(scope, key, value).unwrap_or(false) {
-                copied += 1;
+        let copied = (|| -> Option<usize> {
+            let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+            let ops_key = v8::String::new(scope, "ops")?;
+            let deno_key = v8::String::new(scope, "Deno")?;
+            let global = context.global(scope);
+            let core = global.get(scope, handoff_key.into())?;
+            let core = core.to_object(scope)?;
+            // `Deno.core.ops` is non-writable and non-configurable, so the table
+            // cannot be swapped wholesale: V8 reports success and changes nothing.
+            // Copy the bound op functions into the realm's existing table instead.
+            let target = core.get(scope, ops_key.into())?.to_object(scope)?;
+            let source = v8::Local::new(scope, ops);
+            let source = source.to_object(scope)?;
+            let names = source.get_own_property_names(scope, Default::default())?;
+            let mut copied = 0;
+            for index in 0..names.length() {
+                let Some(key) = names.get_index(scope, index) else {
+                    continue;
+                };
+                let Some(value) = source.get(scope, key) else {
+                    continue;
+                };
+                if target.set(scope, key, value).unwrap_or(false) {
+                    copied += 1;
+                }
             }
+            #[cfg(test)]
+            if let Some(key) = v8::String::new(scope, "__obscura_test_ops") {
+                let _ = global.set(scope, key.into(), target.into());
+            }
+            // The child realm must not expose the handoff to frame script either.
+            global.delete(scope, handoff_key.into());
+            global.delete(scope, deno_key.into());
+            Some(copied)
+        })().unwrap_or(0);
+        if copied == 0 {
+            // The realm was never attached to deno_core storage yet, so its
+            // annex exists only because create_realm_context initialized the
+            // slots. Clear while the isolate scope is live; dropping the
+            // Global's last handle cannot reach these traced slot values.
+            context.clear_all_slots();
         }
-        // The child realm must not expose the handoff to frame script either.
-        global.delete(scope, handoff_key.into());
-        global.delete(scope, deno_key.into());
         copied > 0
+    }
+
+    /// Discard a realm context that was created but never attached to
+    /// deno_core module storage. The isolate must still be alive.
+    pub(crate) fn discard_realm_context(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, realm);
+        if !deno_core::BrowserRealm::has_attached_storage(context) {
+            context.clear_all_slots();
+        }
     }
 
     /// Runs `source` inside `realm` and returns its value as a string. Errors
@@ -1101,6 +1237,10 @@ impl ObscuraJsRuntime {
             None => return Err(exception_text(tc_scope)),
         };
         match script.run(tc_scope) {
+            // Page code can wrap a handler in try/catch, but a watchdog
+            // termination is not a successful result. Report it so callers do
+            // not record completion timings for work that never finished.
+            _ if tc_scope.is_execution_terminating() => Err("execution terminated".to_string()),
             Some(value) => Ok(value.to_rust_string_lossy(tc_scope)),
             None => Err(exception_text(tc_scope)),
         }
@@ -1198,6 +1338,7 @@ impl ObscuraJsRuntime {
 
     pub fn forget_frame_state(&mut self, frame_id: u32) {
         self.realm_states().borrow_mut().forget_frame(frame_id);
+        self.realm_states().borrow_mut().forget_proxies(frame_id);
         self.retire_execution_world_modules();
     }
 
@@ -1257,17 +1398,17 @@ impl ObscuraJsRuntime {
         let id = NEXT_WORLD.try_update(std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| "Execution world id space exhausted")?;
-        let context = self.create_realm_context().ok_or("Execution world context creation failed")?;
+        let context = self.create_realm_context(document_id, Some(id), None).ok_or("Execution world context creation failed")?;
         if !self.share_ops_with_realm(&context) { return Err("Execution world op binding failed".into()); }
         self.copy_identity_to_realm(&context);
         {
-            let canonical = registry.borrow().context(document_id).ok_or("Document context is unavailable")?;
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), main);
-            let canonical = v8::Local::new(scope, canonical);
             let isolated = v8::Local::new(scope, &context);
-            isolated.set_security_token(canonical.get_security_token(scope));
+            // The default token is this context's own global object. Sharing the
+            // author token lets V8 bypass the native world access checks.
+            isolated.use_default_security_token();
         }
         let (base, imports) = { let state = state.borrow();
             (crate::ops::document_base_url(&state).unwrap_or_else(|| state.url.clone()), state.import_map.clone()) };
@@ -1304,7 +1445,7 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
-    fn retire_execution_world_modules(&mut self) {
+    pub(crate) fn retire_execution_world_modules(&mut self) {
         let registry = self.realm_states();
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
@@ -1729,17 +1870,36 @@ impl ObscuraJsRuntime {
         realm.set_security_token(token);
     }
 
-    /// Publishes real frame objects into the bootstrap's native-captured private
-    /// registry. Author-visible access goes through the live, origin-checked
-    /// iframe facade, never a page-readable table of raw handles.
+    /// Retires the window callbacks registered by a frame's old document so a
+    /// replacement document can register its own main world under the same
+    /// frame id.
+    pub(crate) fn retire_realm_callbacks(&mut self, frame_id: u32) {
+        self.windows.borrow_mut().callbacks.remove(&frame_id);
+    }
+
+    /// Publishes real frame objects into the creator realm's bootstrap
+    /// native-captured private registry. Author-visible access goes through
+    /// the live, origin-checked iframe facade, never a page-readable table of
+    /// raw handles.
     pub(crate) fn publish_realm_objects(
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         frame_id: u32,
+        parent_frame_id: u32,
     ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime().main_context();
+        // Publish into the realm that actually embeds the frame, not always the
+        // page's main world: a frame nested in another frame is read through
+        // its own creator's registry.
+        let main = {
+            let realms = self.realm_states();
+            let realms = realms.borrow();
+            let parent = realms.by_frame_id(parent_frame_id)
+                .unwrap_or_else(|| self.state.clone());
+            realms.main_context_for_document(&parent)
+                .unwrap_or_else(|| self.root_context.clone())
+        };
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
         v8::scope!(let scope, isolate);
@@ -1908,6 +2068,8 @@ impl ObscuraJsRuntime {
             let origin = v8::ScriptOrigin::new(scope, resource_name.into(), 0, 0, false, 0,
                 None, false, false, false, None);
             match v8::Script::compile(scope, code, Some(&origin)).and_then(|script| script.run(scope)) {
+                _ if scope.is_execution_terminating() =>
+                    Err("execution terminated".to_string()),
                 Some(value) => Ok(v8::Global::new(scope, value)),
                 None => Err(exception_text(scope)),
             }
@@ -1966,7 +2128,15 @@ impl ObscuraJsRuntime {
         let mut gs = self.state.borrow_mut();
         let replacing = gs.dom.is_some();
         gs.dom = Some(dom);
-        if replacing { gs.document_generation = gs.document_generation.wrapping_add(1); }
+        if replacing {
+            gs.document_generation = gs.document_generation.wrapping_add(1);
+            gs.document_active.set(true);
+            gs.reflected_url = None;
+            for (_, cancel) in gs.timeout_cancels.borrow_mut().drain() { cancel.cancel(); }
+            if gs.inherited_origin.is_none() {
+                gs.opaque_origin = crate::window::opaque_origin_for_url(&gs.url);
+            }
+        }
         gs.focused_node = None;
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1995,6 +2165,7 @@ impl ObscuraJsRuntime {
             gs.resolved_scroll = None;
         }
         drop(gs);
+        self.realm_states().borrow_mut().refresh_document_generation(&self.state);
         self.realm_states().borrow().cancel_inactive_frame_timers();
     }
 
@@ -2002,6 +2173,11 @@ impl ObscuraJsRuntime {
         let mut state = self.state.borrow_mut();
         if state.url != url {
             state.url = url.to_string();
+            state.reflected_url = None;
+            // A URL commit under a non-inherited origin is a new principal.
+            if state.inherited_origin.is_none() {
+                state.opaque_origin = crate::window::opaque_origin_for_url(url);
+            }
             #[cfg(feature = "render")]
             {
                 // Relative resources use the document URL when no <base> is
@@ -2052,8 +2228,32 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().blocked_urls = patterns;
     }
 
-    pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+    pub fn take_pending_navigation(&self) -> Option<crate::ops::PendingNavigation> {
         self.state.borrow_mut().pending_navigation.take()
+    }
+
+    /// Host-side page-visible URL (pushState / blocked-file restore). Never
+    /// executes author JavaScript. `frame_id` 0 means this runtime's root.
+    pub fn set_reflected_url(&self, frame_id: u32, url: Option<&str>) -> bool {
+        let Some(state) = self.document_state(frame_id) else { return false };
+        state.borrow_mut().reflected_url = url.map(str::to_string);
+        true
+    }
+
+    pub fn reflected_url(&self, frame_id: u32) -> Option<String> {
+        self.document_state(frame_id).and_then(|state| state.borrow().reflected_url.clone())
+    }
+
+    fn document_state(&self, frame_id: u32) -> Option<crate::ops::SharedState> {
+        if frame_id == 0 { return Some(self.state.clone()); }
+        self.realm_states().borrow().by_frame_id(frame_id)
+    }
+
+    /// Drain navigations queued by live child documents. They stay on their own
+    /// state until the host fetches and commits an in-place frame replacement;
+    /// draining them here is the only path by which the Page layer sees them.
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, crate::ops::PendingNavigation)> {
+        self.realm_states().borrow_mut().take_pending_frame_navigations(&self.state)
     }
 
     /// Session history index that accompanies the pending navigation when
@@ -2079,7 +2279,7 @@ impl ObscuraJsRuntime {
         let registry = self.realm_states();
         let (documents, contexts) = {
             let registry = registry.borrow();
-            (registry.render_document_states(&self.state).cloned().collect::<Vec<_>>(),
+            (registry.page_document_states(&self.state).cloned().collect::<Vec<_>>(),
                 registry.page_contexts(self.state.borrow().frame_id))
         };
         for document in documents {
@@ -2174,7 +2374,9 @@ impl ObscuraJsRuntime {
         state.network_response_bodies.remove(request_id)
     }
 
-    /// Move retained bodies in completion order before the runtime is suspended.
+    /// Move retained bodies out in completion order. Suspension parks the
+    /// runtime and keeps them; callers drain them only when the runtime that
+    /// owns them is being replaced or discarded.
     pub fn take_network_response_bodies(&self) -> Vec<(String, StoredNetworkResponseBody)> {
         let mut state = self.state.borrow_mut();
         let order = std::mem::take(&mut state.network_response_body_order);
@@ -2919,7 +3121,7 @@ impl ObscuraJsRuntime {
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
         let registry = self.realm_states();
         let registry = registry.borrow();
-        let pending: usize = registry.render_document_states(&self.state)
+        let pending: usize = registry.page_document_states(&self.state)
             .map(|state| state.borrow().render_resource_in_flight.len()).sum();
         let blocked = self.state.borrow().blocked_urls.clone();
         Self::take_document_render_resource_requests(&mut self.state.borrow_mut(),
@@ -2972,7 +3174,7 @@ impl ObscuraJsRuntime {
     ) -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
         let registry = self.realm_states();
         let registry = registry.borrow();
-        let pending: usize = registry.render_document_states(&self.state)
+        let pending: usize = registry.page_document_states(&self.state)
             .map(|state| state.borrow().render_resource_in_flight.len()).sum();
         let available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending);
         let mut state = self.state.borrow_mut();
@@ -2998,7 +3200,7 @@ impl ObscuraJsRuntime {
         let registry = self.realm_states();
         let registry = registry.borrow();
         registry.cancel_inactive_frame_timers();
-        for state in registry.render_document_states(&self.state) {
+        for state in registry.page_document_states(&self.state) {
             state.borrow_mut().abandon_render_resources();
         }
     }
@@ -3010,7 +3212,7 @@ impl ObscuraJsRuntime {
         self.apply_render_resource_results();
         let registry = self.realm_states();
         let registry = registry.borrow();
-        for document in registry.render_document_states(&self.state) {
+        for document in registry.page_document_states(&self.state) {
             let mut state = document.borrow_mut();
             let pending = std::mem::take(&mut state.render_resource_in_flight);
             let backlog = std::mem::take(&mut state.render_resource_backlog);
@@ -3233,21 +3435,21 @@ impl ObscuraJsRuntime {
         let registry = self.realm_states();
         let registry = registry.borrow();
         registry.cancel_inactive_frame_timers();
-        if !registry.render_document_states(&self.state).any(|state| {
+        if !registry.page_document_states(&self.state).any(|state| {
             let state = state.borrow();
             !state.render_resource_rx.is_empty() || !state.render_resource_backlog.is_empty()
                 || state.render_resources.has_sync_misses()
         }) { return 0; }
         let mut loaded = 0;
-        for state in registry.render_document_states(&self.state) {
+        for state in registry.page_document_states(&self.state) {
             loaded += Self::apply_document_render_resource_results(&mut state.borrow_mut());
         }
-        let pending: usize = registry.render_document_states(&self.state)
+        let pending: usize = registry.page_document_states(&self.state)
             .map(|state| state.borrow().render_resource_in_flight.len()).sum();
         let mut available = MAX_PENDING_RENDER_RESOURCES.saturating_sub(pending);
         // Page policy is live even when a child inherited an earlier snapshot.
         let blocked = self.state.borrow().blocked_urls.clone();
-        for state in registry.render_document_states(&self.state) {
+        for state in registry.page_document_states(&self.state) {
             let mut document = state.borrow_mut();
             let mut requests = std::mem::take(&mut document.render_resource_backlog);
             let discovered = Self::take_document_render_resource_requests(&mut document, &blocked, available);
@@ -3264,7 +3466,7 @@ impl ObscuraJsRuntime {
     pub fn has_pending_render_resources(&self) -> bool {
         let registry = self.realm_states();
         let registry = registry.borrow();
-        let pending = registry.render_document_states(&self.state).any(|state| {
+        let pending = registry.page_document_states(&self.state).any(|state| {
             let state = state.borrow();
             !state.render_resource_in_flight.is_empty() || state.render_resources.has_sync_misses()
         });
@@ -3281,7 +3483,7 @@ impl ObscuraJsRuntime {
         let registry = self.realm_states();
         let registry = registry.borrow();
         registry.cancel_inactive_frame_timers();
-        let loaded = registry.render_document_states(&self.state)
+        let loaded = registry.page_document_states(&self.state)
             .map(|state| Self::apply_document_render_resource_results(&mut state.borrow_mut())).sum();
         loaded
     }
@@ -3325,7 +3527,7 @@ impl ObscuraJsRuntime {
         let registry = registry.borrow();
         let root_id = self.state.borrow().frame_id;
         let mut events = Vec::new();
-        for state in registry.render_document_states(&self.state) {
+        for state in registry.page_document_states(&self.state) {
             let mut state = state.borrow_mut();
             for mut event in state.render_resource_events.drain(..) {
                 if event.frame_id == root_id { event.frame_id = 0; }
@@ -3871,17 +4073,6 @@ impl ObscuraJsRuntime {
         self.evaluation_recipes.clear();
     }
 
-    pub fn take_cdp_object_state(&mut self) -> CdpObjectState {
-        CdpObjectState {
-            object_counter: self.object_counter,
-            evaluation_recipes: std::mem::take(&mut self.evaluation_recipes),
-        }
-    }
-
-    pub fn restore_cdp_object_state(&mut self, state: CdpObjectState) {
-        self.object_counter = self.object_counter.max(state.object_counter);
-        self.evaluation_recipes = state.evaluation_recipes;
-    }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(budget_ms);
         let prepared = self.prepare_module(url, budget_ms).await?;
@@ -4955,39 +5146,6 @@ impl ObscuraJsRuntime {
         dom
     }
 
-    /// Export document-owned script preparation state before the runtime realm
-    /// is temporarily destroyed.  Page suspension keeps the DOM alive, so the
-    /// HTML "already started" flags must travel with it rather than resetting
-    /// like window-global JavaScript state.
-    pub fn started_script_ids(&self) -> Vec<u32> {
-        let state = self.state.borrow();
-        let mut ids = state
-            .already_started_scripts
-            .borrow()
-            .iter()
-            .map(|node_id| node_id.raw())
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
-    }
-
-    /// Restore script preparation state only onto script nodes in the current
-    /// DOM.  Callers use this exclusively for the same DomTree surviving a
-    /// suspend/resume cycle; normal set_dom navigation starts from an empty set.
-    pub fn restore_started_script_ids(&self, ids: &[u32]) {
-        let state = self.state.borrow();
-        let Some(dom) = state.dom.as_ref() else {
-            return;
-        };
-        let valid = ids
-            .iter()
-            .copied()
-            .map(NodeId::new)
-            .filter(|node_id| node_is_script(dom, *node_id))
-            .collect::<Vec<_>>();
-        state.already_started_scripts.borrow_mut().extend(valid);
-    }
-
     pub fn with_dom<R>(&self, f: impl FnOnce(&DomTree) -> R) -> Option<R> {
         let state = self.state.borrow();
         // Native callers can mutate this interior-mutable tree without a JS
@@ -5859,7 +6017,13 @@ mod tests {
         let child = rt.document_state_for_frame(child_id).unwrap();
         rt.service_render_resources();
         assert!(child.borrow().render_resource_in_flight.is_empty());
-        assert!(child.borrow().render_resources.has_sync_misses(), "capacity defers, not drops, child work");
+        let root_has_sync_misses = rt.state.borrow().render_resources.has_sync_misses();
+        let child_sync_loading_enabled = child.borrow().render_resources.sync_loading_enabled();
+        assert!(
+            child.borrow().render_resources.has_sync_misses(),
+            "capacity defers, not drops, child work: root_has_sync_misses={root_has_sync_misses}, \
+             child_sync_loading_enabled={child_sync_loading_enabled}"
+        );
         assert!(std::sync::Arc::ptr_eq(&rt.state.borrow().render_resource_limiter,
             &child.borrow().render_resource_limiter));
         rt.state.borrow_mut().render_resource_in_flight.remove(
@@ -6219,9 +6383,18 @@ mod tests {
                     frame.remove();
                 }
                 return retainedFrames.map(child => {
-                    try { child.document; return 'allowed'; } catch (error) { return error.name; }
+                    try {
+                        return [child.document.body.textContent, child.closed];
+                    } catch (error) {
+                        return error.name;
+                    }
                 });
-            })()"#).unwrap(), serde_json::json!(["SecurityError", "SecurityError", "SecurityError", "SecurityError"]));
+            })()"#).unwrap(), serde_json::json!([
+                ["retained", true],
+                ["retained", true],
+                ["retained", true],
+                ["retained", true]
+            ]));
             drop(rt);
         }
     }
@@ -6229,7 +6402,6 @@ mod tests {
     #[test]
     fn document_realm_registration_preserves_main_context_rust_slots() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        rt.expose_ops_for_tests();
         {
             let mut entered = rt.runtime();
             let context = entered.main_context();
@@ -6257,7 +6429,6 @@ mod tests {
         crate::set_v8_flags("--stress-compaction --stress-marking=1");
         for _ in 0..10 {
             let mut rt = setup_runtime("<html><body></body></html>");
-            rt.expose_ops_for_tests();
             assert_eq!(rt.evaluate(r#"(() => {
                 globalThis.retainedFrames = [];
                 for (let i = 0; i < 4; i++) {
@@ -6270,6 +6441,65 @@ mod tests {
                 }
                 return retainedFrames.length;
             })()"#).unwrap(), serde_json::json!(4.0));
+            drop(rt);
+        }
+    }
+
+    /// A function retained from a removed iframe keeps its realm's context
+    /// alive. Its dynamic import must reject from the retired module map
+    /// instead of touching freed context-owned storage, and isolate teardown
+    /// under GC stress must not abort.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_child_realm_import_rejects_after_frame_removal_under_gc_stress() {
+        crate::set_v8_flags("--stress-compaction --stress-marking=1");
+        for detach in ["frame.remove()", "document.body.removeChild(frame)"] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            let source = format!(r#"(() => {{
+                const frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                const child = frame.contentWindow;
+                globalThis.__retainedChildWindow = child;
+                globalThis.__retainedImport = child.eval(
+                    "() => import('data:text/javascript,export default 1')");
+                {detach};
+                return [typeof globalThis.__retainedImport === 'function',
+                    document.body.contains(frame)];
+            }})()"#);
+            assert_eq!(rt.evaluate(&source).unwrap(), serde_json::json!([true, false]));
+            // Let the retired realm leave the live registry before calling back.
+            rt.run_event_loop_bounded(4).await.unwrap();
+            let outcome = rt
+                .evaluate_for_cdp(
+                    r#"(async () => {
+                        let importing;
+                        try {
+                            importing = globalThis.__retainedImport().then(
+                                module => ['fulfilled', String(module && module.default)],
+                                error => ['rejected', error && error.name]);
+                        } catch (error) {
+                            return ['threw', error && error.name];
+                        }
+                        return await Promise.race([
+                            importing,
+                            new Promise(resolve => setTimeout(() => resolve(['pending']), 1000)),
+                        ]);
+                    })()"#,
+                    true,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !outcome.thrown,
+                "a stale import escaped its async wrapper: {}",
+                outcome.description
+            );
+            let value = outcome.value.expect("the stale import must settle");
+            let status = value[0].as_str().unwrap_or_default();
+            assert_eq!(
+                status, "rejected",
+                "a retained function from a removed frame must reject its dynamic import, got {value}"
+            );
             drop(rt);
         }
     }
@@ -6293,6 +6523,68 @@ mod tests {
             ).unwrap(),
             serde_json::json!([true, true, true, true])
         );
+    }
+
+    #[test]
+    fn isolated_worlds_deny_same_origin_author_globals_and_preserve_dom_grants() {
+        let mut rt = ObscuraJsRuntime::with_base_url("http://127.0.0.1/page");
+        rt.set_url("http://127.0.0.1/page");
+        rt.set_dom(parse_html("<html><body><p id='grant-marker'>original</p></body></html>"));
+        rt.run_page_init();
+        rt.evaluate("globalThis.authorSecret = 'parent-author-secret'").unwrap();
+        for (frame_id, url) in [(41, "http://127.0.0.1/child"), (42, "http://localhost/child")] {
+            let child = crate::frame::FrameRealm::new(&mut rt, frame_id, 0, url,
+                "<html><body><p id='child'>child</p></body></html>").unwrap();
+            child.evaluate(&mut rt, "globalThis.childAuthorSecret = 'child-author-secret'").unwrap();
+            if frame_id == 41 {
+                assert_eq!(child.evaluate(&mut rt, "parent.authorSecret").unwrap(),
+                    serde_json::json!("parent-author-secret"));
+            }
+            let id = rt.ensure_isolated_world(frame_id, "native-boundary", false).unwrap();
+            let world = CdpExecutionWorld { frame_id, world_id: Some(id) };
+            let probe = r#"(() => {
+                const result = {};
+                try { result.read = parent.authorSecret; } catch (error) { result.read = error.name; }
+                try { parent.authorSecret = 'isolated-overwrite'; result.write = 'allowed'; }
+                catch (error) { result.write = error.name; }
+                result.ownDocument = document.body.tagName;
+                result.authorGlobal = typeof childAuthorSecret;
+                globalThis.isolatedMarker = 'isolated';
+                document.getElementById('child').textContent = 'shared child';
+                return result;
+            })()"#;
+            let expected = serde_json::json!({"read": "SecurityError", "write": "SecurityError",
+                "ownDocument": "BODY", "authorGlobal": "undefined"});
+            assert_eq!(rt.evaluate_in_cdp_frame(world, probe).unwrap(), expected);
+            assert_eq!(rt.evaluate("authorSecret").unwrap(), serde_json::json!("parent-author-secret"));
+            assert_eq!(child.evaluate(&mut rt,
+                "[childAuthorSecret, typeof isolatedMarker, document.getElementById('child').textContent]")
+                .unwrap(), serde_json::json!(["child-author-secret", "undefined", "shared child"]));
+            let inspect = "(() => { try { return parent.document.getElementById('grant-marker').textContent; } catch (error) { return error.name; } })()";
+            assert_eq!(rt.evaluate_in_cdp_frame(world, inspect).unwrap(), serde_json::json!("SecurityError"));
+            assert_eq!(rt.ensure_isolated_world(frame_id, "native-boundary", false).unwrap(), id);
+            assert_eq!(rt.ensure_isolated_world(frame_id, "native-boundary", true).unwrap(), id);
+            assert_eq!(rt.evaluate_in_cdp_frame(world, inspect).unwrap(), serde_json::json!("original"));
+            rt.evaluate_in_cdp_frame(world,
+                "parent.document.getElementById('grant-marker').textContent = 'granted'").unwrap();
+            assert_eq!(rt.evaluate("document.getElementById('grant-marker').textContent").unwrap(),
+                serde_json::json!("granted"));
+            assert_eq!(rt.evaluate_in_cdp_frame(world, probe).unwrap(), expected);
+            assert_eq!(rt.evaluate("authorSecret").unwrap(), serde_json::json!("parent-author-secret"));
+            rt.dispose_isolated_world(id).unwrap();
+            assert!(rt.validate_cdp_world(world).is_err());
+            assert_eq!(child.evaluate(&mut rt, "document.getElementById('child').textContent").unwrap(),
+                serde_json::json!("shared child"));
+            let fresh = CdpExecutionWorld { frame_id,
+                world_id: Some(rt.ensure_isolated_world(frame_id, "native-boundary", false).unwrap()) };
+            assert_ne!(fresh.world_id, world.world_id);
+            assert_eq!(rt.evaluate_in_cdp_frame(fresh, inspect).unwrap(), serde_json::json!("SecurityError"));
+            assert_eq!(rt.evaluate_in_cdp_frame(fresh, "typeof isolatedMarker").unwrap(),
+                serde_json::json!("undefined"));
+            drop(child);
+            assert!(rt.validate_cdp_world(fresh).is_err());
+            rt.evaluate("document.getElementById('grant-marker').textContent = 'original'").unwrap();
+        }
     }
 
     #[test]
@@ -8022,7 +8314,12 @@ mod tests {
         rt.evaluate("history.back()").unwrap();
         assert_eq!(
             rt.take_pending_navigation(),
-            Some(("http://example.com/one".into(), "GET".into(), String::new())),
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/one".into(),
+                method: "GET".into(),
+                body: String::new(),
+                origin_frame_id: 0,
+            }),
         );
         assert_eq!(rt.take_pending_history_traversal(), Some(0));
     }
@@ -8386,7 +8683,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const before = document.getElementById("component");
                 class SvelteLike extends HTMLElement {
                     constructor() {
@@ -8408,7 +8705,7 @@ mod tests {
                     before.$$s.length,
                     before.shadowRoot && before.shadowRoot.textContent
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true, true, 1, "ready"]));
@@ -8425,7 +8722,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r##"
+                r##"(() => {
                 const tags = nodes => nodes.map(n => n.nodeType === 3 ? "#text" : n.tagName).join(",");
                 const children = el => {
                     const out = [...el.children];
@@ -8535,7 +8832,7 @@ mod tests {
                     tags(realSlot.assignedNodes()),
                     tags(deepSlot.assignedNodes()),
                 ];
-                "##,
+                })()"##,
             )
             .unwrap();
         assert_eq!(
@@ -8578,7 +8875,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const host = document.createElement("lit-host");
                 document.body.appendChild(host);
                 const root = host.attachShadow({ mode: "open" });
@@ -8672,7 +8969,7 @@ mod tests {
                     }
                 }
                 return [inserted, removed, moved, parsed, movedWithin, flattened, replaced, errors];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -8716,7 +9013,7 @@ mod tests {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body><p id='log'></p></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const name = (fn) => {
                     try { fn(); return "none"; }
                     catch (error) { return error instanceof TypeError ? "TypeError" : error.name; }
@@ -8753,7 +9050,7 @@ mod tests {
                     Node.prototype.insertBefore.length,
                     Node.prototype.appendChild.length
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -8773,7 +9070,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const name = (fn) => { try { fn(); return "none"; } catch (error) { return error.name; } };
                 const doc = document.implementation.createHTMLDocument("t");
                 const comment = doc.insertBefore(doc.createComment("c"), doc.firstChild);
@@ -8793,7 +9090,7 @@ mod tests {
                     doc.documentElement.localName, name(() => doc.appendChild(two)),
                     replacedDoctype
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -8810,7 +9107,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><div id='p'><a></a><b></b><i></i></div><div id='q'><u></u></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const p = document.getElementById("p");
                 const q = document.getElementById("q");
                 const [a, b, i] = Array.from(p.childNodes);
@@ -8863,7 +9160,7 @@ mod tests {
                     (() => { try { observer.observe(p, { attributeOldValue: true, attributes: false }); return "none"; } catch (error) { return error.constructor.name; } })()
                 ];
                 return out;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -8942,7 +9239,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><p id='p' title='a'>text</p></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const p = document.getElementById("p");
                 const observer = new MutationObserver(() => {});
                 observer.observe(p, { attributeOldValue: true, characterDataOldValue: true, subtree: true, attributeFilter: ["title"] });
@@ -8958,7 +9255,7 @@ mod tests {
                 p.appendChild(document.createElement("span"));
                 globalThis.__callbackThis = () => seenThis;
                 return records;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -8977,7 +9274,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><div id='d'><b>bold</b><i>ital</i><u>under</u></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const d = document.getElementById("d");
                 const [b, i, u] = Array.from(d.children);
                 const observer = new MutationObserver(() => {});
@@ -9007,7 +9304,7 @@ mod tests {
                 deleteRange.selectNodeContents(d);
                 deleteRange.deleteContents();
                 return [clonedText, unchanged, extractedText, afterExtract, extractRecords, afterInsert, marker.parentNode === wrapper, d.childNodes.length];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9030,7 +9327,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const doc = document.implementation.createHTMLDocument();
                 const el = doc.createElement("p");
                 const text = doc.createTextNode("t");
@@ -9058,7 +9355,7 @@ mod tests {
                     document.createElement("div").ownerDocument === document,
                     document.documentElement.ownerDocument === document
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9128,7 +9425,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head><style id='s'>#t { color: black; } @media all { #t { color: blue; } }</style></head><body><div id='t'></div></body></html>");
         let result = rt
             .evaluate(
-                r##"
+                r##"(() => {
                 const sheet = document.getElementById("s").sheet;
                 const media = sheet.cssRules[1];
                 const before = [media instanceof CSSMediaRule, media instanceof CSSGroupingRule, media.type, media.conditionText, media.cssRules.length];
@@ -9136,7 +9433,7 @@ mod tests {
                 const inserted = [index, media.cssRules.length, media.cssRules[1].parentRule === media, media.cssRules[1].parentStyleSheet === sheet];
                 media.deleteRule(1);
                 return [before, inserted, media.cssRules.length, typeof CSSSupportsRule];
-                "##,
+                })()"##,
             )
             .unwrap();
         assert_eq!(
@@ -9194,7 +9491,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><div id='c' style='color: red'></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const detached = document.createElement("div");
                 detached.style.color = "red";
                 const style = getComputedStyle(detached);
@@ -9206,7 +9503,7 @@ mod tests {
                 shadow.innerHTML = "<p id='in'></p>";
                 const inDetachedShadow = getComputedStyle(shadow.getElementById("in")).display;
                 return [empty, live, inDetachedShadow, typeof getComputedStyle(document.getElementById("c")).color];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9220,7 +9517,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r##"
+                r##"(() => {
                 const host = document.createElement("native-shadow-host");
                 document.body.appendChild(host);
                 const root = host.attachShadow({ mode: "open", delegatesFocus: true });
@@ -9271,7 +9568,7 @@ mod tests {
                     closedHost.shadowRoot,
                     closedHost.internals.shadowRoot === closedHost.closedRoot
                 ];
-                "##,
+                })()"##,
             )
             .unwrap();
         assert_eq!(
@@ -9307,7 +9604,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const testStart = true;
                 class CreatedLater extends HTMLElement {
                     constructor() {
@@ -9334,7 +9631,7 @@ mod tests {
                     element.isConnected,
                     foreign instanceof CreatedLater
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9374,7 +9671,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const parsed = document.getElementById("shape");
                 SVGPathElement.prototype.polyfillProbe = () => "path";
                 const created = document.createElementNS(
@@ -9396,7 +9693,7 @@ mod tests {
                     parsed.polyfillProbe(),
                     typeof div.polyfillProbe
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9429,7 +9726,7 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
-                return [
+                [
                     SVGImageElement, SVGUseElement, SVGTextElement,
                     SVGCircleElement, SVGRectElement, SVGAnimateElement,
                     SVGMarkerElement, SVGTSpanElement, SVGLineElement,
@@ -9456,7 +9753,7 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
-                return [
+                [
                     document.getElementById("i").constructor.name,
                     document.getElementById("i") instanceof SVGImageElement,
                     document.getElementById("u").constructor.name,
@@ -9489,7 +9786,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const ns = "http://www.w3.org/2000/svg";
                 const made = document.createElementNS(ns, "image");
                 const rect = document.createElementNS(ns, "rect");
@@ -9503,7 +9800,7 @@ mod tests {
                     Object.getPrototypeOf(defs) === SVGDefsElement.prototype,
                     defs instanceof SVGGraphicsElement,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9574,7 +9871,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const ns = "http://www.w3.org/2000/svg";
                 const probe = (name) => {
                     const el = document.createElementNS(ns, name);
@@ -9587,7 +9884,7 @@ mod tests {
                     probe("hasOwnProperty"),
                     document.createElement("constructor").constructor.name,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -9603,7 +9900,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const text = document.createElement("text");
                 const image = document.createElement("image");
                 const div = document.createElement("div");
@@ -9613,7 +9910,7 @@ mod tests {
                     image instanceof SVGImageElement,
                     div instanceof SVGElement,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([false, true, false, false]));
@@ -9642,7 +9939,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 let constructorCalls = 0;
                 let connectedCalls = 0;
                 class ThrowsDuringUpgrade extends HTMLElement {
@@ -9663,7 +9960,7 @@ mod tests {
                     connectedCalls,
                     element.__customUpgradeFailed === true
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([1, 0, true]));
@@ -9890,7 +10187,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                "return [window === self, self.constructor === Window,\
+                "[window === self, self.constructor === Window,\
                          window instanceof Window, self.document === document,\
                          self.location === location, self.history === history,\
                          self.navigator === navigator];",
@@ -9915,7 +10212,7 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
-                return [
+                [
                     window.payload === document.getElementById("payload"),
                     window.payload.text,
                     window.duplicate instanceof HTMLCollection,
@@ -9945,7 +10242,7 @@ mod tests {
             globalThis.sameNode = document.body.insertBefore(frame,frame) === frame;
         "#).unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
-        assert_eq!(rt.evaluate("return {aborted:oldSignal.aborted, calls:oldCalls, sameNode, order:Array.from(document.body.children,node=>node.id)};").unwrap(),
+        assert_eq!(rt.evaluate("({aborted:oldSignal.aborted, calls:oldCalls, sameNode, order:Array.from(document.body.children,node=>node.id)});").unwrap(),
             serde_json::json!({"aborted":false,"calls":0,"sameNode":true,
                 "order":["before","frame","after"]}));
     }
@@ -9985,9 +10282,9 @@ mod tests {
             }
         "#).unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
-        let result = rt.evaluate("return {retainedSignal:retainedSignal.aborted, retainedTimers, \
+        let result = rt.evaluate("({retainedSignal:retainedSignal.aborted, retainedTimers, \
             removedSignals:removedSignals.map(signal=>signal.aborted), removedTimers, \
-            freshFrameTimers, freshFrameWindows};").unwrap();
+            freshFrameTimers, freshFrameWindows});").unwrap();
         assert_eq!(result, serde_json::json!({
             "retainedSignal":true, "retainedTimers":1,
             "removedSignals":[false,false,false,false,false,false,false,false],
@@ -10011,7 +10308,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1),rt.run_event_loop())
             .await.expect("Destroyed frame timers must not keep the native event loop alive")
             .unwrap();
-        assert_eq!(rt.evaluate("return timerCalls;").unwrap().as_f64(),Some(0.0));
+        assert_eq!(rt.evaluate("timerCalls;").unwrap().as_f64(),Some(0.0));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10033,7 +10330,7 @@ mod tests {
         drop(doomed);
         drop(borrowed);
         rt.run_event_loop_bounded(100).await.unwrap();
-        assert_eq!(rt.evaluate("return frameCalls;").unwrap(),serde_json::json!([0,1]));
+        assert_eq!(rt.evaluate("frameCalls;").unwrap(),serde_json::json!([0,1]));
     }
 
     #[test]
@@ -10070,7 +10367,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><div id='host'></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const made = document.createElement("section");
                 made.id = "dynamicName";
                 const detachedIdAbsent = !("dynamicName" in window);
@@ -10123,7 +10420,7 @@ mod tests {
                     !("shadowOnly" in window),
                     window.fetch === originalFetch
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -10143,7 +10440,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                "return [innerWidth, innerHeight, visualViewport.width,\
+                "[innerWidth, innerHeight, visualViewport.width,\
                          visualViewport.height, screen.width > 0, screen.height > 0];",
             )
             .unwrap();
@@ -10201,7 +10498,7 @@ mod tests {
         let result = rt
             .evaluate(
                 r#"
-                return [
+                [
                     matchMedia("(min-width: 1024px) and (min-height: 700px)").matches,
                     matchMedia("(min-width: 1024px) and (min-height: 900px)").matches,
                     matchMedia("(max-width: 600px), screen and (orientation: landscape)").matches,
@@ -10234,7 +10531,7 @@ mod tests {
         assert_eq!(
             rt.evaluate(
                 r#"
-                return [
+                [
                     (globalThis.__wideAndShort = matchMedia(
                         "(min-width: 800px) and (max-height: 700px)"
                     )).matches,
@@ -10251,7 +10548,7 @@ mod tests {
         rt.set_viewport(600.0, 900.0);
         assert_eq!(
             rt.evaluate(
-                "return [__wideAndShort.matches, __portrait.matches,\
+                "[__wideAndShort.matches, __portrait.matches,\
                          matchMedia('(max-width: 600px), print').matches];",
             )
             .unwrap(),
@@ -10266,7 +10563,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const box = document.getElementById("box");
                 const computed = getComputedStyle(box);
                 return [
@@ -10277,7 +10574,7 @@ mod tests {
                     computed.getPropertyValue("display"),
                     computed.getPropertyValue("background-color")
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -10302,8 +10599,8 @@ mod tests {
         );
         assert_eq!(
             rt.evaluate(
-                "const style = getComputedStyle(document.getElementById('toggle'), '::before');\
-                 return [style.content, style.display]"
+                "(() => {const style = getComputedStyle(document.getElementById('toggle'), '::before');\
+                 return [style.content, style.display]})()"
             ).unwrap(),
             serde_json::json!(["\"❯\"", "inline"])
         );
@@ -10314,10 +10611,10 @@ mod tests {
         let mut rt = setup_runtime("<html><body><input id='editor'></body></html>");
         assert_eq!(
             rt.evaluate(
-                "let seen = [];\
+                "(() => {let seen = [];\
                  document.addEventListener('blur', event => seen.push([event.target.id, event.eventPhase]), true);\
                  document.getElementById('editor').dispatchEvent(new FocusEvent('blur'));\
-                 return seen"
+                 return seen})()"
             ).unwrap(),
             serde_json::json!([["editor", 1]])
         );
@@ -10328,7 +10625,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         assert_eq!(
             rt.evaluate(
-                "const seen = [];\
+                "(() => {const seen = [];\
                  window.addEventListener('load', () => seen.push('window-capture'), true);\
                  window.addEventListener('click', () => seen.push('window-click-capture'), true);\
                  document.addEventListener('load', () => seen.push('document-capture'), true);\
@@ -10341,7 +10638,7 @@ mod tests {
                  script.remove();\
                  script.dispatchEvent(new Event('load'));\
                  script.dispatchEvent(new Event('click'));\
-                 return seen"
+                 return seen})()"
             )
             .unwrap(),
             serde_json::json!([
@@ -10358,7 +10655,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><div id='carousel'></div></body></html>");
         assert_eq!(
             rt.evaluate(
-                "const element = document.getElementById('carousel');\
+                "(() => {const element = document.getElementById('carousel');\
                  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');\
                  const isPlainObject = value => typeof value === 'object' && value !== null\
                      && value.constructor\
@@ -10368,7 +10665,7 @@ mod tests {
                  target.element = isPlainObject(source.element) ? {} : source.element;\
                  return [Object.prototype.toString.call(element),\
                      Object.prototype.toString.call(svg), isPlainObject(element),\
-                     target.element === element]"
+                     target.element === element]})()"
             )
             .unwrap(),
             serde_json::json!(["[object HTMLElement]", "[object SVGElement]", false, true])
@@ -10383,7 +10680,7 @@ mod tests {
         let mut rt = setup_runtime(
             r#"<html><head></head><body><iframe id="frame"></iframe><div id="plain"></div></body></html>"#,
         );
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const frame = document.getElementById('frame');
             const created = document.createElement('iframe');
             const nodes = [document.head, document.documentElement, document.body,
@@ -10393,7 +10690,7 @@ mod tests {
                 frame.cloneNode() instanceof HTMLIFrameElement,
                 frame instanceof HTMLElement && frame instanceof Element,
                 nodes.map(node => node instanceof HTMLIFrameElement)];
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!([
             true, true, true, true,
             [false, false, false, false, false, false]
@@ -10407,7 +10704,7 @@ mod tests {
                 <meta id="policy" http-equiv="Content-Security-Policy" content="default-src 'self'">
             </head><body></body></html>"#,
         );
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const plain = document.getElementById('plain');
             const policy = document.getElementById('policy');
             const kept = Array.from(document.querySelectorAll('meta'))
@@ -10427,7 +10724,7 @@ mod tests {
                 plain instanceof HTMLMetaElement, cloned instanceof HTMLMetaElement,
                 document.createElement('div') instanceof HTMLMetaElement,
                 document.createElementNS('urn:test', 'META').cloneNode() instanceof HTMLMetaElement];
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!([
             ["plain"], ["", "Content-Security-Policy", "Refresh", "Refresh"],
             "Content-Type", "", "null", true, true, false, false
@@ -10441,7 +10738,7 @@ mod tests {
                 <input id="input" type="button" value="Input label"><div id="other"></div>
             </body></html>"#,
         );
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const button = document.getElementById('button');
             const input = document.getElementById('input');
             const created = document.createElement('input');
@@ -10457,7 +10754,7 @@ mod tests {
             value.set.call(created, 'edited');
             checked.set.call(created, true);
             return [brands, labels, value.get.call(created), checked.get.call(created)];
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!([
             [true, false, false, true, true, false, true],
             ["Visible label", "Input label"], "edited", true
@@ -10467,7 +10764,7 @@ mod tests {
     #[test]
     fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const enumerated = [];
             const states = ['input', 'textarea'].map(tag => {
                 const field = document.createElement(tag);
@@ -10484,7 +10781,7 @@ mod tests {
                 return values;
             });
             return [states, 'readOnly' in document.createElement('div'), enumerated];
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!([
             [
                 [[false, null], [true, ""], [false, null], [true, "false"], [false, null]],
@@ -10504,7 +10801,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const link = document.getElementById("locale");
                 const initial = [
                     link.hreflang, link.rel, link.target, link.download,
@@ -10518,7 +10815,7 @@ mod tests {
                     link.getAttribute("hreflang"),
                     link.getAttribute("referrerpolicy")
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -10582,7 +10879,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const token = document.getElementById("token");
                 const after = document.getElementById("after");
                 const computed = getComputedStyle(token);
@@ -10607,7 +10904,7 @@ mod tests {
                     replaced: [replaced.width, replaced.height],
                     item: [item.width, item.height, getComputedStyle(item).display]
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
 
@@ -10896,7 +11193,7 @@ mod tests {
 
         let initial = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const box = document.getElementById("box");
                 const c = getComputedStyle(box);
                 return [
@@ -10909,7 +11206,7 @@ mod tests {
                     c.flexDirection, c.flexWrap, c.alignItems,
                     c.justifyContent, c.rowGap, c.columnGap, c.transform
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -10948,12 +11245,12 @@ mod tests {
 
         assert_eq!(
             rt.evaluate(
-                r#"
+                r#"(() => {
                 const box = document.getElementById("box");
                 box.className = "alt";
                 const c = getComputedStyle(box);
                 return [c.display, c.width, c.opacity];
-                "#,
+                })()"#,
             )
             .unwrap(),
             serde_json::json!(["grid", "150px", "0.8"])
@@ -10980,7 +11277,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const clamp = getComputedStyle(document.getElementById("clamp"));
                 const legacy = getComputedStyle(document.getElementById("legacy"));
                 return {
@@ -10996,7 +11293,7 @@ mod tests {
                     clamp.getPropertyValue("-webkit-line-clamp")],
                   legacy: [legacy.display, legacy.webkitBoxOrient]
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -11033,13 +11330,13 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const sample = id => {
                     const s = getComputedStyle(document.getElementById(id));
                     return [s.lineHeight, s.letterSpacing, s.whiteSpace, s.textAlign];
                 };
                 return [sample("parent"), sample("child"), sample("zero")];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -11074,7 +11371,7 @@ mod tests {
 
         assert_eq!(
             rt.evaluate(
-                r#"
+                r#"(() => {
                 const nav = document.getElementById("nav");
                 const child = document.getElementById("child");
                 const navStyle = getComputedStyle(nav);
@@ -11096,7 +11393,7 @@ mod tests {
                     childStyle.getPropertyValue("--local-scale"),
                     enumeratesBase
                 ];
-                "#,
+                })()"#,
             )
             .unwrap(),
             serde_json::json!([
@@ -11106,7 +11403,7 @@ mod tests {
 
         assert_eq!(
             rt.evaluate(
-                r#"
+                r#"(() => {
                 const nav = document.getElementById("nav");
                 const computed = getComputedStyle(nav);
                 nav.style.setProperty("--inherited-space", "23px");
@@ -11116,7 +11413,7 @@ mod tests {
                     computed.getPropertyValue("--inherited-space"),
                     computed.getPropertyValue("--derived-space")
                 ];
-                "#,
+                })()"#,
             )
             .unwrap(),
             serde_json::json!(["19px", "23px", "17px"])
@@ -12037,18 +12334,39 @@ mod tests {
             "rendering-opportunity-order",
             r#"
                 globalThis.__renderPhaseOrder = [];
-                const target = document.getElementById("target");
-                new ResizeObserver(() => __renderPhaseOrder.push("resize")).observe(target);
-                new IntersectionObserver(() => __renderPhaseOrder.push("intersection")).observe(target);
-                requestAnimationFrame(() => {
-                    __renderPhaseOrder.push("raf");
-                    target.style.width = "40px";
+                globalThis.__renderPhaseDone = new Promise((resolve, reject) => {
+                    const watchdog = setTimeout(
+                        () => reject(new Error("rendering phases did not complete")),
+                        2000,
+                    );
+                    const finish = () => {
+                        if (__renderPhaseOrder.length === 3) {
+                            clearTimeout(watchdog);
+                            resolve();
+                        }
+                    };
+                    const target = document.getElementById("target");
+                    new ResizeObserver(() => {
+                        __renderPhaseOrder.push("resize");
+                        finish();
+                    }).observe(target);
+                    new IntersectionObserver(() => {
+                        __renderPhaseOrder.push("intersection");
+                        finish();
+                    }).observe(target);
+                    requestAnimationFrame(() => {
+                        __renderPhaseOrder.push("raf");
+                        target.style.width = "40px";
+                        finish();
+                    });
                 });
             "#,
         )
         .unwrap();
 
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.evaluate_for_cdp("globalThis.__renderPhaseDone", true, true)
+            .await
+            .unwrap();
         assert_eq!(
             rt.evaluate("__renderPhaseOrder.slice(0, 3)").unwrap(),
             serde_json::json!(["raf", "resize", "intersection"]),
@@ -12134,38 +12452,27 @@ mod tests {
         rt.execute_script(
             "animation-frame-yield",
             r#"
-                globalThis.__rafCount = 0;
-                globalThis.__rafStopped = false;
-                globalThis.__timerAfterAnimation = false;
+                globalThis.__rafOrder = [];
                 let frameId = 0;
                 function frame() {
-                    __rafCount++;
+                    __rafOrder.push("raf");
                     frameId = requestAnimationFrame(frame);
+                    setTimeout(() => {
+                        __rafOrder.push("timer");
+                        cancelAnimationFrame(frameId);
+                        __rafOrder.push("cancelled");
+                    }, 1);
                 }
                 frameId = requestAnimationFrame(frame);
-                setTimeout(() => {
-                    cancelAnimationFrame(frameId);
-                    __rafStopped = true;
-                }, 55);
-                setTimeout(() => {
-                    __timerAfterAnimation = true;
-                }, 65);
             "#,
         )
         .unwrap();
 
-        rt.run_event_loop_bounded(200).await.unwrap();
-        let result = rt
-            .evaluate("[__rafCount, __rafStopped, __timerAfterAnimation]")
-            .unwrap();
-        let values = result.as_array().unwrap();
-        let frame_count = values[0].as_u64().unwrap();
-        assert!(
-            (2..=5).contains(&frame_count),
-            "expected a few paced animation frames before cancellation, got {frame_count}"
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__rafOrder").unwrap(),
+            serde_json::json!(["raf", "timer", "cancelled"]),
         );
-        assert_eq!(values[1], serde_json::json!(true));
-        assert_eq!(values[2], serde_json::json!(true));
     }
 
     #[test]
@@ -12253,7 +12560,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="test" class="card" data-state="ready"></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const element = document.getElementById("test");
                 const attributes = element.attributes;
                 const sameObject = attributes === element.attributes;
@@ -12272,7 +12579,7 @@ mod tests {
                     length: attributes.length,
                     hasAttributes: element.hasAttributes(),
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12402,7 +12709,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const element = document.getElementById("scroller");
                 element.scrollTo({left: 12, top: 20, behavior: "smooth"});
                 element.scrollBy(3, -5);
@@ -12416,7 +12723,7 @@ mod tests {
                         typeof element.scrollBy,
                     ],
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12477,7 +12784,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 function walk(verdict) {
                     const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
@@ -12491,7 +12798,7 @@ mod tests {
                     return seen;
                 }
                 return [walk(NodeFilter.FILTER_REJECT), walk(NodeFilter.FILTER_SKIP)];
-                "#,
+                })()"#,
             )
             .unwrap();
         // REJECT drops <p> with its <section> parent; SKIP drops only <section>.
@@ -12506,7 +12813,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
                     acceptNode(node) {
@@ -12521,7 +12828,7 @@ mod tests {
                 const backward = [];
                 while ((node = w.previousNode())) backward.push(node.tagName);
                 return [forward, backward];
-                "#,
+                })()"#,
             )
             .unwrap();
         // From <c>, the previous sibling's deepest last child <b> is skipped, so
@@ -12539,7 +12846,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
                 const forward = [];
@@ -12553,7 +12860,7 @@ mod tests {
                 // A failed traversal leaves currentNode untouched (DOM 6.1), so
                 // it stays on the last node previousNode did return.
                 return [forward, backward, w.currentNode.tagName];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12575,7 +12882,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
                     acceptNode(node) {
@@ -12589,7 +12896,7 @@ mod tests {
                 let node;
                 while ((node = w.previousNode())) backward.push(node.tagName);
                 return backward;
-                "#,
+                })()"#,
             )
             .unwrap();
         // <p> lives inside the rejected <section>, so the backward walk from <c>
@@ -12607,12 +12914,12 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
                 const escaped = w.parentNode();
                 return [escaped, w.currentNode.id];
-                "#,
+                })()"#,
             )
             .unwrap();
         // No parent within the subtree, and currentNode stays put at root.
@@ -12627,13 +12934,13 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
                 w.currentNode = root.querySelector('a');
                 const p = w.parentNode();
                 return [p ? p.id : null, w.currentNode === root];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["root", true]));
@@ -12647,7 +12954,7 @@ mod tests {
             setup_runtime(r#"<div id="root"><main id="m"><section><a></a></section></main></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
                     acceptNode(n) {
@@ -12659,7 +12966,7 @@ mod tests {
                 w.currentNode = root.querySelector('a');
                 const p = w.parentNode();
                 return p ? p.id : null;
-                "#,
+                })()"#,
             )
             .unwrap();
         // <a>'s parent <section> is skipped, so <main> is the first accepted
@@ -12674,7 +12981,7 @@ mod tests {
         rt.run_page_init();
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT, {
                     acceptNode(node) {
@@ -12687,7 +12994,7 @@ mod tests {
                 let node;
                 while ((node = it.nextNode())) seen.push(node.tagName);
                 return seen;
-                "#,
+                })()"#,
             )
             .unwrap();
         // The rejected <section> is skipped but not pruned, so <p> still shows.
@@ -12703,14 +13010,14 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
                 const seen = [];
                 let node;
                 while ((node = it.nextNode())) seen.push(node.tagName);
                 return seen;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["DIV", "A"]));
@@ -12723,7 +13030,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><a></a></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
                 const before = [it.referenceNode === root, it.pointerBeforeReferenceNode];
@@ -12742,7 +13049,7 @@ mod tests {
                     // The pointer advanced past the root it just returned.
                     [it.referenceNode.tagName, it.pointerBeforeReferenceNode],
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12769,7 +13076,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><a><b></b></a><c></c></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const it = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
                 const forward = [];
@@ -12778,7 +13085,7 @@ mod tests {
                 const backward = [];
                 while ((node = it.previousNode())) backward.push(node.tagName);
                 return [forward, backward];
-                "#,
+                })()"#,
             )
             .unwrap();
         // Forward ends on <c>; going back re-yields <c> (the pointer sits after
@@ -12799,7 +13106,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const t = document.getElementById('t');
                 return [
                     t.content.childNodes.length,
@@ -12813,7 +13120,7 @@ mod tests {
                     // The children stay off the element itself, per the HTML spec.
                     t.childNodes.length,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12871,7 +13178,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<body><div id="host"></div></body>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const host = document.getElementById('host');
                 host.innerHTML = '<template id="t2"><li class="item">x</li></template>';
                 const t = document.getElementById('t2');
@@ -12882,7 +13189,7 @@ mod tests {
                     t.content.querySelector('.item').textContent,
                     host.querySelectorAll('li.item').length,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         // cloneNode(true) of the content is the canonical stamping idiom.
@@ -12897,7 +13204,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<body></body>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const t = document.createElement('template');
                 t.innerHTML = '<span class="s">hi</span>';
                 return [
@@ -12906,7 +13213,7 @@ mod tests {
                     t.innerHTML,
                     t.childNodes.length,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12925,7 +13232,7 @@ mod tests {
             setup_runtime(r#"<body><template id="t"><li class="item">x</li></template></body>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const t = document.getElementById('t');
                 const clone = t.cloneNode(true);
                 return [
@@ -12936,7 +13243,7 @@ mod tests {
                     // The clone's contents are its own, not shared with the original.
                     (clone.content.firstElementChild === t.content.firstElementChild),
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         let expected = r#"<template id="t"><li class="item">x</li></template>"#;
@@ -12954,7 +13261,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const scrolled = window.scrollTo(0, 500);
                 const afterTo = [window.scrollX, window.scrollY];
                 window.scrollBy(0, 200);
@@ -12966,7 +13273,7 @@ mod tests {
                 // Negative offsets clamp to 0, as they do for elements.
                 window.scrollTo(0, -100);
                 return [afterTo, afterBy, afterOptions, afterScroll, window.scrollY];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -12983,7 +13290,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<html><body><div id="d"></div></body></html>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const isDocEl = document.scrollingElement === document.documentElement;
                 window.scrollTo(0, 300);
                 // Written through the window, read through the element...
@@ -12991,7 +13298,7 @@ mod tests {
                 // ...and the reverse.
                 document.scrollingElement.scrollTop = 90;
                 return [isDocEl, viaElement, window.scrollY, window.pageYOffset];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, 300, 90, 90]));
@@ -13041,7 +13348,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const target = document.getElementById("target");
                 const fixed = document.getElementById("fixed");
                 const fixedChild = document.getElementById("fixed-child");
@@ -13075,7 +13382,7 @@ mod tests {
                     Math.abs(after.fixedChild.left - before.fixedChild.left) < 0.01,
                     Math.abs(after.fixedChild.top - before.fixedChild.top) < 0.01,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         let values = result.as_array().expect("array");
@@ -13123,7 +13430,7 @@ mod tests {
             .expect("top screenshot");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const outer = document.getElementById('outer');
                 const inner = document.getElementById('inner');
                 const target = document.getElementById('target');
@@ -13152,7 +13459,7 @@ mod tests {
                   targetDelta: [after.target.left - before.target.left, after.target.top - before.target.top],
                   repeated: [first[0] === repeated[0], first[1] === repeated[1]],
                 };
-                "#,
+                })()"#,
             )
             .expect("nested scroll state");
         assert_eq!(
@@ -13183,19 +13490,19 @@ mod tests {
 
         let retained = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const outer = document.getElementById('outer');
                 const inner = document.getElementById('inner');
                 outer.setAttribute('data-relayout', '1');
                 return [outer.scrollLeft, outer.scrollTop, inner.scrollLeft, inner.scrollTop];
-                "#,
+                })()"#,
             )
             .expect("retained offsets");
         assert_eq!(retained, serde_json::json!([108, 108, 110, 100]));
 
         let reclamped = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const outer = document.getElementById('outer');
                 const inner = document.getElementById('inner');
                 inner.setAttribute('style', 'width:150px;height:120px;overflow:hidden;position:relative;background:blue');
@@ -13204,7 +13511,7 @@ mod tests {
                   'position:absolute;left:100px;top:80px;width:30px;height:20px;background:lime'
                 );
                 return [outer.scrollLeft, outer.scrollTop, inner.scrollLeft, inner.scrollTop];
-                "#,
+                })()"#,
             )
             .expect("reclamped offsets");
         assert_eq!(reclamped, serde_json::json!([38, 28, 0, 0]));
@@ -13250,7 +13557,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const visible = document.getElementById('visible');
                 const clip = document.getElementById('clip');
                 const hidden = document.getElementById('hidden');
@@ -13268,7 +13575,7 @@ mod tests {
                   fractional: [document.getElementById('f1').scrollWidth, document.getElementById('f2').scrollWidth],
                   inline: [inline.scrollWidth, inline.scrollHeight, inline.clientWidth, inline.clientHeight],
                 };
-                "#,
+                })()"#,
             )
             .expect("overflow oracle metrics");
         assert_eq!(result["visible"], serde_json::json!([210, 160, 0, 0]));
@@ -13310,14 +13617,14 @@ mod tests {
             .expect("initial fractional screenshot");
         let low = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const low = document.getElementById('low');
                 const child = document.getElementById('lowChild');
                 const before = child.getBoundingClientRect();
                 low.scrollLeft = 999;
                 const after = child.getBoundingClientRect();
                 return [low.scrollWidth, low.clientWidth, low.scrollLeft, after.left - before.left];
-                "#,
+                })()"#,
             )
             .expect("low fractional range");
         assert_eq!(low, serde_json::json!([100, 100, 0, 0]));
@@ -13331,14 +13638,14 @@ mod tests {
 
         let high = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const high = document.getElementById('high');
                 const child = document.getElementById('highChild');
                 const before = child.getBoundingClientRect();
                 high.scrollLeft = .5;
                 const after = child.getBoundingClientRect();
                 return [high.scrollWidth, high.clientWidth, high.scrollLeft, after.left - before.left];
-                "#,
+                })()"#,
             )
             .expect("high fractional range");
         assert_eq!(high, serde_json::json!([101, 100, 1, -1]));
@@ -13358,7 +13665,7 @@ mod tests {
         root_rt.run_page_init();
         let root = root_rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const wide = document.getElementById('wide');
                 const before = wide.getBoundingClientRect();
                 window.scrollTo(.5, 0);
@@ -13367,7 +13674,7 @@ mod tests {
                 wide.style.width = '100.4px';
                 window.scrollTo(999, 0);
                 return { high, low: [document.documentElement.scrollWidth, window.scrollX] };
-                "#,
+                })()"#,
             )
             .expect("root fractional range");
         assert_eq!(root["high"], serde_json::json!([101, 1, -1]));
@@ -13392,7 +13699,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const scroller = document.getElementById('scroller');
                 const first = document.getElementById('first');
                 const second = document.getElementById('second');
@@ -13429,7 +13736,7 @@ mod tests {
                   detached: [detached.scrollWidth, detached.scrollHeight, detached.scrollLeft, detached.scrollTop],
                   atomic: [scroller.scrollLeft, scroller.scrollTop, recomputes],
                 };
-                "#,
+                })()"#,
             )
             .expect("scroll lifecycle state");
         assert_eq!(result["initial"], serde_json::json!([70, 60]));
@@ -13471,7 +13778,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const modal = document.getElementById('modal');
                 const panel = document.getElementById('panel');
                 const fixedTarget = document.getElementById('fixedTarget');
@@ -13498,7 +13805,7 @@ mod tests {
                   transformedDelta: [after.transformedTarget.left - before.transformedTarget.left, after.transformedTarget.top - before.transformedTarget.top],
                   offsets: [panel.scrollLeft, panel.scrollTop, transformedScroller.scrollLeft, transformedScroller.scrollTop, affineAncestorScroller.scrollLeft, affineAncestorScroller.scrollTop],
                 };
-                "#,
+                })()"#,
             )
             .expect("fixed and transformed scroll state");
         assert_eq!(result["modalDelta"], serde_json::json!([0, 0]));
@@ -13534,7 +13841,7 @@ mod tests {
 
         let initial = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const tracker = document.getElementById("tracker");
                 const box = document.getElementById("box");
                 return {
@@ -13553,7 +13860,7 @@ mod tests {
                         box.getBoundingClientRect().height
                     ]
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(initial["root"], serde_json::json!([320, 200]));
@@ -13568,7 +13875,7 @@ mod tests {
         // render. Borders do not change the padding box; padding does.
         let mutated = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const tracker = document.getElementById("tracker");
                 const box = document.getElementById("box");
                 tracker.style.height = "50vh";
@@ -13579,7 +13886,7 @@ mod tests {
                     box.clientWidth,
                     box.getBoundingClientRect().width
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(mutated[0], serde_json::json!(100));
@@ -13591,13 +13898,13 @@ mod tests {
         rt.set_viewport(640.0, 360.0);
         assert_eq!(
             rt.evaluate(
-                r#"const tracker = document.getElementById("tracker");
+                r#"(() => {const tracker = document.getElementById("tracker");
                 return [
                     document.documentElement.clientWidth,
                     document.documentElement.clientHeight,
                     tracker.clientWidth,
                     tracker.clientHeight
-                ]"#,
+                ]})()"#,
             )
             .unwrap(),
             serde_json::json!([640, 360, 640, 180])
@@ -13624,7 +13931,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const hidden = document.getElementById("hidden");
                 const detached = document.createElement("div");
                 detached.style.cssText = "display:block;width:90px;height:50px";
@@ -13646,7 +13953,7 @@ mod tests {
                     detached: sample(detached),
                     zero: sample(zero),
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
 
@@ -13679,14 +13986,14 @@ mod tests {
         let mut rt = setup_runtime(r#"<html><body><div id="box"></div></body></html>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const box = document.getElementById("box");
                 const detached = document.createElement("div");
                 return [box, detached].map(element => {
                     const rect = element.getBoundingClientRect();
                     return [rect.width, rect.height, element.getClientRects().length];
                 });
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([[100, 20, 1], [100, 20, 1]]));
@@ -13721,7 +14028,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const top = document.getElementById("top");
                 const child = document.getElementById("top-child");
                 const bottom = document.getElementById("bottom");
@@ -13737,7 +14044,7 @@ mod tests {
                     ];
                 };
                 return [sample(0), sample(100), sample(400), sample(600), sample(9999)];
-                "#,
+                })()"#,
             )
             .unwrap();
         let rows = result.as_array().expect("rows");
@@ -13792,7 +14099,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const sticky = document.getElementById("sticky");
                 const child = document.getElementById("child");
                 const fixed = document.getElementById("fixed");
@@ -13806,7 +14113,7 @@ mod tests {
                     ];
                 };
                 return [sample(0), sample(100), sample(400), sample(800)];
-                "#,
+                })()"#,
             )
             .unwrap();
         let rows = result.as_array().unwrap();
@@ -13862,11 +14169,11 @@ mod tests {
 
         let before = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const hero = document.getElementById("hero");
                 const rect = hero.getBoundingClientRect();
                 return [rect.width, rect.height, document.documentElement.scrollHeight];
-                "#,
+                })()"#,
             )
             .expect("initial geometry");
         let before = before.as_array().expect("initial tuple");
@@ -13916,12 +14223,12 @@ mod tests {
 
         let after = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const hero = document.getElementById("hero");
                 document.getElementById("frame").setAttribute("style", "width:80px");
                 const rect = hero.getBoundingClientRect();
                 return [rect.width, rect.height, document.documentElement.scrollHeight];
-                "#,
+                })()"#,
             )
             .expect("mutated geometry");
         let after = after.as_array().expect("mutated tuple");
@@ -14368,7 +14675,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const box = document.getElementById("box");
                 const before = [
                     document.documentElement.scrollHeight,
@@ -14381,7 +14688,7 @@ mod tests {
                     box.getBoundingClientRect().width,
                 ];
                 return [before, after];
-                "#,
+                })()"#,
             )
             .unwrap();
         let values = result.as_array().expect("result");
@@ -14757,19 +15064,22 @@ mod tests {
             </body></html>"#,
         );
         rt.set_viewport(120.0, 40.0);
-        rt.state.borrow_mut().animation_timeline_origin = std::time::Instant::now();
-        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(0.0)));
+        rt.state.borrow_mut().animation_timeline_origin =
+            std::time::Instant::now() - std::time::Duration::from_millis(200);
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(200.0)));
         rt.screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
             .expect("static frame before WAAPI registration");
         rt.execute_script(
             "waapi-retained-frame",
-            r#"document.getElementById('box').animate(
+            r#"globalThis.__animation = document.getElementById('box').animate(
                 [{opacity:0,transform:'translateX(0px)'},
                  {opacity:1,transform:'translateX(80px)'}],
                 {duration:1000,fill:'both',easing:'linear'}
             )"#,
         )
         .unwrap();
+        let animation_start_time = rt.live_animation_sample().time.milliseconds;
+        assert!(animation_start_time > 0.0, "WAAPI animation must start at nonzero document time");
         {
             let state = rt.state.borrow();
             let box_node = state
@@ -14791,7 +15101,9 @@ mod tests {
             .screenshot_prepared((120.0, 40.0), Some("http://example.com/test"))
             .expect("initial WAAPI frame");
 
-        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(500.0)));
+        assert!(rt.set_animation_sample(obscura_render::AnimationSample::document(
+            animation_start_time + 500.0,
+        )));
         assert!(
             rt.state.borrow().prepared_render.is_some(),
             "a forward WAAPI sample should preserve the prepared style graph until flush"
@@ -15573,7 +15885,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const main = document.getElementById("main");
                 const before = main.getBoundingClientRect();
                 scrollTo(0, 99999);
@@ -15585,7 +15897,7 @@ mod tests {
                     scrollY,
                     after.top,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([5048, 5048, 5048, 4048, -4048]));
@@ -15916,7 +16228,7 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
-    async fn scrolling_does_not_remeasure_resize_observer_targets() {
+    async fn scrolling_does_not_deliver_resize_observer_records() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;height:1000px">
                 <div id="probe" style="width:40px;height:20px"></div>
@@ -15926,46 +16238,31 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
-        rt.execute_script(
-            "observe-before-scroll",
-            r#"
+        let initial = rt.evaluate_for_cdp(
+            r#"new Promise(resolve => {
                 globalThis.__scrollResizeRecords = 0;
                 globalThis.__scrollResizeObserver = new ResizeObserver(entries => {
                     __scrollResizeRecords += entries.length;
+                    resolve(__scrollResizeRecords);
                 });
                 __scrollResizeObserver.observe(document.getElementById("probe"));
-            "#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
-        assert_eq!(
-            rt.evaluate("__scrollResizeRecords").unwrap().as_f64(),
-            Some(1.0)
-        );
+            })"#,
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(initial.value.unwrap().as_f64(), Some(1.0));
 
-        rt.execute_script(
-            "count-scroll-geometry-reads",
-            r#"
-                globalThis.__scrollGeometryReads = 0;
-                globalThis.__nativeLayoutGeometry = __obscura_test_ops.op_layout_geometry;
-                __obscura_test_ops.op_layout_geometry = (...args) => {
-                    __scrollGeometryReads++;
-                    return __nativeLayoutGeometry(...args);
-                };
+        let scrolled = rt.evaluate_for_cdp(
+            r#"new Promise(resolve => {
                 window.scrollTo(0, 50);
-            "#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
-        let result = rt
-            .evaluate("[scrollY, __scrollGeometryReads, __scrollResizeRecords]")
-            .unwrap();
-        rt.execute_script(
-            "restore-layout-geometry-op",
-            "__obscura_test_ops.op_layout_geometry = __nativeLayoutGeometry;",
-        )
-        .unwrap();
-        assert_eq!(result, serde_json::json!([50, 0, 1]));
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    resolve([scrollY, __scrollResizeRecords]);
+                }));
+            })"#,
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(scrolled.value.unwrap(), serde_json::json!([50, 1]));
     }
 
     #[cfg(feature = "render")]
@@ -16095,9 +16392,10 @@ mod tests {
         let result = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
+                new Promise((resolve, reject) => {
                     const records = [];
                     const target = document.getElementById("target");
+                    const watchdog = setTimeout(() => reject(new Error('missing viewport intersection transition')), 2000);
                     const observer = new IntersectionObserver(entries => {
                         for (const entry of entries) {
                             records.push([
@@ -16107,11 +16405,15 @@ mod tests {
                                 Math.round(entry.intersectionRect.height),
                             ]);
                         }
+                        if (records.length === 1) window.scrollTo(0, 100);
+                        else if (records.length === 2) window.scrollTo(0, 260);
+                        else if (records.length === 3) {
+                            clearTimeout(watchdog);
+                            observer.disconnect();
+                            resolve(records);
+                        }
                     }, { threshold: [0, 0.5, 1] });
                     observer.observe(target);
-                    setTimeout(() => window.scrollTo(0, 100), 25);
-                    setTimeout(() => window.scrollTo(0, 260), 50);
-                    setTimeout(() => resolve(records), 80);
                 })
                 "#,
                 true,
@@ -16174,29 +16476,45 @@ mod tests {
                 const detached = document.createElement("div");
                 detached.id = "detached";
                 globalThis.__intersectionBatchRecords = [];
-                const first = new IntersectionObserver(entries => {
-                    __intersectionBatchRecords.push(entries.map(entry => [
-                        entry.target.id,
-                        entry.isIntersecting,
-                    ]));
-                }, { root });
-                const second = new IntersectionObserver(entries => {
-                    __intersectionBatchRecords.push(entries.map(entry => [
-                        entry.target.id,
-                        entry.isIntersecting,
-                    ]));
-                }, { root });
-                first.observe(a);
-                first.observe(b);
-                first.observe(hidden);
-                first.observe(detached);
-                // The second observer shares its target, root, and clip ancestor
-                // with the first and must not duplicate any native measurements.
-                second.observe(b);
+                globalThis.__intersectionBatchDone = new Promise((resolve, reject) => {
+                    const watchdog = setTimeout(
+                        () => reject(new Error("intersection batch did not complete")),
+                        2000,
+                    );
+                    const finish = () => {
+                        if (__intersectionBatchRecords.length === 2) {
+                            clearTimeout(watchdog);
+                            resolve();
+                        }
+                    };
+                    const first = new IntersectionObserver(entries => {
+                        __intersectionBatchRecords.push(entries.map(entry => [
+                            entry.target.id,
+                            entry.isIntersecting,
+                        ]));
+                        finish();
+                    }, { root });
+                    const second = new IntersectionObserver(entries => {
+                        __intersectionBatchRecords.push(entries.map(entry => [
+                            entry.target.id,
+                            entry.isIntersecting,
+                        ]));
+                        finish();
+                    }, { root });
+                    first.observe(a);
+                    first.observe(b);
+                    first.observe(hidden);
+                    first.observe(detached);
+                    // The second observer shares its target, root, and clip ancestor
+                    // with the first and must not duplicate any native measurements.
+                    second.observe(b);
+                });
             "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.evaluate_for_cdp("globalThis.__intersectionBatchDone", true, true)
+            .await
+            .unwrap();
 
         assert_eq!(
             rt.evaluate(
@@ -16240,22 +16558,38 @@ mod tests {
             "intersection-document-delivery-batch",
             r#"
                 globalThis.__intersectionDeliveryOrder = [];
-                const first = new IntersectionObserver(() => {
-                    __intersectionDeliveryOrder.push("first-observer");
-                    scheduler.postTask(() => {
-                        __intersectionDeliveryOrder.push("callback-posted-task");
-                    }, { priority: "user-blocking" });
+                globalThis.__intersectionDeliveryDone = new Promise((resolve, reject) => {
+                    const watchdog = setTimeout(
+                        () => reject(new Error("intersection delivery did not complete")),
+                        2000,
+                    );
+                    const finish = () => {
+                        if (__intersectionDeliveryOrder.length === 3) {
+                            clearTimeout(watchdog);
+                            resolve();
+                        }
+                    };
+                    const first = new IntersectionObserver(() => {
+                        __intersectionDeliveryOrder.push("first-observer");
+                        scheduler.postTask(() => {
+                            __intersectionDeliveryOrder.push("callback-posted-task");
+                            finish();
+                        }, { priority: "user-blocking" });
+                    });
+                    const second = new IntersectionObserver(() => {
+                        __intersectionDeliveryOrder.push("second-observer");
+                        finish();
+                    });
+                    first.observe(document.getElementById("first"));
+                    second.observe(document.getElementById("second"));
                 });
-                const second = new IntersectionObserver(() => {
-                    __intersectionDeliveryOrder.push("second-observer");
-                });
-                first.observe(document.getElementById("first"));
-                second.observe(document.getElementById("second"));
             "#,
         )
         .unwrap();
 
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.evaluate_for_cdp("globalThis.__intersectionDeliveryDone", true, true)
+            .await
+            .unwrap();
         assert_eq!(
             rt.evaluate("__intersectionDeliveryOrder").unwrap(),
             serde_json::json!(["first-observer", "second-observer", "callback-posted-task",])
@@ -16321,8 +16655,9 @@ mod tests {
         let result = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
+                new Promise((resolve, reject) => {
                     const records = [];
+                    let deliveries = 0;
                     const root = document.getElementById("root");
                     const observer = new IntersectionObserver(entries => {
                         records.push(...entries.map(entry => ({
@@ -16337,10 +16672,23 @@ mod tests {
                                 entry.intersectionRect.width, entry.intersectionRect.height,
                             ],
                         })));
+                        deliveries += 1;
+                        if (deliveries === 1) {
+                            root.scrollTop = 999;
+                            return;
+                        }
+                        clearTimeout(watchdog);
+                        observer.disconnect();
+                        resolve(records);
                     }, { root, threshold: [0, 1] });
+                    // Intersection delivery is asynchronous; a fixed delay raced
+                    // the queued records. Resolve only on the scrolled delivery.
+                    const watchdog = setTimeout(
+                        () => reject(new Error(
+                            `IntersectionObserver delivered ${records.length} record(s)`)),
+                        2000,
+                    );
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { root.scrollTop = 999; }, 25);
-                    setTimeout(() => resolve(records), 60);
                 })
                 "#,
                 true,
@@ -16389,8 +16737,9 @@ mod tests {
         let result = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
+                new Promise((resolve, reject) => {
                     const records = [];
+                    let deliveries = 0;
                     const clip = document.getElementById("clip");
                     const observer = new IntersectionObserver(entries => {
                         records.push(...entries.map(entry => [
@@ -16403,13 +16752,26 @@ mod tests {
                                 entry.intersectionRect.height,
                             ],
                         ]));
+                        deliveries += 1;
+                        if (deliveries === 1) {
+                            clip.scrollTop = 999;
+                            return;
+                        }
+                        clearTimeout(watchdog);
+                        observer.disconnect();
+                        resolve(records);
                     }, {
                         root: document.getElementById("root"),
                         threshold: [0, 1],
                     });
+                    // Intersection delivery is asynchronous; a fixed delay raced
+                    // the queued records. Resolve only on the scrolled delivery.
+                    const watchdog = setTimeout(
+                        () => reject(new Error(
+                            `IntersectionObserver delivered ${records.length} record(s)`)),
+                        2000,
+                    );
                     observer.observe(document.getElementById("target"));
-                    setTimeout(() => { clip.scrollTop = 999; }, 25);
-                    setTimeout(() => resolve(records), 60);
                 })
                 "#,
                 true,
@@ -16445,11 +16807,19 @@ mod tests {
                         return nativeRect();
                     };
                 }
-                const observer = new IntersectionObserver(
-                    () => __ioOrder.push("observer")
-                );
-                observer.observe(first);
-                observer.observe(second);
+                globalThis.__ioDone = new Promise((resolve, reject) => {
+                    const watchdog = setTimeout(
+                        () => reject(new Error("initial intersection geometry did not complete")),
+                        2000,
+                    );
+                    const observer = new IntersectionObserver(() => {
+                        __ioOrder.push("observer");
+                        clearTimeout(watchdog);
+                        resolve();
+                    });
+                    observer.observe(first);
+                    observer.observe(second);
+                });
                 Promise.resolve().then(() => __ioOrder.push("microtask"));
                 __ioOrder.push("after-observe-" + __ioReads);
             "#,
@@ -16460,7 +16830,9 @@ mod tests {
             rt.evaluate("[__ioOrder, __ioReads]").unwrap(),
             serde_json::json!([["sync", "after-observe-0", "microtask"], 0])
         );
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.evaluate_for_cdp("globalThis.__ioDone", true, true)
+            .await
+            .unwrap();
         #[cfg(feature = "render")]
         let expected_geometry_reads = 0;
         #[cfg(not(feature = "render"))]
@@ -16607,14 +16979,19 @@ mod tests {
         let result = rt
             .evaluate_for_cdp(
                 r#"
-                new Promise(resolve => {
+                new Promise((resolve, reject) => {
                     const deliveries = [];
+                    const watchdog = setTimeout(
+                        () => reject(new Error("reused intersection observer did not deliver")),
+                        2000,
+                    );
                     const observer = new IntersectionObserver(entries => {
                         deliveries.push(entries.map(entry => entry.target.id));
                         if (deliveries.length === 1) {
                             observer.disconnect();
                             observer.observe(document.getElementById("second"));
                         } else {
+                            clearTimeout(watchdog);
                             observer.disconnect();
                             resolve([
                                 deliveries,
@@ -16627,7 +17004,6 @@ mod tests {
                     observer.observe(document.getElementById("stale"));
                     observer.disconnect();
                     observer.observe(document.getElementById("first"));
-                    setTimeout(() => resolve(["timed out"]), 100);
                 })
                 "#,
                 true,
@@ -16655,36 +17031,39 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(200.0, 100.0);
         rt.run_page_init();
-        rt.execute_script(
-            "intersection-mutation",
-            r#"
+        let initial = rt.evaluate_for_cdp(
+            r#"new Promise(resolve => {
                 globalThis.__ioRecords = [];
+                globalThis.__ioResolve = resolve;
                 globalThis.__io = new IntersectionObserver(entries => {
                     __ioRecords.push(...entries.map(entry => [
                         entry.isIntersecting,
                         Math.round(entry.boundingClientRect.top),
                     ]));
+                    __ioResolve(__ioRecords);
                 });
                 __io.observe(document.getElementById("target"));
-            "#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
+            })"#,
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(initial.value.unwrap(), serde_json::json!([[false, 150]]));
 
-        rt.evaluate(r#"document.getElementById("spacer").setAttribute("style", "height:120px")"#)
+        rt.evaluate_for_cdp(
+            r#"new Promise(resolve => {
+                document.getElementById("spacer").setAttribute("style", "height:120px");
+                requestAnimationFrame(() => requestAnimationFrame(resolve));
+            })"#,
+            true,
+            true,
+        ).await.unwrap();
+        assert_eq!(rt.evaluate("__ioRecords").unwrap(), serde_json::json!([[false, 150]]));
+
+        rt.evaluate("globalThis.__ioResized = new Promise(resolve => { __ioResolve = resolve; }); null")
             .unwrap();
-        rt.run_event_loop_bounded(40).await.unwrap();
-        assert_eq!(
-            rt.evaluate("__ioRecords").unwrap(),
-            serde_json::json!([[false, 150]])
-        );
-
         rt.set_viewport(200.0, 160.0);
-        rt.run_event_loop_bounded(40).await.unwrap();
-        assert_eq!(
-            rt.evaluate("__ioRecords").unwrap(),
-            serde_json::json!([[false, 150], [true, 120]])
-        );
+        let resized = rt.evaluate_for_cdp("__ioResized", true, true).await.unwrap();
+        assert_eq!(resized.value.unwrap(), serde_json::json!([[false, 150], [true, 120]]));
     }
 
     #[cfg(feature = "render")]
@@ -16743,7 +17122,7 @@ mod tests {
 
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const target = document.getElementById("target");
                 const bottom = document.getElementById("bottom");
                 const fixed = document.getElementById("fixed");
@@ -16770,7 +17149,7 @@ mod tests {
                     start, center, end, nearestOutside, nearestVisible,
                     afterFixed, clamped, max,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -16795,7 +17174,7 @@ mod tests {
         rt.set_dom(dom);
         rt.set_viewport(800.0, 600.0);
         rt.run_page_init();
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const scroller = document.getElementById('scroller');
             const target = document.getElementById('target');
             const results = [];
@@ -16809,7 +17188,7 @@ mod tests {
             target.scrollIntoView({block: 'nearest'});
             results.push([scroller.scrollTop, scrollY, target.getBoundingClientRect().top]);
             return results;
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!([
             [440, 0, 360], [520, 0, 280], [600, 200, 0],
             [440, 0, 360], [440, 0, 360],
@@ -16819,7 +17198,7 @@ mod tests {
     #[test]
     fn removing_a_focused_subtree_clears_focus_without_firing_blur() {
         let mut rt = setup_runtime("<main id=parent></main>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const parent = document.getElementById('parent');
             const rows = [];
             for (const remove of [
@@ -16844,7 +17223,7 @@ mod tests {
                 rows.push([focused, document.activeElement === document.body, blurred]);
             }
             return rows;
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!(vec![serde_json::json!([true,true,0]); 7]));
     }
 
@@ -16911,7 +17290,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="root"><section><a></a><b></b></section></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 function mover(verdict, method) {
                     const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
@@ -16928,7 +17307,7 @@ mod tests {
                     mover(NodeFilter.FILTER_REJECT, 'firstChild'),
                     mover(NodeFilter.FILTER_REJECT, 'lastChild'),
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         // SKIP descends into <section>; REJECT prunes it and finds nothing else.
@@ -16944,7 +17323,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 function mover(verdict, method, from) {
                     const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
@@ -16962,7 +17341,7 @@ mod tests {
                     // Rejected: the subtree is off-limits, so skip past to <q>.
                     mover(NodeFilter.FILTER_REJECT, 'nextSibling', 'start'),
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["A", "Q"]));
@@ -16976,7 +17355,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const root = document.getElementById('root');
                 const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
                     acceptNode(node) {
@@ -16988,7 +17367,7 @@ mod tests {
                 w.currentNode = document.getElementById('start');
                 const found = w.previousSibling();
                 return found ? found.tagName : null;
-                "#,
+                })()"#,
             )
             .unwrap();
         // Reverse order descends to <section>'s last child, not its first.
@@ -17000,7 +17379,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<main id="host"></main>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const host = document.getElementById('host');
                 const fragment = document.createDocumentFragment();
                 const first = document.createElement('article');
@@ -17020,7 +17399,7 @@ mod tests {
                     first.parentNode === host,
                     first.parentElement === host,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -17034,7 +17413,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<main id="host"><article id="last"></article></main>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const host = document.getElementById('host');
                 const last = document.getElementById('last');
                 const fragment = document.createDocumentFragment();
@@ -17053,7 +17432,7 @@ mod tests {
                     first.parentElement === host,
                     second.parentElement === host,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -17069,7 +17448,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const host = document.getElementById('host');
                 const old = document.getElementById('old');
                 const fragment = document.createDocumentFragment();
@@ -17089,7 +17468,7 @@ mod tests {
                     first.parentElement === host,
                     second.parentElement === host,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -17112,7 +17491,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const template = document.createElement('template');
                 template.innerHTML = '<tr><td>first</td><td>second</td></tr>';
                 const clone = template.content.firstChild.cloneNode(true);
@@ -17122,7 +17501,7 @@ mod tests {
                     clone.firstElementChild.children.length,
                     clone.textContent,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["TR", "TD", 0, "firstsecond"]));
@@ -17133,7 +17512,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
             .evaluate(
-                "return [document.firstElementChild === document.documentElement,\
+                "[document.firstElementChild === document.documentElement,\
                          document.lastElementChild === document.documentElement,\
                          document.children.length, document.childElementCount];",
             )
@@ -17202,7 +17581,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(
             rt.evaluate(
-                "return [typeof StyleSheet, typeof CSSGroupingRule,\
+                "[typeof StyleSheet, typeof CSSGroupingRule,\
                   new CSSStyleSheet() instanceof StyleSheet,\
                   typeof CSSGroupingRule.prototype.insertRule,\
                   typeof Object.getOwnPropertyDescriptor(StyleSheet.prototype, 'disabled')?.set]"
@@ -19415,12 +19794,12 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const a = document.createElement('div'); a.setAttribute('class', 'x'); a.innerHTML = '<span>hi</span>';
                 const b = document.createElement('div'); b.setAttribute('class', 'x'); b.innerHTML = '<span>hi</span>';
                 const c = document.createElement('div'); c.innerHTML = '<span>bye</span>';
                 return [a.isEqualNode(b), a.isEqualNode(c), a.isSameNode(b)];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, false, false]));
@@ -19436,13 +19815,13 @@ mod tests {
             setup_runtime(r#"<div id="p"><span id="b">b</span><span id="c">c</span></div>"#);
         let order = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const p = document.getElementById('p');
                 const a = document.createElement('span');
                 a.id = 'a';
                 p.insertBefore(a, document.getElementById('b'));
                 return Array.from(p.children).map(e => e.id).join(',');
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(order, serde_json::json!("a,b,c"));
@@ -19467,12 +19846,12 @@ mod tests {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const button = document.getElementById('go');
             button.addEventListener('click', () => { button.dataset.clicked = 'yes'; });
             button.click();
             return button.dataset.clicked;
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("yes"));
@@ -19486,11 +19865,11 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const ids = ['explicit', 'implicit'];
             for (const id of ids) { document.getElementById(id).click(); }
             return [document.getElementById('a').checked, document.getElementById('b').checked];
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true]));
@@ -19510,12 +19889,12 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             for (const id of ['empty', 'dangling', 'disabled', 'both']) {
                 document.getElementById(id).click();
             }
             return ['a', 'b', 'c', 'd', 'e'].map(id => document.getElementById(id).checked);
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -19535,7 +19914,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const reentrant = document.getElementById('reentrant');
             document.getElementById('nested').click();
             let bounces = 0;
@@ -19544,7 +19923,7 @@ mod tests {
             });
             document.getElementById('host').click();
             return [document.getElementById('nested').checked, reentrant.checked, bounces];
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true, 1]));
@@ -19567,12 +19946,12 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const ids = ['direct', 'in-set', 'in-link', 'in-plain'];
             for (const id of ids) { document.getElementById(id).click(); }
             return ['direct', 'set-box', 'link-box', 'plain-box']
                 .map(id => document.getElementById(id).checked);
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([false, false, false, true]));
@@ -19592,7 +19971,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const fresh = document.getElementById('fresh');
             const present = 'indeterminate' in fresh;
             const initial = fresh.indeterminate;
@@ -19611,7 +19990,7 @@ mod tests {
             return [present, initial, roundTrip,
                     clicked.checked, clicked.indeterminate,
                     cancelled.checked, cancelled.indeterminate];
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -19633,7 +20012,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const seen = [];
             for (const id of ['plain', 'link']) {
                 const el = document.getElementById(id);
@@ -19642,7 +20021,7 @@ mod tests {
             }
             document.getElementById('control').click();
             return [seen.join(','), document.getElementById('control').checked];
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["plain,link", false]));
@@ -19664,11 +20043,11 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const ids = ['o', 'bare', 'linked', 'btn'];
             for (const id of ids) { document.getElementById(id).click(); }
             return ['c1', 'c2', 'c3', 'c4'].map(id => document.getElementById(id).checked);
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([true, true, false, false]));
@@ -19686,7 +20065,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const seen = [];
             document.getElementById('b').addEventListener('change', () => seen.push('change'));
             document.getElementById('pick').click();
@@ -19697,7 +20076,7 @@ mod tests {
                 document.getElementById('c').checked, document.getElementById('d').checked,
                 seen.join(','),
             ];
-        "#,
+        })()"#,
             )
             .unwrap();
         // Activating b unchecks its peer a; the cancelled activation of d
@@ -19728,11 +20107,11 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const ids = ['a', 'b', 'c', 'd', 'e', 'f'];
             for (const id of ids) { document.getElementById(id).click(); }
             return ids.map(id => document.getElementById(id).checked);
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -19753,7 +20132,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const events = [];
             const live = document.getElementById('live-box');
             for (const type of ['click', 'input', 'change']) {
@@ -19764,7 +20143,7 @@ mod tests {
             cancelled.addEventListener('click', event => event.preventDefault());
             document.getElementById('cancel').click();
             return [events.join(','), live.checked, cancelled.checked];
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -19778,13 +20157,13 @@ mod tests {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const button = document.getElementById('go');
             let count = 0;
             button.addEventListener('click', () => { count += 1; });
             button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             return count;
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result.as_f64().unwrap() as i64, 1);
@@ -19794,16 +20173,17 @@ mod tests {
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt
-            .evaluate("const next = '/next'; location.href = next; return location.href;")
+            .evaluate("(() => {const next = '/next'; location.href = next; return location.href;})()")
             .unwrap();
         assert_eq!(href, serde_json::json!("http://example.com/next"));
         assert_eq!(
             rt.take_pending_navigation(),
-            Some((
-                "http://example.com/next".to_string(),
-                "GET".to_string(),
-                "".to_string()
-            ))
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/next".to_string(),
+                method: "GET".to_string(),
+                body: String::new(),
+                origin_frame_id: 0,
+            })
         );
     }
 
@@ -19832,11 +20212,12 @@ mod tests {
         );
         assert_eq!(
             rt.take_pending_navigation(),
-            Some((
-                "http://example.com/from-replace".to_string(),
-                "GET".to_string(),
-                "".to_string()
-            ))
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/from-replace".to_string(),
+                method: "GET".to_string(),
+                body: String::new(),
+                origin_frame_id: 0,
+            })
         );
     }
 
@@ -19846,7 +20227,7 @@ mod tests {
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
         let href = rt
             .evaluate(
-                r#"
+                r#"(() => {
             const form = document.querySelector('form');
             form.addEventListener('submit', (event) => {
                 event.preventDefault();
@@ -19854,17 +20235,18 @@ mod tests {
             });
             document.getElementById('submit').click();
             return location.href;
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(href, serde_json::json!("http://example.com/submitted"));
         assert_eq!(
             rt.take_pending_navigation(),
-            Some((
-                "http://example.com/submitted".to_string(),
-                "GET".to_string(),
-                "".to_string()
-            ))
+            Some(crate::ops::PendingNavigation {
+                url: "http://example.com/submitted".to_string(),
+                method: "GET".to_string(),
+                body: String::new(),
+                origin_frame_id: 0,
+            })
         );
     }
 
@@ -19918,7 +20300,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn response_constructor_validates_public_init_without_forging_network_metadata() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const error = callback => { try { callback(); return null; } catch (e) { return e.name; } };
             const response = new Response(null, {type:'opaque',url:'https://example.com/',redirected:true});
             let statusReads = 0;
@@ -19934,7 +20316,7 @@ mod tests {
                 nullInit:String(new Response(null,null).status),
                 getter:[String(singleRead.status),String(statusReads)]
             };
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!({
             "ordinary":["default","",false,"200"],
             "invalidStatus":["RangeError","RangeError","RangeError","RangeError","RangeError"],
@@ -19951,7 +20333,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn response_factories_validate_redirects_and_json_and_preserve_error_clones() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             const error = callback => { try { callback(); return null; } catch (e) { return e.name; } };
             const networkError = Response.error();
             const copy = networkError.clone();
@@ -19968,7 +20350,7 @@ mod tests {
                 jsonSymbol:error(()=>Response.json(Symbol('value'))),
                 jsonNullBodyStatus:[204,205,304].map(status=>error(()=>Response.json('body',{status})))
             };
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!({
             "error":["error","0",null], "clone":["error","0",null],
             "redirect":["default","302","https://example.com/b"],
@@ -20923,7 +21305,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const source = document.getElementById('src');
                 const clone = source.cloneNode(false);
                 clone.className = 'clone';
@@ -20946,7 +21328,7 @@ mod tests {
                     source.getAttribute('data-token'),
                     source.childNodes.length,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -21062,7 +21444,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const source = document.documentElement;
                 const clone = source.cloneNode(true);
                 const cloneItem = clone.querySelector('.item');
@@ -21089,7 +21471,7 @@ mod tests {
                     clone.querySelector('#app').getAttribute('data-state'),
                     source.querySelector('#app').getAttribute('data-state'),
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -21119,7 +21501,7 @@ mod tests {
     #[test]
     fn test_evaluate_multistatement() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate("var x = 5; var y = 10; return x + y;").unwrap();
+        let result = rt.evaluate("var x = 5; var y = 10; x + y;").unwrap();
         assert_eq!(result.as_f64().unwrap() as i64, 15);
     }
 
@@ -21556,7 +21938,7 @@ mod tests {
         // reports one broken path while hiding the others.
         let seen = rt
             .evaluate(
-                r#"return [
+                r#"[
                     document.baseURI,
                     document.getElementById('link').href,
                     document.getElementById('form').action,
@@ -21600,7 +21982,7 @@ mod tests {
         // of the document URL slips through on a page without a base only when nobody is looking.
         let seen = rt
             .evaluate(
-                r#"return [
+                r#"[
                     document.baseURI,
                     document.getElementById('link').href,
                     document.getElementById('form').action,
@@ -21666,7 +22048,7 @@ mod tests {
             </body></html>"#,
         );
         let seen = rt
-            .evaluate("return [document.getElementById('link').href, location.origin]")
+            .evaluate("[document.getElementById('link').href, location.origin]")
             .unwrap();
         assert_eq!(
             seen.as_array().unwrap(),
@@ -21744,7 +22126,7 @@ mod tests {
 
         let elapsed = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const link = document.getElementById('link');
                 const box = document.getElementById('n0');
                 const started = Date.now();
@@ -21753,7 +22135,7 @@ mod tests {
                     getComputedStyle(box, '::before').content;
                 }
                 return Date.now() - started;
-                "#,
+                })()"#,
             )
             .unwrap();
         let ms = elapsed.as_f64().expect("elapsed ms");
@@ -23815,31 +24197,55 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_origin_follows_the_final_redirect_url() {
-        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        // Two loopback origins: the same-origin start answers 302 to a document
+        // served on a different port. The full request is drained before the
+        // response is written so a Windows TCP reset cannot drop it, and the
+        // page client allows private addresses with no proxy.
+        fn serve_once(listener: std::net::TcpListener, response: String) {
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert_ne!(read, 0, "iframe document request must reach the fixture");
+                    request.extend_from_slice(&chunk[..read]);
+                    assert!(request.len() < 16 * 1024, "bounded fixture request");
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+        }
+
+        let final_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let final_origin = format!("http://{}", final_listener.local_addr().unwrap());
+        let final_url = format!("{final_origin}/final");
+        let final_body = "<!doctype html><title>secret</title>";
+        serve_once(final_listener, format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{final_body}",
+            final_body.len(),
+        ));
+
+        let start_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start_origin = format!("http://{}", start_listener.local_addr().unwrap());
+        serve_once(start_listener, format!(
+            "HTTP/1.1 302 Found\r\nLocation: {final_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+
+        let mut rt = redirect_runtime_for_origin(&start_origin);
+
         let evaluation = rt
             .start_cdp_call(
                 r#"async () => {
-                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
-                    try {
-                        __obscura_test_ops.op_fetch_url = async () => JSON.stringify({
-                            status: 200,
-                            headers: { "content-type": "text/html" },
-                            body: "<!doctype html><title>secret</title>",
-                            url: "https://cross-origin.example/secret",
-                            redirected: true,
-                        });
-                        const frame = document.createElement("iframe");
-                        const loaded = new Promise(resolve => frame.onload = resolve);
-                        frame.src = "/same-origin-start";
-                        document.body.appendChild(frame);
-                        await loaded;
-                        return {
-                            readable: frame.contentDocument !== null,
-                            loadedUrl: frame._iframeLoadedUrl,
-                        };
-                    } finally {
-                        __obscura_test_ops.op_fetch_url = originalFetchOp;
-                    }
+                    const frame = document.createElement("iframe");
+                    const loaded = new Promise(resolve => frame.onload = resolve);
+                    frame.src = "/same-origin-start";
+                    document.body.appendChild(frame);
+                    await loaded;
+                    return {
+                        readable: frame.contentDocument !== null,
+                        loadedUrl: frame._iframeLoadedUrl,
+                    };
                 }"#,
                 None,
                 &[],
@@ -23848,9 +24254,13 @@ mod tests {
             )
             .unwrap();
 
-        // The embedder owns frame creation and fires the element's load after it.
-        rt.run_event_loop_bounded(100).await.unwrap();
-        let frame = rt.take_pending_frames().remove(0);
+        // The native Document fetch reserves the frame and commits under that
+        // same reservation; the host adopts the queued document as a realm and
+        // then fires the element's single load.
+        rt.run_event_loop_until_quiescent(2_000, 30).await.unwrap();
+        let frame = rt.take_pending_frames().pop()
+            .expect("the redirected frame document was not queued");
+        assert_eq!(frame.url, final_url);
         let realm = crate::frame::FrameRealm::new(
             &mut rt, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html,
         ).unwrap();
@@ -23865,7 +24275,7 @@ mod tests {
             result.value.unwrap(),
             serde_json::json!({
                 "readable": false,
-                "loadedUrl": "https://cross-origin.example/secret",
+                "loadedUrl": final_url,
             })
         );
     }
@@ -24580,15 +24990,6 @@ mod tests {
     }
 
     #[test]
-    fn test_element_from_point_in_viewport_returns_body() {
-        let mut rt = setup_runtime("<html><body><h1>Hi</h1></body></html>");
-        let tag = rt
-            .evaluate("document.elementFromPoint(10, 10)?.tagName")
-            .unwrap();
-        assert_eq!(tag, serde_json::json!("BODY"));
-    }
-
-    #[test]
     fn test_element_from_point_out_of_viewport_returns_null() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let neg_x = rt.evaluate("document.elementFromPoint(-1, 10)").unwrap();
@@ -24605,7 +25006,12 @@ mod tests {
     fn test_elements_from_point_returns_array() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(rt.evaluate("Array.isArray(document.elementsFromPoint(10,10))").unwrap(), serde_json::json!(true));
-        assert_eq!(rt.evaluate("document.elementsFromPoint(-1,-1).length").unwrap(), serde_json::json!(0));
+        assert_eq!(
+            rt.evaluate("document.elementsFromPoint(-1,-1).length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -25522,10 +25928,10 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const el = document.getElementById('b');
                 return [el.role, el.ariaLabel, el.ariaSelected];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["tab", "Settings", "true"]));
@@ -25544,7 +25950,7 @@ mod tests {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const connection = navigator.connection;
                 let calls = 0;
                 let receiverMatches = false;
@@ -25565,7 +25971,7 @@ mod tests {
                     calls,
                     receiverMatches,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25581,7 +25987,7 @@ mod tests {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const encoder = new TextEncoderStream();
                 const decoder = new TextDecoderStream();
                 return {
@@ -25592,7 +25998,7 @@ mod tests {
                     decoderReadable: typeof decoder.readable.getReader,
                     decoderWritable: typeof decoder.writable.getWriter,
                 };
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25708,7 +26114,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="p"><span id="t">X</span></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const t = document.getElementById('t');
                 t.insertAdjacentText('afterbegin', 'AB');
                 t.insertAdjacentText('beforeend', 'BE');
@@ -25720,7 +26126,7 @@ mod tests {
                     document.getElementById('p').textContent,
                     t.getElementsByTagName('b').length,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25738,7 +26144,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="p"><span id="t">X</span></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const t = document.getElementById('t');
                 const before = document.createElement('b');  before.id = 'before';
                 const after  = document.createElement('i');  after.id  = 'after';
@@ -25756,7 +26162,7 @@ mod tests {
                     siblings,
                     inT,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25775,7 +26181,7 @@ mod tests {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
             let called = false;
             const saved = Error.prepareStackTrace;
             Error.prepareStackTrace = function() { called = true; return saved; };
@@ -25783,7 +26189,7 @@ mod tests {
             console.log(e);
             Error.prepareStackTrace = saved;
             return called;
-        "#,
+        })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(false));
@@ -25794,12 +26200,12 @@ mod tests {
         let mut rt = setup_runtime(r#"<div id="d"></div>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const el = document.getElementById('d');
                 el.role = 'menu';
                 el.ariaExpanded = 'true';
                 return [el.getAttribute('role'), el.getAttribute('aria-expanded')];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["menu", "true"]));
@@ -25813,7 +26219,7 @@ mod tests {
         let mut rt = setup_runtime("<div></div>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const TypedEventTarget = class extends EventTarget {};
                 const target = new TypedEventTarget();
                 const calls = [];
@@ -25845,7 +26251,7 @@ mod tests {
                     first.target === target,
                     first.currentTarget === null,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25870,7 +26276,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 const media = document.getElementById("media");
                 return [
                     media.canPlayType("video/mp4"),
@@ -25883,7 +26289,7 @@ mod tests {
                     media.currentSrc,
                     media.poster,
                 ];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -25907,7 +26313,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head></head><body><div id=target></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 globalThis.__fragmentScriptRuns = 0;
 
@@ -25960,7 +26366,7 @@ mod tests {
                     __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
                 return [globalThis.__fragmentScriptRuns, externalFetches];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!([0, 0]));
@@ -25971,7 +26377,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head></head><body><i id=anchor></i></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 globalThis.__dynamicScriptRuns = [];
 
@@ -25998,7 +26404,7 @@ mod tests {
                 document.body.appendChild(subtree);
 
                 return [beforeConnection, globalThis.__dynamicScriptRuns];
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -26014,7 +26420,7 @@ mod tests {
         );
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 globalThis.__cloneScriptRuns = 0;
                 const parser = document.getElementById("parser");
@@ -26035,7 +26441,7 @@ mod tests {
                 fragment.appendChild(dynamic.cloneNode(true));
                 document.body.appendChild(fragment.cloneNode(true));
                 return globalThis.__cloneScriptRuns;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(1.0));
@@ -26046,7 +26452,7 @@ mod tests {
         let mut rt = setup_runtime("<html><head></head><body><div id=context></div></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 globalThis.__executableFragmentRuns = [];
                 const range = document.createRange();
@@ -26060,7 +26466,7 @@ mod tests {
                     "<script>globalThis.__executableFragmentRuns.push('write')<\/script>"
                 );
                 return globalThis.__executableFragmentRuns;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["range", "write"]));
@@ -26073,14 +26479,14 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 document.write('<di');
                 document.write('v id="split">');
                 document.write('content</div>');
                 const el = document.getElementById('split');
                 return el ? el.textContent : null;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("content"));
@@ -26091,13 +26497,13 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 document.write('<spa');
                 document.write('n id="half">x</span>');
                 const el = document.getElementById('half');
                 return el ? el.tagName : null;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("SPAN"));
@@ -26117,7 +26523,7 @@ mod tests {
                 document.write('>');
                 document.write('globalThis.__splitScriptRan = true;');
                 document.write('<\/scr' + 'ipt>');
-                return [!!document.getElementById('split-script'), globalThis.__splitScriptRan];
+                [!!document.getElementById('split-script'), globalThis.__splitScriptRan];
                 "#,
             )
             .unwrap();
@@ -26139,7 +26545,7 @@ mod tests {
                 // assigns __currentScriptNid around every script it prepares.
                 globalThis.__currentScriptNid = document.getElementById('writer')._nid;
                 document.write('<span id="written"></span>');
-                return JSON.stringify({
+                JSON.stringify({
                   head: Array.from(document.head.children).map(e => e.id || e.tagName),
                   body: Array.from(document.body.children).map(e => e.id || e.tagName),
                 });
@@ -26158,12 +26564,12 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 document.write('<div id="unclosed">hello');
                 const el = document.getElementById('unclosed');
                 return el ? el.textContent : null;
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("hello"));
@@ -26174,7 +26580,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 document.write('<div id="wrap">');
                 document.write('<span id="inner">y</span>');
@@ -26184,7 +26590,7 @@ mod tests {
                   inner: !!inner,
                   nested: !!(inner && inner.parentElement && inner.parentElement.id === 'wrap'),
                 });
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(
@@ -26196,7 +26602,7 @@ mod tests {
     #[test]
     fn document_write_foster_parenting_preserves_order_and_mutation_records() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             var scriptTestSetup = true;
             document.open();
             document.write('<table id="table"><tr><td>cell');
@@ -26210,7 +26616,7 @@ mod tests {
             const order = Array.from(document.body.childNodes, label);
             document.close();
             return {order, added, sameTable: document.getElementById('table') === table};
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!({
             "order": ["outside", "B", "tail", "TABLE", "P"],
             "added": ["outside", "B", "tail", "P"],
@@ -26221,7 +26627,7 @@ mod tests {
     #[test]
     fn document_write_foster_parenting_grows_the_existing_text_node() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt.evaluate(r#"
+        let result = rt.evaluate(r#"(() => {
             var scriptTestSetup = true;
             document.open();
             document.write('<table id="table"><tr><td>cell');
@@ -26234,7 +26640,7 @@ mod tests {
             const sameText = document.body.firstChild === text;
             document.close();
             return {first, second, sameText, sameTable: document.getElementById('table') === table};
-        "#).unwrap();
+        })()"#).unwrap();
         assert_eq!(result, serde_json::json!({
             "first": "outside", "second": "outsidemore", "sameText": true, "sameTable": true,
         }));
@@ -26245,7 +26651,7 @@ mod tests {
         for moved in [false, true] {
             let mut rt = setup_runtime("<html><body></body></html>");
             rt.evaluate(&format!("globalThis.moveWrittenTable = {moved}")).unwrap();
-            let result = rt.evaluate(r#"
+            let result = rt.evaluate(r#"(() => {
                 var scriptTestSetup = true;
                 document.open();
                 document.write('<table id="table"><tr><td>cell');
@@ -26269,7 +26675,7 @@ mod tests {
                 const order = Array.from(parent.childNodes, label);
                 document.close();
                 return {order, added, error, sameTable: moveWrittenTable ? parent.lastChild === table : table.parentNode === null};
-            "#).unwrap();
+            })()"#).unwrap();
             let order = if moved { vec!["outside", "TABLE"] } else { vec!["outside"] };
             assert_eq!(result, serde_json::json!({
                 "order": order, "added": ["outside"], "error": null, "sameTable": true,
@@ -26286,7 +26692,7 @@ mod tests {
             document.write('<table id="table"><tr><td>cell');
             document.write('</td></tr>outside</table><p>end</p>');
             globalThis.__currentScriptNid = 0;
-            return Array.from(document.body.childNodes, node => node.nodeType === 3 ? node.data : node.nodeName);
+            Array.from(document.body.childNodes, node => node.nodeType === 3 ? node.data : node.nodeName);
         "#).unwrap();
         assert_eq!(result, serde_json::json!(["SCRIPT", "outside", "TABLE", "P"]));
     }
@@ -26301,7 +26707,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 const descriptor =
                   Object.getOwnPropertyDescriptor(MutationObserver.prototype, 'observe');
@@ -26314,7 +26720,7 @@ mod tests {
                   writable: descriptor.writable,
                   configurable: descriptor.configurable,
                 });
-                "#,
+                })()"#,
             )
             .unwrap();
         let seen: serde_json::Value =
@@ -26341,7 +26747,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 const Original = globalThis.MutationObserver;
                 const ORIGINAL_INSTANCE = '__zone_symbol__originalInstance';
@@ -26363,7 +26769,7 @@ mod tests {
                 const taken = observer.takeRecords().length;
                 observer.disconnect();
                 return JSON.stringify({ forwarded: forwarded.sort().join(','), taken });
-                "#,
+                })()"#,
             )
             .unwrap();
         let patched: serde_json::Value =
@@ -26438,7 +26844,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 globalThis.__seen = [];
                 const observer = new MutationObserver((records) => {
@@ -26452,7 +26858,7 @@ mod tests {
                   for (const node of record.addedNodes) globalThis.__seen.push(node.nodeName);
                 });
                 return globalThis.__seen.join(',');
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("SPAN"));
@@ -26467,7 +26873,7 @@ mod tests {
         let mut rt = setup_runtime(r#"<html><body><p id="a"></p><p id="b"></p></body></html>"#);
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 const ids = () => Array.from(document.body.children).map((e) => e.id).join(',');
                 const make = (id) => { const e = document.createElement('span'); e.id = id; return e; };
@@ -26489,7 +26895,7 @@ mod tests {
                 observer.disconnect();
                 steps.added = added.join(',');
                 return JSON.stringify(steps);
-                "#,
+                })()"#,
             )
             .unwrap();
         let steps: serde_json::Value =
@@ -26508,7 +26914,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body><p id=\"ref\"></p></body></html>");
         let result = rt
             .evaluate(
-                r#"
+                r#"(() => {
                 var scriptTestSetup = true;
                 const observer = new MutationObserver(() => {});
                 observer.observe(document.body, { childList: true });
@@ -26520,7 +26926,7 @@ mod tests {
                   .flatMap((record) => Array.from(record.addedNodes).map((n) => n.nodeName));
                 observer.disconnect();
                 return seen.join(',');
-                "#,
+                })()"#,
             )
             .unwrap();
         assert_eq!(result, serde_json::json!("SPAN"));
@@ -26534,7 +26940,7 @@ mod tests {
                 r#"
                 var scriptTestSetup = true;
                 document.write('<img name="namedImage" src="x.png">');
-                return typeof window.namedImage;
+                typeof window.namedImage;
                 "#,
             )
             .unwrap();
@@ -26553,7 +26959,7 @@ mod tests {
                 globalThis.__currentScriptNid = document.getElementById('writer')._nid;
                 document.write('<span id="one"></span>');
                 document.write('<span id="two"></span>');
-                return Array.from(document.head.children).map(e => e.id).join(',');
+                Array.from(document.head.children).map(e => e.id).join(',');
                 "#,
             )
             .unwrap();

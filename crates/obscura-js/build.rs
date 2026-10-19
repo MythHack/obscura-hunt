@@ -1,278 +1,267 @@
-use std::path::PathBuf;
+use std::env;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[path = "src/native_window.rs"]
+mod native_window;
+#[path = "snapshot_generation.rs"]
+mod snapshot_generation;
+#[path = "snapshot_fingerprint.rs"]
+mod snapshot_fingerprint;
+
+use snapshot_generation as snapshot;
+
+enum ArtifactSource {
+    /// The build script runs on the target: generate the snapshot inline.
+    Generate,
+    /// Consume a target-native snapshot produced by `obscura-js-snapshot`.
+    Prebuilt(PathBuf),
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=js/windows.js");
+    println!("cargo:rerun-if-changed=snapshot_generation.rs");
+    println!("cargo:rerun-if-changed=src/native_window.rs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=native");
+    println!("cargo:rerun-if-changed=../obscura-v8-native/src/lib.rs");
+    println!("cargo:rerun-if-env-changed=OBSCURA_SNAPSHOT_BIN");
+    println!("cargo:rerun-if-env-changed=OBSCURA_SNAPSHOT_DIR");
+    println!("cargo:rerun-if-env-changed=OBSCURA_SNAPSHOT_PRODUCER");
+
     compile_incumbent_context();
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let snapshot_path = out_dir.join("OBSCURA_SNAPSHOT.bin");
+    let workspace_root = workspace_root().unwrap_or_else(|error| fail(&error));
+    for path in snapshot_fingerprint::input_paths(&workspace_root) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    for key in snapshot_fingerprint::target_env_keys() {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let build_fingerprint = snapshot_fingerprint::build_fingerprint(&workspace_root)
+        .unwrap_or_else(|error| fail(&error));
 
-    // Detect cross-compilation: build script runs on host, target differs.
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let host = std::env::var("HOST").unwrap_or_default();
+    let out_dir = absolute(PathBuf::from(env::var("OUT_DIR").expect("Cargo sets OUT_DIR")))
+        .unwrap_or_else(|error| fail(&error));
+    let target = env::var("TARGET").expect("Cargo sets TARGET");
+    let host = env::var("HOST").expect("Cargo sets HOST");
     let is_cross = target != host;
+    let usize_bytes = target_usize_bytes();
+    let v8_version = deno_core::v8::V8::get_version();
+    // Host helper contract. For a native build this is the target contract;
+    // for a cross build it must not be compared with the target artifact.
+    let host_v8_abi = obscura_v8_native::native_window_abi();
 
-    // Keep the native window facade and IndexedDB shim inside bootstrap's
-    // private closure in every snapshot path. The markers are deliberately the
-    // only stitch points: they are not page-visible APIs and they are available
-    // before __obscura_init runs.
-    let bootstrap_js = include_str!("js/bootstrap.js")
-        .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
-        .replace("/* OBSCURA_WINDOWS */", include_str!("js/windows.js"));
-
-    if is_cross {
-        // Cross-compilation: the host V8 (linked into this build script) produces
-        // snapshots for the host architecture, which crash on the target when
-        // deserializing due to architecture-specific heap layout differences.
-        //
-        // Solution: use the target-specific `mksnapshot` tool (built by V8's GN
-        // build system) which runs on the host but generates snapshots for the
-        // target architecture. Then wrap the raw blob in deno_core's format.
-        eprintln!("[obscura-js build.rs] Cross-compilation detected (host={host}, target={target})");
-        eprintln!("[obscura-js build.rs] Using cross-mksnapshot for target-compatible snapshot");
-
-        // Locate the cross-mksnapshot binary.
-        // OUT_DIR is under target/<triple>/<profile>/build/obscura-js-*/out,
-        // so the GN output directory is 4 levels up.
-        let target_dir = out_dir
-            .parent() // build/obscura-js-*/
-            .and_then(|p| p.parent()) // build/
-            .and_then(|p| p.parent()) // <profile>/
-            .and_then(|p| p.parent()) // <triple>/
-            .expect("Cannot determine target directory from OUT_DIR");
-
-        let profile = if std::env::var("PROFILE").unwrap_or_default() == "release" {
-            "release"
-        } else {
-            "debug"
-        };
-
-        // The cross-mksnapshot lives in gn_out/clang_x64_v8_arm64/ (or similar).
-        // Try known paths.
-        let cross_mksnapshot = find_cross_mksnapshot(target_dir, &target, profile);
-        let cross_mksnapshot = match cross_mksnapshot {
-            Some(p) => {
-                eprintln!("[obscura-js build.rs] Found cross-mksnapshot: {}", p.display());
-                p
+    match resolve_artifact(&target, is_cross, &workspace_root)
+        .unwrap_or_else(|error| fail(&error))
+    {
+        ArtifactSource::Generate => {
+            let generated = snapshot::generate_artifact(
+                &out_dir,
+                &target,
+                &build_fingerprint,
+                host_v8_abi,
+                env!("CARGO_MANIFEST_DIR"),
+                usize_bytes,
+            )
+            .unwrap_or_else(|error| fail(&error));
+            let snapshot_v8_abi = snapshot::validate_artifact(
+                &generated.blob,
+                &target,
+                v8_version,
+                &build_fingerprint,
+                Some(host_v8_abi),
+                usize_bytes,
+            )
+            .unwrap_or_else(|error| fail(&error));
+            for file in &generated.files_loaded_during_snapshot {
+                println!("cargo:rerun-if-changed={}", file.display());
             }
-            None => {
-                // Fallback: use host V8 (will produce wrong-arch snapshot).
-                eprintln!("[obscura-js build.rs] WARNING: cross-mksnapshot not found, falling back to host V8 snapshot");
-                eprintln!("[obscura-js build.rs] The snapshot may crash on the target device!");
-                generate_host_snapshot(bootstrap_js, &snapshot_path);
-                return;
-            }
-        };
-
-        // Step 1: Generate a host snapshot to extract the deno_core sidecar data.
-        // The sidecar contains only fixed-size types (i32, u32, String, Vec) so it
-        // is architecture-independent and can be reused with the target blob.
-        eprintln!("[obscura-js build.rs] Extracting deno_core sidecar from host snapshot...");
-        let host_bootstrap_js = bootstrap_js.clone();
-        let host_output = deno_core::snapshot::create_snapshot(
-            deno_core::snapshot::CreateSnapshotOptions {
-                cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
-                startup_snapshot: None,
-                skip_op_registration: true,
-                extensions: vec![],
-                extension_transpiler: None,
-                with_runtime_cb: Some(Box::new(move |runtime| {
-                    runtime
-                        .execute_script("<obscura:bootstrap>", host_bootstrap_js.clone())
-                        .expect("bootstrap.js should not fail during snapshot creation");
-                })),
-            },
-            None,
-        )
-        .expect("Failed to create host snapshot for sidecar extraction");
-
-        // Decompose the host snapshot: [v8_blob][sidecar][8-byte v8_blob_len]
-        let host_data = &*host_output.output;
-        let ulen = std::mem::size_of::<usize>();
-        let v8_blob_len = usize::from_le_bytes(
-            host_data[host_data.len() - ulen..]
-                .try_into()
-                .unwrap(),
-        );
-        let sidecar = &host_data[v8_blob_len..host_data.len() - ulen];
-
-        // Step 2: Run cross-mksnapshot to generate the target-architecture raw blob.
-        eprintln!("[obscura-js build.rs] Running cross-mksnapshot for target architecture...");
-        let raw_blob_path = out_dir.join("cross_raw_blob.bin");
-        let bootstrap_path = out_dir.join("bootstrap.js");
-        std::fs::write(&bootstrap_path, bootstrap_js).expect("Failed to write bootstrap.js");
-
-        let status = Command::new(&cross_mksnapshot)
-            .arg(format!("--startup-blob={}", raw_blob_path.display()))
-            .arg("--target_arch=arm64")
-            .arg("--target_os=android")
-            .arg(&bootstrap_path)
-            .status()
-            .expect("Failed to run cross-mksnapshot");
-        assert!(status.success(), "cross-mksnapshot failed with status: {status}");
-
-        let mut raw_blob = std::fs::read(&raw_blob_path).expect("Failed to read cross-mksnapshot output");
-
-        // Step 3: Patch the snapshot version in the raw blob header.
-        // mksnapshot produces version 1 (no external refs), but the target V8
-        // (built with SnapshotCreator) expects version 2 (with external refs).
-        // The actual serialized heap data is compatible; only the version tag differs.
-        let expected_version: u32 = u32::from_le_bytes(
-            host_data[0..4].try_into().unwrap(),
-        );
-        let raw_version: u32 = u32::from_le_bytes(
-            raw_blob[0..4].try_into().unwrap(),
-        );
-        if raw_version != expected_version {
-            eprintln!(
-                "[obscura-js build.rs] Patching snapshot version: {} -> {}",
-                raw_version, expected_version
+            println!(
+                "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
+                generated.blob.display()
             );
-            raw_blob[0..4].copy_from_slice(&expected_version.to_le_bytes());
+            println!("cargo:rustc-env=OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI={snapshot_v8_abi}");
         }
-
-        // Step 4: Combine the patched raw blob with the extracted sidecar.
-        let mut combined = Vec::with_capacity(raw_blob.len() + sidecar.len() + ulen);
-        combined.extend_from_slice(&raw_blob);
-        combined.extend_from_slice(sidecar);
-        combined.extend_from_slice(&(raw_blob.len() as u64).to_le_bytes());
-
-        std::fs::write(&snapshot_path, &combined).expect("Failed to write cross-compiled snapshot");
-        eprintln!(
-            "[obscura-js build.rs] Cross-compiled snapshot written: {} bytes (v8_blob={}, sidecar={})",
-            combined.len(),
-            raw_blob.len(),
-            sidecar.len()
-        );
-
-        println!(
-            "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
-            snapshot_path.display()
-        );
-
-        // Mark bootstrap.js as a dependency.
-        println!("cargo:rerun-if-changed=js/bootstrap.js");
-    } else {
-        // Native build: use the host V8 directly (snapshot matches the target).
-        generate_host_snapshot(bootstrap_js, &snapshot_path);
+        ArtifactSource::Prebuilt(blob) => {
+            let expected_v8_abi = if is_cross { None } else { Some(host_v8_abi) };
+            let snapshot_v8_abi = snapshot::validate_artifact(
+                &blob,
+                &target,
+                v8_version,
+                &build_fingerprint,
+                expected_v8_abi,
+                usize_bytes,
+            )
+            .unwrap_or_else(|error| fail(&error));
+            println!("cargo:rerun-if-changed={}", blob.display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                snapshot::sidecar_path(&blob).display()
+            );
+            println!("cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}", blob.display());
+            println!("cargo:rustc-env=OBSCURA_SNAPSHOT_NATIVE_WINDOW_ABI={snapshot_v8_abi}");
+        }
     }
 }
 
 fn compile_incumbent_context() {
-    // These public headers must match deno_core's linked rusty_v8, not a
-    // separately discovered Cargo registry installation. The same dependency
-    // supplies both the host snapshot generator and the target runtime.
+    // The native archive lives in obscura-v8-native so both this build script
+    // process and the target runtime link the same C++ callback table.
     let version = deno_core::v8::V8::get_version();
-    assert_eq!(
-        version.split('-').next(),
-        Some("15.0.245.2"),
-        "Refresh native/v8-150.4.0 public headers for linked V8 {version}"
-    );
-
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++20")
-        .include("native/v8-150.4.0/include")
-        .file("native/incumbent_context.cc")
-        // rusty_v8 already supplies the correct C++ standard library linkage.
-        .cpp_link_stdlib(None);
-
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        let features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
-        build
-            .static_crt(features.split(',').any(|feature| feature == "crt-static"))
-            // MSVC otherwise reports C++98 even with /std:c++20.
-            .flag("/Zc:__cplusplus")
-            // Match rusty_v8: no embedded default-library CRT directives.
-            .flag("/Zl");
-    }
-
-    // cc selects TARGET's compiler and emits static archive/link-search flags.
-    // Compile before either snapshot branch, including cross-build early exits.
-    build.compile("obscura_v8_incumbent_context");
+    snapshot::ensure_v8_version(version).unwrap_or_else(|error| fail(&error));
 }
 
-/// Generate a snapshot using the host V8 (for native builds or as fallback).
-fn generate_host_snapshot(bootstrap_js: String, snapshot_path: &PathBuf) {
-    let output = deno_core::snapshot::create_snapshot(
-        deno_core::snapshot::CreateSnapshotOptions {
-            cargo_manifest_dir: env!("CARGO_MANIFEST_DIR"),
-            startup_snapshot: None,
-            skip_op_registration: true,
-            extensions: vec![],
-            extension_transpiler: None,
-            with_runtime_cb: Some(Box::new(move |runtime| {
-                runtime
-                    .execute_script("<obscura:bootstrap>", bootstrap_js.clone())
-                    .expect("bootstrap.js should not fail during snapshot creation");
-            })),
-        },
-        None,
-    )
-    .expect("Failed to create V8 snapshot");
-
-    std::fs::write(&snapshot_path, &*output.output).expect("Failed to write snapshot");
-    println!(
-        "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
-        snapshot_path.display()
-    );
-
-    for file in &output.files_loaded_during_snapshot {
-        println!("cargo:rerun-if-changed={}", file.display());
+fn target_usize_bytes() -> usize {
+    let bits = env::var("CARGO_CFG_TARGET_POINTER_WIDTH")
+        .expect("Cargo sets CARGO_CFG_TARGET_POINTER_WIDTH for build scripts");
+    match bits.parse::<usize>() {
+        Ok(bits @ (32 | 64)) => bits / 8,
+        _ => fail(&format!(
+            "unsupported target pointer width {bits:?}; deno_core snapshot envelopes \
+             are supported on 32-bit and 64-bit targets"
+        )),
     }
 }
 
-/// Find the cross-mksnapshot binary for the target architecture.
-fn find_cross_mksnapshot(target_dir: &std::path::Path, target: &str, profile: &str) -> Option<PathBuf> {
-    let gn_out = target_dir.join(profile).join("gn_out");
-
-    // Determine the cross directory name based on host and target architectures.
-    // Common patterns: clang_x64_v8_arm64, clang_x64_v8_arm, etc.
-    let host_arch = if cfg!(target_arch = "x86_64") {
-        "x64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "unknown"
-    };
-
-    let target_v8_arch = if target.contains("aarch64") || target.contains("arm64") {
-        "arm64"
-    } else if target.contains("x86_64") || target.contains("x64") {
-        "x64"
-    } else if target.contains("arm") {
-        "arm"
-    } else if target.contains("x86") {
-        "x86"
-    } else {
-        "unknown"
-    };
-
-    // Try the cross directory first (e.g., clang_x64_v8_arm64)
-    let cross_dir_name = format!("clang_{host_arch}_v8_{target_v8_arch}");
-    let cross_mksnapshot = gn_out.join(&cross_dir_name).join("mksnapshot");
-    if cross_mksnapshot.exists() {
-        return Some(cross_mksnapshot);
+fn resolve_artifact(
+    target: &str,
+    is_cross: bool,
+    workspace_root: &Path,
+) -> Result<ArtifactSource, String> {
+    let explicit_bin = env::var_os("OBSCURA_SNAPSHOT_BIN");
+    let explicit_dir = env::var_os("OBSCURA_SNAPSHOT_DIR");
+    if explicit_bin.is_some() && explicit_dir.is_some() {
+        return Err(
+            "set only one of OBSCURA_SNAPSHOT_BIN or OBSCURA_SNAPSHOT_DIR; \
+             OBSCURA_SNAPSHOT_BIN names a snapshot blob, OBSCURA_SNAPSHOT_DIR names \
+             the directory holding OBSCURA_SNAPSHOT.bin"
+                .to_string(),
+        );
     }
-
-    // Try without the host arch prefix (e.g., just clang_x64_v8_arm64)
-    for entry in std::fs::read_dir(&gn_out).ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("clang_") && name_str.contains(&format!("v8_{target_v8_arch}")) {
-            let candidate = entry.path().join("mksnapshot");
-            if candidate.exists() {
-                return Some(candidate);
-            }
+    if let Some(path) = explicit_bin {
+        let blob = absolute(PathBuf::from(path))?;
+        if !blob.is_file() {
+            return Err(format!(
+                "OBSCURA_SNAPSHOT_BIN={} does not exist; the blob and its \
+                 {}.json sidecar must be produced by obscura-js-snapshot for {target}",
+                blob.display(),
+                blob.display()
+            ));
         }
+        return Ok(ArtifactSource::Prebuilt(blob));
     }
 
-    None
+    let artifact_dir = match explicit_dir {
+        Some(dir) => absolute(PathBuf::from(dir))?,
+        None if is_cross => absolute(snapshot::artifact_dir(target, workspace_root))?,
+        None => return Ok(ArtifactSource::Generate),
+    };
+    let blob = artifact_dir.join(snapshot::SNAPSHOT_FILE);
+    if blob.is_file() {
+        return Ok(ArtifactSource::Prebuilt(blob));
+    }
+
+    if let Some(producer) = env::var_os("OBSCURA_SNAPSHOT_PRODUCER") {
+        run_producer(&producer, &artifact_dir)?;
+        if !blob.is_file() {
+            return Err(format!(
+                "snapshot producer {} completed but did not write {}",
+                Path::new(&producer).display(),
+                blob.display()
+            ));
+        }
+        return Ok(ArtifactSource::Prebuilt(blob));
+    }
+
+    if is_cross {
+        Err(format!(
+            "no target-native V8 snapshot for {target} at {}. The host build script \
+             cannot create one: the blob and its global-template handlers are tied to \
+             the target V8. On a native {target} runner (or a compatible runner) run:\n  \
+             cargo run -p obscura-js-snapshot --release -- --out-dir {}\n\
+             then copy that directory here, or set OBSCURA_SNAPSHOT_PRODUCER to a runner \
+             that executes `obscura-js-snapshot --out-dir <directory>` for {target}.",
+            artifact_dir.display(),
+            artifact_dir.display()
+        ))
+    } else {
+        Err(format!(
+            "OBSCURA_SNAPSHOT_DIR={} does not contain {}. Generate it with \
+             `cargo run -p obscura-js-snapshot --release -- --out-dir {}` or unset \
+             OBSCURA_SNAPSHOT_DIR to generate the host snapshot inline.",
+            artifact_dir.display(),
+            snapshot::SNAPSHOT_FILE,
+            artifact_dir.display()
+        ))
+    }
+}
+
+fn run_producer(producer: &OsStr, out_dir: &Path) -> Result<(), String> {
+    let producer = absolute(PathBuf::from(producer))?;
+    if !producer.is_file() {
+        return Err(format!(
+            "OBSCURA_SNAPSHOT_PRODUCER={} is not a file; point it at an \
+             obscura-js-snapshot binary or an executable runner for the target",
+            producer.display()
+        ));
+    }
+    println!("cargo:rerun-if-changed={}", producer.display());
+    let status = Command::new(&producer)
+        .arg("--out-dir")
+        .arg(out_dir)
+        .status()
+        .map_err(|error| {
+            format!(
+                "cannot start snapshot producer {}: {error}. A prebuilt target binary \
+                 needs a runner for this host; otherwise copy the artifact directory \
+                 and use OBSCURA_SNAPSHOT_DIR/OBSCURA_SNAPSHOT_BIN.",
+                producer.display()
+            )
+        })?;
+    if !status.success() {
+        return Err(format!(
+            "snapshot producer {} failed with {status}",
+            producer.display()
+        ));
+    }
+    Ok(())
+}
+
+/// `include_bytes!` in runtime.rs resolves relative paths against that source
+/// file, so prebuilt artifact paths must be absolute before they are exported.
+fn absolute(path: PathBuf) -> Result<PathBuf, String> {
+    std::path::absolute(&path).map_err(|error| {
+        format!(
+            "cannot resolve snapshot artifact path {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    let start = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut directory = start.as_path();
+    loop {
+        if directory.join("Cargo.lock").is_file() && directory.join("Cargo.toml").is_file() {
+            return directory.canonicalize().map_err(|error| {
+                format!("cannot resolve workspace root {}: {error}", directory.display())
+            });
+        }
+        directory = directory.parent().ok_or_else(|| {
+            format!(
+                "cannot locate the workspace root above {}; set OBSCURA_SNAPSHOT_DIR \
+                 to the directory holding the target snapshot artifact",
+                start.display()
+            )
+        })?;
+    }
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("obscura-js build error: {message}");
+    std::process::exit(1);
 }

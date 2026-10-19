@@ -141,7 +141,7 @@ pub use paint::{
 #[cfg(feature = "paint")]
 pub mod inline;
 #[cfg(feature = "paint")]
-pub use inline::configure_font_directories;
+pub use inline::configure_fonts;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
@@ -222,6 +222,18 @@ pub mod inline {
             _style: &crate::LayoutStyle,
         ) -> usize {
             0
+        }
+
+        /// Layout-only builds have no font database, so native text controls
+        /// keep their historical proportional approximation. The paint build
+        /// derives these from the selected face (see the paint `TextEngine`).
+        pub(crate) fn text_control_char_widths(
+            &self,
+            style: &crate::LayoutStyle,
+        ) -> (f32, f32) {
+            let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+            let average = font_size * 0.6;
+            (average, average + font_size * 0.675)
         }
         /// Layout-only builds have no shaper, so no container is ever treated
         /// as a cosmic-text inline formatting context: the word-split path
@@ -727,6 +739,26 @@ impl VisualTransform {
     pub fn translate(x: f32, y: f32) -> Self { Self::Affine(Affine2::translate(x,y)) }
     pub fn is_identity(self) -> bool { self.affine().is_some_and(Affine2::is_identity) }
     pub fn is_translation(self) -> bool { self.affine().is_some_and(Affine2::is_translation) }
+    /// The translation this transform applies to flat (z = 0) content, if it
+    /// maps the plane by translation only.
+    ///
+    /// A `perspective` camera is projective in depth yet maps its own plane
+    /// identically; depth-bearing transforms (a z translation or a nonzero w
+    /// coefficient on x/y) return `None` and keep the projective paint path.
+    pub(crate) fn flat_plane_translation(self) -> Option<(f32, f32)> {
+        match self {
+            Self::Affine(matrix) => matrix.is_translation().then_some((matrix.e, matrix.f)),
+            Self::Projective(matrix) => {
+                let m = matrix.0;
+                (m[3] == 0.0 && m[7] == 0.0 && m[14] == 0.0 && m[15] == 1.0
+                    && (m[0] - 1.0).abs() < f32::EPSILON
+                    && m[1].abs() < f32::EPSILON
+                    && m[4].abs() < f32::EPSILON
+                    && (m[5] - 1.0).abs() < f32::EPSILON)
+                    .then_some((m[12], m[13]))
+            }
+        }
+    }
     pub fn around(self, origin: (f32,f32,f32)) -> Self {
         Self::from_matrix(Matrix4::translate(origin.0,origin.1,origin.2))
             .then(self).then(Self::from_matrix(Matrix4::translate(-origin.0,-origin.1,-origin.2)))
@@ -1408,9 +1440,9 @@ pub struct LayoutStyle {
     pub margin_auto: [bool; 4],
     /// Percentage margin per side (top, right, bottom, left) as a 0..1 fraction,
     /// `None` when the side is a fixed length. Like padding, every side resolves
-    /// against the containing block's WIDTH; the f32 `margin` cannot carry a
-    /// percentage, so this is resolved to px during `dom::layout_dom`'s top-down
-    /// pass once the containing-block width is known.
+    /// against the containing block's WIDTH. Keep percentages typed through
+    /// Taffy layout so min/max constraints and flex/grid sizing establish that
+    /// width before `dom::layout_dom` synchronizes the used pixel margins.
     pub margin_percent: [Option<f32>; 4],
     /// Font- and viewport-relative margin lengths (top, right, bottom, left).
     /// These retain their unit until the top-down pass knows the element font
@@ -1418,6 +1450,9 @@ pub struct LayoutStyle {
     pub margin_relative: [Option<Dimension>; 4],
     /// Deferred `calc()`/`min()`/`max()`/`clamp()` margin expressions.
     pub margin_expressions: [Option<String>; 4],
+    /// Keeps deferred margin expression handles alive through Taffy layout.
+    pub(crate) margin_calc_expressions:
+        [Option<std::sync::Arc<crate::style::GridCalcExpression>>; 4],
     pub padding: Edges,
     /// Percentage padding per side (top, right, bottom, left) as a 0..1
     /// fraction, `None` when the side is a fixed length. All four sides resolve
@@ -1782,10 +1817,10 @@ pub struct LayoutStyle {
     /// are isolated into composited groups by the paint pass.
     pub effectively_invisible: bool,
 
-    /// A CSS image supplied by `content: url(...)` on a replaced element.
-    /// This is distinct from generated pseudo text: on an `<img>` it becomes
-    /// the element's image source and contributes intrinsic dimensions just
-    /// like an HTML `src`.
+    /// A CSS image supplied by `content: url(...)`, replacing any element's
+    /// contents and contributing intrinsic dimensions. On `<img>` and `<video>`
+    /// it also replaces the ordinary image source. Generated pseudo text is
+    /// handled separately.
     pub content_image: Option<String>,
     /// Literal text injected by a `::before`/`::after` rule with a plain
     /// string-literal `content` (see `css::Stylesheet::pseudo_content`).
@@ -3113,7 +3148,7 @@ pub(crate) fn to_taffy_style(style: &LayoutStyle) -> Style {
         }
     }
 
-    s.margin = rect_auto(style.margin, style.margin_auto);
+    s.margin = rect_auto(style);
     s.padding = rect_lp_percent(style.padding, style.padding_percent);
     s.border = rect_lp(style.border);
     if style.ignores_used_box_sizes() {
@@ -3183,19 +3218,25 @@ fn rect_lp_percent(
     }
 }
 
-fn rect_auto(e: Edges, auto: [bool; 4]) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
-    let side = |value, is_auto| {
-        if is_auto {
+fn rect_auto(style: &LayoutStyle) -> taffy::Rect<taffy::style::LengthPercentageAuto> {
+    let side = |value, index: usize| {
+        if style.margin_auto[index] {
             taffy::style::LengthPercentageAuto::auto()
+        } else if let Some(percent) = style.margin_percent[index] {
+            taffy::style::LengthPercentageAuto::percent(percent)
+        } else if let Some(expression) = &style.margin_calc_expressions[index] {
+            taffy::style::LengthPercentageAuto::calc(
+                std::sync::Arc::as_ptr(expression).cast(),
+            )
         } else {
             taffy::style::LengthPercentageAuto::length(value)
         }
     };
     taffy::Rect {
-        top: side(e.top, auto[0]),
-        right: side(e.right, auto[1]),
-        bottom: side(e.bottom, auto[2]),
-        left: side(e.left, auto[3]),
+        top: side(style.margin.top, 0),
+        right: side(style.margin.right, 1),
+        bottom: side(style.margin.bottom, 2),
+        left: side(style.margin.left, 3),
     }
 }
 

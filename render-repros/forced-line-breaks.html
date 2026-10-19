@@ -4,6 +4,24 @@
   <meta charset="utf-8">
   <title>forced line break geometry</title>
   <style>
+    /* Named but unloaded faces fall back to the host font; declare the bundled
+       bytes so both engines shape identical lines. */
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
     html, body { margin: 0; }
     .column {
       position: absolute;

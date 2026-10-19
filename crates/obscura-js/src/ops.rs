@@ -11,6 +11,7 @@ use deno_core::OpState;
 use deno_core::{AsyncResult, CancelFuture, CancelHandle, Resource};
 use deno_core::op2;
 use deno_core::v8;
+use deno_error::JsErrorBox;
 use obscura_dom::tree::{AttachShadowError, ShadowRootMode};
 use obscura_dom::{DomTree, NodeData, NodeId};
 #[cfg(feature = "stealth")]
@@ -176,6 +177,21 @@ pub struct ObscuraState {
     /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
     pub(crate) inherited_origin: Option<String>,
+    /// Page-visible URL when it differs from the committed document URL
+    /// (history.pushState and the host's blocked-file restore). Host writes go
+    /// through set_reflected_url so no author-observable JS assignment runs.
+    pub(crate) reflected_url: Option<String>,
+    /// Per-realm cancellable sleeps, keyed by the JS-visible timer id.
+    pub(crate) timeout_cancels: Rc<RefCell<HashMap<u32, Rc<CancelHandle>>>>,
+    /// False once the frame's browsing context is torn down. Retained
+    /// JavaScript keeps its owned DOM, but new module jobs must reject as
+    /// inactive rather than fetching under the retired document.
+    pub(crate) document_active: Rc<Cell<bool>>,
+    /// Identity of an opaque origin. Two documents both serializing as
+    /// `"null"` are same-principal only when they share this token (inherited
+    /// about:blank/srcdoc); distinct data: or sandboxed documents each get a
+    /// fresh one.
+    pub(crate) opaque_origin: Option<Rc<()>>,
     pub(crate) scripting_enabled: bool,
     pub(crate) sandbox_opaque_origin: bool,
     storage_origin_cache: RefCell<StorageOriginCache>,
@@ -210,7 +226,7 @@ pub struct ObscuraState {
     /// hints instead of the rustls ClientHello op_fetch_url would otherwise send.
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
-    pub pending_navigation: Option<(String, String, String)>,
+    pub pending_navigation: Option<PendingNavigation>,
     /// The tab's session history as the owning page sees it: entry URLs, the
     /// index of this document's first entry, and the current index. Empty
     /// for frames and for runtimes outside a page, where `history` only
@@ -411,6 +427,8 @@ pub struct PendingFrame {
     pub frame_id: u32,
     pub url: String,
     pub html: String,
+    /// A live native realm must replace its document rather than be re-created.
+    pub replace_document: bool,
     pub viewport_width: u64,
     pub viewport_height: u64,
     /// The frame that holds this one; 0 when the page does.
@@ -502,6 +520,10 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
+            reflected_url: None,
+            timeout_cancels: Rc::new(RefCell::new(HashMap::new())),
+            document_active: Rc::new(Cell::new(true)),
+            opaque_origin: None,
             scripting_enabled: true,
             sandbox_opaque_origin: false,
             storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
@@ -1001,10 +1023,21 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<ExecutionRealm>,
+    proxies: HashMap<(u32, Option<u64>), WindowProxyRecord>,
     documents: HashMap<u32, SharedState>,
     main_context: Option<v8::Global<v8::Context>>,
     frame_timers: HashMap<u32, FrameTimers>,
     retired_modules: Vec<deno_core::BrowserRealm>,
+}
+
+/// Context-owned document state for a realm. The context annex drops it when
+/// V8 collects the context, so a retained frame's DOM survives exactly as long
+/// as author JavaScript can still reach its context.
+pub(crate) struct DocumentStateSlot(pub SharedState);
+
+struct WindowProxyRecord {
+    proxy: v8::Global<v8::Object>,
+    snapshot_index: usize,
 }
 
 struct ExecutionRealm {
@@ -1025,11 +1058,38 @@ struct FrameTimers {
     sandboxed_opaque: bool,
     document_url: Option<String>,
     document_load_started: bool,
+    document_load_cancel: Option<Rc<CancelHandle>>,
     referrer_policy: Option<String>,
     cancel: Rc<CancelHandle>,
 }
 
 impl RealmStates {
+    pub(crate) fn proxy_record(&self, frame_id: u32, world_id: Option<u64>)
+        -> Option<(v8::Global<v8::Object>, usize)>
+    {
+        self.proxies.get(&(frame_id, world_id))
+            .map(|record| (record.proxy.clone(), record.snapshot_index))
+    }
+
+    pub(crate) fn remember_proxy(&mut self, frame_id: u32, world_id: Option<u64>,
+        proxy: v8::Global<v8::Object>, snapshot_index: usize)
+    {
+        self.proxies.insert((frame_id, world_id),
+            WindowProxyRecord { proxy, snapshot_index });
+    }
+
+    pub(crate) fn forget_proxies(&mut self, frame_id: u32) {
+        self.proxies.retain(|(id, _), _| *id != frame_id);
+    }
+
+    /// Isolated worlds belong to one document, not to the browsing context.
+    /// Replacing the document retires their contexts, so their WindowProxy
+    /// handles must go with them; only the main world's proxy survives
+    /// navigation.
+    fn forget_world_proxies(&mut self, frame_id: u32) {
+        self.proxies.retain(|(id, world), _| *id != frame_id || world.is_none());
+    }
+
     pub(crate) fn set_main_context(&mut self, context: v8::Global<v8::Context>) {
         self.main_context = Some(context);
     }
@@ -1044,6 +1104,17 @@ impl RealmStates {
 
     pub(crate) fn context(&self, frame_id: u32) -> Option<v8::Global<v8::Context>> {
         self.world_context(frame_id, None)
+    }
+
+    /// Main-world context of one specific document. Frame ids alone are not
+    /// unique across roots (every window registers frame 0), so publishing
+    /// must resolve by document identity, not by id.
+    pub(crate) fn main_context_for_document(&self, state: &SharedState)
+        -> Option<v8::Global<v8::Context>>
+    {
+        self.entries.iter().find(|entry| entry.world_id.is_none()
+            && Rc::ptr_eq(&entry.state, state) && self.entry_active(entry))
+            .map(|entry| entry.context.clone())
     }
 
     pub(crate) fn world_context(&self, frame_id: u32, world_id: Option<u64>)
@@ -1116,9 +1187,54 @@ impl RealmStates {
         }
     }
 
+    pub(crate) fn world_id_of_context(&self, context: &v8::Global<v8::Context>)
+        -> Option<Option<u64>>
+    {
+        self.entries.iter().find(|entry| &entry.context == context
+            && self.entry_active(entry)).map(|entry| entry.world_id)
+    }
+
     pub(crate) fn context_universal_access(&self, context: &v8::Global<v8::Context>) -> bool {
         self.entries.iter().any(|entry| &entry.context == context && entry.world_id.is_some()
             && entry.universal_access && self.entry_active(entry))
+    }
+
+    /// Re-anchor this document's default realm to its current generation.
+    ///
+    /// Replacing a document in place keeps the Window's realm context alive,
+    /// so the registry must follow the new generation or every later lookup
+    /// answers "no live execution context". Execution worlds stay stale: they
+    /// belong to the replaced document and must be recreated on demand.
+    pub(crate) fn refresh_document_generation(&mut self, state: &SharedState) {
+        let generation = match state.try_borrow() {
+            Ok(state) => state.document_generation,
+            Err(_) => return,
+        };
+        for entry in &mut self.entries {
+            if entry.world_id.is_none() && Rc::ptr_eq(&entry.state, state) {
+                entry.generation = generation;
+            }
+        }
+    }
+
+    /// Drain navigations queued by live child documents, leaving the root
+    /// document's own request to `ObscuraJsRuntime::take_pending_navigation`.
+    /// Each item carries the document's own frame id: for a self-navigation it
+    /// equals the origin, while a targeted iframe navigation names the frame
+    /// that must be replaced and keeps `origin_frame_id` as the referrer.
+    pub(crate) fn take_pending_frame_navigations(
+        &mut self, root: &SharedState,
+    ) -> Vec<(u32, PendingNavigation)> {
+        let mut pending = Vec::new();
+        for document in self.page_document_states(root) {
+            if Rc::ptr_eq(document, root) { continue; }
+            let mut document = document.borrow_mut();
+            if let Some(navigation) = document.pending_navigation.take() {
+                document.pending_history_traversal = None;
+                pending.push((document.frame_id, navigation));
+            }
+        }
+        pending
     }
 
     pub(crate) fn document_contexts(&self, document: &SharedState) -> Vec<v8::Global<v8::Context>> {
@@ -1145,7 +1261,7 @@ impl RealmStates {
 
     /// Native document ownership, not execution worlds. Popups and retired
     /// owner chains are not subdocuments of this page.
-    pub(crate) fn render_document_states<'a>(&'a self, root: &'a SharedState)
+    pub(crate) fn page_document_states<'a>(&'a self, root: &'a SharedState)
         -> impl Iterator<Item = &'a SharedState> + 'a
     {
         let root_id = root.borrow().frame_id;
@@ -1173,12 +1289,26 @@ impl RealmStates {
     }
 
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
+        // The browsing context and its stable main-world global proxy outlive a
+        // document replacement. Isolated-world realms are retired with the
+        // document, and only explicit browsing-context destruction calls
+        // forget_proxies for the remaining main-world entry.
+        self.forget_world_proxies(frame_id);
         self.cancel_frame_timers(frame_id);
         let mut index = 0;
         while index < self.entries.len() {
             if self.entries[index].frame_id == frame_id {
                 let entry = self.entries.remove(index);
                 entry.cancel.cancel();
+                if let Ok(mut state) = entry.state.try_borrow_mut() {
+                    for (_, cancel) in state.timeout_cancels.borrow_mut().drain() {
+                        cancel.cancel();
+                    }
+                    state.document_active.set(false);
+                    state.pending_navigation = None;
+                    #[cfg(feature = "render")]
+                    state.abandon_render_resources();
+                }
                 if let Some(modules) = entry.modules { self.retired_modules.push(modules); }
             } else { index += 1; }
         }
@@ -1196,11 +1326,37 @@ impl RealmStates {
             owner: None, parent_document: None, sandboxed_opaque: false, document_url: None,
             referrer_policy: None,
             document_load_started: false, cancel: CancelHandle::new_rc(),
+            document_load_cancel: None,
         });
         let generation = state.borrow().document_generation;
+        state.borrow_mut().document_active.set(true);
         self.documents.insert(frame_id, state.clone());
         self.entries.push(ExecutionRealm { context, frame_id, world_id: None, name: String::new(),
             generation, state, cancel: CancelHandle::new_rc(), modules: None, universal_access: false });
+    }
+
+    /// Remove a frame's realm entries for an in-place document replacement,
+    /// keeping its timer owner/parent binding so the same browsing context
+    /// continues. Contexts move to the owned set so retained JS keeps its DOM.
+    pub(crate) fn retire_frame_realm(&mut self, old: &v8::Global<v8::Context>, frame_id: u32) {
+        self.forget_world_proxies(frame_id);
+        let mut index = 0;
+        while index < self.entries.len() {
+            if &self.entries[index].context == old || self.entries[index].frame_id == frame_id {
+                let entry = self.entries.remove(index);
+                entry.cancel.cancel();
+                if let Ok(mut state) = entry.state.try_borrow_mut() {
+                    for (_, cancel) in state.timeout_cancels.borrow_mut().drain() {
+                        cancel.cancel();
+                    }
+                    state.document_active.set(false);
+                    state.pending_navigation = None;
+                    #[cfg(feature = "render")]
+                    state.abandon_render_resources();
+                }
+                if let Some(modules) = entry.modules { self.retired_modules.push(modules); }
+            } else { index += 1; }
+        }
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
@@ -1210,6 +1366,7 @@ impl RealmStates {
                 return;
             }
             let entry = self.entries.remove(index);
+            self.proxies.remove(&(entry.frame_id, entry.world_id));
             entry.cancel.cancel();
             if let Some(modules) = entry.modules { self.retired_modules.push(modules); }
         }
@@ -1229,6 +1386,7 @@ impl RealmStates {
             owner: Some((Rc::downgrade(parent), node, generation)),
             parent_document: Some((Rc::downgrade(parent), generation)),
             sandboxed_opaque, document_url: None, document_load_started: false,
+            document_load_cancel: None,
             referrer_policy: None,
             cancel: CancelHandle::new_rc(),
         });
@@ -1251,6 +1409,21 @@ impl RealmStates {
     pub fn live_frame_owners(&self) -> Vec<(u32, u32, NodeId)> {
         self.frame_timers.keys().filter_map(|id| self.live_frame_owner(*id)
             .map(|(parent, node)| (*id, parent, node))).collect()
+    }
+
+    /// Number of `iframe` elements in the document. This is the value
+    /// `window.length` exposes, matching the document-based definition used by
+    /// the realm bootstrap rather than the number of materialized realms.
+    pub(crate) fn document_iframe_count(&self, frame_id: u32) -> usize {
+        let count = self.documents.get(&frame_id)
+            .and_then(|document| document.try_borrow().ok())
+            .and_then(|document| document.dom.as_ref()
+                .and_then(|dom| dom.query_selector_all("iframe").ok()))
+            .map(|frames| frames.len());
+        // A document under an outstanding borrow cannot be inspected here; the
+        // live frame table is the closest consistent answer.
+        count.unwrap_or_else(|| self.live_frame_owners().iter()
+            .filter(|(_, parent, _)| *parent == frame_id).count())
     }
 
     fn frame_owner_matches(&self, frame_id: u32, parent: &SharedState, node: NodeId) -> bool {
@@ -1301,6 +1474,7 @@ impl RealmStates {
         for (id, timers) in &self.frame_timers {
             if self.frame_timers_active(*id) == Some(false) {
                 timers.cancel.cancel();
+                if let Some(cancel) = &timers.document_load_cancel { cancel.cancel(); }
                 #[cfg(feature = "render")]
                 if let Some(state) = self.documents.get(id) {
                     if let Ok(mut state) = state.try_borrow_mut() { state.abandon_render_resources(); }
@@ -1310,7 +1484,10 @@ impl RealmStates {
     }
 
     fn cancel_frame_timers(&self, frame_id: u32) {
-        if let Some(timers) = self.frame_timers.get(&frame_id) { timers.cancel.cancel(); }
+        if let Some(timers) = self.frame_timers.get(&frame_id) {
+            timers.cancel.cancel();
+            if let Some(cancel) = &timers.document_load_cancel { cancel.cancel(); }
+        }
         self.cancel_inactive_frame_timers();
     }
 
@@ -1457,6 +1634,15 @@ fn render_mutation_impact(
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
                 actual_change,
+            }
+        }
+        "set_popover_open" => {
+            let Some(target) = node(arg1) else {
+                return RenderMutationImpact::default();
+            };
+            RenderMutationImpact {
+                connected: node_is_connected(dom, target),
+                actual_change: dom.is_popover_open(target) != (arg2 == "true"),
             }
         }
         "set_attribute" => {
@@ -1910,6 +2096,7 @@ fn is_render_mutation_command(cmd: &str) -> bool {
             | "set_form_value"
             | "set_form_checked"
             | "set_form_indeterminate"
+            | "set_popover_open"
             | "remove_attribute"
             | "set_attribute_ns"
             | "remove_attribute_ns"
@@ -1958,9 +2145,31 @@ fn fragment_context_and_html(arg: &str) -> (html5ever::QualName, &str) {
     )
 }
 
+/// The document that owns a script node id, named by the appending realm.
+///
+/// `frame_state` deliberately falls back to the page for unknown ids because
+/// DOM getters must still answer for stale realms. Script preparation must
+/// not: an unknown child realm would mark the page's colliding nid instead of
+/// declining the inert script.
+fn script_document(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 {
+        return Some(state.borrow::<SharedState>().clone());
+    }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?;
+    registry.borrow().by_frame_id(frame_id)
+}
+
 #[op2(fast)]
-fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_mark_started(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // The node id belongs to one DomTree. Name the owner realm explicitly, as
+    // the `op_dom` wrapper does: appending a script runs in the appending
+    // document's realm, and inferring it from the running/entered context can
+    // answer the page (shared snapshot ops, nested parser tasks). The resolved
+    // live document is authoritative: `node_is_script` proves the nid really
+    // is a script node of that document.
+    let Some(shared) = script_document(state, frame_id) else {
+        return false;
+    };
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -1976,8 +2185,14 @@ fn op_script_mark_started(state: &OpState, nid: u32) -> bool {
 /// Atomically claim an executable script.  A false result means the node was
 /// created inert by an HTML-string API or has already been prepared once.
 #[op2(fast)]
-fn op_script_try_start(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_script_try_start(state: &OpState, nid: u32, frame_id: u32) -> bool {
+    // Same owner-realm contract as `op_script_mark_started`: insertion-time
+    // preparation names the appending document rather than guessing it from
+    // the running context, and an unknown non-page realm declines instead of
+    // touching a colliding page node.
+    let Some(shared) = script_document(state, frame_id) else {
+        return false;
+    };
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return false;
@@ -2202,8 +2417,22 @@ fn op_dom(
 ) -> String {
     let Some(context) = receiver.get_creation_context(scope) else { return "null".into() };
     if !receiver.strict_equals(context.global(scope).into()) { return "null".into(); }
+    let context_state = context.get_slot::<DocumentStateSlot>().map(|slot| slot.0.clone());
     let context = v8::Global::new(scope, context);
-    let Ok((_, root, shared)) = crate::window::context_document(state, &context) else { return "null".into() };
+    // A retained (removed) frame keeps its old document reachable through its
+    // own wrappers. Its browsing context no longer resolves to a live root
+    // window, so pure DOM commands read the context-owned retired state. The
+    // inactive flag keeps every other authority path rejecting.
+    let (root, shared) = match crate::window::context_document(state, &context) {
+        Ok((_, root, shared)) => (root, shared),
+        Err(_) => {
+            let Some(shared) = context_state else {
+                return "null".into();
+            };
+            if shared.borrow().document_active.get() { return "null".into(); }
+            (u32::MAX, shared)
+        }
+    };
     if shared.borrow().frame_id != frame_id { return "null".into(); }
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
@@ -2313,6 +2542,7 @@ fn op_dom(
                         && *generation == shared.borrow().document_generation);
                 if !owns { return "false".into(); }
                 registry.forget_frame(id);
+                registry.forget_proxies(id);
             }
             return "true".into();
         }
@@ -2573,6 +2803,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     };
 
     match cmd.as_str() {
+        "get_popover_open" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.is_popover_open(nid).to_string()
+        }
+        "set_popover_open" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.set_popover_open(nid, arg2 == "true").to_string()
+        }
         "get_form_state" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             dom.form_control_state(nid)
@@ -2616,6 +2854,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_reflected_url" => serde_json::to_string(&gs.reflected_url).unwrap_or("null".into()),
         "scripting_enabled" => gs.scripting_enabled.to_string(),
         "sandbox_opaque_origin" => gs.sandbox_opaque_origin.to_string(),
         "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
@@ -3550,14 +3789,24 @@ fn op_report_browser_exception<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     state: &OpState,
     error: v8::Local<'s, v8::Value>,
-    frame_id: u32,
+    receiver: v8::Local<'s, v8::Object>,
 ) {
-    let Some(owner) = posted_task_owner(state, frame_id) else { return; };
-    let Ok(page) = owner.try_borrow() else { return; };
-    if !page.runtime_events_enabled { return; }
-    let url = page.url.clone();
-    drop(page);
-    let error = deno_core::error::JsError::from_v8_exception(scope, error);
+    let Some(context) = receiver.get_creation_context(scope) else { return; };
+    if !receiver.strict_equals(context.global(scope).into()) { return; }
+    let handle = v8::Global::new(scope, context);
+    let Ok((windows, window_id, document)) = crate::window::context_document(state, &handle) else { return; };
+    let Some(owner) = windows.borrow().windows.get(&window_id)
+        .filter(|window| !window.closed).map(|window| window.state.clone()) else { return; };
+    if !owner.borrow().runtime_events_enabled { return; }
+    let url = document.borrow().url.clone();
+    // Shared ops run in the control context. deno_core classifies Error by its
+    // realm's Error.prototype, so convert the original value in its own realm.
+    let error_context = error.try_cast::<v8::Object>().ok()
+        .and_then(|error| error.get_creation_context(scope)).unwrap_or(context);
+    let error = {
+        let scope = &mut v8::ContextScope::new(scope, error_context);
+        deno_core::error::JsError::from_v8_exception(scope, error)
+    };
     if let Ok(mut page) = owner.try_borrow_mut() {
         record_uncaught_exception(&mut page, &error, &url);
     };
@@ -4142,12 +4391,12 @@ fn op_fetch_url(
         let registry = state.borrow().borrow::<Rc<RefCell<RealmStates>>>().clone();
         let world_cancel = registry.borrow().context_cancel(&context)
             .ok_or_else(|| deno_error::JsErrorBox::type_error("Fetch execution world is retired"))?;
-        let (destination, cancel_rid, document_frame, referrer, referrer_policy) = match options {
-            FetchOptions::Destination(destination) => (destination, None, None, None, String::new()),
-            FetchOptions::Request { cancel_rid, destination, referrer, referrer_policy } =>
-                (destination, cancel_rid, None, referrer, referrer_policy),
+        let (destination, cancel_rid, document_frame, referrer, referrer_policy, redirect) = match options {
+            FetchOptions::Destination(destination) => (destination, None, None, None, String::new(), follow_redirect_mode()),
+            FetchOptions::Request { cancel_rid, destination, referrer, referrer_policy, redirect } =>
+                (destination, cancel_rid, None, referrer, referrer_policy, redirect),
             FetchOptions::FrameDocument { frame_id, destination } =>
-                (destination, None, Some(frame_id), None, String::new()),
+                (destination, None, Some(frame_id), None, String::new(), follow_redirect_mode()),
         };
         let (referrer_source, referrer_policy) = {
             let owner = owner.borrow();
@@ -4175,20 +4424,21 @@ fn op_fetch_url(
             (owner.frame_id, owner.document_generation)
         };
         let frame_id = document_frame.unwrap_or(calling_frame);
-        if let Some(frame_id) = document_frame {
+        let document_cancel = if let Some(frame_id) = document_frame {
             let mut registry = registry.borrow_mut();
             let valid = destination == "Document"
                 && registry.live_frame_owner(frame_id).is_some_and(|(_, node)|
                     registry.frame_owner_matches(frame_id, &owner, node))
-                && registry.by_frame_id(frame_id).is_none()
                 && method == "GET" && body.is_empty()
                 && registry.frame_timers.get(&frame_id).is_some_and(|frame|
                     !frame.document_load_started && frame.document_url.as_deref() == Some(url.as_str()));
             if !valid {
                 return Err(deno_error::JsErrorBox::generic("Invalid iframe document request owner"));
             }
-            registry.frame_timers.get_mut(&frame_id).unwrap().document_load_started = true;
-        }
+            let frame = registry.frame_timers.get_mut(&frame_id).unwrap();
+            frame.document_load_started = true;
+            frame.document_load_cancel.clone()
+        } else { None };
         let load_cancel = owner.borrow().resource_load_cancel.clone();
         let initiator = FetchInitiator { frame_id, owner, generation, registry, world_cancel, load_cancel };
         initiator.ensure_live()?;
@@ -4198,18 +4448,18 @@ fn op_fetch_url(
         };
         let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
             .map(|resource| resource.0.clone())
-            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
-        Ok((page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy))
+            .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?.or(document_cancel);
+        Ok((page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy, redirect))
     })();
     async move {
-        let (page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy) = captured?;
+        let (page, initiator, parent_frame_id, destination, cancel, origin, referrer_source, referrer_policy, redirect) = captured?;
         initiator.ensure_live()?;
         let request_cancel = cancel.clone();
         let world_cancel = initiator.world_cancel.clone();
         let load_cancel = initiator.load_cancel.clone();
         let future = async move {
             fetch_url_inner(state, page, initiator, url, method, headers_json, body,
-                origin, mode, credentials, destination, parent_frame_id, request_cancel, referrer_source, referrer_policy)
+                origin, mode, credentials, redirect, destination, parent_frame_id, request_cancel, referrer_source, referrer_policy)
                 .or_cancel(world_cancel).await
                 .map_err(|_| deno_error::JsErrorBox::type_error("Fetch execution world was disposed"))?
         }.or_cancel(load_cancel);
@@ -4230,7 +4480,12 @@ enum FetchOptions {
         #[serde(default)] cancel_rid: Option<u32>, destination: String,
         #[serde(default)] referrer: Option<String>,
         #[serde(default)] referrer_policy: String,
+        #[serde(default = "follow_redirect_mode")] redirect: String,
     },
+}
+
+fn follow_redirect_mode() -> String {
+    "follow".to_string()
 }
 
 struct FetchInitiator {
@@ -4299,7 +4554,7 @@ async fn fetch_url_inner(
     state: Rc<RefCell<OpState>>, page: SharedState, initiator: FetchInitiator,
     url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
-    destination: String, parent_frame_id: Option<u32>, cancel: Option<Rc<CancelHandle>>,
+    redirect: String, destination: String, parent_frame_id: Option<u32>, cancel: Option<Rc<CancelHandle>>,
     mut referrer_source: Option<url::Url>, mut referrer_policy: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     let frame_id = initiator.frame_id;
@@ -4715,6 +4970,7 @@ async fn fetch_url_inner(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                redirect.clone(),
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
@@ -4858,6 +5114,23 @@ async fn fetch_url_inner(
             Ok(u) => u,
             Err(_) => break resp,
         };
+
+        // Fetch spec HTTP-redirect fetch: a redirect mode other than "follow"
+        // must not issue the hop the Location points at.
+        if redirect == "error" {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": current_url, "headers": {},
+                "blocked": true,
+                "error": "Redirect encountered while redirect mode is \"error\"",
+            })
+            .to_string());
+        }
+        if redirect == "manual" {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": current_url, "headers": {}, "opaqueredirect": true,
+            })
+            .to_string());
+        }
 
         // Apply SSRF and same-origin mode before following any redirect.
         if let Err(reason) = validate_fetch_request_url(&next_url, allow_private_network, &mode, &page_origin) {
@@ -5064,6 +5337,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    redirect: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
@@ -5170,6 +5444,22 @@ async fn stealth_fetch_all(
             Ok(u) => u,
             Err(_) => break r,
         };
+        // Fetch spec HTTP-redirect fetch: a redirect mode other than "follow"
+        // must not issue the hop the Location points at.
+        if redirect == "error" {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": current_url, "headers": {},
+                "blocked": true,
+                "error": "Redirect encountered while redirect mode is \"error\"",
+            })
+            .to_string());
+        }
+        if redirect == "manual" {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": current_url, "headers": {}, "opaqueredirect": true,
+            })
+            .to_string());
+        }
         // Match the rustls pre-send SSRF and same-origin request-mode gate.
         if let Err(reason) = validate_fetch_request_url(&next_url, allow_private_network, &mode, &page_origin) {
             return Ok(serde_json::json!({
@@ -5785,8 +6075,23 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut sock, _) = listener.accept().await.unwrap();
+            // Consume the GET headers before closing, otherwise Windows can
+            // reset the connection while the response is still being received.
+            let mut request = [0u8; 8192];
+            let mut received = 0;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let count = sock.read(&mut request[received..]).await.unwrap();
+                    assert!(count > 0, "client closed before sending request headers");
+                    received += count;
+                    if request[..received].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(received < request.len(), "fixture request headers exceed capacity");
+                }
+            }).await.expect("client must send request headers");
             let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
             if with_content_length {
                 header.push_str(&format!("Content-Length: {body_len}\r\n"));
@@ -5811,24 +6116,20 @@ mod tests {
     async fn read_body_capped_rejects_oversized_streamed_body() {
         // No Content-Length forces the streaming-cap branch (lying/chunked server).
         let addr = serve_body_once(4 * 1024 * 1024, false).await;
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder().no_proxy().build().unwrap()
             .get(format!("http://{addr}/"))
             .send()
             .await
             .expect("request should reach the local server");
-        let err = read_body_capped(resp, 1024 * 1024)
+        read_body_capped(resp, 1024 * 1024)
             .await
             .expect_err("a body larger than the cap must be rejected");
-        assert!(
-            err.to_string().contains("maximum"),
-            "error should mention the cap: {err}"
-        );
     }
 
     #[tokio::test]
     async fn read_body_capped_reads_body_within_cap() {
         let addr = serve_body_once(1024, true).await;
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder().no_proxy().build().unwrap()
             .get(format!("http://{addr}/"))
             .send()
             .await
@@ -5836,7 +6137,7 @@ mod tests {
         let body = read_body_capped(resp, 1024 * 1024)
             .await
             .expect("a small body must be read successfully");
-        assert_eq!(body.len(), 1024, "should read the whole small body");
+        assert_eq!(body, vec![b'a'; 1024], "the response body must arrive intact");
     }
 
     #[test]
@@ -6638,6 +6939,20 @@ pub struct SessionHistory {
     pub current: usize,
 }
 
+/// A navigation queued by page script for the host to perform.
+///
+/// `origin_frame_id` is the native frame id of the document that queued it
+/// (0 for the page's root document), so the host can apply that document's
+/// origin/file gate and route in-place frame navigations back to the same
+/// browsing context.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingNavigation {
+    pub url: String,
+    pub method: String,
+    pub body: String,
+    pub origin_frame_id: u32,
+}
+
 /// `"documentStart,current,length"` of the session history; length is 0 when
 /// this realm has none.
 #[op2]
@@ -6653,13 +6968,23 @@ fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// false when the index is out of range.
 #[op2(fast)]
 fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
-    let gs = realm_state(scope, state);
+    let Ok((windows, root, gs)) = crate::window::caller_window(scope, state) else { return false };
+    let origin_frame_id = {
+        let windows = windows.borrow();
+        if windows.windows.get(&root).is_some_and(|window| Rc::ptr_eq(&window.state, &gs)) {
+            0
+        } else {
+            gs.borrow().frame_id
+        }
+    };
     let mut gs = gs.borrow_mut();
     let index = index as usize;
     let Some(url) = gs.session_history.urls.get(index).cloned() else {
         return false;
     };
-    gs.pending_navigation = Some((url, "GET".to_string(), String::new()));
+    gs.pending_navigation = Some(PendingNavigation {
+        url, method: "GET".to_string(), body: String::new(), origin_frame_id,
+    });
     gs.pending_history_traversal = Some(index);
     true
 }
@@ -6675,10 +7000,12 @@ fn op_navigate(
     #[string] body: &str,
 ) -> Result<(), deno_error::JsErrorBox> {
     let (windows, root, gs) = crate::window::caller_window(scope, state)?;
+    let mut origin_frame_id = gs.borrow().frame_id;
     {
         let mut windows = windows.borrow_mut();
         if let Some(window) = windows.windows.get_mut(&root).filter(|window| Rc::ptr_eq(&window.state, &gs)) {
             window.navigation_generation = window.navigation_generation.wrapping_add(1);
+            origin_frame_id = 0;
             // Page may consume the pending tuple before the native drain.
             // Supersede an older queued/root request at this task boundary.
             windows.navigations.retain(|job| job.id != root);
@@ -6690,10 +7017,27 @@ fn op_navigate(
     // Moving it early let synchronous JS run between two navigations read and
     // write another origin's cookies through document.cookie, whose ops derive
     // the cookie domain from this URL (SOP bypass, #940).
-    gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+    gs.pending_navigation = Some(PendingNavigation {
+        url: url.to_string(), method: method.to_string(), body: body.to_string(), origin_frame_id,
+    });
     drop(gs);
     state.waker.wake();
     Ok(())
+}
+
+/// Set the page-visible URL without executing author code. An empty URL
+/// clears it back to the committed document URL. The write is bound to the
+/// receiver's native realm, not the op wrapper's realm, so a child document's
+/// location setter updates its own reflected URL.
+#[op2(fast)]
+fn op_set_reflected_url(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, #[string] url: &str) -> bool {
+    let Some(context) = receiver.get_creation_context(scope) else { return false };
+    if !receiver.strict_equals(context.global(scope).into()) { return false; }
+    let Some(slot) = context.get_slot::<DocumentStateSlot>() else { return false };
+    slot.0.borrow_mut().reflected_url = (!url.is_empty()).then(|| url.to_string());
+    state.waker.wake();
+    true
 }
 
 fn frame_message_queue_entry_limit() -> usize {
@@ -6714,6 +7058,13 @@ fn frame_message_queue_byte_limit() -> usize {
 // the caller's: the Page drains a single queue, and a message sent by a nested
 // frame would otherwise sit in that frame's own state and never be looked at.
 //
+// The sender is the native incumbent context. Every caller of this op is a
+// private bootstrap helper of the author's own realm (the facade/proxy entry
+// wrappers, or the dispatch the native `window.postMessage` entry invokes in
+// the captured source realm), so no author wrapper from the receiver's realm
+// is on the stack. The native entry itself attributes the sender before it
+// reaches any JS helper.
+//
 // The queue is capped. Script can post in a synchronous loop while the host
 // only drains between event loop turns, and this buffer lives on the process
 // heap rather than V8's, so an unbounded queue would let a page grow memory
@@ -6728,7 +7079,7 @@ fn op_post_frame_message(
     #[string] target_origin: &str,
     #[string] data_json: &str,
 ) -> bool {
-    let source = realm_state(scope, state);
+    let Ok((_, _, source)) = crate::window::caller_window(scope, state) else { return false };
     let source = source.borrow();
     let source_frame_id = source.frame_id;
     if source_frame_id == 0 && target_frame_id == 0 {
@@ -6766,6 +7117,179 @@ fn op_post_frame_message(
         data_json: data_json.to_string(),
     });
     true
+}
+
+/// Installs the realm's private `postMessage` dispatch.
+///
+/// The native window entry runs it in the captured source realm so the only JS
+/// frames between the native attribution and the enqueue ops belong to that
+/// realm. First registration wins, like the delivery callbacks above: re-running
+/// page init must not let a later wrapper replace the captured entry point.
+#[op2]
+fn op_register_post_message<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    dispatch: v8::Local<'s, v8::Function>,
+    entry: v8::Local<'s, v8::Function>,
+) -> Result<v8::Local<'s, v8::Function>, JsErrorBox> {
+    let context = dispatch.get_creation_context(scope)
+        .ok_or_else(|| JsErrorBox::type_error("Invalid message realm"))?;
+    if context.get_embedder_data(scope, POST_MESSAGE_DISPATCH_SLOT)
+        .is_none_or(|value| !value.is_function())
+    {
+        context.set_embedder_data(POST_MESSAGE_DISPATCH_SLOT, dispatch.into());
+    }
+    // Shared snapshot ops have the engine realm as their function context.
+    // Create the public native function in the document realm so a bare call
+    // defaults to that Window, while .call(otherWindow, ...) still works.
+    // This runs only after snapshot restoration, never during snapshot creation.
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::Function::builder(post_message_entry)
+        .data(entry.into())
+        .length(1)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .build(scope)
+        .ok_or_else(|| JsErrorBox::generic("Cannot create message entry"))
+}
+
+fn post_message_entry(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments,
+    _result: v8::ReturnValue) {
+    let Ok(entry) = v8::Local::<v8::Function>::try_from(args.data()) else {
+        if let Some(message) = v8::String::new(scope, "Native message entry is unavailable") {
+            let exception = v8::Exception::type_error(scope, message);
+            scope.throw_exception(exception);
+        }
+        return;
+    };
+    // No JavaScript frame intervenes before native sender authentication.
+    let arguments = [args.get(0), args.get(1), args.get(2)];
+    // Window.postMessage is Web IDL void. Do not expose the internal op's
+    // transport return value; a pending exception from call still propagates.
+    let _ = entry.call(scope, args.this().into(), &arguments);
+}
+
+/// The native `window.postMessage` entry.
+///
+/// A realm-local native function calls this op without a bootstrap JavaScript
+/// receiver wrapper. Such a wrapper would make V8's incumbent context name the
+/// receiver, attributing `contentWindow.postMessage` and `parent.postMessage`
+/// to the wrong document. Here the
+/// receiver (`this`) names the destination window, and the incumbent names the
+/// script that actually called, including `eval` code running in another realm.
+/// Cloning, overload handling, Blob/File support and queueing stay in the
+/// calling realm's existing helpers, which this op invokes in the source realm
+/// after the principals are fixed natively.
+#[op2(nofast, reentrant)]
+fn op_post_message(
+    #[varargs] args: Option<&v8::FunctionCallbackArguments>,
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    data: Option<v8::Local<v8::Value>>,
+    target_origin: Option<v8::Local<v8::Value>>,
+    transfer: Option<v8::Local<v8::Value>>,
+) -> Result<(), deno_error::JsErrorBox> {
+    let target_context = {
+        let object = args.ok_or_else(|| JsErrorBox::type_error("Illegal invocation"))?.this();
+        let Some(creation) = object.get_creation_context(scope) else {
+            return Err(JsErrorBox::type_error("Illegal invocation"));
+        };
+        // Only an actual Window is a valid WebIDL receiver.
+        if !object.strict_equals(creation.global(scope).into()) {
+            return Err(JsErrorBox::type_error("Illegal invocation"));
+        }
+        v8::Global::new(scope, creation)
+    };
+    // A discarded frame or closed popup has no live receiver document. Posting
+    // to it is a no-op in the facade path too; it never establishes authority.
+    let Ok((windows, root, document)) = crate::window::context_document(state, &target_context) else {
+        return Ok(())
+    };
+    let frame_id = document.borrow().frame_id;
+    let target_is_root = windows.borrow().windows.get(&root)
+        .is_some_and(|window| window.realm_id == frame_id);
+    let Ok(source_context) = crate::window::caller_context(scope) else { return Ok(()) };
+    let Ok(_) = crate::window::context_document(state, &source_context) else {
+        return Ok(())
+    };
+    // Transport belongs to the actual receiver, not the sender's numeric realm
+    // id. Every top-level Window (including a popup with a nonzero realm id)
+    // has a native task consumer; only child destinations need the frame queue.
+    let window_target = target_is_root;
+    if window_target && windows.borrow().windows.get(&root).is_none_or(|window| window.closed) {
+        return Ok(())
+    }
+    dispatch_post_message(scope, source_context, window_target,
+        if window_target { root } else { frame_id }, true,
+        data, target_origin, transfer)
+}
+
+/// Runs the source realm's private `postMessage` pipeline.
+///
+/// The principals are already fixed when this runs: the native entry named the
+/// destination and captured the incumbent source realm before any JS helper.
+/// This only normalizes the public overloads, carries Blob/File encoding and
+/// enqueues through the source realm's own helpers, so a thrown
+/// DataCloneError/SyntaxError is exactly the author-visible failure.
+fn dispatch_post_message(
+    scope: &mut v8::PinScope,
+    source_context: v8::Global<v8::Context>,
+    window_target: bool,
+    id: u32,
+    deliver: bool,
+    data: Option<v8::Local<v8::Value>>,
+    target_origin: Option<v8::Local<v8::Value>>,
+    transfer: Option<v8::Local<v8::Value>>,
+) -> Result<(), JsErrorBox> {
+    let source_context = v8::Local::new(scope, &source_context);
+    let Some(dispatch) = source_context
+        .get_embedder_data(scope, POST_MESSAGE_DISPATCH_SLOT)
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    else { return Ok(()) };
+    let is_window = v8::Boolean::new(scope, window_target);
+    let id = v8::Integer::new_from_unsigned(scope, id);
+    let deliver = v8::Boolean::new(scope, deliver);
+    let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
+    let data = data.unwrap_or(undefined);
+    let target_origin = target_origin.unwrap_or(undefined);
+    let transfer = transfer.unwrap_or(undefined);
+    let scope = &mut v8::ContextScope::new(scope, source_context);
+    let receiver = v8::undefined(scope).into();
+    let args = [is_window.into(), id.into(), data, target_origin, transfer, deliver.into()];
+    // Leave a pending V8 exception untouched: the dispatch threw the author's
+    // DataCloneError/SyntaxError, and the native callback propagates it.
+    let _ = dispatch.call(scope, receiver, &args);
+    Ok(())
+}
+
+/// The native `postMessage` entry published on a WindowProxy facade.
+///
+/// A proxied window cannot hand out its own native `postMessage` (a
+/// cross-origin facade has no access to the target realm's global), so the
+/// facade binds this op to the target it was built from. `window_target`,
+/// `deliver` and `id` are structural facts fixed by the native-authorized
+/// proxy factory, never by message data. Because this op is the entry, it
+/// captures the incumbent before any JS helper runs; the old facade wrapper
+/// put its own realm on the stack and could name that realm as the sender.
+#[op2(nofast, reentrant)]
+fn op_facade_post_message(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    window_target: bool,
+    deliver: bool,
+    id: u32,
+    data: Option<v8::Local<v8::Value>>,
+    target_origin: Option<v8::Local<v8::Value>>,
+    transfer: Option<v8::Local<v8::Value>>,
+) -> Result<(), JsErrorBox> {
+    // A frame may have been discarded since the facade was built. Delivery
+    // then becomes the same silent drop a browser performs, but the public
+    // overload is still validated by the dispatch.
+    let deliver = deliver && (window_target
+        || state.try_borrow::<Rc<RefCell<RealmStates>>>().cloned()
+            .is_some_and(|realms| realms.borrow().by_frame_id(id).is_some()));
+    let Ok(source_context) = crate::window::caller_context(scope) else { return Ok(()) };
+    if crate::window::context_document(state, &source_context).is_err() { return Ok(()) }
+    dispatch_post_message(scope, source_context, window_target, id, deliver,
+        data, target_origin, transfer)
 }
 
 // A cancellation handle identifies a particular registered context, even when
@@ -6816,16 +7340,64 @@ impl TimerContext {
 /// Only Rust-owned generation/cancellation state crosses the await boundary.
 #[op2]
 fn op_sleep(scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>, #[number] millis: u64,
-    receiver: v8::Local<v8::Object>)
+    receiver: v8::Local<v8::Object>, timer_id: Option<f64>)
     -> impl Future<Output = bool> + use<>
 {
     let context = TimerContext::capture(scope, &state.borrow(), receiver);
+    let timer_cancel = timer_id
+        .filter(|id| id.is_finite() && *id > 0.0)
+        .and_then(|id| {
+            let id = id as u32;
+            let context = context.as_ref()?;
+            let owner = context.owner.upgrade()?;
+            let cancels = owner.borrow().timeout_cancels.clone();
+            let cancel = CancelHandle::new_rc();
+            cancels.borrow_mut().insert(id, cancel.clone());
+            Some((id, cancel))
+        });
     async move {
-        let Some(context) = context else { return false };
+        let Some(context) = context else { return false; };
         if !context.active() { return false; }
-        tokio::time::sleep(std::time::Duration::from_millis(millis))
-            .or_cancel(context.cancel.clone()).await.is_ok() && context.active()
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(millis));
+        tokio::pin!(sleep);
+        let fired = match &timer_cancel {
+            Some((_, cancel)) => {
+                let timer = std::future::pending::<()>().or_cancel(cancel.clone());
+                let realm = sleep.as_mut().or_cancel(context.cancel.clone());
+                tokio::pin!(timer);
+                tokio::pin!(realm);
+                tokio::select! {
+                    result = &mut realm => result.is_ok(),
+                    _ = &mut timer => false,
+                }
+            }
+            None => sleep.or_cancel(context.cancel.clone()).await.is_ok(),
+        };
+        if let Some((id, cancel)) = &timer_cancel {
+            if let Some(owner) = context.owner.upgrade() {
+                let cancels = owner.borrow().timeout_cancels.clone();
+                let mut cancels = cancels.borrow_mut();
+                if cancels.get(id).is_some_and(|current| Rc::ptr_eq(current, cancel)) {
+                    cancels.remove(id);
+                }
+            }
+        }
+        fired && context.active()
     }
+}
+
+/// Cancel a timer so its pending sleep is dropped instead of keeping the
+/// event loop alive until the deadline. Returns whether this realm owned it.
+#[op2(fast)]
+fn op_cancel_timeout(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, timer_id: f64) -> bool {
+    if !timer_id.is_finite() || timer_id <= 0.0 { return false; }
+    let Some(context) = TimerContext::capture(scope, state, receiver) else { return false };
+    let Some(owner) = context.owner.upgrade() else { return false };
+    let cancels = owner.borrow().timeout_cancels.clone();
+    let Some(cancel) = cancels.borrow_mut().remove(&(timer_id as u32)) else { return false };
+    cancel.cancel();
+    true
 }
 
 // A child protocol identity must never alias a later document/runtime's child.
@@ -6836,7 +7408,7 @@ fn allocate_frame_id() -> Option<u32> {
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
 const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-/// Reserve the browsing-context identity before its real Document request.
+/// Reserve a document load without replacing its browsing-context identity.
 #[op2(nofast)]
 fn op_frame_document_begin(
     scope: &mut v8::PinScope,
@@ -6854,19 +7426,37 @@ fn op_frame_document_begin(
             return Err(deno_error::JsErrorBox::generic("Iframe document owner is detached or invalid"));
         }
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
-        let active = {
-            let registry = registry.borrow();
-            registry.frame_timers.keys().filter(|id|
-                registry.frame_timers_active(**id) != Some(false)).count()
-        };
-        if active >= max_live_frames() {
-            return Err(deno_error::JsErrorBox::generic("Live frame limit exceeded"));
-        }
-        let frame_id = allocate_frame_id()
-            .ok_or_else(|| deno_error::JsErrorBox::generic("Frame id space exhausted"))?;
         let mut registry = registry.borrow_mut();
-        registry.own_frame(frame_id, &parent, node);
-        registry.frame_timers.get_mut(&frame_id).unwrap().document_url = Some(url.to_string());
+        let frame_id = if let Some(id) = registry.frame_for_owner(&parent, node) {
+            id
+        } else {
+            let active = registry.frame_timers.keys().filter(|id|
+                registry.frame_timers_active(**id) != Some(false)).count();
+            if active >= max_live_frames() {
+                return Err(deno_error::JsErrorBox::generic("Live frame limit exceeded"));
+            }
+            let id = allocate_frame_id()
+                .ok_or_else(|| deno_error::JsErrorBox::generic("Frame id space exhausted"))?;
+            registry.own_frame(id, &parent, node);
+            id
+        };
+        let frame = registry.frame_timers.get_mut(&frame_id).unwrap();
+        if let Some(cancel) = frame.document_load_cancel.take() { cancel.cancel(); }
+        frame.document_load_cancel = Some(CancelHandle::new_rc());
+        frame.document_url = Some(url.to_string());
+        frame.document_load_started = matches!(url, "about:blank" | "about:srcdoc");
+        drop(registry);
+        // Supersede a document queued before its host turn, including an
+        // initial blank document materialized synchronously by contentWindow.
+        let page = state.borrow::<SharedState>();
+        let mut page = page.borrow_mut();
+        let mut removed_bytes = 0usize;
+        page.pending_frames.retain(|frame| {
+            if frame.frame_id != frame_id { return true; }
+            removed_bytes = removed_bytes.saturating_add(frame.url.len()).saturating_add(frame.html.len());
+            false
+        });
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_sub(removed_bytes);
         Ok(frame_id)
     })).unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Iframe document reservation failed")))
 }
@@ -6887,11 +7477,12 @@ fn op_frame_document_ready(
         let parent = fetch_realm_state(scope, state)?;
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         let valid = registry.borrow().frame_owner_matches(frame_id, &parent, NodeId::new(owner_node))
-            && registry.borrow().by_frame_id(frame_id).is_none()
-            && registry.borrow().frame_timers.get(&frame_id).is_some_and(|frame| frame.document_load_started);
+            && registry.borrow().frame_timers.get(&frame_id).is_some_and(|frame|
+                frame.document_load_started && frame.document_load_cancel.as_ref().is_some_and(|cancel| !cancel.is_canceled()));
         if !valid {
             return Err(deno_error::JsErrorBox::generic("Iframe document owner is detached or was replaced"));
         }
+        let replace_document = registry.borrow().by_frame_id(frame_id).is_some();
         let parent_frame_id = parent.borrow().frame_id;
         let page = state.borrow::<SharedState>().clone();
         let mut page = page.borrow_mut();
@@ -6908,6 +7499,7 @@ fn op_frame_document_ready(
         page.pending_frames.push(PendingFrame {
             frame_id, url: url.to_string(), html: html.to_string(),
             viewport_width, viewport_height, parent_frame_id,
+            replace_document,
         });
         Ok(frame_id)
     })).unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Iframe document commit failed")))
@@ -6915,10 +7507,13 @@ fn op_frame_document_ready(
 
 // deno_core owns the context-state and module-map slots. Store traced V8 values
 // after them, not Global handles that would keep the context alive after detach.
-const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
+pub(crate) const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
 const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
 pub(crate) const FRAME_OBJECTS_SLOT: i32 = DOCUMENT_OWNER_SLOT + 1;
 pub(crate) const FRAME_MESSAGE_SLOT: i32 = FRAME_OBJECTS_SLOT + 1;
+// The realm's private `postMessage` dispatch, invoked by the native window
+// entry after it fixes the source principal natively.
+const POST_MESSAGE_DISPATCH_SLOT: i32 = crate::window::WINDOW_MESSAGE_SLOT + 1;
 
 pub(crate) fn initialize_document_realm_slots(
     context: v8::Local<v8::Context>,
@@ -6930,11 +7525,13 @@ pub(crate) fn initialize_document_realm_slots(
         context.set_embedder_data(slot, undefined);
     }
     crate::window::initialize_world_callback_slots(context, undefined);
+    context.set_embedder_data(POST_MESSAGE_DISPATCH_SLOT, undefined);
 }
 
 #[op2(nofast)]
 fn op_register_document_realm(
     scope: &mut v8::PinScope,
+    state: &OpState,
     members: v8::Local<v8::Object>,
     frame_id: u32,
     deliver_message: v8::Local<v8::Value>,
@@ -6942,6 +7539,11 @@ fn op_register_document_realm(
     deliver_window_message: v8::Local<v8::Value>,
 ) {
     if let Some(context) = members.get_creation_context(scope) {
+        // The context owns its document state: retained JavaScript keeps the
+        // old DOM alive after frame teardown, and V8 drops the state with the
+        // context. No strong context handles are retained by the registry.
+        let document = frame_state(state, frame_id);
+        let _ = context.set_slot(Rc::new(DocumentStateSlot(document)));
         context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         context.set_embedder_data(DOCUMENT_OWNER_SLOT, id.into());
@@ -6962,12 +7564,15 @@ fn op_register_document_realm(
         {
             context.set_embedder_data(FRAME_OBJECTS_SLOT, frame_objects);
         }
-        if context != scope.get_current_context() {
+        if context != scope.get_current_context()
+            && !deno_core::BrowserRealm::has_attached_storage(context) {
             // Frame contexts own no Rust typed slots. Discard the empty annex
             // created by these setters while the isolate is alive (#1161).
             // Traced native embedder fields remain intact; deno_core cleans up
             // the main context's annex itself. The shared op runs in main, so
             // compare native identity, not the script-provided frame id.
+            // Never clear a context deno_core has attached storage to: its
+            // module-map slot would dangle.
             context.clear_all_slots();
         }
     }
@@ -7068,15 +7673,19 @@ fn op_initial_frame(
             return 0;
         }
         let Some(frame_id) = allocate_frame_id() else { return 0 };
-        let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
-            .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
+        let Some(context) = crate::window::create_realm_context(
+            scope, &registry, frame_id, None, None)
         else { return 0 };
+        // A context handle cannot call Local-only APIs; keep the live handle
+        // for token/global/attach work and re-root it only when storing.
+        let context = v8::Local::new(scope, &context);
         let undefined = v8::undefined(scope);
         initialize_document_realm_slots(context, undefined.into());
         context.set_security_token(parent_context.get_security_token(scope));
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
         child.set_viewport(300.0, 150.0);
+        let parent_opaque = crate::window::inherited_opaque_principal(&parent_state);
         {
             let parent = parent_state.borrow();
             child.sandbox_opaque_origin = opaque;
@@ -7093,6 +7702,13 @@ fn op_initial_frame(
             child.inherited_origin = Some(if opaque { "null".to_string() } else {
                 crate::window::origin(&parent)
             });
+            // A sandboxed frame gets a fresh opaque principal; an inherited
+            // about:blank/srcdoc keeps its creator's opaque principal.
+            child.opaque_origin = if opaque || crate::window::origin(&parent) != "null" {
+                opaque.then(|| Rc::new(()))
+            } else {
+                parent_opaque.clone()
+            };
             child.inherit_resources(&parent);
         }
         let child = Rc::new(RefCell::new(child));
@@ -7137,6 +7753,7 @@ fn op_initial_frame(
             parent_frame_id,
             url: frame_url.to_string(),
             html: String::new(),
+            replace_document: false,
             viewport_width: 300,
             viewport_height: 150,
         });
@@ -8263,6 +8880,7 @@ pub fn build_extension() -> Extension {
         op_indexed_db(),
         op_indexed_db_task(),
         op_navigate(),
+        op_set_reflected_url(),
         op_session_history(),
         op_history_traverse(),
         op_frame_document_begin(),
@@ -8270,8 +8888,12 @@ pub fn build_extension() -> Extension {
         op_initial_frame(),
         op_document_realm_member(),
         op_register_document_realm(),
+        op_register_post_message(),
         op_post_frame_message(),
+        op_post_message(),
+        op_facade_post_message(),
         op_sleep(),
+        op_cancel_timeout(),
         op_async_runtime_available(),
         op_posted_task(),
         op_posted_task_generation(),

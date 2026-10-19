@@ -1,0 +1,25 @@
+[package]
+name = "obscura-js-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+publish = false
+
+[features]
+# Match the consumer's supported V8 configuration so the produced artifact and
+# linked runtime agree; deno_core 0.412 exposes no sandbox feature.
+v8_enable_pointer_compression = [
+    "deno_core/v8_enable_pointer_compression",
+    "obscura-v8-native/v8_enable_pointer_compression",
+]
+
+[build-dependencies]
+sha2 = "0.11.0"
+
+[dependencies]
+deno_core = "0.412"
+obscura-v8-native = { path = "../obscura-v8-native" }
+serde_json = "1"
+sha2 = "0.11.0"

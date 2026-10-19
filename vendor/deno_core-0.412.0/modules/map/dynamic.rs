@@ -54,8 +54,14 @@ impl ModuleMap {
     cped_handle: v8::Global<v8::Value>,
   ) -> bool {
     if self.retired.get() {
-      let message = v8::String::new(scope, "Cannot import into a retired browser realm")
-        .unwrap();
+      // Matches the rejection a retained function from a detached document
+      // receives in Chromium: the old realm keeps executing, but no new module
+      // jobs may be started from an inactive browsing context.
+      let message = v8::String::new(
+        scope,
+        "Cannot import module from an inactive browsing context.",
+      )
+      .unwrap();
       let exception = v8::Exception::error(scope, message);
       let resolver = resolver_handle.open(scope);
       resolver.reject(scope, exception);

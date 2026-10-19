@@ -4,6 +4,57 @@
   <meta charset="utf-8">
   <title>font metric line-height geometry</title>
   <style>
+    /* Pin the bundled faces so Chromium and Obscura shape the same bytes.
+       The line-gap override restores the hhea gap that the Windows font
+       backend drops; Obscura already fits normal line height from hhea. */
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
+    @font-face {
+      font-family: "Liberation Serif";
+      src: url("../crates/obscura-render/assets/liberation-serif.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 4.2480%;
+    }
+    @font-face {
+      font-family: "Liberation Serif";
+      src: url("../crates/obscura-render/assets/liberation-serif-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 4.2480%;
+    }
+    @font-face {
+      font-family: "Liberation Mono";
+      src: url("../crates/obscura-render/assets/liberation-mono.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 0%;
+    }
+    @font-face {
+      font-family: "Liberation Mono";
+      src: url("../crates/obscura-render/assets/liberation-mono-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 0%;
+    }
     html, body { margin: 0; }
     .column {
       position: absolute;

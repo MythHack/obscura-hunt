@@ -6,11 +6,13 @@ Render-enabled builds can load additional fonts for screenshots and PDF output:
 obscura mcp --font-dir /path/to/fonts
 ```
 
-Repeat `--font-dir` to load multiple directories. It recursively loads TTF, TTC,
-OTF, and OTC files once before rendering, using the same opt-in font database as
-`obscura serve`. System fonts are not scanned automatically. Invalid directories
-fail at startup, and no-render builds reject a nonempty font directory option.
-The option works with both stdio and HTTP transports.
+Render builds use installed system fonts by default. Repeat the global
+`--font-dir` option to add directories recursively containing TTF, TTC, OTF, or
+OTC files. Use `--no-system-fonts` for bundled and explicitly added fonts only.
+The same policy applies to body text, form controls, SVG, screenshots, and PDF,
+and is shared with `fetch`, `serve`, and scrape workers. Both options work before
+or after `mcp`, with either stdio or HTTP transport. Invalid directories fail
+before transport startup; no-render builds reject font options.
 
 ## Run
 

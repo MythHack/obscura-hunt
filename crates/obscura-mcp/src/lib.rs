@@ -140,15 +140,16 @@ impl BrowserState {
     /// Scoped isolate entries allow inactive tabs to keep their realms, as in CDP.
     fn activate(&mut self, tab_id: &str) {
         if let Some(page) = self.tabs.get_mut(tab_id) {
-            if !page.has_js() { page.resume_js(); }
+            // Suspension parks a live runtime (globals, frames and CDP handles
+            // stay alive), so `has_js()` cannot tell a parked tab from an
+            // active one. Activation must resume in both cases; resume_js is
+            // idempotent for an already-active page and still initializes a
+            // page that never had a runtime.
+            page.resume_js();
         }
     }
 
-    /// Retire frame handles before disposing their owning runtime.
     fn close_tab(&mut self, tab_id: &str) -> bool {
-        if let Some(page) = self.tabs.get_mut(tab_id) {
-            page.suspend_js();
-        }
         self.tabs.remove(tab_id).is_some()
     }
 
@@ -156,7 +157,11 @@ impl BrowserState {
         self.active_tab
             .as_ref()
             .and_then(|tab_id| self.tabs.get(tab_id))
-            .is_some_and(Page::has_js)
+            // A parked tab still has a runtime, but autonomous turns would
+            // return immediately. Treat it as inactive so the transport does
+            // not arm a pump that can never make progress; activation resumes
+            // it through page_mut() on the next command.
+            .is_some_and(|page| page.has_js() && !page.is_suspended())
     }
 
     /// Advance the active page by one wake-driven browser task and immediately
@@ -170,6 +175,16 @@ impl BrowserState {
 
     // Complete navigation outside the cancelable wait: it consumes pending state before I/O.
     async fn finish_active_page_turn(&mut self, reached_idle: bool) -> Result<bool, String> {
+        // Child frames move themselves independently of the page's root
+        // pending navigation; drive those before the root take so a root
+        // replacement does not strand a sibling frame's queued document. A
+        // child document that submitted a form or assigned its own location is
+        // a frame navigation, not a page navigation; the outcome path never
+        // takes it, so it is serviced here on every turn.
+        self.page_mut()
+            .process_pending_frame_navigations()
+            .await
+            .map_err(|error| error.to_string())?;
         let navigated = self.page_mut()
             .process_pending_navigation()
             .await
@@ -198,6 +213,14 @@ impl BrowserState {
     /// written before any pump turn could run, so the tool would answer
     /// "Clicked" while the request has not left the process.
     async fn settle_synthetic_navigation(&mut self) -> Result<(), String> {
+        // A submit targeting a named frame moves that frame, not the page.
+        // Drive the frame-only queue first (it also adopts frames the
+        // interaction just created), then take any root navigation. The root
+        // outcome correctly reports no navigation for a frame-only submit.
+        self.page_mut()
+            .process_pending_frame_navigations()
+            .await
+            .map_err(|error| error.to_string())?;
         let navigated = self
             .page_mut()
             .process_pending_navigation()
@@ -1286,10 +1309,6 @@ fn tool_console_messages(state: &mut BrowserState) -> Result<String, String> {
 }
 
 fn tool_close(state: &mut BrowserState) -> Result<String, String> {
-    // Retire each page's frame handles before clearing the tab map.
-    for page in state.tabs.values_mut() {
-        page.suspend_js();
-    }
     state.tabs.clear();
     state.active_tab = None;
     state.console_messages.clear();
@@ -2837,16 +2856,107 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::{Read, Write};
+            use std::time::{Duration, Instant};
+
+            const MAX_HEADER_BYTES: usize = 16 * 1024;
+            const MAX_RECORDED_BODY_BYTES: usize = 64 * 1024;
+            const MAX_REQUEST_TIME: Duration = Duration::from_secs(2);
+
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
-                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
-                let start = raw.lines().next().unwrap_or("").to_string();
+                let deadline = Instant::now() + MAX_REQUEST_TIME;
+                let mut request = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() || request.len() == MAX_HEADER_BYTES {
+                        break None;
+                    }
+                    let _ = stream.set_read_timeout(Some(remaining));
+                    let to_read = (MAX_HEADER_BYTES - request.len()).min(chunk.len());
+                    match stream.read(&mut chunk[..to_read]) {
+                        Ok(0) => break None,
+                        Ok(read) => {
+                            request.extend_from_slice(&chunk[..read]);
+                            if let Some(end) = request
+                                .windows(4)
+                                .position(|bytes| bytes == b"\r\n\r\n")
+                            {
+                                break Some(end + 4);
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => break None,
+                        Err(_) => break None,
+                    }
+                };
+                let Some(header_end) = header_end else { continue };
+
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let start = headers.lines().next().unwrap_or("").to_string();
                 let mut parts = start.split_whitespace();
                 let method = parts.next().unwrap_or("").to_string();
                 let path = parts.next().unwrap_or("").to_string();
-                let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+
+                let initial_body = &request[header_end..];
+                let already_received = initial_body.len().min(content_length);
+                let mut recorded_body = Vec::with_capacity(
+                    content_length.min(MAX_RECORDED_BODY_BYTES),
+                );
+                recorded_body.extend_from_slice(
+                    &initial_body[..already_received.min(MAX_RECORDED_BODY_BYTES)],
+                );
+                let mut body_remaining = content_length - already_received;
+                let mut body_complete = true;
+                while body_remaining > 0 {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        body_complete = false;
+                        break;
+                    }
+                    let _ = stream.set_read_timeout(Some(remaining));
+                    let to_read = body_remaining.min(chunk.len());
+                    match stream.read(&mut chunk[..to_read]) {
+                        Ok(0) => {
+                            body_complete = false;
+                            break;
+                        }
+                        Ok(read) => {
+                            body_remaining -= read;
+                            let room = MAX_RECORDED_BODY_BYTES.saturating_sub(recorded_body.len());
+                            recorded_body.extend_from_slice(&chunk[..read.min(room)]);
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {
+                                body_complete = false;
+                                break;
+                            }
+                        Err(_) => {
+                            body_complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !body_complete {
+                    continue;
+                }
+
+                let body = String::from_utf8_lossy(&recorded_body);
                 let _ = tx.send(format!("{method} {path} body='{body}'"));
                 let page = "<!doctype html><meta charset=utf-8>\
                     <form id=f method=POST action=/submitted>\

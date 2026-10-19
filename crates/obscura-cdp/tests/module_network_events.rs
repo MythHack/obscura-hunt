@@ -157,29 +157,24 @@ async fn late_import_records_root_and_redirected_descendant() {
         "expression": "import('/lazy.js').then(m=>m.value)", "awaitPromise": true, "returnByValue": true,
     })).await;
     assert_eq!(result["result"]["value"], "lazy-ready");
-    // The live server drains after commands and autonomous turns; dispatch
-    // alone does not run that owner loop, so flush its page queue explicitly.
-    ctx.pages[0].sync_js_network_events();
-    for (path, body) in [("/lazy.js", ROOT), ("/child.js", CHILD)] {
-        let events = ctx.pages[0].network_events.iter()
-            .filter(|e| e.url == format!("{base}{path}")).collect::<Vec<_>>();
-        assert_eq!(events.len(), 1);
-        let event = events[0];
-        assert_eq!(event.resource_type, "Script");
-        assert_eq!(event.status, 200);
-        assert_eq!(event.body_size, body.len());
-        assert_eq!(event.response_headers.get("x-module-probe").map(String::as_str), Some("observed"));
-        let id = event.request_id.clone();
-        let stored = cdp(&mut ctx, "Network.getResponseBody", json!({"requestId": id})).await;
-        assert_eq!(stored, json!({"body": body, "base64Encoded": false}));
-    }
-    let recorded = ctx.pages[0].network_events.len();
+    // Consume the protocol's own Network events, not the Page's internal
+    // receipt queue: exactly one requestWillBeSent/responseReceived/
+    // loadingFinished per module, with the response body retrievable through
+    // Network.getResponseBody.
+    assert_module(&mut ctx, &base, "/lazy.js", 200, ROOT).await;
+    assert_module(&mut ctx, &base, "/child.js", 200, CHILD).await;
+    let lazy_url = format!("{base}/lazy.js");
+    let recorded = ctx.pending_events.iter()
+        .filter(|e| e.method == "Network.responseReceived" && e.params["response"]["url"] == lazy_url)
+        .count();
+    assert_eq!(recorded, 1);
     cdp(&mut ctx, "Runtime.evaluate", json!({
         "expression": "import('/lazy.js')", "awaitPromise": true,
     })).await;
-    ctx.pages[0].sync_js_network_events();
-    assert_eq!(ctx.pages[0].network_events.len(), recorded,
-        "cached import must not invent another request");
+    let after_cached = ctx.pending_events.iter()
+        .filter(|e| e.method == "Network.responseReceived" && e.params["response"]["url"] == lazy_url)
+        .count();
+    assert_eq!(after_cached, recorded, "cached import must not invent another request");
 }
 
 #[tokio::test(flavor = "current_thread")]

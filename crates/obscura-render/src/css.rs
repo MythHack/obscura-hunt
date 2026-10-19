@@ -5068,6 +5068,7 @@ fn set_margin_animation_value(style: &mut LayoutStyle, index: usize, value: Anim
     style.margin_percent[index] = None;
     style.margin_relative[index] = None;
     style.margin_expressions[index] = None;
+    style.margin_calc_expressions[index] = None;
     *edge_value_mut(&mut style.margin, index) = 0.0;
     match value {
         AnimatedLength::Auto => style.margin_auto[index] = true,
@@ -5079,7 +5080,10 @@ fn set_margin_animation_value(style: &mut LayoutStyle, index: usize, value: Anim
         }
         AnimatedLength::Dimension(crate::Dimension::Auto) => style.margin_auto[index] = true,
         AnimatedLength::Dimension(value) => style.margin_relative[index] = Some(value),
-        AnimatedLength::Expression(value) => style.margin_expressions[index] = Some(value),
+        AnimatedLength::Expression(value) => {
+            style.margin_calc_expressions[index] = crate::style::parse_margin_calc(&value);
+            style.margin_expressions[index] = Some(value);
+        }
     }
 }
 

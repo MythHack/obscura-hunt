@@ -204,6 +204,20 @@ impl ModuleLoader for ObscuraModuleLoader {
         options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         let url = module_specifier.to_string();
+        // A retained frame keeps its old realm and owned DOM alive, but its
+        // browsing context is gone. New module jobs there have no document to
+        // load under, so reject instead of fetching with retired authority.
+        if let Some(state) = self.page_state.as_ref().and_then(Weak::upgrade) {
+            let active = state
+                .try_borrow()
+                .map(|state| state.document_active.get())
+                .unwrap_or(true);
+            if !active {
+                return ModuleLoadResponse::Sync(Err(JsErrorBox::generic(
+                    "Cannot import module from an inactive browsing context.",
+                )));
+            }
+        }
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct
@@ -361,7 +375,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 url: url.clone(), method: "GET".to_string(), resource_type: "Script".to_string(),
                                 status: 0, response_headers: Default::default(), body_size: 0,
                                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default().as_secs_f64(), error_text: Some(message.clone()),
+                                    .unwrap_or_default().as_secs_f64(), error_text: Some("net::ERR_FAILED".to_string()),
                             });
                         }
                         io_err(message)

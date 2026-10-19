@@ -305,6 +305,16 @@ fn table_width_uses_local_space_and_keeps_width_hints_shrinkable() {
             "nested table sizing must settle outer-first for {id}: {box_rect:?}"
         );
     }
+    let inner = rect("inner");
+    for id in ["outer", "outer-cell"] {
+        let container = rect(id);
+        assert!(
+            (container.y - inner.y).abs() < 0.01
+                && (container.height - inner.height).abs() < 0.01,
+            "normal source indentation around a nested block table must not create a line: \
+             {id}={container:?}, inner={inner:?}"
+        );
+    }
 
     let overflow = rect("overflow");
     assert!(
@@ -479,6 +489,598 @@ fn percentage_padding_uses_final_flex_containing_block_width() {
             (layout.styles[&node].padding.top - expected).abs() < 0.05,
             "paint/content consumers must see final used padding for {id}: {:?}",
             layout.styles[&node].padding
+        );
+    }
+}
+
+#[test]
+fn percentage_margin_resolves_against_block_content_box_not_outer_padding_box() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="parent" style="width:200px;padding:10px">
+            <div id="horizontal" style="width:10px;height:10px;margin-left:10%"></div>
+            <div id="vertical" style="width:10px;height:10px;margin-top:calc(10%)"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (600.0, 500.0));
+    let parent = layout.rects[&tree.get_element_by_id("parent").unwrap()];
+    let horizontal = layout.rects[&tree.get_element_by_id("horizontal").unwrap()];
+    let vertical = layout.rects[&tree.get_element_by_id("vertical").unwrap()];
+    assert!((parent.width - 220.0).abs() < 0.01, "content 200 + 20 padding: {parent:?}");
+    let horizontal_style = &layout.styles[&tree.get_element_by_id("horizontal").unwrap()];
+    assert!(
+        (horizontal_style.margin.left - 20.0).abs() < 0.01,
+        "10% of the 200px content box, not the 220px outer box: {:?}",
+        horizontal_style.margin
+    );
+    assert!(
+        (horizontal.x - (parent.x + 10.0 + 20.0)).abs() < 0.01,
+        "used inset must include the content-box margin: {horizontal:?} parent={parent:?}"
+    );
+    let vertical_style = &layout.styles[&tree.get_element_by_id("vertical").unwrap()];
+    assert!(
+        (vertical_style.margin.top - 20.0).abs() < 0.01,
+        "vertical/calc percentages use the same content-box width: {:?}",
+        vertical_style.margin
+    );
+    assert!(
+        (vertical.y - (horizontal.y + horizontal.height + 20.0)).abs() < 0.01,
+        "vertical margin must use the final content-box basis: {vertical:?} horizontal={horizontal:?}"
+    );
+}
+
+#[test]
+fn percentage_margin_does_not_absorb_collapsed_descendant_margin() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="parent" style="width:200px;margin-top:10%">
+            <div id="child" style="height:10px;margin-top:50px"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (400.0, 500.0));
+    let parent = tree.get_element_by_id("parent").unwrap();
+    let child = tree.get_element_by_id("child").unwrap();
+    let parent_rect = layout.rects[&parent];
+    let child_rect = layout.rects[&child];
+    assert!(
+        (layout.styles[&parent].margin.top - 40.0).abs() < 0.01,
+        "parent own margin is 10% of the 400px body content box, not the 50px collapsed set: {:?}",
+        layout.styles[&parent].margin
+    );
+    assert!(
+        (parent_rect.y - 50.0).abs() < 0.01 && (child_rect.y - 50.0).abs() < 0.01,
+        "positions still collapse to the larger 50px descendant margin: parent={parent_rect:?} child={child_rect:?}"
+    );
+}
+
+#[test]
+fn calc_margin_min_max_is_not_linearized_at_a_large_basis() {
+    // Sampling a few basis widths cannot distinguish 10% from min(10%,100px).
+    // At a 2000px parent the cap must remain 100px (a sampled linear factor
+    // produced 200px); max() must still select the 200px percentage arm.
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="container" style="width:2000px">
+            <div id="cap" style="width:10px;height:10px;margin-left:min(10%, 100px)"></div>
+            <div id="floor" style="width:10px;height:10px;margin-left:max(10%, 100px)"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (2200.0, 700.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for (id, expected) in [("cap", 100.0), ("floor", 200.0)] {
+        let style = &layout.styles[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            (style.margin.left - expected).abs() < 0.01,
+            "{id}: nonlinear min()/max() margin must stay a general calc expression: {:?}",
+            style.margin
+        );
+        assert!(
+            (rect(id).x - expected).abs() < 0.01,
+            "{id}: used position must use the final-basis calc result: {:?}",
+            rect(id)
+        );
+    }
+}
+
+#[test]
+fn calc_margin_keeps_font_relative_units_after_context_setup() {
+    // The cascade-created calc handle receives this element's own 32px font
+    // context before layout. Reparsing it in the margin loop would reset em to
+    // the 16px default and produce 72px instead of 104px.
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="container" style="width:400px;font-size:32px">
+            <div id="element" style="width:10px;height:10px;margin-left:calc(10% + 2em)"></div>
+            <div id="host" style="width:400px;font-size:32px"></div>
+          </div>
+          <style>
+            #host::before { content:""; display:block; height:10px; margin-left:calc(10% + 2em) }
+          </style>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 500.0));
+    let element = layout.rects[&tree.get_element_by_id("element").unwrap()];
+    let element_style = &layout.styles[&tree.get_element_by_id("element").unwrap()];
+    assert!(
+        (element_style.margin.left - 104.0).abs() < 0.01,
+        "calc margin must keep the initialized 32px em basis: {:?}",
+        element_style.margin
+    );
+    assert!((element.x - 104.0).abs() < 0.01, "{element:?}");
+    let host = tree.get_element_by_id("host").unwrap();
+    let before = layout.styles[&host].before_pseudo.as_ref().unwrap();
+    assert!(
+        (before.margin.left - 104.0).abs() < 0.01,
+        "pseudo calc margin must keep its initialized font context: {:?}",
+        before.margin
+    );
+    assert!(
+        (layout.rects[&host].height - 10.0).abs() < 0.01,
+        "pseudo must still participate: {:?}",
+        layout.rects[&host]
+    );
+}
+
+#[test]
+fn inline_svg_siblings_share_a_row_and_keep_authored_height_under_max_width() {
+    // Chromium UA display for svg is inline; no author display is present.
+    // height:27px + max-width:64px must not re-derive height from the clamped
+    // ratio-derived width (27px stayed 27px, not 17/18/19px), and the three
+    // anchors must stay on one inline row instead of one block per line.
+    let tree = parse_html(include_str!("../../../render-repros/inline-svg-row.html"));
+    let layout = layout_dom(&tree, (1000.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let logos = ["logo1", "logo2", "logo3"].map(rect);
+    for (logo, (id, expected_width)) in logos
+        .iter()
+        .zip([("logo1", 64.0f32), ("logo2", 64.0f32), ("logo3", 62.765_625f32)])
+    {
+        assert!(
+            (logo.height - 27.0).abs() < 0.01,
+            "{id} must keep the authored 27px height when max-width caps width: {logo:?}"
+        );
+        assert!(
+            logo.width > 0.0 && logo.width <= 64.0 + 0.01,
+            "{id} must stay measurable and max-width capped: {logo:?}"
+        );
+        assert!(
+            (logo.width - expected_width).abs() < 0.51,
+            "{id} must match Chromium's used width (rect edges round): {logo:?}"
+        );
+    }
+    assert!(
+        (logos[0].y - logos[1].y).abs() < 0.01 && (logos[1].y - logos[2].y).abs() < 0.01,
+        "inline SVG siblings must share one row: {logos:?}"
+    );
+    assert!(
+        logos[1].x > logos[0].x && logos[2].x > logos[1].x,
+        "inline SVG siblings must flow left-to-right: {logos:?}"
+    );
+
+    // The public fixture contains a collapsed source space between anchors.
+    // Its advance and the 16px outer margin must both participate in the
+    // shrink-to-fit width. These values come from the same fixture in Chromium.
+    let logos_box = rect("logos");
+    assert!(
+        (logos_box.width - 247.671_875).abs() < 0.51,
+        "margins and collapsed spaces must contribute to shrink-to-fit width: {logos_box:?}"
+    );
+    assert!(
+        (logos[0].x - 572.328_125).abs() < 0.51,
+        "right-aligned logos row must start at the Chromium x: {logos:?}"
+    );
+    for (index, pair) in logos.windows(2).enumerate() {
+        let gap = pair[1].x - (pair[0].x + pair[0].width);
+        assert!(
+            (gap - 20.453_125).abs() < 1.01,
+            "anchor margin plus collapsed whitespace must separate logo {index}: {logos:?}"
+        );
+    }
+
+    // Baseline-aligned replaced boxes leave the containing line's font descent
+    // below their bottom margin edge. The footer's 27px SVG line is 31px in
+    // Chromium, which also places the next 30px-margin footer at y=81.
+    for id in ["footer1", "footer2"] {
+        let footer = rect(id);
+        assert!((footer.height - 31.0).abs() < 0.51,
+            "baseline SVG line box must include the 4px font descent: {id}={footer:?}");
+    }
+    let second_row = rect("logo4");
+    assert!(
+        (second_row.y - 81.0).abs() < 0.51,
+        "second footer must follow the 31px line box and 30px margin: {second_row:?}"
+    );
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn inline_svg_whitespace_collapses_across_anchor_boundaries() {
+    // Chromium, 16px Arial: one space advances 4.453125px. Non-atomic
+    // anchors share the line's collapse state even when margins keep their
+    // boxes, while preserved whitespace retains all nine authored spaces.
+    for white_space in ["normal", "nowrap", "pre", "pre-wrap", "break-spaces"] {
+        for margin in [0.0, 16.0] {
+            let preserved = matches!(white_space, "pre" | "pre-wrap" | "break-spaces");
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                body{{margin:0;font:16px Arial,sans-serif}}
+                .footer{{display:flex;justify-content:space-between;width:400px}}
+                #logos{{white-space:{white_space}}}
+                a{{margin-right:{margin}px}} svg{{width:64px;height:27px}}
+                </style><div class="footer"><span>Supported by</span><div id="logos"><a><span> </span> <svg id="first"></svg> <span> </span></a> <a> <span> </span><svg id="second"></svg> <span> </span></a></div></div>"#));
+            let layout = layout_dom(&tree, (800.0, 300.0));
+            let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+            let group = rect("logos");
+            let first = rect("first");
+            let second = rect("second");
+            let expected_width = 128.0 + 2.0 * margin
+                + if preserved { 40.078_125 } else { 4.453_125 };
+            let expected_gap = margin + if preserved { 22.265_625 } else { 4.453_125 };
+            let expected_leading = if preserved { 8.906_25 } else { 0.0 };
+            assert!((group.width - expected_width).abs() < 0.75,
+                "{white_space}, margin {margin}: shrink-to-fit group={group:?}");
+            assert!((group.x + group.width - 400.0).abs() < 0.75,
+                "{white_space}, margin {margin}: flex alignment group={group:?}");
+            assert!((first.x - group.x - expected_leading).abs() < 0.75,
+                "{white_space}, margin {margin}: leading whitespace first={first:?}, group={group:?}");
+            assert!((second.x - first.x - first.width - expected_gap).abs() < 0.75,
+                "{white_space}, margin {margin}: inter-anchor whitespace first={first:?}, second={second:?}");
+            assert!((first.width - 64.0).abs() < 0.01 && (second.width - 64.0).abs() < 0.01,
+                "{white_space}, margin {margin}: replaced widths first={first:?}, second={second:?}");
+            assert!((first.y - second.y).abs() < 0.01,
+                "{white_space}, margin {margin}: SVGs must share a row: {first:?}, {second:?}");
+        }
+    }
+}
+
+#[test]
+fn inline_svg_baseline_reserves_font_descent_only_for_baseline_alignment() {
+    // Chromium oracle for a 27px SVG in a 16px Arial line: baseline alignment
+    // produces a 31px line (27px ascent + 4px descent), while top/middle/bottom
+    // alignment produce a 27px line and must not inherit a synthetic strut.
+    let tree = parse_html(
+        r#"
+        <!doctype html><body style="margin:0;font:16px Arial,sans-serif">
+          <div id="baseline"><a><svg style="height:27px;line-height:27px;width:54px" viewBox="0 0 2 1"></svg></a></div>
+          <div id="top"><a><svg style="height:27px;line-height:27px;width:54px;vertical-align:top" viewBox="0 0 2 1"></svg></a></div>
+          <div id="middle"><a><svg style="height:27px;line-height:27px;width:54px;vertical-align:middle" viewBox="0 0 2 1"></svg></a></div>
+          <div id="bottom"><a><svg style="height:27px;line-height:27px;width:54px;vertical-align:bottom" viewBox="0 0 2 1"></svg></a></div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let height = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].height;
+    assert!(
+        (height("baseline") - 31.0).abs() < 0.51,
+        "baseline SVG line must include font descent: {}",
+        height("baseline")
+    );
+    for id in ["top", "middle", "bottom"] {
+        assert!(
+            (height(id) - 27.0).abs() < 0.51,
+            "{id}-aligned SVG line must stay at the replaced height: {}",
+            height(id)
+        );
+    }
+}
+
+#[test]
+fn inline_horizontal_margins_survive_flattening_for_percentage_and_calc() {
+    // A shaped inline formatting context must preserve final-used percentage
+    // and calc margins, including collapsed inter-anchor whitespace.
+    let tree = parse_html(
+        r#"
+        <body style="margin:0;font:16px Arial,sans-serif">
+          <div id="row" style="width:300px">
+            <span id="percent" style="margin-right:10%"><svg style="height:27px;line-height:27px;width:54px" viewBox="0 0 2 1"></svg></span>
+            <span id="calc" style="margin-left:calc(5% + 5px)"><svg style="height:27px;line-height:27px;width:54px" viewBox="0 0 2 1"></svg></span>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let first = rect("percent");
+    let second = rect("calc");
+    let gap = second.x - (first.x + first.width);
+    assert!(
+        (gap - 54.453_125).abs() < 1.01,
+        "30px percentage margin + 20px calc margin + collapsed space must advance the second owner: first={first:?} second={second:?} gap={gap}"
+    );
+}
+
+#[test]
+fn shaped_inline_margins_resolve_after_flex_shrink() {
+    for (margin, expected_wide, expected_narrow) in [
+        ("10%", 20.0, 10.0),
+        ("calc(10% + 5px)", 25.0, 15.0),
+        ("clamp(12px, 10%, 18px)", 18.0, 12.0),
+        ("-10%", -20.0, -10.0),
+    ] {
+        for (row_width, expected_margin) in [(400.0, expected_wide), (200.0, expected_narrow)] {
+            let html = format!(r#"<!doctype html><style>
+                body{{margin:0;font:16px Arial}} .row{{display:flex;width:{row_width}px}}
+                .cell{{flex:1;min-width:0}} span{{margin-left:{margin}}}
+                </style><div class="row"><div id="left" class="cell"><span id="a">A</span></div>
+                <div id="right" class="cell"><span id="b">B</span></div></div>"#);
+            let tree = parse_html(&html);
+            let layout = layout_dom(&tree, (800.0, 400.0));
+            for (cell, span) in [("left", "a"), ("right", "b")] {
+                let cell = layout.rects[&tree.get_element_by_id(cell).unwrap()];
+                let span_id = tree.get_element_by_id(span).unwrap();
+                let span = layout.rects[&span_id];
+                assert!((cell.width - row_width / 2.0).abs() < 0.02, "{cell:?}");
+                assert!((span.x - cell.x - expected_margin).abs() < 0.02,
+                    "{margin} in {row_width}px flex row: cell={cell:?}, inline={span:?}");
+                assert!((layout.styles[&span_id].margin.left - expected_margin).abs() < 0.02,
+                    "paint and used style must agree on the final containing-block basis");
+            }
+        }
+    }
+}
+
+#[test]
+fn inline_svg_ratio_derived_auto_axis_survives_nonbinding_max_width() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div style="width:400px">
+            <svg id="ratio" style="display:block;height:20px;max-width:200px" viewBox="0 0 2 1"></svg>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 400.0));
+    let ratio = layout.rects[&tree.get_element_by_id("ratio").unwrap()];
+    assert!(
+        (ratio.width - 40.0).abs() < 0.01 && (ratio.height - 20.0).abs() < 0.01,
+        "2:1 viewBox at height:20px must keep the ratio-derived 40px width; \
+         max-width:200px is not binding and must not stretch to 200px: {ratio:?}"
+    );
+}
+
+#[test]
+fn percentage_margins_use_final_max_width_constrained_content_box() {
+    // Old behavior: the top-down containing-block estimate ignored max-width,
+    // so 25% + 8.333% widths/margins resolved against 1432px instead of the
+    // row's real 1312px content box (offset 119.333 instead of 109.333).
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="container" style="width:100%;max-width:1320px;padding:16px;box-sizing:border-box">
+            <div id="row" style="display:flex;margin:0 -12px">
+              <div id="col1" style="width:25%;height:10px"></div>
+              <div id="col2" style="width:16.66666667%;height:10px;margin-left:8.33333333%"></div>
+              <div id="col3" style="width:16.66666667%;height:10px"></div>
+              <div id="col4" style="width:16.66666667%;height:10px"></div>
+              <div id="col5" style="width:16.66666667%;height:10px"></div>
+            </div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1440.0, 900.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    let container = rect("container");
+    let row = rect("row");
+    let col1 = rect("col1");
+    let col2 = rect("col2");
+    assert!((container.width - 1320.0).abs() < 0.01, "max-width: {container:?}");
+    assert!((row.width - 1312.0).abs() < 0.01, "negative margins: {row:?}");
+    assert!((col1.width - 328.0).abs() < 0.01, "25% of the used row width: {col1:?}");
+    let offset = col2.x - (col1.x + col1.width);
+    assert!(
+        (offset - 109.333_333).abs() < 0.51,
+        "8.333% margin must use the final 1312px row content box, not the 1432px estimate \
+         (physical offsets are device-pixel rounded): {offset}"
+    );
+    let col2_style = &layout.styles[&tree.get_element_by_id("col2").unwrap()];
+    assert!(
+        (col2_style.margin.left - 109.333_333).abs() < 0.02,
+        "CSSOM/paint must see the used margin: {:?}",
+        col2_style.margin
+    );
+    for id in ["col2", "col3", "col4", "col5"] {
+        let column = rect(id);
+        assert!(
+            (column.y - row.y).abs() < 0.01,
+            "all columns must share one flex row: row={row:?} {id}={column:?}"
+        );
+    }
+    let last = rect("col5");
+    assert!(
+        (last.x + last.width - (row.x + row.width)).abs() < 0.05,
+        "the percentage margins/widths must fill the row exactly: {last:?} row={row:?}"
+    );
+}
+
+#[test]
+fn percentage_margins_follow_nested_resized_containers() {
+    let html = r#"
+        <body style="margin:0">
+          <div id="container" style="width:100%;max-width:600px;padding:10px;box-sizing:border-box">
+            <div id="row" style="display:flex;margin:0 -10px">
+              <div id="col" style="width:25%;height:10px"></div>
+              <div id="offset" style="width:25%;height:10px;margin-left:5%"></div>
+            </div>
+          </div>
+        </body>
+        "#;
+    for (viewport, container_width, row_width, column_width, margin) in [
+        (1000.0, 600.0, 600.0, 150.0, 30.0),
+        (500.0, 500.0, 500.0, 125.0, 25.0),
+    ] {
+        let tree = parse_html(html);
+        let layout = layout_dom(&tree, (viewport, 600.0));
+        let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+        assert!((rect("container").width - container_width).abs() < 0.01);
+        assert!((rect("row").width - row_width).abs() < 0.01);
+        assert!((rect("col").width - column_width).abs() < 0.01);
+        let offset_style = &layout.styles[&tree.get_element_by_id("offset").unwrap()];
+        assert!(
+            (offset_style.margin.left - margin).abs() < 0.01,
+            "5% margin must track the resized row {row_width}: {:?}",
+            offset_style.margin
+        );
+        let offset_column = rect("offset");
+        assert!(
+            (offset_column.x - (rect("col").x + rect("col").width) - margin).abs() < 0.01,
+            "used margin must move the flex item: {offset_column:?}"
+        );
+    }
+}
+
+#[test]
+fn percentage_margins_use_the_final_grid_area_width() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="grid" style="width:100%;max-width:400px;padding:10px;box-sizing:border-box;display:grid;grid-template-columns:1fr 1fr">
+            <div id="cell" style="height:10px;margin-left:10%"></div>
+            <div style="height:10px"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let grid = layout.rects[&tree.get_element_by_id("grid").unwrap()];
+    let cell = layout.rects[&tree.get_element_by_id("cell").unwrap()];
+    let style = &layout.styles[&tree.get_element_by_id("cell").unwrap()];
+    // 400 border-box - 20 padding = 380 content / 2 tracks = 190 grid area.
+    assert!(
+        (style.margin.left - 19.0).abs() < 0.01,
+        "grid item margin must use its 190px grid area, not the 380px content box: {:?}",
+        style.margin
+    );
+    assert!(
+        (cell.x - (grid.x + 10.0 + 19.0)).abs() < 0.01,
+        "grid item inset must use the area-resolved margin: {cell:?} grid={grid:?}"
+    );
+}
+
+#[test]
+fn percentage_margins_preserve_negative_auto_and_block_axis_signs() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="row" style="width:400px">
+            <div id="negative" style="width:100px;height:10px;margin-left:-10%"></div>
+            <div id="auto" style="width:100px;height:10px;margin-left:auto;margin-right:auto"></div>
+            <div id="block-axis" style="width:100px;height:10px;margin-top:10%"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let row = layout.rects[&tree.get_element_by_id("row").unwrap()];
+    let negative = layout.rects[&tree.get_element_by_id("negative").unwrap()];
+    let negative_style = &layout.styles[&tree.get_element_by_id("negative").unwrap()];
+    assert!(
+        (negative_style.margin.left + 40.0).abs() < 0.01 && negative_style.margin.left < 0.0,
+        "negative percentage margin must stay negative: {:?}",
+        negative_style.margin
+    );
+    assert!((negative.x - (row.x - 40.0)).abs() < 0.01, "{negative:?}");
+    let auto_style = &layout.styles[&tree.get_element_by_id("auto").unwrap()];
+    assert!(auto_style.margin_auto[1] && auto_style.margin_auto[3]);
+    assert!(
+        (auto_style.margin.left - 0.0).abs() < 0.01,
+        "auto margins must not be overwritten with a used percentage: {:?}",
+        auto_style.margin
+    );
+    let auto = layout.rects[&tree.get_element_by_id("auto").unwrap()];
+    assert!((auto.x - row.x - 150.0).abs() < 0.01, "auto centering: {auto:?}");
+    let block_style = &layout.styles[&tree.get_element_by_id("block-axis").unwrap()];
+    assert!(
+        (block_style.margin.top - 40.0).abs() < 0.01,
+        "percentage block-axis margins resolve against width: {:?}",
+        block_style.margin
+    );
+}
+
+#[test]
+fn percentage_margins_resolve_for_generated_and_positioned_pseudos() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="host" style="width:100%;max-width:1320px;padding:16px;box-sizing:border-box"></div>
+          <div id="positioned" style="position:relative;width:200px;height:40px;border:10px solid"></div>
+          <style>
+            #host::before { content:""; display:block; height:10px; margin-left:10% }
+            #positioned::before { content:""; position:absolute; width:20px; height:10px; margin-left:10% }
+          </style>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (1440.0, 600.0));
+    let host = tree.get_element_by_id("host").unwrap();
+    let host_rect = layout.rects[&host];
+    let before = layout.styles[&host].before_pseudo.as_ref().unwrap();
+    assert!((host_rect.width - 1320.0).abs() < 0.01);
+    assert!(
+        (before.margin.left - 128.8).abs() < 0.01,
+        "in-flow pseudo margin must use the final 1288px host content box: {:?}",
+        before.margin
+    );
+    assert!(
+        (host_rect.height - 42.0).abs() < 0.01,
+        "block pseudo participates in the host content box (10px + 2*16px padding): {host_rect:?}"
+    );
+
+    let positioned = tree.get_element_by_id("positioned").unwrap();
+    let absolute = layout.styles[&positioned].before_pseudo.as_ref().unwrap();
+    assert!(
+        (absolute.margin.left - 20.0).abs() < 0.01,
+        "positioned pseudo margin must use its host padding box: {:?}",
+        absolute.margin
+    );
+}
+
+#[test]
+fn percentage_margins_in_calc_min_max_use_the_final_basis() {
+    let tree = parse_html(
+        r#"
+        <body style="margin:0">
+          <div id="container" style="width:100%;max-width:400px">
+            <div id="pure" style="width:50px;height:10px;margin-left:calc(8.33333333%)"></div>
+            <div id="mixed" style="width:50px;height:10px;margin-left:calc(50% - 20px)"></div>
+            <div id="negative" style="width:50px;height:10px;margin-left:calc(10% - 100px)"></div>
+            <div id="minimum" style="width:50px;height:10px;margin-left:min(10%, 100px)"></div>
+            <div id="maximum" style="width:50px;height:10px;margin-left:max(5%, 30px)"></div>
+          </div>
+        </body>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    for (id, expected) in [
+        ("pure", 33.333_333),
+        ("mixed", 180.0),
+        ("negative", -60.0),
+        ("minimum", 40.0),
+        ("maximum", 30.0),
+    ] {
+        let style = &layout.styles[&tree.get_element_by_id(id).unwrap()];
+        assert!(
+            (style.margin.left - expected).abs() < 0.02,
+            "{id}: calc/min/max margin must resolve against the final 400px basis: {:?}",
+            style.margin
+        );
+        assert!(
+            (rect(id).x - expected).abs() < 0.51,
+            "{id}: used fold position must match the late basis \
+             (physical x is device-pixel rounded): {:?}",
+            rect(id)
         );
     }
 }
@@ -1844,7 +2446,17 @@ fn ratio_only_inline_svg_sizes_inside_an_auto_grid_row() {
     let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
     let cell = rect("cell");
     let logo = rect("logo");
-    assert!((logo.width - 254.0).abs() < 0.01, "SVG width: {logo:?}");
+    let logo_style = &layout.styles[&tree.get_element_by_id("logo").unwrap()];
+    assert!(
+        (logo.width - 254.0).abs() < 0.01,
+        "SVG width: {logo:?}; declared width={:?} height={:?} min={:?} max={:?} display={:?} ratio={:?}",
+        logo_style.width,
+        logo_style.height,
+        logo_style.min_width,
+        logo_style.max_width,
+        logo_style.display,
+        logo_style.aspect_ratio,
+    );
     assert!(
         (logo.height - 76.1875).abs() < 0.25,
         "viewBox ratio must transfer the final grid width before Obscura's device-pixel rounding: {logo:?}"
@@ -4902,6 +5514,70 @@ fn perspective_projects_pixels_cssom_bounds_and_pointer_plane_together() {
     assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
     let pixel = image.pixel(310, 100).unwrap();
     assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 255, 255));
+}
+
+/// A perspective camera is projective in depth, but its children at z = 0 are
+/// not projected: Chromium paints them with their authored geometry, without
+/// resampling the layer. A composited camera layer used to shrink an
+/// absolutely positioned badge by one pixel on every edge.
+#[cfg(feature = "paint")]
+#[test]
+fn flat_descendants_of_a_perspective_camera_paint_without_resampling() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body { margin:0; background:white }
+        #stage { position:absolute;left:20px;top:20px;width:100px;height:80px;
+            perspective:1000px }
+        #badge { position:absolute;right:5px;bottom:5px;width:20px;height:20px;
+            background:rgb(25,113,194) }
+        </style><div id="stage"><span id="badge"></span></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (300.0, 200.0), None, &mut resources).unwrap();
+    let badge = tree.get_element_by_id("badge").unwrap();
+    let rect = prepared.document_rect(badge).unwrap();
+    assert!((rect.x - 95.0).abs() < 0.01 && (rect.y - 75.0).abs() < 0.01, "{rect:?}");
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    for (x, y) in [(95, 75), (114, 75), (95, 94), (114, 94)] {
+        let pixel = image.pixel(x, y).unwrap();
+        assert_eq!(
+            (pixel.red(), pixel.green(), pixel.blue()),
+            (25, 113, 194),
+            "flat perspective child must paint its authored rectangle at {x},{y}"
+        );
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn projective_own_translation_is_not_dropped_by_the_flat_fast_path() {
+    let tree = parse_html(r#"<!doctype html><style>
+        html,body { margin:0; background:white }
+        #stage { position:absolute;left:10px;top:20px;width:200px;height:60px;
+            perspective:1000px }
+        #moved { position:absolute;left:20px;top:10px;width:10px;height:10px;
+            background:rgb(25,113,194); transform-origin:0 0;
+            transform:perspective(1000px) translateX(50px) }
+        </style><div id="stage"><div id="moved"></div></div>"#);
+    let mut resources = obscura_render::RenderResourceCache::with_loader(|_: &str| None);
+    let mut prepared = obscura_render::prepare_dom(&tree, (300.0, 150.0), None, &mut resources).unwrap();
+    let moved = tree.get_element_by_id("moved").unwrap();
+    let rect = prepared.document_rect(moved).unwrap();
+    assert!(
+        (rect.x - 80.0).abs() < 0.01 && (rect.y - 30.0).abs() < 0.01,
+        "the projective translate must reach CSSOM geometry: {rect:?}"
+    );
+    let image = obscura_render::paint_prepared(&tree, &mut prepared, &mut resources, (0.0, 0.0)).unwrap();
+    let shifted = image.pixel(85, 35).unwrap();
+    assert_eq!(
+        (shifted.red(), shifted.green(), shifted.blue()),
+        (25, 113, 194),
+        "an own perspective+translateX transform must paint at the translated position"
+    );
+    let unshifted = image.pixel(35, 35).unwrap();
+    assert_eq!(
+        (unshifted.red(), unshifted.green(), unshifted.blue()),
+        (255, 255, 255),
+        "the fast path must not paint at the pre-translation origin"
+    );
 }
 
 #[cfg(feature = "paint")]

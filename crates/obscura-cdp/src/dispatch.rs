@@ -557,13 +557,26 @@ impl CdpContext {
                 _ => {}
             }
         }
+    }
+
+    /// Publish `Page.frameNavigated` for native windows whose document commit
+    /// was observed but not yet announced. This is asynchronous renderer
+    /// output, so the connection publishes it after the command reply (or on
+    /// its autonomous pump), never inside the command that happened to notice
+    /// the commit.
+    pub(crate) fn publish_native_navigation_events(&mut self) {
         self.emit_native_navigation_events();
     }
 
     pub(crate) async fn drive_native_windows(&mut self, budget_ms: u64) -> Result<(), String> {
         let mut groups = HashSet::new();
         for page in &mut self.pages {
-            if !page.window_info().closed && page.has_js() && groups.insert(page.window_group_id()) {
+            // A parked tab must not run its event loop. Skip it before the
+            // group claim so an active sibling in the same native window can
+            // still take the group's turn.
+            if !page.window_info().closed && page.has_js() && !page.is_suspended()
+                && groups.insert(page.window_group_id())
+            {
                 page.drive_windows(budget_ms).await.map_err(|error| error.to_string())?;
             }
         }
@@ -884,6 +897,12 @@ impl CdpContext {
             if !target.has_js() {
                 target.resume_js();
                 initialized = target.has_js();
+            } else if target.is_suspended() {
+                // A parked tab retains its live heap; an explicit command
+                // routed to it is activation and must unpark it even though
+                // `has_js()` is already true. Pump/event consumer borrows use
+                // `get_page_mut`, not this activation path.
+                target.resume_js();
             }
         }
         if initialized {
@@ -1052,13 +1071,47 @@ fn is_v8_free_method(method: &str) -> bool {
     )
 }
 
+/// Run one CDP command and return its response.
+///
+/// The renderer turn a command schedules (timers, microtasks, native window
+/// jobs) is deliberately **not** part of the command itself: a real browser
+/// answers the protocol command before returning to its event loop, so a client
+/// waiting for the reply is not trapped behind a page timer the command merely
+/// armed. Wire callers use [`dispatch_command`] and then
+/// [`finalize_command_after_reply`]; direct embedders with no reply to flush
+/// use this wrapper, which runs both in order.
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    let response = dispatch_command(req, ctx).await;
+    finalize_command_after_reply(ctx, &req.method).await;
+    response
+}
+
+/// Drive one renderer/window turn and publish the events it produced. This is
+/// the half of a command that belongs *after* its reply on the wire.
+pub(crate) async fn finalize_command_after_reply(ctx: &mut CdpContext, method: &str) {
+    if !is_v8_free_method(method) {
+        if let Err(error) = ctx.drive_native_windows(1).await {
+            tracing::warn!("renderer turn after {method} failed: {error}");
+        }
+    }
+    // Native navigation receipts (`Page.frameNavigated` for a window that
+    // committed while the command ran) are asynchronous renderer results, not
+    // command side effects. They must follow the reply: a click's input ACK is
+    // sent first, and only then does the navigation it started publish.
+    ctx.publish_native_navigation_events();
+}
+
+/// Dispatch the command itself: domain handler, command-caused event drains,
+/// and the response. Does not run renderer work; see [`dispatch`].
+pub async fn dispatch_command(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
     // per-connection V8 lock — the recursive dispatch will acquire it for the
     // inner call, and tokio Mutex is not reentrant.
     if req.method == "Target.sendMessageToTarget" {
-        return dispatch_send_message_to_target(req, ctx).await;
+        let response = dispatch_send_message_to_target(req, ctx).await;
+        finalize_command_after_reply(ctx, &req.method).await;
+        return response;
     }
 
     // Issue #430: keep this connection's V8 work serialized on its own thread.
@@ -1125,7 +1178,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
     ctx.sync_native_windows();
 
-    let mut result = match domain {
+    let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
         "Browser" => domains::browser::handle(method, &req.params).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
@@ -1162,11 +1215,6 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     ctx.sync_native_windows();
-    if !is_v8_free_method(&req.method) {
-        if let Err(error) = ctx.drive_native_windows(1).await {
-            if result.is_ok() { result = Err(error); }
-        }
-    }
 
     #[cfg(feature = "render")]
     if result.is_ok()
@@ -1191,6 +1239,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         }
     }
 
+    drain_script_network_events(ctx, &req.session_id);
     drain_runtime_events(ctx);
     drain_binding_calls(ctx);
     drain_frame_events(ctx);
@@ -1202,6 +1251,29 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
             CdpResponse::error(req.id, -32601, msg, req.session_id.clone())
         }
     }
+}
+
+/// Emit script-initiated network events completed by this command. Chromium
+/// pushes them asynchronously, but direct dispatch callers (`Runtime.evaluate`
+/// started fetches, XHR, module loads) must observe them alongside the reply.
+pub(crate) fn drain_script_network_events(ctx: &mut CdpContext, session_id: &Option<String>) {
+    let Some(session) = session_id else { return };
+    let Some(page_id) = ctx.sessions.get(session).cloned() else { return };
+    // The page queue is the native receipt stream. Whoever drains it owns the
+    // emission, exactly once: here for command-completed script fetches, or the
+    // connection's background drain for autonomous turns. No second reader and
+    // no cursor bookkeeping, so a receipt can neither be lost nor re-emitted.
+    let Some(page) = ctx.get_page_mut(&page_id) else { return };
+    page.sync_js_network_events();
+    if page.network_events.is_empty() {
+        return;
+    }
+    let frame_id = page.frame_id.clone();
+    let page_url = page.url_string();
+    let events: Vec<_> = page.network_events.drain(..).collect();
+    crate::domains::page::emit_runtime_network_events(
+        ctx, session_id, &frame_id, &page_url, &page_id, &events,
+    );
 }
 
 pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
@@ -1529,7 +1601,7 @@ async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext)
         params: inner.params,
         session_id: session_id.clone().or(inner.session_id),
     };
-    let inner_response = Box::pin(dispatch(&inner_with_session, ctx)).await;
+    let inner_response = Box::pin(dispatch_command(&inner_with_session, ctx)).await;
 
     // Re-emit the inner response as the legacy event headless_chrome (and
     // older Puppeteer) listen for instead of correlating responses by id.

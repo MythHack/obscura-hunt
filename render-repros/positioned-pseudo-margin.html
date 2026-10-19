@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Positioned pseudo applies used margins</title>
+<!--
+  Paint regression for absolutely positioned generated content. The host is
+  200x100; ::before is 20x20 at left:0/top:0 with margin-left:5% (resolved
+  against the 200px containing block => 10px) and margin-top:6px.
+
+  Chromium pixels: (10,6)..(30,26) are red inside the blue host; (0,0) and
+  (9,5) remain host blue. Paint must use the used margin, not only store it in
+  LayoutStyle.
+-->
+<style>
+  html, body { margin: 0; background: #fff }
+  #host { position: relative; width: 200px; height: 100px; background: #00f }
+  #host::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 20px;
+    height: 20px;
+    margin-left: 5%;
+    margin-top: 6px;
+    background: #f00;
+  }
+</style>
+<div id="host"></div>

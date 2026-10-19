@@ -12,10 +12,20 @@ Top-level flags apply to every subcommand.
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
+    --font-dir <DIR>         Add a font directory (repeatable; render builds)
+    --no-system-fonts       Use only bundled and explicitly added fonts
 -h, --help                   Help
 -V, --version                Version
     --build-info             Print JSON source revision, dirty state, target and features
 ```
+
+Render builds use installed system fonts by default, with bundled fallback faces.
+`--font-dir` recursively adds TTF, TTC, OTF, and OTC files; invalid directories fail
+before navigation or server startup. `--no-system-fonts` disables system discovery
+without disabling explicit directories or bundled fallbacks. Both options work
+before or after `fetch`, `serve`, `scrape`, and `mcp`; scrape workers inherit the
+same policy. Body text, text measurement, form controls, and SVG share that policy.
+No-render builds reject either font option.
 
 ## `obscura fetch <URL>`
 

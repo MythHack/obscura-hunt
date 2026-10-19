@@ -4,8 +4,26 @@
   <meta charset="utf-8">
   <title>table row geometry</title>
   <style>
+    /* Row heights follow text line boxes; pin the bundled face so both
+       engines fit 13px normal lines from the same bytes. */
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
     html, body { margin: 0; }
-    body { font-family: sans-serif; font-size: 13px; }
+    body { font-family: "Liberation Sans", sans-serif; font-size: 13px; }
     table { position: absolute; border-spacing: 0; }
     td { padding: 0; }
 

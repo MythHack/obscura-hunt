@@ -401,7 +401,7 @@ function _decodeDataScriptUrl(url) {
 // native per-document state so it survives wrapper churn, fragment parsing,
 // moves, and cloneNode().
 globalThis.__markParserScripts = function(nids) {
-  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid);
+  for (const nid of nids || []) __obscuraCore.ops.op_script_mark_started(+nid, _realmFrameId);
 };
 async function __fetchDynClassicScript(task) {
   let body;
@@ -409,7 +409,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script", globalThis
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "include", "Script", globalThis
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -523,23 +523,17 @@ async function __processParserBlockingScriptQueue() {
     if (epoch === __resourceLoadEpoch) __parserBlockingScriptBusy = false;
   }
 }
-// Resolve a resource URL (script src / link href) against <base href> or the
-// document URL, the way the inline dynamic-script path does. Guarded so a bad
-// base or href never throws into appendChild.
+// Resolve a resource URL (script src / link href) against the document base
+// URL: native <base href>, or the creator base retained by about:blank and
+// about:srcdoc child realms. `location.href` is not a usable base there, since
+// `new URL('/', 'about:blank')` throws and the fetch would receive the raw
+// relative href. Guarded so a bad base or href never throws into appendChild.
 function _resolveResourceUrl(src) {
-  let baseHref = null;
-  try {
-    const baseEl = globalThis.document?.querySelector('base[href]');
-    baseHref = baseEl ? baseEl.getAttribute('href') : null;
-  } catch(e) { baseHref = null; }
-  const docUrl = globalThis.location?.href || 'http://localhost/';
-  let baseUrl;
-  try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
-  catch(e) { baseUrl = docUrl; }
+  const docBase = _documentBase() || globalThis.location?.href || 'http://localhost/';
   try {
     return src.startsWith('http') || src.startsWith('data:')
       ? src
-      : new URL(src, baseUrl).href;
+      : new URL(src, docBase).href;
   } catch(e) { return src; }
 }
 
@@ -996,61 +990,42 @@ const _scheduleAfter = (delay, fn) => {
   // Recheck at delivery too: a completed host sleep may still be waiting for
   // its promise reaction when the native host replaces or closes the document.
   const generation = __obscuraCore.ops.op_posted_task_generation(_realmFrameId);
-  // Only deno_core's original main context owns the native timer heap that
-  // its event loop dispatches. Attached snapshot contexts, including a new
-  // primary document with realm id 0, use the existing host task timer source.
-  // The continuation runs in the scheduling realm; native cancellation binds
-  // it to that document rather than a navigable's reusable realm id. Negative
-  // ids distinguish host timers for clearTimeout without exposing a new API.
-  if (!_nativeWindowMainRealm) {
-    const frameTimerId = -(++_frameTimerSeq);
-    const state = { cancelled: false };
-    _frameTimerStates.set(frameTimerId, state);
-    __obscuraCore.ops.op_sleep(d, globalThis).then(active => {
-      _frameTimerStates.delete(frameTimerId);
-      if (!active || generation < 0
-          || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) !== generation) {
-        _frameTimerStates.clear();
-        _timerStates.clear();
-        _nativeTimerIds.clear();
-        _intervals.clear();
-        __obscuraPendingTimeoutDeadlines.clear();
-        _rafPending.clear();
-        _rafFrameScheduled = false;
-        _renderOpportunityScheduled = false;
-        return;
-      }
-      if (state.cancelled) return;
-      __obscuraCore.ops.op_begin_render_task?.();
-      fn();
-    });
-    return frameTimerId;
-  }
-  // The callback runs only when the embedder pumps the event loop, after the
-  // current microtask checkpoint. deno_core's timer queue drives the callback
-  // from the native event loop; the returned timer object doubles as the
-  // cancel handle. A refed timer keeps the event loop alive until it fires,
-  // which is how a page with only pending timers stays observable.
-  return __obscuraCore.createTimer(() => {
-    if (__obscuraCore.ops.op_window_closed(_nativeWindowId)
-        || generation < 0
-        || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) !== generation) return;
-    // HTML timer/observer/rAF delivery starts a new task. Freeze animation
-    // time lazily on that task's first style/layout read so a callback that
-    // waited in the host queue samples its actual delivery instant.
+  // All document realms use the host timer source. The engine's private
+  // control context owns the shared async-op wrappers and is never detached.
+  // Negative ids distinguish these cancellable host timers from public ids.
+  const frameTimerSeq = ++_frameTimerSeq;
+  const frameTimerId = -frameTimerSeq;
+  const state = { cancelled: false };
+  _frameTimerStates.set(frameTimerId, state);
+  __obscuraCore.ops.op_sleep(d, globalThis, frameTimerSeq).then(active => {
+    _frameTimerStates.delete(frameTimerId);
+    if (generation < 0
+        || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) !== generation) {
+      _frameTimerStates.clear();
+      _timerStates.clear();
+      _nativeTimerIds.clear();
+      _intervals.clear();
+      __obscuraPendingTimeoutDeadlines.clear();
+      _rafPending.clear();
+      _rafFrameScheduled = false;
+      _renderOpportunityScheduled = false;
+      return;
+    }
+    if (!active || state.cancelled) return;
     __obscuraCore.ops.op_begin_render_task?.();
-    return fn();
-  }, d, undefined, false, true, false);
+    fn();
+  });
+  return frameTimerId;
 };
 
 const _cancelScheduled = (nativeId) => {
   if (nativeId < 0) {
+    // Cancel the native sleep before dropping the state so the pump can go
+    // idle; the promise still resolves false.
+    __obscuraCore.ops.op_cancel_timeout(globalThis, -nativeId);
     const state = _frameTimerStates.get(nativeId);
     if (state) state.cancelled = true;
     _frameTimerStates.delete(nativeId);
-  }
-  else if (nativeId !== undefined && nativeId !== null) {
-    __obscuraCore.cancelTimer(nativeId);
   }
 };
 
@@ -2241,7 +2216,7 @@ const _customElementConstructionStack = [];
 let _scriptingEnabled = true;
 function __prepareInsertedScript(script) {
   if (!_scriptingEnabled) return;
-  if (!__obscuraCore.ops.op_script_try_start(script._nid)) return;
+  if (!__obscuraCore.ops.op_script_try_start(script._nid, _realmFrameId)) return;
   const scriptType = (script.getAttribute('type') || '').trim().toLowerCase();
   const isModule = scriptType === 'module';
   const isImportMap = scriptType === 'importmap';
@@ -2280,15 +2255,9 @@ function __prepareInsertedScript(script) {
     && !isModule
     && (!src || (!script.hasAttribute('async') && !script.hasAttribute('defer')));
   if (src) {
-    let baseHref;
-    try {
-      const baseEl = globalThis.document?.querySelector('base[href]');
-      baseHref = baseEl ? baseEl.getAttribute('href') : null;
-    } catch(e) { baseHref = null; }
-    const docUrl = globalThis.location?.href || 'http://localhost/';
-    let baseUrl;
-    try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
-    catch(e) { baseUrl = docUrl; }
+    // Same document base as _resolveResourceUrl: a blank/srcdoc child realm
+    // keeps its creator base, while its location.href cannot resolve paths.
+    const baseUrl = _documentBase() || globalThis.location?.href || 'http://localhost/';
     let fullUrl;
     try {
       fullUrl = src.startsWith('http') || src.startsWith('data:')
@@ -2413,10 +2382,57 @@ function _iframeConnectionPending(iframe) {
   return false;
 }
 
+// Embedded elements inserted under a disconnected ancestor - including a
+// shadow tree, whose iframes no light-tree selector sees - keep their
+// connection steps until the subtree that finally connects them runs. Entries
+// are weak: an abandoned tree can be collected, and no connected element is
+// ever dropped by a size cap (a silent cap would skip a real frame or script).
+const _connectionPendingEmbedded = new Set();
+const _connectionPendingEmbeddedFinalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(ref => _connectionPendingEmbedded.delete(ref)) : null;
+
+function _queueConnectionPendingEmbedded(element) {
+  if (!element || (element.tagName !== 'SCRIPT' && element.tagName !== 'IFRAME')) return;
+  const ref = typeof WeakRef === 'function' ? new WeakRef(element) : { deref: () => element };
+  _connectionPendingEmbedded.add(ref);
+  _connectionPendingEmbeddedFinalizer?.register(element, ref);
+}
+
+function _prepareEmbeddedElement(element) {
+  if (element.tagName === 'SCRIPT') __prepareInsertedScript(element);
+  // srcdoc takes precedence over src, and a frame whose srcdoc was assigned
+  // while it was disconnected has no browsing context yet.
+  else if (element.hasAttribute('srcdoc')) element._loadIframeSrcdoc();
+  else {
+    const src = element.getAttribute('src');
+    if (src && src !== 'about:blank') element._loadIframeSrc(src);
+  }
+}
+
+function _drainConnectionPendingEmbedded() {
+  if (!_connectionPendingEmbedded.size) return;
+  for (const ref of [..._connectionPendingEmbedded]) {
+    const element = ref.deref();
+    if (!element) {
+      _connectionPendingEmbedded.delete(ref);
+      continue;
+    }
+    if (!element.isConnected) continue;
+    _connectionPendingEmbedded.delete(ref);
+    _connectionPendingEmbeddedFinalizer?.unregister(element);
+    if (_postConnection) _postConnection.cursor = element;
+    _prepareEmbeddedElement(element);
+  }
+}
+
 function __prepareInsertedSubtree(root) {
   // Disconnected scripts and iframes wait for insertion into a live document.
   // Visit both in tree order when an ancestor becomes connected.
-  if (!root || !root.isConnected) return;
+  if (!root) return;
+  if (!root.isConnected) {
+    if (root.nodeType === 1) _queueConnectionPendingEmbedded(root);
+    return;
+  }
   const elements = [];
   const seen = new Set();
   if (root.nodeType === 1 && (root.tagName === 'SCRIPT' || root.tagName === 'IFRAME')) {
@@ -2433,15 +2449,9 @@ function __prepareInsertedSubtree(root) {
   }
   for (const element of elements) {
     if (_postConnection) _postConnection.cursor = element;
-    if (element.tagName === 'SCRIPT') __prepareInsertedScript(element);
-    // srcdoc takes precedence over src, and a frame whose srcdoc was assigned
-    // while it was disconnected has no browsing context yet.
-    else if (element.hasAttribute('srcdoc')) element._loadIframeSrcdoc();
-    else {
-      const src = element.getAttribute('src');
-      if (src && src !== 'about:blank') element._loadIframeSrc(src);
-    }
+    _prepareEmbeddedElement(element);
   }
+  _drainConnectionPendingEmbedded();
 }
 
 function _seedDetachedTreeState(node) {
@@ -3461,13 +3471,13 @@ function _applyDocQueryEncoding(u) {
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url
 // Returns "" when there is no document, so each call site keeps its own fallback.
 function _documentBase() {
-  // history.pushState moves the document URL without reaching the Rust side. Then the base must
-  // be built here, or every relative URL resolves against the pre-routing address.
-  const virtual = globalThis.__virtualUrl;
-  if (virtual) {
+  // A same-document route moves the document URL without reaching the Rust
+  // side; resolve a relative <base href> against the native reflected URL.
+  const reflected = _domParse("document_reflected_url");
+  if (reflected) {
     const raw = _domParse("document_base_href");
-    if (!raw) return virtual;
-    try { return new URL(raw, virtual).href; } catch (e) { return virtual; }
+    if (!raw) return reflected;
+    try { return new URL(raw, reflected).href; } catch (e) { return reflected; }
   }
   return _domParse("document_base_url") || _domParse("document_url") || "";
 }
@@ -4321,6 +4331,14 @@ class Element extends Node {
     if (!this._sandboxList) this._sandboxList = new DOMTokenList(this, "sandbox", ["allow-downloads","allow-forms","allow-modals","allow-orientation-lock","allow-pointer-lock","allow-popups","allow-popups-to-escape-sandbox","allow-presentation","allow-same-origin","allow-scripts","allow-top-navigation","allow-top-navigation-by-user-activation","allow-top-navigation-to-custom-protocols"]);
     return this._sandboxList;
   }
+  // [SameObject, PutForwards=value]: assignment forwards to the cached
+  // DOMTokenList's `value` setter, which writes the content attribute. A
+  // getter-only accessor silently discarded `frame.sandbox = ...`, so the
+  // frame was created unsandboxed.
+  set sandbox(v) {
+    if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "iframe") return;
+    this.sandbox.value = v;
+  }
   get sizes() {
     if (this.namespaceURI !== "http://www.w3.org/1999/xhtml" || this.localName !== "link") return undefined;
     if (!this._sizesList) this._sizesList = new DOMTokenList(this, "sizes");
@@ -4365,8 +4383,7 @@ class Element extends Node {
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
     if (n === "src" && this.localName === "iframe" && !this.hasAttribute('srcdoc')) {
-      if (value && value !== "about:blank") this._loadIframeSrc(value);
-      else this._resetIframeFrame();
+      this._loadIframeSrc(value || 'about:blank', true);
     }
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.set(n, value);
@@ -4405,6 +4422,7 @@ class Element extends Node {
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
     const localName = n.includes(':') ? n.slice(n.indexOf(':') + 1) : n;
+    const popoverPrev = (ns === '' && localName.toLowerCase() === 'popover') ? this.popover : undefined;
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttributeNS(ns, localName) : null;
     _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
     if (_hasMutationObservers()) _queueAttributeMutationRecord(this, localName, ns || null, observedOldValue);
@@ -4414,6 +4432,7 @@ class Element extends Node {
     this._nullNamespaceAttrs = null;
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrcdoc(true);
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
   }
   removeAttribute(n) {
     n = _htmlAttrName(this, n);
@@ -4428,7 +4447,7 @@ class Element extends Node {
     if (this._nullNamespaceAttrs instanceof Map) {
       this._nullNamespaceAttrs.delete(n);
     }
-    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
+    if (n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank', true);
     if (previousWindowName
         && (n === "id" || (n === "name" && _windowNameEligibleElement(this)))) {
       _reconcileWindowNamedProperty(previousWindowName);
@@ -4455,12 +4474,14 @@ class Element extends Node {
     ns = String(ns == null ? "" : ns);
     n = String(n);
     if (ns === '' && n === 'srcdoc' && this.localName === 'iframe' && this.getAttributeNS(ns, n) === null) return;
+    const popoverPrev = (ns === '' && n.toLowerCase() === 'popover') ? this.popover : undefined;
     const observedOldValue = _hasMutationObservers() ? this.getAttributeNS(ns, n) : null;
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
     if (observedOldValue !== null) _queueAttributeMutationRecord(this, n, ns || null, observedOldValue);
     this._nullNamespaceAttrs = null;
-    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank');
+    if (ns === '' && n === 'srcdoc' && this.localName === 'iframe') this._loadIframeSrc(this.getAttribute('src') || 'about:blank', true);
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return this.attributes.length > 0; }
@@ -4483,17 +4504,8 @@ class Element extends Node {
       throw new ((view && view.TypeError) || TypeError)(
         "Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
     }
-    // :popover-open is a JS-observable popover state, not understood by the
-    // native selector engine. Handle it here (and strip it from compound
-    // selectors so the rest can still be matched natively).
-    if (typeof s === "string" && s.indexOf(":popover-open") !== -1) {
-      if (this._popoverState !== "showing") return false;
-      const rest = s.replace(/:popover-open/g, "").trim();
-      if (rest === "") return true;
-      return this.matches(rest);
-    }
     // :modal is a JS-observable dialog state (a dialog opened via showModal()),
-    // not understood by the native selector engine; handle it like :popover-open.
+    // not understood by the native selector engine.
     if (typeof s === "string" && s.indexOf(":modal") !== -1) {
       if (!_modalInput.isModal(this)) return false;
       const rest = s.replace(/:modal/g, "").trim();
@@ -4762,7 +4774,7 @@ class Element extends Node {
   // throw) when the current state does not match expectedToBeShowing.
   _checkPopoverValidity(expectedToBeShowing) {
     if (this.popover === null) throw new DOMException("Not supported on elements that don't have a valid value for the popover attribute", "NotSupportedError");
-    const showing = this._popoverState === "showing";
+    const showing = _nodeDom(this, "get_popover_open", this._nid) === "true";
     if ((expectedToBeShowing && !showing) || (!expectedToBeShowing && showing)) return false;
     if (!this.isConnected) throw new DOMException("Invalid on popover elements which aren't connected", "InvalidStateError");
     return true;
@@ -4773,39 +4785,39 @@ class Element extends Node {
     if (!this.dispatchEvent(beforeEvent)) return;
     // The beforetoggle handler may have changed our type or shown us; re-check.
     if (!this._checkPopoverValidity(/*expectedToBeShowing*/false)) return;
-    this._popoverState = "showing";
+    if (_nodeDom(this, "set_popover_open", this._nid, "true") !== "true") return;
     const target = this;
     setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "closed", newState: "open" })); } catch (e) {} }, 0);
   }
   hidePopover() {
     if (!this._checkPopoverValidity(/*expectedToBeShowing*/true)) return;
     this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-    this._popoverState = "hidden";
+    if (_nodeDom(this, "set_popover_open", this._nid, "false") !== "true") return;
     const target = this;
     setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
   }
   togglePopover(force) {
     let options = force;
     if (options && typeof options === "object") force = options.force;
-    const showing = this._popoverState === "showing";
+    const showing = _nodeDom(this, "get_popover_open", this._nid) === "true";
     if (showing && (force === undefined || force === null || force === false)) {
       this.hidePopover();
     } else if (force === undefined || force === null || force === true) {
       this.showPopover();
     }
-    return this._popoverState === "showing";
+    return _nodeDom(this, "get_popover_open", this._nid) === "true";
   }
   // Called from setAttribute/removeAttribute/IDL setter when the popover
   // attribute may have changed. If the effective type changed while showing,
   // hide the popover (firing the hide events) per the HTML spec.
   _popoverTypeMaybeChanged(prevType) {
     const newType = this.popover;
-    if (this._popoverState === "showing" && prevType !== newType) {
+    if (prevType !== newType && _nodeDom(this, "get_popover_open", this._nid) === "true") {
       // Hide directly. Do not call hidePopover(): it re-validates against the
       // popover attribute, which may now be removed (No Popover), and would
       // throw NotSupportedError. This mirrors the spec hide with throw=false.
       this.dispatchEvent(new ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }));
-      this._popoverState = "hidden";
+      if (_nodeDom(this, "set_popover_open", this._nid, "false") !== "true") return;
       const target = this;
       setTimeout(() => { try { target.dispatchEvent(new ToggleEvent("toggle", { oldState: "open", newState: "closed" })); } catch (e) {} }, 0);
     }
@@ -5184,19 +5196,21 @@ class Element extends Node {
   _resetIframeFrame() {
     _resetIframeElement(this);
   }
-  _loadIframeSrc(url) {
+  _loadIframeSrc(url, force = false) {
     // A disconnected owner has no browsing context yet: the insertion steps
     // start the load once the element is connected.
     if (!this.isConnected) return;
     if (this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
-    if (url === 'about:blank' || !url) { this._resetIframeFrame(); return; }
+    url = url || 'about:blank';
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     // The parser sweep and the src setter must share the same real request.
-    if (this._iframeLoadingUrl === fullUrl) return;
-    this._resetIframeFrame();
+    if (!force && this._iframeLoadingUrl === fullUrl) return;
+    if (!this._iframeWin) this._resetIframeFrame();
+    const generation = this._iframeLoadGeneration = (this._iframeLoadGeneration || 0) + 1;
+    const retainedDocument = !!this._frameId && !!_windowSource(this._frameId);
     this._iframeLoadingUrl = fullUrl;
     const el = this;
     let frameId;
@@ -5210,14 +5224,21 @@ class Element extends Node {
       el.dispatchEvent(new Event('error'));
       return;
     }
+    if (fullUrl === 'about:blank') {
+      __obscuraCore.ops.op_frame_document_ready(
+        fullUrl, '<!doctype html><html><head></head><body></body></html>',
+        el.clientWidth || 300, el.clientHeight || 150, el._nid, frameId);
+      el._iframeLoadedUrl = fullUrl;
+      return;
+    }
     let pageOrigin = '';
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
       'no-cors', 'same-origin', {destination: 'Document', frame_id: frameId}, globalThis
     ).then(raw => {
-      // Numeric identity also distinguishes replaced owners with the same URL.
-      if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
+      // A browsing context survives navigation; the load generation does not.
+      if (el._frameId !== frameId || el._iframeLoadGeneration !== generation) return;
       const response = _iframeResponseParse(raw);
       if (response.blocked || response.status <= 0 || response.status >= 400) {
         throw new Error('Iframe document request failed');
@@ -5227,26 +5248,23 @@ class Element extends Node {
       if (!_iframeEmbeddingAllowed(raw)) {
         throw new Error('Iframe embedding denied or unsupported by response policy');
       }
-      // Commit under the reservation that initiated the request: the host
-      // adopts this identity, so the element keeps the frame it reserved and
-      // the facade is published only after the document is queued.
+      // Queue the document under the native reservation that fetched it.
+      // Keep the current Window until the host commits its replacement.
       __obscuraCore.ops.op_frame_document_ready(
         loadedUrl, html, el.clientWidth || 300, el.clientHeight || 150,
         el._nid, frameId);
       el._iframeLoadedUrl = loadedUrl;
-      const document = new _IframeDocument(html, loadedUrl, el);
-      el._iframeWin = new _IframeWindow(document, loadedUrl);
-      _bindIframeWindowFrame(el._iframeWin, frameId);
-      _frameWindows[frameId] = el._iframeWin;
-      // The shim is only a guarded parent facade; the host builds the real V8
-      // document under the identity already used for the Document request.
-      el.dispatchEvent(new Event('load'));
+      // The host installs the real native document, runs author scripts and
+      // dispatches the element's single `load` (run_next_pending_frame). Do not
+      // parse a parent-arena shim here: its defaultView would resolve to the
+      // previous document's WindowProxy, which can already be cross-origin.
     }).catch(() => {
-      // A replaced owner or a superseded navigation already released whatever
-      // it reserved; only the live generation may discard its own frame.
-      if (el._frameId !== frameId || el._iframeLoadingUrl !== fullUrl) return;
-      globalThis.__obscura_forgetFrame(frameId);
-      el._frameId = 0;
+      if (el._frameId !== frameId || el._iframeLoadGeneration !== generation) return;
+      // A failed provisional load must not destroy its last committed document.
+      if (!retainedDocument) {
+        globalThis.__obscura_forgetFrame(frameId);
+        el._frameId = 0;
+      }
       el.dispatchEvent(new Event('error'));
     });
   }
@@ -5255,7 +5273,7 @@ class Element extends Node {
     const html = this.getAttribute('srcdoc');
     if (html === null) return;
     if (!force && this._iframeLoadingUrl === 'about:srcdoc' && this._iframeSrcdoc === html) return;
-    this._resetIframeFrame();
+    this._iframeLoadGeneration = (this._iframeLoadGeneration || 0) + 1;
     this._iframeLoadingUrl = 'about:srcdoc';
     this._iframeSrcdoc = html;
     // Coalesce attribute writes into one navigation task, after microtasks.
@@ -5264,14 +5282,22 @@ class Element extends Node {
     _browserPostedTaskEnqueue(() => {
       this._iframeSrcdocTaskPending = false;
       if (!this.isConnected || this._iframeLoadingUrl !== 'about:srcdoc' || !this.hasAttribute('srcdoc')) return;
-      if (this._frameId) globalThis.__obscura_forgetFrame(this._frameId);
-      this._frameId = 0;
-      // Committing a srcdoc document completes the element's load exactly like
-      // a fetched document: one reservation, one load event.
-      if (_ensureInitialFrameRealm(this, this._iframeSrcdoc) === true) {
-        this._iframeLoadedUrl = 'about:srcdoc';
-        this.dispatchEvent(new Event('load'));
+      if (!this._frameId) {
+        if (_ensureInitialFrameRealm(this, this._iframeSrcdoc) === true) {
+          this._iframeLoadedUrl = 'about:srcdoc';
+        }
+        return;
       }
+      // Committing a srcdoc document completes the element's load in the host
+      // exactly like a fetched document: the pending frame runs author scripts
+      // and dispatches one `load`. A dispatch here fired before those scripts.
+      try {
+        const frameId = __obscuraCore.ops.op_frame_document_begin(this._nid, 'about:srcdoc');
+        __obscuraCore.ops.op_frame_document_ready(
+          'about:srcdoc', this._iframeSrcdoc, this.clientWidth || 300,
+          this.clientHeight || 150, this._nid, frameId);
+        this._iframeLoadedUrl = 'about:srcdoc';
+      } catch (_) { this.dispatchEvent(new Event('error')); }
     }, _schedulerPriorityRank['user-visible'] * 2, _browserPostedTaskGeneration(), () => {
       this._iframeSrcdocTaskPending = false;
     });
@@ -5281,6 +5307,15 @@ class Element extends Node {
     if (_iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
     const real = _frameObjectsFor(this);
+    if (_realmIsolated) {
+      // The facade's membrane returns the target document only when the native
+      // same-origin/grant decision admits this world; it never returns the
+      // target realm's raw global.
+      if (!this._frameId) return null;
+      const win = _windowSource(this._frameId);
+      if (!win) return null;
+      try { return win.document; } catch (_) { return null; }
+    }
     if (real) {
       // The registry entry is created while the frame realm initializes, before
       // the host installs that realm's document global. A native same-origin
@@ -5302,10 +5337,11 @@ class Element extends Node {
     if (this.localName !== 'iframe') return undefined;
     if (_iframeConnectionPending(this)) return null;
     if (_ensureInitialFrameRealm(this) === false) return null;
-    if (_frameObjectsFor(this)) {
-      const win = _frameWindowFor(this._frameId);
-      if (win) return win;
-    }
+    const frameObjects = _frameObjectsFor(this);
+    if (frameObjects && frameObjects.window) return frameObjects.window;
+    // Same canonical object as message.source/frames[i]/parent for this frame.
+    const canonical = _canonicalFrameWindowFor(this._frameId);
+    if (canonical) return canonical;
     if (!this._iframeWin) {
       if (this.parentNode === null) return null;
       this.contentDocument;
@@ -5461,19 +5497,91 @@ class Element extends Node {
       pairs.push(enc(name) + '=' + enc(val));
     }
 
-    const action = this.getAttribute('action') || '';
-    const method = (this.getAttribute('method') || 'GET').toUpperCase();
-    const baseUrl = globalThis.location?.href || 'about:blank';
+    // The submitter's formaction/formmethod override the form's attributes, and
+    // the action resolves against the document base URL (including <base>),
+    // not merely the current location.
+    const submitterAction = submitter && submitter.getAttribute('formaction');
+    const submitterMethod = submitter && submitter.getAttribute('formmethod');
+    const action = submitterAction != null ? submitterAction : (this.getAttribute('action') || '');
+    const method = String(submitterMethod != null ? submitterMethod
+      : (this.getAttribute('method') || 'GET')).toUpperCase();
+    const baseUrl = _documentBase() || globalThis.location?.href || 'about:blank';
     let targetUrl;
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
 
     const encoded = pairs.join('&');
-    if (method === 'POST') {
-      __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded);
-    } else {
-      const sep = targetUrl.includes('?') ? '&' : '?';
-      __obscuraCore.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+    const queryUrl = method === 'POST' ? targetUrl
+      : targetUrl + (encoded ? (targetUrl.includes('?') ? '&' : '?') + encoded : '');
+    // The submission target names a browsing context, not a URL. HTML's
+    // navigable selection: _self keeps this document, _parent/_top pick the
+    // enclosing realm, a name matching a frame in this document navigates that
+    // frame, and _blank or an unmatched name creates a window first and then
+    // navigates it. Body-bearing submissions use the native pending-navigation
+    // API (extended op_window_navigate) so POST reaches the selected context
+    // instead of destroying the embedder.
+    const submitterTarget = submitter && submitter.getAttribute('formtarget');
+    const targetName = String(submitterTarget != null ? submitterTarget
+      : (this.getAttribute('target') || '')).trim();
+    const lowerTarget = targetName.toLowerCase();
+    const navigationMethod = method === 'POST' ? 'POST' : 'GET';
+    const navigationBody = method === 'POST' ? encoded : '';
+    const navigateContext = (windowId, realmId) => {
+      // Realm 0 names the top document, which the window path addresses by the
+      // window's own realm id; only real child frames use the frame path.
+      if (!realmId) {
+        const selfRelation = _windowRelation(windowId, 'self');
+        realmId = selfRelation && selfRelation.realmId ? selfRelation.realmId : 0;
+      }
+      return __obscuraCore.ops.op_window_navigate(windowId, queryUrl, false, realmId,
+        navigationMethod, navigationBody);
+    };
+    if (!targetName || lowerTarget === '_self') {
+      __obscuraCore.ops.op_navigate(queryUrl, navigationMethod, navigationBody);
+      return;
     }
+    if (lowerTarget === '_parent' || lowerTarget === '_top') {
+      const relation = _windowRelation(_nativeWindowId, lowerTarget.slice(1), _realmFrameId);
+      if (relation && relation.windowId) {
+        navigateContext(relation.windowId, relation.realmId);
+        return;
+      }
+      __obscuraCore.ops.op_navigate(queryUrl, navigationMethod, navigationBody);
+      return;
+    }
+    const frames = this.ownerDocument.querySelectorAll('iframe, frame');
+    for (let i = 0; i < frames.length; i++) {
+      const candidate = frames[i];
+      const name = candidate.getAttribute('name');
+      if (name && name === targetName) {
+        // A named iframe is a navigable target from insertion, including the
+        // common `<iframe name=t>` with no src: it has no native realm until
+        // first use. Materialize it here so the submission reaches that frame
+        // instead of falling through to a new window.
+        if (!candidate._frameId) _ensureInitialFrameRealm(candidate);
+        if (candidate._frameId) {
+          navigateContext(_nativeWindowId, candidate._frameId);
+          return;
+        }
+      }
+    }
+    // `_blank` and unmatched names: a single op_window_open call. The producer
+    // enqueues the method/body navigation itself on both the existing-target
+    // path and the created path, including noopener where the return id is 0;
+    // there is no open-then-navigate race and no second navigation queue.
+    //
+    // A form targeting _blank is implicitly noopener unless rel=opener (a
+    // different default from window.open, which keeps the opener for _blank).
+    // Explicit rel=noopener/noreferrer apply to any target; a named new target
+    // keeps the normal opener relationship.
+    const relTokens = new Set(String(this.getAttribute('rel') || '')
+      .toLowerCase().split(/\s+/).filter(Boolean));
+    const features = [];
+    if (relTokens.has('noreferrer')) features.push('noreferrer');
+    if (relTokens.has('noopener') || (lowerTarget === '_blank' && !relTokens.has('opener'))) {
+      features.push('noopener');
+    }
+    __obscuraCore.ops.op_window_open(queryUrl, targetName, features.join(','),
+      navigationMethod, navigationBody);
   }
   reset() {
     this.dispatchEvent(new Event('reset', { bubbles: true }));
@@ -6515,9 +6623,30 @@ class Document extends Node {
     const qualified = String(t);
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
     if (namespace === "http://www.w3.org/1999/xhtml") {
-      const el = this.createElement(qualified);
-      if (el) el._ns = namespace;
-      return _stampNodeDocument(el, this);
+      if (!qualified.includes(":")) {
+        const el = this.createElement(qualified);
+        if (el) el._ns = namespace;
+        return _stampNodeDocument(el, this);
+      }
+      // The HTML namespace keeps the qualified name on tagName but brands and
+      // selects the interface from the local name: createElementNS(xhtml,
+      // 'x:input') is an HTMLInputElement, exactly like 'input'.
+      const nid = +_dom("create_element_ns", namespace + "\0" + qualified);
+      const localName = qualified.slice(qualified.indexOf(":") + 1);
+      const C = _elementClassForKnownName(namespace, localName);
+      const el = new C(nid, _htmlElementConstructionToken);
+      el._tagName = qualified.toUpperCase();
+      el._lname = localName;
+      el._ns = namespace;
+      el._nullNamespaceAttrs = new Map();
+      _seedDetachedTreeState(el);
+      _cache.set(nid, el);
+      _stampNodeDocument(el, this);
+      if (localName === 'template') {
+        el._templateContent = this.createDocumentFragment();
+        el._templateContent._fragmentContext = 'template';
+      }
+      return el;
     }
     const nid = +_dom(
       "create_element_ns",
@@ -8058,19 +8187,18 @@ function _resolveUrl(url) {
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _documentBase() || "about:blank").href; } catch(e) { return url; }
 }
-// `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
-// any real navigation). When set, `location.href` and friends read it instead
-// of the underlying `document_url`. Without this, client-side routers
-// (Next.js, React Router, vue-router) call `pushState` but the URL never
-// changes, so their `useLocation` hooks return the wrong path and the UI
-// freezes on the original route.
-globalThis.__virtualUrl = null;
+// A same-document URL (history routing, location setters) lives only in the
+// native `reflected_url` field. There is deliberately no JS global: the host
+// restores a blocked file URL by writing that field without running script,
+// and `set_url`/document init clears it on a real commit, so `document_url`
+// takes over again. A page-owned same-named global is simply never read.
 function __currentUrl() {
-  return globalThis.__virtualUrl || _domParse("document_url") || "about:blank";
+  return _domParse("document_reflected_url") || _domParse("document_url") || "about:blank";
 }
+const _previewUrl = (url) => __obscuraCore.ops.op_set_reflected_url(globalThis, url);
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -8080,14 +8208,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); _previewUrl(r); __obscuraCore.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -8826,7 +8954,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   let raw;
   try {
     raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
-      { cancel_rid: cancelRid, destination: resourceType, referrer, referrer_policy: referrerPolicy }, globalThis);
+      { cancel_rid: cancelRid, destination: resourceType, referrer, referrer_policy: referrerPolicy, redirect: fetchRedirect }, globalThis);
   } catch (error) {
     cleanup();
     throw signalState && signalState.aborted ? signalState.reason
@@ -8842,9 +8970,9 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     cleanup();
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
-  const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
-  const exposeRedirectMetadata = respType !== "opaque" && fetchRedirect === "follow";
-  const responseBody = respType === "opaque"
+  const respType = parsed.opaqueredirect ? "opaqueredirect" : (parsed.status === 0 || parsed.opaque ? "opaque" : "basic");
+  const exposeRedirectMetadata = respType === "basic" && fetchRedirect === "follow";
+  const responseBody = respType === "opaque" || respType === "opaqueredirect"
     ? null
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
   const response = _createInternalResponse(responseBody, {
@@ -8852,7 +8980,7 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     statusText: parsed.statusText || "",
     headers: parsed.headers || {},
     type: respType,
-    url: respType === "opaque" ? "" : (parsed.url || url),
+    url: respType === "opaque" || respType === "opaqueredirect" ? "" : (parsed.url || url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
   _attachResponseAbort(response, signal);
@@ -12091,7 +12219,7 @@ __obscuraCore.setReportExceptionCallback(error => {
   catch (_) { message = "Uncaught exception"; }
   const event = new _browserErrorEvent("error", { message, error, cancelable: true });
   if (_eventTargetDispatch(globalThis, event)) {
-    __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
+    __obscuraCore.ops.op_report_browser_exception(error, globalThis);
     _consoleFn("error", [error]);
   }
 });
@@ -12201,22 +12329,9 @@ globalThis.PromiseRejectionEvent = class PromiseRejectionEvent extends Event {
 };
 _markNative(globalThis.PromiseRejectionEvent);
 
-__obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
-  const event = new PromiseRejectionEvent("unhandledrejection", {
-    promise,
-    reason,
-    cancelable: true,
-  });
-  globalThis.dispatchEvent(event);
-  // Browsers report an unhandled rejection without terminating the page's
-  // event loop. Returning true tells deno_core that the host delivered it.
-  return true;
-});
-
-__obscuraCore.setHandledPromiseRejectionHandler((promise, reason) => {
-  const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
-  globalThis.dispatchEvent(event);
-});
+// The host installs rejection handlers after snapshot restoration. All document
+// realms share deno_core's exception queue, so delivery resolves the promise's
+// native creation context instead of closing over the private control window.
 
 globalThis.StorageEvent = class StorageEvent extends Event {
   constructor(type, init = {}) {
@@ -13325,6 +13440,146 @@ globalThis.Crypto = class Crypto {
   }
 };
 globalThis.crypto = globalThis.crypto || new globalThis.Crypto();
+// Cross-realm File/Blob wire codec. The emulated Blob/File classes keep their
+// bytes in `_bytes`, and no transport preserves that: V8's ValueSerializer
+// (native windows) and the JSON frame channel both deliver a
+// prototype-stripped plain object, so `instanceof File`,
+// `Object.prototype.toString.call(v) === '[object File]'` and `.text()` are
+// all gone in the receiving realm. One codec, shared by every transport, with
+// the existing base64 helpers and the existing structuredClone hook table -
+// never a second serializer. `seen` mirrors the structured-clone memo, so
+// shared and cyclic graphs keep their identity in both directions. Only the
+// shapes JSON already round-trips (arrays, plain objects) are walked; every
+// other value passes through untouched, exactly as the JSON channel did.
+// One bounded, memoized scan over the shapes a wire channel can carry, used by
+// both directions to decide whether anything needs rewriting at all.
+function _cloneGraphMatches(value, match, seen) {
+  if (match(value)) return true;
+  if (value === null || typeof value !== "object") return false;
+  seen = seen || new Set();
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) if (_cloneGraphMatches(item, match, seen)) return true;
+    return false;
+  }
+  if (value instanceof Map) {
+    for (const [k, v] of value) if (_cloneGraphMatches(k, match, seen) || _cloneGraphMatches(v, match, seen)) return true;
+    return false;
+  }
+  if (value instanceof Set) {
+    for (const item of value) if (_cloneGraphMatches(item, match, seen)) return true;
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  for (const key of Object.keys(value)) if (_cloneGraphMatches(value[key], match, seen)) return true;
+  return false;
+}
+
+function _isBlobValue(value) {
+  return (typeof File !== "undefined" && value instanceof File)
+    || (typeof Blob !== "undefined" && value instanceof Blob);
+}
+
+function _isTaggedCloneValue(value) {
+  return value !== null && typeof value === "object" && typeof value.__obscura_clone__ === "string";
+}
+
+// A message that carries no Blob/File is returned untouched: it keeps its
+// identity and its old transport semantics (V8 still throws DataCloneError
+// for a Proxy, the JSON channel still serializes it, a shared node stays
+// shared) and nothing is copied, so page data is never expanded. Only a
+// graph that actually carries a Blob/File is rewritten, once, at the root.
+function _encodeCloneValue(value, seen) {
+  if (seen === undefined && !_cloneGraphMatches(value, _isBlobValue)) return value;
+  const isFile = typeof File !== "undefined" && value instanceof File;
+  if (isFile || (typeof Blob !== "undefined" && value instanceof Blob)) {
+    const bytes = new Uint8Array(_bodyToUint8Array(value));
+    return { __obscura_clone__: isFile ? "File" : "Blob",
+      bytes: btoa(_bytesToBinaryString(bytes)), type: value.type,
+      name: isFile ? value.name : undefined,
+      lastModified: isFile ? value.lastModified : undefined };
+  }
+  if (value === null || typeof value !== "object") return value;
+  seen = seen || new Map();
+  if (seen.has(value)) return seen.get(value);
+  if (Array.isArray(value)) {
+    const out = [];
+    seen.set(value, out);
+    for (const item of value) out.push(_encodeCloneValue(item, seen));
+    return out;
+  }
+  if (value instanceof Map) {
+    const out = new Map();
+    seen.set(value, out);
+    for (const [k, v] of value) out.set(_encodeCloneValue(k, seen), _encodeCloneValue(v, seen));
+    return out;
+  }
+  if (value instanceof Set) {
+    const out = new Set();
+    seen.set(value, out);
+    for (const item of value) out.add(_encodeCloneValue(item, seen));
+    return out;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return value;
+  const out = {};
+  seen.set(value, out);
+  for (const key of Object.keys(value)) out[key] = _encodeCloneValue(value[key], seen);
+  return out;
+}
+
+function _reviveCloneValue(value, seen) {
+  if (seen === undefined && !_cloneGraphMatches(value, _isTaggedCloneValue)) return value;
+  if (_isTaggedCloneValue(value)) {
+    const bytes = _base64ToUint8Array(value.bytes);
+    return value.__obscura_clone__ === "File"
+      ? new File([bytes], value.name, { type: value.type, lastModified: value.lastModified })
+      : new Blob([bytes], { type: value.type });
+  }
+  if (value === null || typeof value !== "object") return value;
+  seen = seen || new Map();
+  if (seen.has(value)) return seen.get(value);
+  if (Array.isArray(value)) {
+    const out = [];
+    seen.set(value, out);
+    for (const item of value) out.push(_reviveCloneValue(item, seen));
+    return out;
+  }
+  if (value instanceof Map) {
+    const out = new Map();
+    seen.set(value, out);
+    for (const [k, v] of value) out.set(_reviveCloneValue(k, seen), _reviveCloneValue(v, seen));
+    return out;
+  }
+  if (value instanceof Set) {
+    const out = new Set();
+    seen.set(value, out);
+    for (const item of value) out.add(_reviveCloneValue(item, seen));
+    return out;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return value;
+  const out = {};
+  seen.set(value, out);
+  for (const key of Object.keys(value)) out[key] = _reviveCloneValue(value[key], seen);
+  return out;
+}
+
+// Same-realm transports (structuredClone, MessagePort and worker postMessage,
+// which go through _structuredClone's hook table) rebuild a real instance: a
+// prototype-stripped Blob has no `_bytes`, so `.text()`/`.arrayBuffer()` would
+// throw. Bytes are the only data copied, matching structuredClone's own rules.
+globalThis.__obscura_clone_hooks = globalThis.__obscura_clone_hooks || {};
+for (const _cloneTag of ["Blob", "File"]) {
+  globalThis.__obscura_clone_hooks[_cloneTag] = function (source, seen) {
+    if (seen && seen.has(source)) return seen.get(source);
+    const copy = _reviveCloneValue(_encodeCloneValue(source));
+    if (seen) seen.set(source, copy);
+    return copy;
+  };
+}
 // Real structured clone (not JSON). JSON.parse(JSON.stringify) silently drops
 // ArrayBuffer/TypedArray (they serialize to {}), so Cloudflare's turnstile
 // orchestrate loses every byte it tries to round-trip through postMessage and
@@ -13574,9 +13829,10 @@ globalThis.atob = globalThis.atob || ((s) => {
 // never updated, and popstate-driven UI froze.
 //
 // Internally we keep a tiny in-memory stack of {state, url} entries. push/
-// replace mutate the stack and set globalThis.__virtualUrl so location.href
-// reads the new URL. Real Chrome doesn't fire popstate on push/replace,
-// only on user-driven back/forward — we match that exactly.
+// replace mutate the stack and reflect the current entry through
+// op_set_reflected_url, the single owner of the uncommitted URL. Real Chrome
+// doesn't fire popstate on push/replace, only on user-driven back/forward — we
+// match that exactly.
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
@@ -13630,7 +13886,10 @@ globalThis.atob = globalThis.atob || ((s) => {
   };
   const applyVirtual = () => {
     const entry = stack[idx];
-    globalThis.__virtualUrl = entry.url ?? null;
+    // Native is the only owner of the reflected URL: host reads (page
+    // .sync_virtual_url) and blocked-file restores never consult page state.
+    // The empty string clears back to the committed document URL.
+    __obscuraCore.ops.op_set_reflected_url(globalThis, entry.url ?? '');
   };
   const fireHashChangeIfNeeded = (prevUrl) => {
     try {
@@ -15703,14 +15962,16 @@ function _iframeWindowIsLive(state) {
 
 function _iframeWindowSameOrigin(state) {
   if (!_iframeWindowIsLive(state) || state.opaque) return false;
-  if (_frameObjects[state.frameId]) {
+  // Native principal identity is authoritative: inherited blank/srcdoc
+  // documents carry their creator's opaque_origin token, so an opaque creator
+  // (data:, file:, empty URL) still matches even though both serialize to
+  // "null", while sandbox-created opaque principals stay distinct.
+  if (state.frameId) {
     return __obscuraCore.ops.op_window_realm_same_origin(state.frameId);
   }
-  // The URL parser and native creator origin also cover inherited blank/srcdoc
-  // documents. Serialized opaque origins are not mutually same-origin.
-  if (!__obscuraCore.ops.op_window_realm_same_origin(_realmFrameId)) return false;
-  return state.inherited ? state.origin === _realmOrigin()
-    : state.origin !== 'null' && state.origin === _realmOrigin();
+  // No reserved realm yet (about:blank default document between a reset and
+  // the next commit). Do not claim access to a document that has no principal.
+  return false;
 }
 
 function _iframeAccessDenied() {
@@ -15728,7 +15989,7 @@ function _iframeNavigate(state, value) {
 
 function _iframeWindowRelation(name) {
   return name === 'parent'
-    ? __obscuraCore.ops.op_window_realm_proxy(_nativeWindowId, _realmFrameId, _windowProxy)
+    ? __obscuraCore.ops.op_window_realm_proxy(_nativeWindowId, _realmFrameId)
     : _windowRelated(_nativeWindowId, 'top', _realmFrameId);
 }
 
@@ -15745,10 +16006,19 @@ function _iframeCrossOriginValue(target, key, state) {
   return Reflect.get(target, key, target);
 }
 
+function _bindIframeWindowPostMessage(state) {
+  const frameId = state.frameId >>> 0;
+  // A facade with no reserved realm still validates the public overload and
+  // serializes before dropping. Frame id 0 names the page root here, so a
+  // detached facade must not bind it as its target.
+  state.postMessage = _facadePostMessageOp(false, frameId !== 0, frameId);
+}
+
 function _bindIframeWindowFrame(win, frameId) {
   const state = _iframeWindowState.get(win);
   if (state) {
     state.frameId = frameId >>> 0;
+    _bindIframeWindowPostMessage(state);
     state.opaque = __obscuraCore.ops.op_dom(
       'frame_is_sandboxed_opaque', String(state.frameId), '', _realmFrameId, _iframePolicyGlobal) !== 'false';
   }
@@ -15759,7 +16029,10 @@ const _iframeWindowProxyHandler = {
     const state = _iframeWindowState.get(target);
     if (!_iframeWindowSameOrigin(state)) return _iframeCrossOriginValue(target, key, state);
     if (key === 'document') return _frameObjectsFor(state.element)?.document || state.document;
-    if (key === 'localStorage' || key === 'sessionStorage') return globalThis[key];
+    // Storage belongs to the frame's Window, like every other global: Chrome
+    // gives each realm its own Storage object over the shared origin area. An
+    // embedding-realm alias would both break identity and expose the caller's
+    // object through a facade that is supposed to represent the frame.
     if (key === 'postMessage') return state.postMessage;
     if (key === 'parent' || key === 'top') return _iframeWindowRelation(key);
     if (key === 'window' || key === 'self' || key === 'frames') return receiver;
@@ -15790,7 +16063,7 @@ const _iframeWindowProxyHandler = {
     }
     const real = _frameObjectsFor(state.element)?.window;
     if (real) return Reflect.has(real, key);
-    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage') return true;
+    if (key === 'document') return true;
     return key === 'globalThis'
       || Reflect.has(target, key)
       || (typeof key === 'string' && _iframeRealmGlobalNameSet.has(key));
@@ -15807,9 +16080,7 @@ const _iframeWindowProxyHandler = {
       if (!seen.has(name)) { keys.push(name); seen.add(name); }
     }
     if (!seen.has('globalThis')) keys.push('globalThis');
-    for (const name of ['document', 'localStorage', 'sessionStorage']) {
-      if (!seen.has(name)) keys.push(name);
-    }
+    if (!seen.has('document')) keys.push('document');
     return keys;
   },
   getOwnPropertyDescriptor(target, key) {
@@ -15818,7 +16089,7 @@ const _iframeWindowProxyHandler = {
       return { value: _iframeCrossOriginValue(target, key, state), writable: false,
         enumerable: true, configurable: true };
     }
-    if (key === 'document' || key === 'localStorage' || key === 'sessionStorage' || key === 'postMessage'
+    if (key === 'document' || key === 'postMessage'
         || key === 'window' || key === 'self' || key === 'frames' || key === 'globalThis') {
       return { value: this.get(target, key, state.proxy), writable: false,
         enumerable: true, configurable: true };
@@ -15946,23 +16217,32 @@ function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin, sourceF
   return !!expected && expected !== 'null' && receiverOrigin === expected;
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
-  const to = _normalizePostMessageTargetOrigin(targetOrigin);
+// Structured clone cannot cross realms here. JSON carries what postMessage is
+// actually used for; anything else throws the same DataCloneError a browser
+// throws for an unclonable value, rather than arriving silently as null.
+function _serializeRealmMessage(data) {
   let json;
-  // Structured clone cannot cross realms here. JSON carries what postMessage is
-  // actually used for; anything else throws the same DataCloneError a browser
-  // throws for an unclonable value, rather than arriving silently as null.
   try {
-    json = JSON.stringify({ v: data === undefined ? null : data });
+    json = JSON.stringify({ v: _encodeCloneValue(data === undefined ? null : data) });
   } catch (_) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
-  if (json === undefined) json = '{"v":null}';
+  return json === undefined ? '{"v":null}' : json;
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin) {
+  const to = _normalizePostMessageTargetOrigin(targetOrigin);
+  const json = _serializeRealmMessage(data);
   if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
+  // A closed document keeps serving reads through the objects author script
+  // already holds, but new posts addressed to its retired browsing context are
+  // dropped instead of re-entering the local task queue.
+  if (_realmFrameId !== 0
+      && __obscuraCore.ops.op_window_source(_realmFrameId) === 0) return;
   // Top-level self-posts also work in a standalone runtime without a Page to
   // drain cross-realm messages. Serialize only once, before scheduling.
   const origin = _realmOrigin();
-  const clone = JSON.parse(json).v;
+  const clone = _reviveCloneValue(JSON.parse(json).v);
   setTimeout(() => {
     if (!_targetOriginAllows(to, _realmOrigin(), origin, _realmFrameId)) return;
     _dispatchRealmMessage(clone, origin, globalThis);
@@ -15978,6 +16258,10 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
 // public interface is visible to anything that walks it, and real Chrome has no
 // such member.
 function _frameObjectsFor(element) {
+  // Published objects are the target document's raw Window/Document, owned by
+  // the main world. Isolated worlds resolve the same frame through the native
+  // facade instead, so they never receive a foreign world's globals.
+  if (_realmIsolated) return null;
   const state = _iframeWindowState.get(element._iframeWin);
   if (!state || state.element !== element || !_iframeWindowSameOrigin(state)) return null;
   return _frameObjects[state.frameId] || null;
@@ -16056,15 +16340,45 @@ function _resetIframeElement(element) {
   if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
   element._frameId = 0;
   element._iframeLoadingUrl = null;
+  element._iframeLoadGeneration = (element._iframeLoadGeneration || 0) + 1;
   const doc = new _IframeDocument(
     '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
   element._iframeWin = new _IframeWindow(doc, 'about:blank');
 }
 
-// Reuse the guarded facade after publishing the real realm. A retained facade
-// must recheck current native origin and ownership on every access.
+// One object represents a frame in its embedding realm: the real child Window
+// when native principal/owner authorization allows same-origin access, else the
+// gated facade. contentWindow, frames[i], document.defaultView, parent, and both
+// message dispatchers resolve through here so `event.source` identity checks
+// compare equal to `iframe.contentWindow` (and to `window`/`parent` where the
+// relation names them). The facade rechecks native origin and ownership on every
+// trap, so a reference retained across a navigation stays gated.
 function _frameWindowFor(frameId) {
   return _frameWindows[frameId] || null;
+}
+
+// Objects embedded in THIS realm. Never consults the native source resolver:
+// that resolver can call back into the Window proxy factory, so using it here
+// would recurse for every frame this realm does not embed (popup realms and
+// frame ids observed before the local facade is registered).
+function _localFrameWindowFor(frameId) {
+  if (frameId === _realmFrameId) return globalThis;
+  if (!frameId) return null;
+  const element = globalThis.__obscura_frameElements[frameId];
+  if (element) {
+    const frameObjects = _frameObjectsFor(element);
+    if (frameObjects && frameObjects.window) return frameObjects.window;
+  }
+  return _frameWindowFor(frameId) || null;
+}
+
+function _canonicalFrameWindowFor(frameId) {
+  if (frameId === _realmFrameId) return globalThis;
+  if (!frameId) return null;
+  // A live native realm owns the stable WindowProxy for this browsing context:
+  // the raw global for the main world (V8 access checks gate each crossing) or
+  // an isolated-world facade. The JS shim is only the pre-realm placeholder.
+  return _windowSource(frameId) || _localFrameWindowFor(frameId);
 }
 
 // Captured in native context embedder data, never installed on the page global.
@@ -16074,10 +16388,10 @@ function _deliverRealmMessage(dataJson, origin, sourceFrameId, targetOrigin) {
   // drops the message silently.
   if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin, sourceFrameId)) return;
   let data = null;
-  try { data = _parseFrameMessage(dataJson).v; } catch (_) {}
+  try { data = _reviveCloneValue(_parseFrameMessage(dataJson).v); } catch (_) {}
   // Who to reply to: the frame above, or one of the frames below.
   const source = (_realmFrameId !== 0 && sourceFrameId === _realmParentFrameId)
-    ? globalThis.parent : (_frameWindowFor(sourceFrameId) || _windowSource(sourceFrameId));
+    ? globalThis.parent : _canonicalFrameWindowFor(sourceFrameId);
   _dispatchRealmMessage(data, origin, source);
 }
 
@@ -16097,24 +16411,47 @@ function _dispatchRealmMessage(data, origin, source) {
   }
 }
 
-// Installs real parent and top browsing-context proxies before a framed
-// document can run author code. The native registry resolves the caller's
-// document, so an isolated execution world follows its canonical frame rather
-// than constructing a private remote placeholder.
+// The embedding document's own Window is this frame's parent browsing context.
+// A browser returns that same WindowProxy from both `frame.contentWindow` and
+// `frame.contentWindow.parent`; resolving through the owner document keeps the
+// identity instead of minting one wrapper per realm. Only the creator relation
+// is resolved this way: `top` may skip levels and stays a native proxy.
+function _embeddingCreatorWindow(relation) {
+  if (!relation || relation.realmId !== _realmParentFrameId) return null;
+  const element = globalThis.frameElement;
+  const ownerDocument = element && element.ownerDocument;
+  const view = ownerDocument && ownerDocument.defaultView;
+  if (!view || view === globalThis) return null;
+  // The native principal decides whether this frame may see the creator's
+  // Window: inherited blank/srcdoc frames share the creator's opaque token,
+  // while a sandbox-created opaque principal must keep the gated proxy.
+  const creatorPrincipal = __obscuraCore.ops.op_window_realm_same_origin(_realmParentFrameId);
+  return creatorPrincipal ? view : null;
+}
+
 function _installFramingRelationships() {
   if (!_realmFrameId) return;
   for (const name of ['parent', 'top']) {
-    try {
-      const relation = JSON.parse(__obscuraCore.ops.op_window_relation(
-        __obscuraCore.ops.op_window_current(), name, _realmFrameId));
-      const value = relation.windowId
-        ? __obscuraCore.ops.op_window_realm_proxy(relation.windowId, relation.realmId, _windowProxy)
-        : null;
-      if (!value) continue;
-      Object.defineProperty(globalThis, name, {
-        value, writable: false, enumerable: true, configurable: true,
-      });
-    } catch (_) {}
+    let resolved;
+    let computed = false;
+    // Lazy: frameElement is installed by the frame initializer after this runs,
+    // and the native relation must be re-resolved against the live registry.
+    // The first read happens in author code, when both are available.
+    const resolve = () => {
+      if (computed) return resolved;
+      computed = true;
+      resolved = null;
+      try {
+        const relation = _windowRelation(_nativeWindowId, name, _realmFrameId);
+        if (!relation.windowId) return resolved;
+        const proxy = __obscuraCore.ops.op_window_realm_proxy(relation.windowId, relation.realmId);
+        resolved = (name === 'parent' && _embeddingCreatorWindow(relation)) || proxy || null;
+      } catch (_) {}
+      return resolved;
+    };
+    Object.defineProperty(globalThis, name, {
+      get: resolve, set(_value) { resolve(); }, enumerable: true, configurable: true,
+    });
   }
 }
 
@@ -16164,13 +16501,7 @@ class _IframeWindow {
     const proxy = new Proxy(this, _iframeWindowProxyHandler);
     state.proxy = proxy;
     _iframeWindowState.set(proxy, state);
-    state.postMessage = _markNative(function postMessage(data, targetOrigin, _transfer) {
-      if (_iframeWindowIsLive(state) && state.frameId) {
-        _sendRealmMessage(state.frameId, data, targetOrigin);
-      } else {
-        _normalizePostMessageTargetOrigin(targetOrigin);
-      }
-    });
+    _bindIframeWindowPostMessage(state);
     state.operations = Object.create(null);
     for (const name of ['close', 'focus', 'blur']) {
       state.operations[name] = _markNative(this[name].bind(this));
@@ -16709,6 +17040,18 @@ class HTMLCanvasElement extends Element {
   }
 }
 globalThis.HTMLCanvasElement = HTMLCanvasElement;
+// The interface branding above runs before this behavioral class exists, and
+// it registered a prototype-less stand-in for <canvas>. Wrapping resolves the
+// class through this table, so without the rebind canvas elements stayed plain
+// Element shells and getContext/toDataURL lived on an unreachable prototype.
+_htmlElementInterfaces['canvas'] = HTMLCanvasElement;
+Object.defineProperty(HTMLCanvasElement, Symbol.hasInstance, { value(value) {
+  if (this !== HTMLCanvasElement) return Function.prototype[Symbol.hasInstance].call(this, value);
+  const nid = _weakMapGet(_nodeIdentity, value);
+  return nid !== undefined
+    && _domParse('namespace_uri', nid) === 'http://www.w3.org/1999/xhtml'
+    && _domParse('local_name', nid) === 'canvas';
+}, configurable: true });
 
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
   if (type === '2d') {
@@ -16940,10 +17283,12 @@ _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
 
-// Timezone is driven by the process TZ (set by the CLI, default Europe/Berlin),
-// so native Intl.DateTimeFormat and Date report the same zone. No JS override:
-// forcing a fixed zone here only on Intl left Date on UTC, which is the exact
-// cross-surface mismatch a fingerprinting script looks for.
+// Timezone comes from native ICU. The embedder selects the zone before the
+// first isolate (OBSCURA_TIMEZONE, else the host TZ, with the CLI defaulting to
+// Europe/Berlin) and the runtime applies it directly to ICU on Windows, where
+// ICU does not read TZ. Intl.DateTimeFormat and Date therefore report the same
+// zone. No JS override: forcing a fixed zone only on Intl left Date on UTC,
+// which is the exact cross-surface mismatch a fingerprinting script looks for.
 
 if (typeof PointerEvent === 'undefined') {
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
@@ -18523,6 +18868,10 @@ if (typeof TreeWalker === 'undefined') {
 
 if (typeof FontFace === 'undefined') {
   const _fontFaceString = value => String(value ?? '');
+  const _fontFaceDocumentGeneration = () => {
+    const op = __obscuraCore.ops.op_posted_task_generation;
+    return typeof op === 'function' ? op(_realmFrameId) : -1;
+  };
   const _fontFaceSource = source => {
     if (typeof source === 'string') {
       if (!source.trim()) throw new DOMException('The font source is empty', 'SyntaxError');
@@ -18621,6 +18970,7 @@ if (typeof FontFace === 'undefined') {
       this._ascentOverride = _fontFaceDescriptor(descriptors, 'ascentOverride', 'normal');
       this._descentOverride = _fontFaceDescriptor(descriptors, 'descentOverride', 'normal');
       this._lineGapOverride = _fontFaceDescriptor(descriptors, 'lineGapOverride', 'normal');
+      this._documentGeneration = _fontFaceDocumentGeneration();
       this._status = 'unloaded';
       this._loadedPromise = new Promise((resolve, reject) => {
         this._resolveLoaded = resolve;
@@ -18690,6 +19040,10 @@ if (typeof FontFace === 'undefined') {
       if (this._status !== 'unloaded') return this.loaded;
       this._status = 'loading';
       this._changed();
+      if (_fontFaceDocumentGeneration() !== this._documentGeneration) {
+        this._settle({ ok: false, name: 'SecurityError', message: 'Font document is retired' });
+        return this.loaded;
+      }
       const op = __obscuraCore.ops.op_load_font_face;
       try {
         if (typeof op !== 'function') {
@@ -18793,8 +19147,16 @@ if (typeof FontFace === 'undefined') {
       if (this._retired || !this._ownerDocument || typeof __obscuraCore.ops.op_set_dynamic_fonts !== 'function') return;
       const registrations = [];
       for (const face of this._faces) {
-        if (face._cssConnected || face.status !== 'loaded' || face._retired) continue;
-        registrations.push({ family: face.family, source: face._resolvedSource,
+        // A face in document.fonts is a layout candidate even before an
+        // explicit .load(): the renderer discovers and fetches it. Requiring
+        // status === 'loaded' made that discovery impossible - the only code
+        // that would have loaded it was the renderer that never saw it.
+        // CSS-connected faces already arrive through the stylesheet cache, and
+        // a face that failed stays failed instead of being retried forever.
+        if (face._cssConnected || face._retired || face.status === 'error') continue;
+        const source = face._resolvedSource || face._source;
+        if (!source) continue;
+        registrations.push({ family: face.family, source,
           style: face.style, weight: face.weight, unicodeRange: face.unicodeRange });
       }
       try {
@@ -19235,6 +19597,9 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['rangeInsertNode', function(range, node) { return _nativeRangeInsertNode.call(range, node); }],
   ['rangeSurroundContents', function(range, node) { return _nativeRangeSurroundContents.call(range, node); }],
   ['nodeDom', function(cmd, a1, a2) { return _dom(cmd, a1, a2); }],
+  ['foreignGet', function(key) { return Reflect.get(globalThis, key, globalThis); }],
+  ['foreignSet', function(key, value) { return Reflect.set(globalThis, key, value, globalThis); }],
+  ['foreignHas', function(key) { return Reflect.has(globalThis, key); }],
   ['activateElement', function() {
     return _nativeElementClick.call(this);
   }],
@@ -19308,8 +19673,11 @@ const _worldNativeInput = (() => {
     }
     return inside;
   };
-  const read = (element,name) => name==='selectionStart' ? (_ns_selectionStart.get(element) ?? null)
-    : name==='selectionEnd' ? (_ns_selectionEnd.get(element) ?? null) : apply(descriptors[name].get,element,[]);
+  const read = (element,name) => {
+    if (name==='selectionStart') return _ns_selectionStart.get(element) ?? value(element).length;
+    if (name==='selectionEnd') return _ns_selectionEnd.get(element) ?? value(element).length;
+    return apply(descriptors[name].get,element,[]);
+  };
   const value = element => _domParse('get_form_state',nid(element))?.value
     ?? (tag(element)==='TEXTAREA' ? _domParse('text_content',nid(element)) : attr(element,'value')) ?? '';
   const setValue = (element,text) => apply(descriptors.value.set,element,[text]);
@@ -19609,7 +19977,19 @@ const _worldNativeInput = (() => {
       return true;
     }
     if (kind!=='mouse') throw new TypeError('Unknown native input kind');
-    const target=payload.nodeId==null ? body() : _worldWrapNode(payload.nodeId);
+    // The native painter returns no node when no box is hit (collapsed/empty
+    // body, transformed content the paint pass did not emit). The DOM's own
+    // hit test is the same platform answer a browser uses at that point, so
+    // fall back to it instead of pretending the click landed on <body> and
+    // losing the activation behavior of the element under the pointer.
+    const hitTarget = payload.nodeId != null ? _worldWrapNode(payload.nodeId) : (() => {
+      try {
+        const hit = globalThis.document.elementFromPoint(payload.x || 0, payload.y || 0);
+        if (hit) return hit;
+      } catch (_) {}
+      return body();
+    })();
+    const target = hitTarget || body();
     if (!allowed(target)) { mouseDown=null; return false; }
     const count=payload.clickCount ?? 1;
     Object.assign(init,{clientX:payload.x,clientY:payload.y,button:payload.buttonCode || 0,buttons:payload.buttons || 0,detail:count});
@@ -19693,6 +20073,10 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
     _realmIsolated = !!isolated;
     _realmRegistered = true;
     _registerNativeWindow(windowId, !_realmIsolated);
+    // A realm-local native entry preserves the implicit Window receiver without
+    // placing a receiver-realm JavaScript wrapper on the caller's stack.
+    globalThis.postMessage = _nativePostMessage(__obscuraCore.ops.op_register_post_message(
+      _postMessageDispatch, __obscuraCore.ops.op_post_message));
     // Bind window listeners to the restored realm, not the snapshot's global
     // proxy: the listener WeakMap must not carry a snapshot-era window key.
     _eventTargetAdd(globalThis, 'resize', _viewportRenderingUpdate);
@@ -19701,12 +20085,22 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
   __obscuraCore.ops.op_register_document_realm(
     Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
     _realmFrameId, _deliverRealmMessage, _frameObjects, _deliverWindowMessage);
+  // The document's scripting flag is native state: a sandboxed frame without
+  // allow-scripts still exposes its DOM, but inline event handler content
+  // attributes and dynamically inserted scripts must stay inert even when
+  // another realm activates or mutates its elements.
+  _scriptingEnabled = _domParse("scripting_enabled") === true;
+  // Media preferences are native per-document state shared with the creator on
+  // frame creation. Initialize this realm's matchMedia flags before author
+  // script runs; a child created after set_media_preferences() must not read
+  // the snapshot defaults.
+  __obscura_update_media_preferences();
   if (_realmIsolated) {
     // Resolve the canonical realm through the existing authenticated window
     // target. The sentinel requests a borrowed native member even though both
     // worlds have the same frame id; no public document/prototype is consulted.
-    const owner=_windowTarget(_nativeWindowId,_realmFrameId);
-    const state=__obscuraCore.ops.op_document_realm_member(owner,'modalState',0xFFFFFFFF);
+    const state=__obscuraCore.ops.op_window_realm_member(
+      _nativeWindowId,_realmFrameId,'modalState');
     _modalState=Reflect.apply(state,undefined,[]);
   }
   _browserPostedTaskWakePending = false;
@@ -19716,7 +20110,7 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
   // A real navigation just completed (this runs after set_url), so drop any
   // URL a location setter previewed synchronously and let document_url drive
   // location.href again, including any redirect target.
-  globalThis.__virtualUrl = null;
+  _previewUrl('');
   _installWasmStreamingFallback();
 
   const documentNid = +_dom("document_node_id");
@@ -19808,6 +20202,60 @@ globalThis.__obscura_init = function(windowId = 0, isolated = false) {
       }
     }
   }
+
+  // The native access-check interceptor reads this bundle from the global
+  // proxy's internal field when a different-origin document touches this
+  // Window. Every value is created in this realm; the interceptor never hands
+  // out the raw global.
+  const liveChildWindows = () => globalThis.document
+    ? globalThis.document.querySelectorAll('iframe') : [];
+  // Ephemeron keys are target document bundles, so navigation creates a new
+  // callable identity and an unreachable document/cache cycle can be collected.
+  const crossOriginCallables = new WeakMap();
+  __obscuraCore.ops.op_install_window_bundle(Object.freeze({
+    crossOriginCallable: (target, name, value) => {
+      let callables = _weakMapGet(crossOriginCallables, target);
+      if (!callables) {
+        if (value === undefined) return undefined;
+        callables = { __proto__: null };
+        _weakMapSet(crossOriginCallables, target, callables);
+      }
+      if (value !== undefined) callables[name] = value;
+      return callables[name];
+    },
+    // A retained closed document keeps running its own script-visible state;
+    // `closed` reflects the browsing context that owns it.
+    closed: () => _nativeWindowRoot
+      ? __obscuraCore.ops.op_window_closed(_nativeWindowId)
+      : __obscuraCore.ops.op_window_source(_realmFrameId) === 0,
+    parent: () => _windowRelated(_nativeWindowId, 'parent'),
+    top: () => _windowRelated(_nativeWindowId, 'top'),
+    opener: () => _windowRelated(_nativeWindowId, 'opener'),
+    length: () => liveChildWindows().length,
+    index: (index) => {
+      const frame = liveChildWindows()[index];
+      return frame ? frame.contentWindow : undefined;
+    },
+    // Cross-origin named access only reaches live child browsing contexts,
+    // never arbitrary document members or author globals.
+    named: (name) => {
+      for (const frame of liveChildWindows()) {
+        if (frame.getAttribute('name') === name) return frame.contentWindow;
+      }
+      return undefined;
+    },
+    location: _windowCrossOriginLocation(_nativeWindowId, _realmFrameId),
+    setLocation: (value) => {
+      __obscuraCore.ops.op_window_navigate(_nativeWindowId, String(value), false,
+        _realmFrameId, 'GET', '');
+      return true;
+    },
+    postMessage: globalThis.postMessage,
+    close: globalThis.close,
+    focus: globalThis.focus,
+    blur: globalThis.blur,
+    deny: () => _windowAccessDenied(),
+  }));
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this
@@ -20124,7 +20572,12 @@ if (!Element.prototype.removeAttributeNode) {
     if (!attr || typeof attr.name !== 'string') return attr;
     const val = this.getAttribute(attr.name);
     if (val !== null) {
+      // Removing the attribute detaches the node: ownerElement becomes null and
+      // the value freezes at what the element held, so a retained Attr cannot
+      // keep writing into the element it no longer belongs to.
+      if (attr.value !== undefined) attr._value = String(val);
       this.removeAttribute(attr.name);
+      attr.ownerElement = null;
     }
     return attr;
   };

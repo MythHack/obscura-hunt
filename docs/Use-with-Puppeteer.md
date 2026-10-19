@@ -204,6 +204,6 @@ not receive this traffic.
 
 ES-module roots, dependencies, and dynamic imports report their actual HTTP
 status, response headers, and body size. Retained bodies remain readable by
-request ID when a page's JavaScript runtime is suspended, subject to
+request ID while a page is parked with its runtime retained, subject to
 `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`.
 Cached imports do not produce another network request.

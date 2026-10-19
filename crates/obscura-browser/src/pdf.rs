@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(pages.len(), 1);
         assert!(channel_near(*pages[0].get_pixel(50, 60), [32, 80, 224]));
         assert_eq!(page.screenshot((100.0, 80.0)).unwrap(), before);
-        assert_eq!(page.evaluate("return matchMedia('(prefers-color-scheme:dark)').matches;"), serde_json::json!(true));
+        assert_eq!(page.evaluate("matchMedia('(prefers-color-scheme:dark)').matches"), serde_json::json!(true));
     }
 
     #[test]

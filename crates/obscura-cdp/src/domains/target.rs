@@ -219,7 +219,19 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "activateTarget" => Ok(json!({})),
+        "activateTarget" => {
+            // Explicit activation unparks a background tab. A parked page
+            // retains its live heap, so this clears only the autonomous-work
+            // gate and stays V8-free (the method is listed as such).
+            if let Some(target_id) = params.get("targetId").and_then(Value::as_str) {
+                if let Some(page) = ctx.get_page_mut(target_id) {
+                    if page.is_suspended() && page.has_js() {
+                        page.resume_js();
+                    }
+                }
+            }
+            Ok(json!({}))
+        }
         "getBrowserContexts" => {
             let mut ids: Vec<&String> = ctx.browser_contexts.keys().collect();
             ids.sort();

@@ -4,6 +4,23 @@
   <meta charset="utf-8">
   <title>inline replaced flow</title>
   <style>
+    /* The unstyled cell strut must not depend on the host standard font. */
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans.ttf");
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
+    @font-face {
+      font-family: "Liberation Sans";
+      src: url("../crates/obscura-render/assets/liberation-sans-bold.ttf");
+      font-weight: 700;
+      font-style: normal;
+      font-display: block;
+      line-gap-override: 3.2715%;
+    }
     html, body { margin: 0; }
     .case {
       position: absolute;
@@ -40,6 +57,7 @@
       top: 160px;
       width: 300px;
       border-spacing: 0;
+      font-family: "Liberation Sans", sans-serif;
     }
     #mixed-cell table {
       width: 100%;

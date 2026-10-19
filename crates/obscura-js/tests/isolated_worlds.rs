@@ -98,6 +98,18 @@ fn explicit_isolated_grant_upgrades_only_live_related_dom_access() {
     assert_eq!(runtime.evaluate_in_cdp_frame(utility, inspect).unwrap(), json!("SecurityError"));
     assert_eq!(runtime.ensure_isolated_world(42, "dom-access", true).unwrap(), utility.world_id.unwrap());
     assert_eq!(runtime.evaluate_in_cdp_frame(utility, inspect).unwrap(), json!("original"));
+    runtime.evaluate("globalThis.authorSecret = 'author'").unwrap();
+    assert_eq!(runtime.evaluate_in_cdp_frame(utility, r#"[
+        parent.document.defaultView === parent,
+        ...[
+            () => parent.authorSecret,
+            () => parent.eval,
+            () => parent.Function,
+            () => parent.document.defaultView.authorSecret,
+            () => { parent.authorSecret = () => 'overwritten'; },
+        ].map(probe => { try { probe(); return 'allowed'; } catch (error) { return error.name; } }),
+    ]"#).unwrap(), json!([true, "SecurityError", "SecurityError", "SecurityError", "SecurityError", "SecurityError"]));
+    assert_eq!(runtime.evaluate("authorSecret").unwrap(), json!("author"));
     assert_eq!(child.evaluate(&mut runtime, inspect).unwrap(), json!("SecurityError"));
     assert_eq!(runtime.evaluate_in_cdp_frame(ordinary, inspect).unwrap(), json!("SecurityError"));
     assert_eq!(runtime.evaluate("open('', 'unrelated', 'noopener')").unwrap(), json!(null));

@@ -50,8 +50,20 @@ pub async fn handle(
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let url = page.url_string();
             let title = page.title.clone();
-            page.with_dom(|dom| build_capture_snapshot(dom, &url, &title))
-                .ok_or_else(|| "No DOM loaded".to_string())
+            let (mut snapshot, native_ids) = page
+                .with_dom(|dom| build_capture_snapshot(dom, &url, &title))
+                .ok_or_else(|| "No DOM loaded".to_string())?;
+            // Snapshot backend ids must come from the same allocator as
+            // DOM.getDocument, otherwise clients cannot resolve a snapshot
+            // node through DOM.requestNode / DOM.describeNode.
+            let mut backend_ids = Vec::with_capacity(native_ids.len());
+            for node_id in native_ids {
+                backend_ids.push(json!(crate::domains::dom::backend_node_id(
+                    ctx, session_id, 0, node_id,
+                )?));
+            }
+            snapshot["documents"][0]["nodes"]["backendNodeId"] = json!(backend_ids);
+            Ok(snapshot)
         }
         // Permissive no-op for the rest of the domain (e.g. getSnapshot) so a
         // client that probes it does not abort on an Unknown-method error.
@@ -113,7 +125,7 @@ fn walk(
     }
 }
 
-fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
+fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> (Value, Vec<u32>) {
     let mut order: Vec<NodeId> = Vec::new();
     let mut parent_idx: Vec<i64> = Vec::new();
     walk(dom, dom.document(), -1, &mut order, &mut parent_idx);
@@ -127,6 +139,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
     let mut node_name: Vec<i64> = Vec::with_capacity(n);
     let mut node_value: Vec<i64> = Vec::with_capacity(n);
     let mut backend_ids: Vec<i64> = Vec::with_capacity(n);
+    let mut native_ids: Vec<u32> = Vec::with_capacity(n);
     let mut attributes: Vec<Value> = Vec::with_capacity(n);
     let mut clickable: Vec<i64> = Vec::new();
 
@@ -147,6 +160,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
                 node_name.push(0);
                 node_value.push(0);
                 backend_ids.push(nid.index() as i64);
+                native_ids.push(nid.raw());
                 attributes.push(json!([]));
                 layout_node_index.push(i as i64);
                 bounds.push(json!([0.0, 0.0, 0.0, 0.0]));
@@ -187,6 +201,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
         node_name.push(strings.intern(&nname));
         node_value.push(strings.intern(&nval));
         backend_ids.push(nid.index() as i64);
+        native_ids.push(nid.raw());
 
         let mut attr_idx: Vec<Value> = Vec::with_capacity(attrs.len() * 2);
         for (k, v) in &attrs {
@@ -240,7 +255,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
     }
 
     let content_height = (n as i64) * 18;
-    json!({
+    (json!({
         "documents": [{
             "documentURL": doc_url_idx,
             "title": title_idx,
@@ -274,7 +289,7 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
             "contentHeight": content_height,
         }],
         "strings": strings.list,
-    })
+    }), native_ids)
 }
 
 #[cfg(test)]

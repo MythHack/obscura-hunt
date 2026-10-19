@@ -43,6 +43,28 @@ fn security_error() -> JsErrorBox {
     JsErrorBox::new("DOMExceptionSecurityError", "Storage is unavailable for this document")
 }
 
+/// Browser storage origin for a document.
+///
+/// `file:` documents have a filesystem-scoped origin in Chromium (their
+/// `location.origin` serializes as `file://`) even though the URL parser calls
+/// their origin opaque, and all local files share its storage. Every other
+/// opaque origin (data:, sandboxed) stays `null` and storage-less.
+pub(crate) fn storage_document_origin(
+    document: &crate::ops::SharedState,
+) -> Result<String, JsErrorBox> {
+    let document = document.try_borrow()
+        .map_err(|_| JsErrorBox::generic("Storage document is unavailable"))?;
+    let origin = match &document.inherited_origin {
+        Some(origin) => origin.clone(),
+        None => url::Url::parse(&document.url).map(|url| {
+            if url.scheme() == "file" { "file://".to_string() }
+            else { url.origin().ascii_serialization() }
+        }).unwrap_or_else(|_| "null".to_string()),
+    };
+    if origin == "null" { return Err(security_error()); }
+    Ok(origin)
+}
+
 fn quota_error() -> JsErrorBox {
     JsErrorBox::new("DOMExceptionQuotaExceededError", "Storage quota exceeded")
 }
@@ -250,9 +272,7 @@ fn op_storage(
 ) -> Result<serde_json::Value, JsErrorBox> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let (registry, root, document) = crate::window::storage_window(scope, state, receiver)?;
-        let origin = crate::window::origin(&*document.try_borrow()
-            .map_err(|_| JsErrorBox::generic("Storage document is unavailable"))?);
-        if origin == "null" { return Err(security_error()); }
+        let origin = storage_document_origin(&document)?;
         let storage = {
             let registry = registry.try_borrow()
                 .map_err(|_| JsErrorBox::generic("Storage window registry is unavailable"))?;

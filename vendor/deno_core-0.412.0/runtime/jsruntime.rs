@@ -256,6 +256,26 @@ impl InnerIsolateState {
     // the runtime.
     _ = unsafe { Rc::from_raw(state_ptr as *const JsRuntimeState) };
 
+    // Drop every attached context's slot annex while the isolate handle is
+    // still valid. The annex owns the browser context storage and a weak
+    // context handle with a guaranteed finalizer; finalizing it during
+    // isolate disposal cannot reset that weak handle and leaves V8's teardown
+    // GC calling through freed finalizer storage. `browser_realms` only lists
+    // live realms, so contexts retired while JS still retained them are
+    // reached through the registered weak handles.
+    {
+      let contexts =
+        std::mem::take(&mut *self.state.attached_contexts.borrow_mut());
+      v8::scope!(let scope, &mut *self.v8_isolate);
+      for anchored in &contexts {
+        if let Some(context) = anchored.to_local(scope) {
+          BrowserRealm::clear_context_slots(context);
+        }
+      }
+      // Drop the weak handles too: a disposed isolate cannot reset them, and
+      // their payloads must not survive past the isolate they belong to.
+      drop(contexts);
+    }
     // Retire document-local module maps while the isolate and shared op state
     // are still alive. This does not shut down the shared driver or callbacks.
     for realm in std::mem::take(&mut *self.state.browser_realms.borrow_mut()) {
@@ -547,6 +567,12 @@ pub struct JsRuntimeState {
   pub(crate) function_templates: Rc<RefCell<FunctionTemplateData>>,
   pub(crate) browser_realms: RefCell<Vec<BrowserRealm>>,
   main_browser_realm: RefCell<Option<BrowserRealm>>,
+  /// Non-owning handles for every context registered through
+  /// `BrowserRealm::attach`. Retired realms leave `browser_realms`, but their
+  /// V8 context can outlive that entry while JS retains it, together with the
+  /// slot annex holding browser-owned storage. Cleanup must reach all of them
+  /// while the isolate handle is valid.
+  pub(crate) attached_contexts: RefCell<Vec<v8::Weak<v8::Context>>>,
   pub(crate) callsite_prototype: RefCell<Option<v8::Global<v8::Object>>>,
   waker: Arc<AtomicWaker>,
   /// Foreground V8 tasks queued by the custom platform. Shared with the
@@ -910,6 +936,7 @@ impl JsRuntime {
       function_templates: Default::default(),
       browser_realms: Default::default(),
       main_browser_realm: Default::default(),
+      attached_contexts: Default::default(),
       callsite_prototype: None.into(),
       lazy_extensions,
       tla_stall_retries: Cell::new(0),

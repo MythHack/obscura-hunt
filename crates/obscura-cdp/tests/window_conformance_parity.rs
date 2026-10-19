@@ -81,6 +81,18 @@ async fn setup() -> (CdpContext, String) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn document_replacement_keeps_current_document_timer_tasks_alive() {
+    let (mut ctx, sid) = setup().await;
+    let url = serve_once().await;
+    cdp(&mut ctx, 2, "Page.navigate", json!({"url": url, "waitUntil": "load"}), &sid).await;
+    let result = cdp(&mut ctx, 3, "Runtime.evaluate", json!({
+        "expression": "new Promise(resolve => setTimeout(() => { document.getElementById('a').textContent = 'current document'; resolve([location.href, document.getElementById('a').textContent]); }, 0))",
+        "returnByValue": true, "awaitPromise": true, "timeout": 1000,
+    }), &sid).await;
+    assert_eq!(result["result"]["value"], json!([url, "current document"]));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn element_toggle_attribute_is_callable_and_toggles() {
     let (mut ctx, sid) = setup().await;
     // Element.prototype.toggleAttribute is on every real Chrome. Bootstrap

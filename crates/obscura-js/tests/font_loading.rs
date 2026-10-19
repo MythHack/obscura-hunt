@@ -133,10 +133,31 @@ async fn unattached_font_from_replaced_document_rejects_with_security_error() {
     let observer_id = runtime.take_created_windows().pop().unwrap();
     let mut observer = runtime.for_window(observer_id).unwrap();
     runtime.set_dom(obscura_dom::parse_html("<html><body>replacement</body></html>"));
-    assert!(runtime.validate_cdp_world(Default::default()).is_err());
+    // Production navigation replaces the document realm (Page::init_js calls
+    // refresh_window_realm) before running page init. set_dom alone retains the
+    // previous JS realm, so model the same public contract here.
+    runtime.set_url("https://font.example/page/index.html");
+    runtime.seed_render_resource("https://font.example/fonts/good.ttf".into(), Some(FONT.to_vec()));
+    runtime.refresh_window_realm().unwrap();
     runtime.run_page_init();
     assert_eq!(runtime.evaluate_with_timeout("typeof oldFace", std::time::Duration::from_secs(1)).unwrap(),
         json!("undefined"));
+    // The replacement document is a live, current world of its own: a fresh
+    // FontFace from that document still reaches the transport and loads.
+    runtime.execute_script("replacement-font-owner", r#"
+        globalThis.freshFontResult = 'pending';
+        const fresh = new FontFace('ReplacementDocument', "url('../fonts/good.ttf')");
+        fresh.load().then(face => {
+            document.fonts.add(face);
+            freshFontResult = [face === fresh, face.status,
+                document.fonts.check('16px ReplacementDocument')];
+        }, error => freshFontResult = error.name);
+    "#).unwrap();
+    runtime.run_event_loop_bounded(100).await.unwrap();
+    assert_eq!(
+        runtime.evaluate("freshFontResult").unwrap(),
+        json!([true, "loaded", true])
+    );
     observer.execute_script("retired-font-owner", r#"
         globalThis.result = 'pending';
         oldFace.load().then(() => result = 'unexpected success', error => {
