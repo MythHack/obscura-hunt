@@ -9,13 +9,19 @@ dependencies, but a release source edit can still require substantial compilatio
 and linking. For the scoped incremental runtime workflow, see
 [Fast edit/test loop](Testing-and-debugging.md#fast-edittest-loop).
 
+For the current V8 152 engine, build a recorded revision of this fork's `main`
+branch. Older tagged release archives do not acquire later engine changes.
+See [Installation](Installation.md) for public package availability and
+[upgrade validation](Testing-and-debugging.md#upgrade-validation-october-19)
+for the exercised source revision.
+
 ## Build
 
 ```bash
 git clone https://github.com/MythHack/obscura-hunt.git
 cd obscura-hunt
 export RUSTC_WRAPPER=sccache
-cargo build --release -p obscura-cli --bins --features render
+cargo build --release --locked -p obscura-cli --bins --features render
 ```
 
 Binary is at `./target/release/obscura`.
@@ -26,7 +32,7 @@ and PDF export.
 ## Rendering and stealth
 
 ```bash
-cargo build --release -p obscura-cli --bins --features render,stealth
+cargo build --release --locked -p obscura-cli --bins --features render,stealth
 ```
 
 This is the complete rendering build with the stealth wreq/BoringSSL transport,
@@ -77,6 +83,11 @@ isolate, and navigating or closing one document retires only its module work.
 The original dependency keeps `JsRealm` and `ModuleMap` private, so this integration
 cannot be implemented through its public interface alone. Keep the patch until
 an upstream interface can replace it without losing those browser semantics.
+
+`vendor/deno_v8-0.4.0` is the second engine-related patch. It pins the underlying
+raw `v8` package to `=152.2.0` for both `deno_core` and `serde_v8`; keep it together
+with the browser-realm patch. The following section describes the matching SDK,
+native ABI and snapshots.
 
 ### V8 version, SDK and snapshots
 
@@ -188,11 +199,15 @@ cargo install --path crates/obscura-cli --features render
 cargo nextest run --release --features render --no-fail-fast
 ```
 
-Integration suite:
+For focused browser and CDP integration coverage, select the affected crates:
 
 ```bash
-python3 tests/test_all.py
+cargo nextest run --release --locked --features render -p obscura-browser -p obscura-cdp --no-fail-fast
 ```
+
+For actual CLI/CDP/MCP behavior, reproduce the scenario with the release
+executable and a local fixture. See [Testing and debugging](Testing-and-debugging.md)
+for the runtime and rendering workflow.
 
 Use `cargo nextest`, not `cargo test`: runtime tests require process isolation
 because the engine owns a single V8 isolate per process.

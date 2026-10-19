@@ -1,21 +1,22 @@
-Obscura is an open-source headless browser engine written in Rust. It runs JavaScript via V8, speaks the Chrome DevTools Protocol, and works as a drop-in replacement for headless Chrome with Puppeteer and Playwright.
+# Obscura-Hunt
 
-## Versus headless Chrome
+Obscura-Hunt is a fork of [Obscura](https://github.com/h4ckf0r0day/obscura),
+a native headless browser engine written in Rust with embedded V8. Use it through
+the CLI, the Chrome DevTools Protocol (CDP), the MCP server for agent workflows,
+or the Rust library. Puppeteer and Playwright can connect through CDP; supported
+behavior and limitations are documented in the guides below.
 
-| Metric      | Obscura  | Headless Chrome |
-| ----------- | -------- | --------------- |
-| Memory      | 30 MB    | 200+ MB         |
-| Binary size | ~70 MiB  | 300+ MB         |
-| Startup     | Instant  | ~2s             |
-| Page load   | 85 ms    | ~500 ms         |
-| Anti-detect | Built-in | None            |
-| Puppeteer   | Yes      | Yes             |
-| Playwright  | Yes      | Yes             |
+Current `main` uses rusty_v8 **`152.2.0`**, reporting engine version
+**`15.2.124.1-rusty`**, with matching native SDK, C++ ABI and snapshots.
+To get that engine, [build the fork from source](Build-from-source.md).
+The `v0.1.2` tag predates this upgrade; it is not a V8 152 build. See the
+[October 19 upgrade validation](Testing-and-debugging.md#upgrade-validation-october-19)
+for the exercised configurations and results, rather than treating an engine
+version change as a performance claim.
 
-Rendering and stealth are both first-class capabilities. Release builds
-support screenshots, scroll-aware layout, activity-driven CDP screencasting,
-and raster PDF export; stealth builds retain all of those surfaces while adding
-the wreq/BoringSSL transport and browser-identity protections.
+Rendering builds support screenshots, scroll-aware layout, CDP screencasting
+and raster PDF export. Rendering and the optional transport feature are selected
+independently; see [Installation](Installation.md) for all four configurations.
 
 ## Quickstart
 
@@ -32,6 +33,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 - [Use with Puppeteer](Use-with-Puppeteer.md)
 - [Use with Playwright](Use-with-Playwright.md)
 - [Use the MCP server](Use-the-MCP-server.md)
+- [Watch agent sessions live](Watch-agent-sessions-live.md)
 - [Use as a Rust library](Use-as-a-Rust-library.md)
 - [Persist cookies and storage](Persist-cookies-and-storage.md)
 - [Intercept and modify requests](Intercept-and-modify-requests.md)
@@ -41,6 +43,7 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 - [CLI reference](CLI-reference.md)
 - [Environment variables](Environment-variables.md)
+- [CDP media preference emulation](CDP-media.md)
 
 ## Contributing
 
@@ -50,8 +53,9 @@ the wreq/BoringSSL transport and browser-identity protections.
 
 ## Links
 
-- Source: https://github.com/h4ckf0r0day/obscura
-- Releases: https://github.com/h4ckf0r0day/obscura/releases
-- Issues: https://github.com/h4ckf0r0day/obscura/issues
+- Source: https://github.com/MythHack/obscura-hunt
+- Releases and available assets: https://github.com/MythHack/obscura-hunt/releases
+- Issues: https://github.com/MythHack/obscura-hunt/issues
+- Upstream project and original browser engine: https://github.com/h4ckf0r0day/obscura
 
 License: Apache-2.0.

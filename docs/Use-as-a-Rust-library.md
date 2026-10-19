@@ -38,7 +38,7 @@ above, not to an assumed `vendor/` directory inside your application or Cargo's
 git cache.
 
 The locked engine family is `deno_core 0.412.0`, `serde_v8 0.321.0`,
-`deno_v8 0.4.0` and raw `v8 152.2.0` (V8 `15.2.124.1`). `deno_v8` is a facade,
+`deno_v8 0.4.0` and raw `v8 152.2.0` (V8 `15.2.124.1-rusty`). `deno_v8` is a facade,
 not Deno CLI `2.9.7`; that CLI uses the same facade family but raw V8 `150.4.0`.
 Keep the fork checkout at a recorded commit and commit the consumer's own
 `Cargo.lock` with the patched versions selected; the dependency's lockfile does

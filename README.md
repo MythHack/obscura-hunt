@@ -18,9 +18,15 @@ The latest upstream sync includes
 [`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588).
 Its 69 commits add IndexedDB, Web Storage updates, iframe lifecycle work, MCP
 improvements, request interception and rendering fixes while retaining the fork's
-native popup and child-frame ownership. See the
-[verification report](docs/Testing-and-debugging.md#latest-update-upstream-bd95294)
-for exercised coverage and unresolved failures.
+native popup and child-frame ownership. The current branch also upgrades raw
+`rusty_v8` from `150.4.0` to **`152.2.0`** (engine **`15.2.124.1-rusty`**).
+The native SDK, C++ shims, startup snapshots and optional ICU 78 data are aligned.
+See the
+[October 19 validation](docs/Testing-and-debugging.md#upgrade-validation-october-19)
+for local Windows/Linux coverage and the successful
+[upgrade CI run](https://github.com/MythHack/obscura-hunt/actions/runs/39230174839).
+The [merge-stage report](docs/Testing-and-debugging.md#merge-stage-record-upstream-bd95294)
+is retained as a historical record, not the current validation status.
 
 ## Why choose Obscura-Hunt?
 
@@ -63,6 +69,7 @@ transitive update.
 
 | Area | Version changes |
 | --- | --- |
+| JavaScript engine | raw `v8` (rusty_v8) 150.4.0 → 152.2.0 |
 | HTML parsing | `html5ever` 0.39.0 → 0.40.1; `markup5ever` 0.39.0 → 0.40.0 |
 | CSS and selectors | `cssparser` 0.34.0 → 0.38.0; `selectors` 0.26.0 → 0.41.0; `servo_arc` 0.4.3 → 0.5.0 |
 | HTTP and CDP transport | `reqwest` 0.12.28 → 0.13.5; `ureq` 2.12.1 → 3.4.2; `tokio-tungstenite` 0.26.2 → 0.30.0 |
@@ -75,9 +82,11 @@ transitive update.
 | TLS test support | `rcgen` 0.13.2 → 0.14.10; `tokio-rustls` 0.26.4 → 0.26.6 |
 | Native build support | `cc` 1.2.64 → 1.7.0, now also a direct build dependency of the JavaScript runtime |
 
-`deno_core` remains at 0.412.0 with a browser-realm patch; the existing patched
-`cosmic-text` 0.14.2 and `taffy` 0.12.1 are retained. Older versions of some
-utilities still appear as transitive dependencies.
+`deno_core` remains at `0.412.0` with the browser-realm and V8 compatibility
+patches. The patched `deno_v8 0.4.0` facade selects raw `v8 =152.2.0` for both
+the core and `serde_v8 0.321.0`; its version is not a Deno CLI version. The
+existing patched `cosmic-text` 0.14.2 and `taffy` 0.12.1 are retained. Older
+versions of some utilities still appear as transitive dependencies.
 
 Sources: [Cargo.lock](Cargo.lock), [workspace dependencies](Cargo.toml), and the
 [JavaScript](crates/obscura-js/Cargo.toml), [network](crates/obscura-net/Cargo.toml),
@@ -92,7 +101,7 @@ Obscura-Hunt; commands and executables are still named `obscura` and `obscura-wo
 
 ### Requirements
 
-- Current stable Rust and a C/C++ toolchain.
+- Current stable Rust and a C++20 toolchain.
 - For stealth: CMake, Clang, and the libclang/LLVM development libraries.
 - On Windows x64: Visual Studio C++ Build Tools, CMake, LLVM/Clang, and NASM on
   `PATH`. Before building, set `LIBCLANG_PATH` to the actual LLVM directory
@@ -138,9 +147,12 @@ another directory. Parallel scraping and multi-worker serving need the worker.
 Add that directory to `PATH`, or use the full executable path in commands and
 MCP client configuration.
 
-Cargo automatically uses this fork's checked-in dependency patches; keep them
-when building. See [Build from source](docs/Build-from-source.md) for the details
-and additional platform guidance. `sccache` does not replace the native build tools.
+Cargo automatically uses this fork's checked-in dependency patches. Keep the
+patches, native SDK and snapshots aligned on the selected engine; an old V8
+snapshot or archive is not interchangeable. See
+[V8 version, SDK and snapshots](docs/Build-from-source.md#v8-version-sdk-and-snapshots)
+for the build and embedding requirements. `sccache` does not replace the native
+build tools.
 
 For rendering without stealth, use `--features render`. To omit rendering,
 use `--no-default-features`, optionally adding `--features stealth`; keep
@@ -149,15 +161,21 @@ provide screenshots, screencasts, or PDF output.
 
 ### Downloads
 
-Download **v0.1.2** from the
-[fork Releases page](https://github.com/MythHack/obscura-hunt/releases/tag/v0.1.2).
+Find published binaries on the
+[fork Releases page](https://github.com/MythHack/obscura-hunt/releases/latest).
 Native packages cover Linux x64/ARM64, macOS x64/ARM64, and Windows x64.
 Choose the default rendering build, `-stealth` (rendering + stealth),
-`-no-render`, or `-no-render-stealth`; each archive contains the matching
-`obscura`/`obscura-worker` pair, `LICENSE`, and `build-info.json`.
-Verify the archive against `SHA256SUMS.txt`, then run `obscura --build-info`
-to inspect the actual source commit and compiled features. Upstream packages
-and Docker images do not include this fork's changes.
+`-no-render`, or `-no-render-stealth`. Keep the matching
+`obscura`/`obscura-worker` pair together and verify archives against the release's
+`SHA256SUMS.txt`. Current source builds also support `obscura --build-info` to
+inspect the source commit and compiled features. Do not assume older archives
+include that flag or a `build-info.json` file. Upstream packages and Docker
+images do not include this fork's changes.
+
+As of October 19, the latest public release is `v0.1.1`; `v0.1.2` remains a draft.
+Both tags predate the V8 152 upgrade on `main`. Build from source for that
+upgrade, rather than assuming a release archive contains the current checkout.
+See [Installation](docs/Installation.md) for package provenance and verification.
 
 ## Use it
 
@@ -243,6 +261,10 @@ The host was Windows x64 (10.0.26300), Intel Core Ultra 7 265K, 20 logical CPUs,
 The suite is [official obscura-benchmark at
 `2d7bc304`](https://github.com/h4ckf0r0day/obscura-benchmark/tree/2d7bc304fbb7ebefc44f770938192e3cede87dbd),
 with the checked-in [Windows measurement patch](render-repros/benchmark-windows.patch).
+
+These pinned October 11 results are historical, not measurements of the current
+V8 152 build. For the latest exercised gates and the bounded V8 upgrade
+comparison, see [October 19 validation](docs/Testing-and-debugging.md#upgrade-validation-october-19).
 
 ### Capability and stealth
 
@@ -401,6 +423,8 @@ These local artifacts are not upstream's published results.
 
 ## More guides
 
+- [Documentation index](docs/README.md)
+- [Current V8 upgrade validation](docs/Testing-and-debugging.md#upgrade-validation-october-19)
 - [CLI reference](docs/CLI-reference.md)
 - [Cookies and storage](docs/Persist-cookies-and-storage.md)
 - [Build from source](docs/Build-from-source.md)

@@ -27,6 +27,7 @@
 
 * [CLI reference](CLI-reference.md)
 * [Environment variables](Environment-variables.md)
+* [CDP media preference emulation](CDP-media.md)
 
 ## Contributing
 

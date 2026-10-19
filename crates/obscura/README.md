@@ -33,7 +33,7 @@ The patch table belongs in the consumer's **workspace root** manifest, with
 paths relative to that manifest. Cargo does not inherit a dependency's patches,
 even for a git dependency. Both Deno patches are required: `deno_core 0.412.0`
 supplies browser realms, and `deno_v8 0.4.0` pins raw `v8` to `=152.2.0` (engine
-V8 `15.2.124.1`), shared with `serde_v8 0.321.0`. `deno_v8` is a Rust facade,
+V8 `15.2.124.1-rusty`), shared with `serde_v8 0.321.0`. `deno_v8` is a Rust facade,
 not a Deno CLI version. Keep the `taffy` and `cosmic-text` patches when enabling
 `render` to retain this fork's layout and font behavior.
 
@@ -67,4 +67,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-See `examples/basic.rs` for a runnable version (`cargo run --example basic`).
+See [examples/basic.rs](examples/basic.rs) for a runnable version. From the
+workspace root, run:
+
+```bash
+cargo run -p obscura --example basic --features stealth
+```

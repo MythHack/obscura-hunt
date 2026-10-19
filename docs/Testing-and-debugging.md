@@ -108,6 +108,14 @@ the [consumer-root patches](Use-as-a-Rust-library.md#add-the-dependency).
 
 #### Upgrade validation (October 19)
 
+The V8 migration is committed as
+[`02aaadb`](https://github.com/MythHack/obscura-hunt/commit/02aaadbff2b77d442d75cd0b226b882ce960e2ec).
+After the local gates below passed, the
+[GitHub Actions run](https://github.com/MythHack/obscura-hunt/actions/runs/39230174839)
+also completed successfully. Its `PR / Core` job passed; `PR / Policy` and
+`PR / Performance` were skipped. That workflow result does not replace the
+local cross-platform matrix or certify an unexecuted cloud performance run.
+
 V8 152 removes `--no-validate-asm`. Keeping that obsolete leading flag made V8
 ignore later initialization flags, including `--enable-queue-microtask`, and
 caused valid IndexedDB transactions to abort. The core removes only the obsolete
@@ -171,6 +179,8 @@ No material regression was observed in these two scenarios. The timing changes
 are within the repository's roughly 10% noise floor, not evidence of a general
 engine speedup.
 
+These results describe the October 19 source revision, not the earlier
+`v0.1.2` tag or October 11 README benchmark binaries.
 
 ### Fast edit/test loop
 
@@ -596,9 +606,15 @@ A handler is awaiting something that never resolves. Run with `RUST_LOG=obscura=
 
 ## Reproducing user bug reports
 
-The integration suite in `tests/test_all.py` is the fastest path from a one-line repro to a regression test. Add the failing case as a new test function, get it failing, then fix.
+Reduce the report to a local fixture and reproduce it with a release binary.
+Keep temporary Puppeteer or Playwright scripts and generated output outside the
+repository, and run them against that binary's CDP server. The connection guides
+for [Puppeteer](Use-with-Puppeteer.md) and [Playwright](Use-with-Playwright.md)
+describe the endpoints and client setup.
 
-For Puppeteer / Playwright bug reports, the user's repro script usually drops straight in. Save it as `tests/repro_<issue>.js`, run with `node`, fix until it passes.
+For a Rust regression, add the reduced consumer-visible case to the affected
+crate's existing tests and run crate-scoped release-mode nextest coverage before
+the full workspace gate. Do not use `cargo test` for V8 runtime tests.
 
 ### Rendering regressions
 

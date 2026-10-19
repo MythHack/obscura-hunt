@@ -15,8 +15,9 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 [`bd95294`](https://github.com/h4ckf0r0day/obscura/commit/bd9529418b7fa975b50eabeac415cfaaa865a588)。
 这 69 个提交包含 IndexedDB、Web Storage 更新、iframe 生命周期、MCP 改进、
 请求拦截与渲染修复，同时保留本分支的原生 popup 和子 frame 所有权语义。
-已执行的验证及尚未通过的项目见
-[验证报告](docs/Testing-and-debugging.md#latest-update-upstream-bd95294)。
+合并阶段的历史记录见[同步记录](docs/Testing-and-debugging.md#merge-stage-record-upstream-bd95294)。
+当前 `main` 已升级至 `v8`（rusty_v8）152.2.0，运行时引擎版本为 `15.2.124.1-rusty`；
+最新验证结果见 [10 月 19 日 V8 升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
 
 ## 为什么选择 Obscura-Hunt？
 
@@ -52,6 +53,7 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 
 | 用途 | 版本变化 |
 | --- | --- |
+| JavaScript 引擎 | `v8`（rusty_v8）150.4.0 → 152.2.0 |
 | HTML 解析 | `html5ever` 0.39.0 → 0.40.1；`markup5ever` 0.39.0 → 0.40.0 |
 | CSS 与选择器 | `cssparser` 0.34.0 → 0.38.0；`selectors` 0.26.0 → 0.41.0；`servo_arc` 0.4.3 → 0.5.0 |
 | HTTP 与 CDP 传输 | `reqwest` 0.12.28 → 0.13.5；`ureq` 2.12.1 → 3.4.2；`tokio-tungstenite` 0.26.2 → 0.30.0 |
@@ -64,8 +66,10 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 | TLS 测试支持 | `rcgen` 0.13.2 → 0.14.10；`tokio-rustls` 0.26.4 → 0.26.6 |
 | 原生构建支持 | `cc` 1.2.64 → 1.7.0，同时新增为 JavaScript 运行时的直接构建依赖 |
 
-`deno_core` 仍为 0.412.0，新增浏览器 realm 补丁；保留原有带补丁的
-`cosmic-text` 0.14.2 和 `taffy` 0.12.1。部分工具的旧版本仍作为间接依赖存在。
+`deno_core` 保持 0.412.0，并包含浏览器 realm 补丁；带补丁的 `deno_v8` 0.4.0
+为它和 `serde_v8` 0.321.0 选择底层 `v8` 152.2.0。`deno_v8` 是 Rust facade，
+其版本号不是 Deno CLI 版本。保留原有带补丁的 `cosmic-text` 0.14.2 和 `taffy` 0.12.1。
+部分工具的旧版本仍作为间接依赖存在。
 
 来源：[Cargo.lock](Cargo.lock)、[工作区依赖](Cargo.toml)，以及
 [JavaScript](crates/obscura-js/Cargo.toml)、[网络](crates/obscura-net/Cargo.toml)、
@@ -79,7 +83,7 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 
 ### 构建要求
 
-- 当前稳定版 Rust 和 C/C++ 工具链。
+- 当前稳定版 Rust 和支持 C++20 的 C/C++ 工具链。
 - stealth 构建需要 CMake、Clang 和 libclang/LLVM 开发库。
 - Windows x64 需要 Visual Studio C++ Build Tools、CMake、LLVM/Clang，以及 `PATH` 上的 NASM。
   构建前必须将 `LIBCLANG_PATH` 指向实际包含 `libclang.dll` 的 LLVM 目录。
@@ -122,8 +126,10 @@ cargo build --release --locked -p obscura-cli --bins --features render,stealth
 `obscura` 与 `obscura-worker` 放在一起。并行抓取、多 worker 服务等命令需要 worker。
 将该目录加入 `PATH`，或在命令和 MCP 客户端配置中使用可执行文件的完整路径。
 
-Cargo 自动使用本分支随仓库提供的依赖补丁，构建时请保留它们。
-补丁说明和更多平台指导见 [从源码构建](docs/Build-from-source.md)。
+Cargo 自动使用本分支随仓库提供的依赖补丁，构建时请保留它们，并将 V8 补丁、
+原生 SDK、C++ ABI 与快照生产和加载端作为整体更新，不要混用不同引擎版本的产物。
+具体要求见 [V8 版本、SDK 与快照](docs/Build-from-source.md#v8-version-sdk-and-snapshots)，
+更多平台指导见[从源码构建](docs/Build-from-source.md)。
 `sccache` 不能代替原生构建工具。
 
 只需要渲染、不需要 stealth 时，使用 `--features render`。
@@ -133,12 +139,13 @@ Cargo 自动使用本分支随仓库提供的依赖补丁，构建时请保留�
 
 ### 下载发布包
 
-在 [v0.1.2 Release 页面](https://github.com/MythHack/obscura-hunt/releases/tag/v0.1.2)下载发布包。
-原生构建覆盖 Linux x64/ARM64、macOS x64/ARM64 和 Windows x64。
-默认包启用渲染，`-stealth` 启用渲染与 stealth；另提供 `-no-render` 和
-`-no-render-stealth`。每个包包含同一构建的 `obscura`/`obscura-worker`、
-`LICENSE` 和 `build-info.json`。先用 `SHA256SUMS.txt` 核对压缩包，
-再运行 `obscura --build-info` 查看实际源码提交与编译 features。
+可用的公开发布包请查看本分支的 [Releases 页面](https://github.com/MythHack/obscura-hunt/releases)。
+截至 2026-10-19，最新公开版本为 `v0.1.1`；`v0.1.2` 仍是草稿。
+两者均早于当前 `main` 的 V8 152 升级。需要 V8 152 时，请按上文从源码构建。
+下载时以具体 Release 的资产和说明为准，先用 `SHA256SUMS.txt` 核对压缩包。
+`v0.1.1` 包仅包含 `obscura`/`obscura-worker`，可用 `obscura --version` 检查版本；
+不要假定旧包附带 `build-info.json` 或支持 `--build-info`。当前源码构建可运行
+`obscura --build-info` 核对实际源码提交与编译 features；两个可执行文件必须来自同一构建。
 上游发布包和 Docker 镜像不包含本分支的改动。
 
 ## 使用方法
@@ -169,6 +176,8 @@ Puppeteer 连接 `ws://127.0.0.1:9222/devtools/browser`。
 Playwright 的 `chromium.connectOverCDP` 连接 `ws://127.0.0.1:9222`。
 可用示例见 [Puppeteer 指南](docs/Use-with-Puppeteer.md) 和
 [Playwright 指南](docs/Use-with-Playwright.md)。
+颜色主题、减少动态效果等覆盖设置见[媒体偏好模拟](docs/CDP-media.md)；
+worker 平滑回收见[生产环境运行指南](docs/Run-in-production-at-scale.md)。
 
 ### 同时抓取多个页面
 
@@ -177,6 +186,7 @@ obscura scrape https://example.com https://news.ycombinator.com --concurrency 2 
 ```
 
 将 `obscura-worker` 保持在 `obscura` 同目录。
+`scrape` 和批量 `fetch` 最多同时运行 `--concurrency` 个任务，结果保留输入顺序。
 
 ### 使用 MCP 客户端
 
@@ -209,6 +219,9 @@ obscura serve --port 9222 --allow-private-network
 完整网络规则见 [环境变量说明](docs/Environment-variables.md)。
 
 ## 本地基准（2026-10-11）
+
+以下数据保留为 10 月 11 日的历史记录，不代表当前 V8 152 的性能或验收状态。
+当前版本的验证与测量见 [10 月 19 日升级报告](docs/Testing-and-debugging.md#upgrade-validation-october-19)。
 
 以下是本机实测，不是上游发布的 Linux/无渲染成绩。机器为 Windows x64（10.0.26300）、
 Intel Core Ultra 7 265K、20 个逻辑 CPU、47.28 GiB 可用内存、Python 3.13.12。
@@ -364,6 +377,8 @@ Pop-Location
 
 ## 更多指南
 
+- [文档索引](docs/README.md)
+- [当前 V8 升级验证](docs/Testing-and-debugging.md#upgrade-validation-october-19)
 - [CLI 参数参考](docs/CLI-reference.md)
 - [Cookie 与存储](docs/Persist-cookies-and-storage.md)
 - [从源码构建](docs/Build-from-source.md)
