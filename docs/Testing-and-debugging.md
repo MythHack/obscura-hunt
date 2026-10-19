@@ -28,6 +28,9 @@ dependency cache without installing `sccache`. This overrides the repository's
 wrapper default for cache repair, builds and tests. The release workflow installs
 and enables `sccache` separately.
 
+Linux-only storage tests use POSIX FIFOs; Windows results do not cover those
+tests. Keep the Linux CI gate when changing storage persistence.
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation

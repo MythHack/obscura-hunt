@@ -527,7 +527,7 @@ mod tests {
         writer.join().unwrap();
         mutator.join().unwrap();
         let written: StoredOriginStorage = serde_json::from_slice(&reader.join().unwrap()).unwrap();
-        assert_eq!(written.entries, vec![("token", old)]);
+        assert_eq!(written.entries, vec![("token".to_owned(), old)]);
         assert!(ns(&context).is_dirty(), "a newer mutation must survive the older flush acknowledgement");
         context.save_local_storage();
         let reloaded = BrowserContext::with_storage("reloaded".into(), Some(dir.clone()));
