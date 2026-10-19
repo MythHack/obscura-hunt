@@ -38,6 +38,16 @@ same-document navigation.
 CSS-positioned isolated-world fixtures likewise use DOM activation without
 rendering while retaining shared event cancellation and checked-state assertions.
 
+Renderer-only CSS/font resource helpers are excluded from no-render production
+builds. Parsing helpers remain enabled in unit tests so the same edge cases are
+covered without enabling the renderer.
+
+The layout-only renderer is separate from a CLI no-render build. Check it with
+`cargo check --release -p obscura-render --no-default-features`. Its approximate
+font box stays font-sized; ascent/descent exclude CSS line-height and leading.
+Keep paint-only retained metadata separate from shared layout work, including
+generated content, tables, transforms and scrolling.
+
 Native C++ builds classify the pinned V8 SDK as external/system headers while
 retaining warnings for local shims. Linux validation covers both normal and
 `v8_enable_pointer_compression` builds with `CXXFLAGS=-Werror`; a first-party

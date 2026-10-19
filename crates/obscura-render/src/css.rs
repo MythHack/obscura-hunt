@@ -1642,7 +1642,9 @@ struct DeclarationStreamFlags {
     has_var: bool,
     has_color_scheme: bool,
     has_animation: bool,
+    #[cfg(any(feature = "paint", test))]
     has_transform: bool,
+    #[cfg(any(feature = "paint", test))]
     has_opacity: bool,
 }
 
@@ -1669,9 +1671,11 @@ fn declaration_stream_flags(css: &str) -> DeclarationStreamFlags {
         {
             flags.has_animation = true;
         }
+        #[cfg(any(feature = "paint", test))]
         if name.eq_ignore_ascii_case("transform") || name.eq_ignore_ascii_case("all") {
             flags.has_transform = true;
         }
+        #[cfg(any(feature = "paint", test))]
         if name.eq_ignore_ascii_case("opacity") || name.eq_ignore_ascii_case("all") {
             flags.has_opacity = true;
         }
@@ -2566,6 +2570,7 @@ impl Stylesheet {
             .is_some_and(|evaluator| evaluator.condition_matches(self, subject, id, kind))
     }
 
+    #[cfg(feature = "paint")]
     pub(crate) fn animation_affects_non_geometric_style(&self, name: &str) -> bool {
         // Only tracks exposed by the partial CSSOM snapshot require live sampling.
         self.keyframes.get(name).is_some_and(|keyframes| {
@@ -4134,19 +4139,24 @@ impl Stylesheet {
         // author !important. Keep the renderer-side effect separate from the
         // authored declaration block so cancel() reveals the exact underlying
         // value and CSSOM never observes a synthetic inline rewrite.
+        #[cfg(any(feature = "paint", test))]
         let has_waapi = animation_timeline
             .waapi_for_node(nid, animation_sample.time)
             .next()
             .is_some();
+        #[cfg(any(feature = "paint", test))]
         let waapi_underlying_transform_ops = has_waapi.then(|| style.transform_ops.clone());
+        #[cfg(any(feature = "paint", test))]
         let waapi_underlying_opacity = style.opacity;
         sample_waapi_properties(animation_timeline, nid, style, animation_sample);
 
+        #[cfg(any(feature = "paint", test))]
         let important_has_transform = shadow_important_flags.has_transform
             || inline_important_flags.has_transform
             || important_matched
                 .iter()
                 .any(|&(_, _, i)| self.rules[i].important_flags.has_transform);
+        #[cfg(any(feature = "paint", test))]
         let important_has_opacity = shadow_important_flags.has_opacity
             || inline_important_flags.has_opacity
             || important_matched
@@ -4168,15 +4178,18 @@ impl Stylesheet {
             shadow_important_flags.has_var,
         );
         crate::style::apply_declarations_with_locked_color_scheme(style, &expanded);
-        style.waapi_sample_state =
-            waapi_underlying_transform_ops.map(|underlying_transform_ops| {
-                Box::new(crate::WaapiSampleState {
-                    underlying_transform_ops,
-                    underlying_opacity: waapi_underlying_opacity,
-                    transform_fast_path: !important_has_transform,
-                    opacity_fast_path: !important_has_opacity,
-                })
-            });
+        #[cfg(any(feature = "paint", test))]
+        {
+            style.waapi_sample_state =
+                waapi_underlying_transform_ops.map(|underlying_transform_ops| {
+                    Box::new(crate::WaapiSampleState {
+                        underlying_transform_ops,
+                        underlying_opacity: waapi_underlying_opacity,
+                        transform_fast_path: !important_has_transform,
+                        opacity_fast_path: !important_has_opacity,
+                    })
+                });
+        }
         effective
     }
 }
@@ -4184,6 +4197,7 @@ impl Stylesheet {
 /// Replay transform-only Web Animations from their exact underlying cascade
 /// value. Returns the sampled operations and transform containing-block bit;
 /// callers apply them only after every target has passed preflight.
+#[cfg(any(feature = "paint", test))]
 pub(crate) struct ResampledVisualWaapi {
     pub transform_ops: Vec<crate::TransformOp>,
     pub opacity: Option<f32>,
@@ -4192,6 +4206,7 @@ pub(crate) struct ResampledVisualWaapi {
     pub establishes_transform_cb: bool,
 }
 
+#[cfg(any(feature = "paint", test))]
 pub(crate) fn resample_visual_waapi(
     timeline: &crate::AnimationTimelineState,
     node: NodeId,

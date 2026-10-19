@@ -149,12 +149,7 @@ pub mod inline {
     use std::collections::HashMap;
 
     #[derive(Clone)]
-    pub(crate) struct WebFont {
-        pub data: std::sync::Arc<Vec<u8>>,
-        pub family: Option<String>,
-        pub weight: Option<(u16, u16)>,
-        pub italic: Option<bool>,
-    }
+    pub(crate) struct WebFont {}
 
     #[derive(Default)]
     pub struct TextEngine {
@@ -167,10 +162,6 @@ pub mod inline {
 
     impl TextEngine {
         pub fn new() -> Self {
-            Self::default()
-        }
-
-        pub(crate) fn new_with_web_fonts(_fonts: &[WebFont]) -> Self {
             Self::default()
         }
 
@@ -675,6 +666,7 @@ impl Matrix4 {
     /// Authored singular 3D matrices suppress the entire element subtree even
     /// when their z=0 homography alone could still be inverted. Internal CSS
     /// flattening matrices are intentionally checked at a different boundary.
+    #[cfg(feature = "paint")]
     pub(crate) fn is_invertible(self) -> bool {
         if let Some(matrix) = self.affine() { return matrix.inverse().is_some(); }
         let mut rows = [[0_f64; 4]; 4];
@@ -695,6 +687,7 @@ impl Matrix4 {
 
     /// CSS backface test: the inverse matrix's m33, not polygon winding.
     /// A reflected 2D plane is not thereby a back face.
+    #[cfg(feature = "paint")]
     pub(crate) fn back_facing(self) -> bool {
         let mut rows = [[0_f64; 8]; 4];
         for r in 0..4 {
@@ -754,6 +747,7 @@ impl VisualTransform {
     /// A `perspective` camera is projective in depth yet maps its own plane
     /// identically; depth-bearing transforms (a z translation or a nonzero w
     /// coefficient on x/y) return `None` and keep the projective paint path.
+    #[cfg(feature = "paint")]
     pub(crate) fn flat_plane_translation(self) -> Option<(f32, f32)> {
         match self {
             Self::Affine(matrix) => matrix.is_translation().then_some((matrix.e, matrix.f)),
@@ -1300,6 +1294,7 @@ pub enum GeneratedContentItem {
 /// Sparse retained provenance for direct transform-only WAAPI sampling.
 /// Kept behind one pointer so ordinary, non-animated elements do not pay for
 /// another `Vec` in every `LayoutStyle`.
+#[cfg(any(feature = "paint", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct WaapiSampleState {
     pub underlying_transform_ops: Vec<TransformOp>,
@@ -1967,6 +1962,7 @@ pub struct LayoutStyle {
     /// A retained compositor-style sample restores this value before replaying
     /// the registered effects, so sparse keyframes never compound on the
     /// previously sampled transform.
+    #[cfg(any(feature = "paint", test))]
     pub(crate) waapi_sample_state: Option<Box<WaapiSampleState>>,
     /// Individual CSS `translate` property. This composes independently with
     /// the legacy `transform` property, so `transform:none` must not clear it.
@@ -2687,12 +2683,14 @@ impl AnimationTimelineState {
         })
     }
 
+    #[cfg(feature = "paint")]
     pub(crate) fn has_active_waapi(&self, document_time: AnimationSampleTime) -> bool {
         self.waapi
             .values()
             .any(|animation| waapi_is_active(animation, document_time))
     }
 
+    #[cfg(feature = "paint")]
     pub(crate) fn active_waapi_effect_impact(
         &self,
         document_time: AnimationSampleTime,
@@ -2812,6 +2810,7 @@ impl AnimationTimelineState {
     }
 }
 
+#[cfg(feature = "paint")]
 fn waapi_is_active(animation: &WaapiAnimation, document_time: AnimationSampleTime) -> bool {
     if animation.play_state != WaapiPlayState::Running
         || animation.timing.duration_ms <= 0.0

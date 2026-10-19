@@ -3106,7 +3106,7 @@ impl ObscuraJsRuntime {
         self.state.borrow().render_resources.sync_loading_enabled()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "render"))]
     fn document_generation(&self) -> u64 {
         self.state.borrow().document_generation
     }
