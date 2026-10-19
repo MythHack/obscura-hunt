@@ -35,6 +35,8 @@ No-render CI must retain click, form and hover-state coverage. Computed CSS and
 native child-frame coordinate input require `render`; the no-render frame
 contract verifies the unsupported-input boundary and uses DOM activation for
 same-document navigation.
+CSS-positioned isolated-world fixtures likewise use DOM activation without
+rendering while retaining shared event cancellation and checked-state assertions.
 
 Native C++ builds classify the pinned V8 SDK as external/system headers while
 retaining warnings for local shims. Linux validation covers both normal and

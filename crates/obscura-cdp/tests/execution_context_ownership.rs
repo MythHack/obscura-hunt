@@ -300,17 +300,24 @@ async fn isolated_input_listeners_cancel_one_shared_form_activation() {
         .await.result.unwrap()["executionContextId"].as_i64().unwrap();
     assert_eq!(world_value(&mut ctx, &session, None, "(()=>{globalThis.clicks=0;globalThis.changes=0;globalThis.saved=null;let c=document.getElementById('check');c.addEventListener('click',e=>{clicks++;saved=e});c.addEventListener('change',()=>changes++);return true})()").await, true);
     assert_eq!(world_value(&mut ctx, &session, Some(world), "(()=>{globalThis.clicks=0;globalThis.cancel=true;let c=document.getElementById('check');c.addEventListener('click',e=>{clicks++;if(cancel)e.preventDefault()});document.getElementById('text').value='shared value';return [c.form===document.getElementById('f'),typeof changes]})()").await, json!([true,"undefined"]));
+    // This fixture's stylesheet needs rendering for coordinate hit testing.
+    #[cfg(feature = "render")]
     for event in ["mousePressed", "mouseReleased"] {
         let response = cdp(&mut ctx, 4, "Input.dispatchMouseEvent", json!({"type":event,"x":30,"y":30,"button":"left","clickCount":1}), Some(&session)).await;
         assert!(response.error.is_none(), "{:?}", response.error);
     }
+    #[cfg(not(feature = "render"))]
+    world_value(&mut ctx, &session, None, "document.getElementById('check').click()").await;
     assert_eq!(world_value(&mut ctx, &session, None, "[clicks,changes,document.getElementById('check').checked,document.getElementById('text').value,saved && saved.defaultPrevented]").await, json!([1,0,false,"shared value",true]));
     assert_eq!(world_value(&mut ctx, &session, Some(world), "[clicks,document.getElementById('check').checked]").await, json!([1,false]));
     world_value(&mut ctx, &session, Some(world), "cancel=false").await;
+    #[cfg(feature = "render")]
     for event in ["mousePressed", "mouseReleased"] {
         let response = cdp(&mut ctx, 5, "Input.dispatchMouseEvent", json!({"type":event,"x":30,"y":30,"button":"left","clickCount":1}), Some(&session)).await;
         assert!(response.error.is_none(), "{:?}", response.error);
     }
+    #[cfg(not(feature = "render"))]
+    world_value(&mut ctx, &session, None, "document.getElementById('check').click()").await;
     assert_eq!(world_value(&mut ctx, &session, None, "[clicks,changes,document.getElementById('check').checked,saved && saved.defaultPrevented]").await, json!([2,1,true,false]));
     assert_eq!(world_value(&mut ctx, &session, Some(world), "[clicks,document.getElementById('check').checked]").await, json!([2,true]));
 }
