@@ -23,6 +23,11 @@ Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
 because the engine owns one V8 isolate per process. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
+The PR checks workflow sets `RUSTC_WRAPPER` to an empty string: it uses the Rust
+dependency cache without installing `sccache`. This overrides the repository's
+wrapper default for cache repair, builds and tests. The release workflow installs
+and enables `sccache` separately.
+
 ### Fast edit/test loop
 
 For runtime unit tests, the `test-js` Cargo alias enables incremental compilation

@@ -19,6 +19,8 @@ env:
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  # sccache is optional and is not installed in this workflow.
+  RUSTC_WRAPPER: ""
   OPENSSL_NO_VENDOR: "1"
 
 jobs:
