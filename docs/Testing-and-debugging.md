@@ -182,6 +182,55 @@ engine speedup.
 These results describe the October 19 source revision, not the earlier
 `v0.1.2` tag or October 11 README benchmark binaries.
 
+### Upstream sync: `a754dce`
+
+The October 20 sync adds two upstream commits after `8b49681`, through
+[`a754dce`](https://github.com/h4ckf0r0day/obscura/commit/a754dce). It adds
+`DOM.getAttributes`, `DOM.requestNode`, `DOM.requestChildNodes`, and
+`DOM.getNodeForLocation`, with session-owned light-DOM publication and navigation,
+detach, and target-close cleanup.
+
+The integration retains the fork's page/frame/document-generation-scoped node
+IDs and native object handles instead of restoring raw DOM IDs or the old
+JavaScript object registry. Main-frame isolated-world handles preserve node
+identity. Child-frame attribute queries retain their owning document, while
+child-frame, detached, shadow-tree, forged, foreign-page, and stale handles
+cannot be published into the requested main light-DOM document. Namespace checks
+also account for the fork's newer `string_cache` API without allocating strings.
+
+#### Local Windows release verification
+
+| Gate | Result |
+| --- | --- |
+| `obscura-cdp` release nextest, `render` | 370 passed, 4 existing skips |
+| Full release workspace nextest, `render` | 2529 passed, 5 existing skips |
+| No-render node-query and tracking selection | 8 passed |
+| Release CLI and worker, `--features render` | Passed, no compiler warnings |
+| Actual WebSocket CDP scenarios | 8 passed |
+| Offline obstacle course, `--runs 1 --warmup 0` | 33/33 |
+
+The pre-sync executable returned `-32601`, `Unknown DOM method: getAttributes`.
+The merged release executable passed qualified-attribute and invalid-ID checks,
+native-handle ancestor publication, bounded child expansion without duplicate
+events, hit-test identity, isolated-world and forged/detached-handle checks,
+independent session publication and detach, navigation invalidation with fresh
+IDs, and explicit unsupported-piercing errors followed by target close.
+
+The no-render selection uses:
+
+```bash
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --release --locked \
+  --no-default-features -p obscura-cdp \
+  -E 'test(dom_node_queries::) | test(dom_node_tracking_is_released_on_navigation_detach_and_close)' \
+  --no-fail-fast
+```
+
+Other no-render tests were excluded by this filter, not newly disabled. The
+obstacle course used benchmark revision `2d7bc304fbb7ebefc44f770938192e3cede87dbd`,
+its three-second settle, profile `0`, and timezone `Europe/Berlin`. These are
+local Windows results for the merged source tree, not Linux, stealth-transport,
+GitHub CI, or new rendering-fidelity evidence. No renderer or stealth code changed.
+
 ### Upstream sync: `8b49681`
 
 This sync adds 14 upstream commits after `bd95294`, through

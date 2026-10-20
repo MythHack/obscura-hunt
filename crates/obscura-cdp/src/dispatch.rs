@@ -83,6 +83,7 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: std::rc::Rc<std::cell::RefCell<HashMap<String, Vec<String>>>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) dom_documents: HashMap<Option<String>, domains::dom::DomDocument>,
     pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
@@ -190,6 +191,7 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             pending_events: Vec::new(),
+            dom_documents: HashMap::new(),
             pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
@@ -591,6 +593,7 @@ impl CdpContext {
         self.native_windows.remove(id);
         self.native_navigation_generations.remove(id);
         self.pending_native_navigations.remove(id);
+        self.dom_documents.retain(|_, document| document.page_id != id);
         self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
@@ -751,6 +754,13 @@ impl CdpContext {
         frame_id: &str,
         origin: &str,
     ) -> Vec<ExecutionContextRecord> {
+        self.dom_documents.retain(|session, document| {
+            if document.page_id != page_id { return true; }
+            self.pending_events.push(CdpEvent {
+                method: "DOM.documentUpdated".into(), params: json!({}), session_id: session.clone(),
+            });
+            false
+        });
         if let Some(previous) = self.page_contexts.remove(page_id) {
             for id in previous {
                 self.execution_contexts.remove(&id);

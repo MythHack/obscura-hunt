@@ -1,8 +1,131 @@
-use obscura_js::runtime::CdpExecutionWorld;
+use std::collections::HashMap;
+
+use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
+use obscura_js::runtime::CdpExecutionWorld;
 use serde_json::{json, Value};
 
 use crate::dispatch::{CdpContext, NodeRecord};
+use crate::types::CdpEvent;
+
+pub(crate) struct DomDocument {
+    pub page_id: String,
+    document_generation: u64,
+    children_sent: HashMap<u64, bool>,
+}
+
+impl DomDocument {
+    fn remember(&mut self, root: &Value) {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if let Some(id) = node["nodeId"].as_u64() {
+                self.children_sent.insert(id,
+                    node["children"].is_array() || node["childNodeCount"] == 0);
+            }
+            if let Some(children) = node["children"].as_array() {
+                pending.extend(children);
+            }
+        }
+    }
+}
+
+fn node_id_param(params: &Value) -> Result<u64, String> {
+    params["nodeId"].as_u64().ok_or_else(|| "valid nodeId required".into())
+}
+
+fn push_children(ctx: &mut CdpContext, state: &mut DomDocument, node: u64, depth: u32,
+    session_id: &Option<String>, events: &mut Vec<CdpEvent>) -> Result<(), String> {
+    let mut pending = vec![(node, depth.min(MAX_SERIALIZE_DEPTH))];
+    while let Some((parent, depth)) = pending.pop() {
+        let Some(sent) = state.children_sent.get(&parent).copied() else { continue };
+        let record = ctx.backend_nodes.get(&parent).ok_or("Cannot find node in the current document")?;
+        let (frame_id, native) = (record.frame_id, NodeId::new(record.node_id));
+        let page = ctx.get_session_page(session_id).ok_or("No page")?;
+        let js = page.js.as_ref().ok_or("No JavaScript runtime")?;
+        if !sent {
+            let mut nodes = js.with_dom_in_frame(frame_id, |dom| dom.children(native).into_iter()
+                .map(|child| serialize_node(dom, child, depth - 1, 0)).collect::<Vec<_>>())?;
+            for node in &mut nodes {
+                scope_node_tree(ctx, session_id, frame_id, node)?;
+                state.remember(node);
+            }
+            state.children_sent.insert(parent, true);
+            events.push(CdpEvent {
+                method: "DOM.setChildNodes".into(),
+                params: json!({"parentId":parent, "nodes":nodes}),
+                session_id: session_id.clone(),
+            });
+        } else if depth > 1 {
+            let children = js.with_dom_in_frame(frame_id, |dom| dom.children(native))?;
+            if children.is_empty() { continue; }
+            let mut child_record = record.clone();
+            for child in children.into_iter().rev() {
+                child_record.node_id = child.index() as u32;
+                if let Some(&id) = ctx.backend_node_ids.get(&child_record) {
+                    pending.push((id, depth - 1));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_node(ctx: &mut CdpContext, session_id: &Option<String>, world: CdpExecutionWorld,
+    node: NodeId) -> Result<u64, String> {
+    if world.frame_id != 0 {
+        return Err("Node is outside the requested light-DOM document".into());
+    }
+    let page = ctx.get_session_page(session_id).ok_or("No page")?;
+    let js = page.js.as_ref().ok_or("No JavaScript runtime")?;
+    let generation = js.cdp_document_generation(world.frame_id)?;
+    let path = js.with_dom_in_frame(world.frame_id, |dom| {
+        if dom.get_node(node).is_none() { return Err("No node with given id found"); }
+        let path = dom.ancestors(node);
+        if node != dom.document() && path.last().copied() != Some(dom.document()) {
+            return Err("Node is outside the requested light-DOM document");
+        }
+        Ok(path)
+    })?.map_err(str::to_string)?;
+    let Some(state) = ctx.dom_documents.get(session_id) else { return Ok(0) };
+    if state.page_id != page.id || state.document_generation != generation {
+        ctx.dom_documents.remove(session_id);
+        return Ok(0);
+    }
+    let id = backend_node_id(ctx, session_id, world.frame_id, node.index() as u32)?;
+    let mut state = ctx.dom_documents.remove(session_id).expect("document was just checked");
+    let mut events = Vec::new();
+    let result = (|| {
+        if !state.children_sent.contains_key(&id) {
+            for parent in path.into_iter().rev() {
+                let parent_id = backend_node_id(ctx, session_id, world.frame_id, parent.index() as u32)?;
+                push_children(ctx, &mut state, parent_id, 1, session_id, &mut events)?;
+            }
+            if !state.children_sent.contains_key(&id) {
+                // Refresh inserted children until live DOM mutation events publish them.
+                return Err("Node requires DOM mutation events; request the document again".into());
+            }
+        }
+        Ok(id)
+    })();
+    ctx.dom_documents.insert(session_id.clone(), state);
+    ctx.pending_events.extend(events);
+    result
+}
+
+fn node_for_location(page: &mut Page, x: i64, y: i64) -> Result<NodeId, String> {
+    if x < 0 || y < 0 || x as f64 >= f64::from(page.viewport.0) || y as f64 >= f64::from(page.viewport.1) {
+        return Err("No node found at given location".into());
+    }
+    #[cfg(feature = "render")]
+    {
+        page.js.as_mut().ok_or("No JavaScript runtime")?.native_hit_test(0, x as f64, y as f64)?
+            .ok_or_else(|| "No node found at given location".into())
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        Err("DOM hit testing requires rendering support".into())
+    }
+}
 
 fn resolve_node_id(ctx: &mut CdpContext, session: &Option<String>, params: &Value)
     -> Result<(CdpExecutionWorld, u32), String>
@@ -126,13 +249,96 @@ pub async fn handle(
             Ok(json!({"nodeId": id, "backendNodeId": id}))
         }
         "enable" => Ok(json!({})),
+        "disable" => {
+            ctx.dom_documents.remove(session_id);
+            Ok(json!({}))
+        }
         "getDocument" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(2);
             let mut root = page.with_dom(|dom| serialize_node(dom, dom.document(), depth as u32, 0))
                 .ok_or("No DOM loaded")?;
+            let mut state = DomDocument {
+                page_id: page.id.clone(), children_sent: HashMap::new(),
+                document_generation: page.js.as_ref().ok_or("No JavaScript runtime")?.cdp_document_generation(0)?,
+            };
             scope_node_tree(ctx, session_id, 0, &mut root)?;
-            Ok(json!({"root": root}))
+            state.remember(&root);
+            ctx.dom_documents.insert(session_id.clone(), state);
+            Ok(json!({"root":root}))
+        }
+        "getAttributes" => {
+            node_id_param(params)?;
+            let (world, node_id) = resolve_node_id(ctx, session_id, params)?;
+            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let attributes = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(world.frame_id, |dom| {
+                let node = dom.get_node(NodeId::new(node_id)).ok_or("No node with given id found")?;
+                let attrs = node.attrs().ok_or("Node is not an Element")?;
+                Ok::<_, &str>(attrs.iter().flat_map(|attr| [attr.qualified_name(), attr.value.clone()]).collect::<Vec<_>>())
+            })?.map_err(str::to_string)?;
+            Ok(json!({"attributes":attributes}))
+        }
+        "requestChildNodes" => {
+            let node = node_id_param(params)?;
+            let (world, native) = resolve_node_id(ctx, session_id, params)?;
+            let depth = match params.get("depth") {
+                None => 1,
+                Some(value) => match value.as_i64() {
+                    Some(-1) => u32::MAX,
+                    Some(value) if value > 0 => u32::try_from(value).unwrap_or(u32::MAX),
+                    _ => return Err("depth must be positive or -1".into()),
+                },
+            };
+            if params["pierce"].as_bool() == Some(true) {
+                let page = ctx.get_session_page(session_id).ok_or("No page")?;
+                let needs_piercing = page.js.as_ref().ok_or("No JavaScript runtime")?.with_dom_in_frame(world.frame_id, |dom| {
+                    let mut pending = vec![(NodeId::new(native), depth.min(MAX_SERIALIZE_DEPTH))];
+                    while let Some((id, remaining)) = pending.pop() {
+                        if dom.shadow_root(id).is_some() || dom.get_node(id).is_some_and(|node|
+                            node.as_element().is_some_and(|name| &*name.ns == "http://www.w3.org/1999/xhtml"
+                                && matches!(name.local.as_ref(), "iframe" | "frame"))) {
+                            return true;
+                        }
+                        if remaining > 0 {
+                            pending.extend(dom.children(id).into_iter().map(|child| (child, remaining - 1)));
+                        }
+                    }
+                    false
+                })?;
+                if needs_piercing {
+                    return Err("Piercing frame and shadow trees is not supported".into());
+                }
+            }
+            if let Some(mut state) = ctx.dom_documents.remove(session_id) {
+                let mut events = Vec::new();
+                let result = push_children(ctx, &mut state, node, depth, session_id, &mut events);
+                ctx.dom_documents.insert(session_id.clone(), state);
+                ctx.pending_events.extend(events);
+                result?;
+            }
+            Ok(json!({}))
+        }
+        "requestNode" => {
+            let oid = params["objectId"].as_str().ok_or("objectId required")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let (world, native) = page.js.as_mut().ok_or("No JavaScript runtime")?.object_node_id(oid)?;
+            Ok(json!({"nodeId":push_node(ctx, session_id, world, NodeId::new(native))?}))
+        }
+        "getNodeForLocation" => {
+            let x = params["x"].as_i64().ok_or("integer x required")?;
+            let y = params["y"].as_i64().ok_or("integer y required")?;
+            if params["ignorePointerEventsNone"].as_bool() == Some(true) {
+                return Err("Ignoring pointer-events in hit testing is not supported".into());
+            }
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let frame = page.frame_id.clone();
+            let node = node_for_location(page, x, y)?;
+            let id = backend_node_id(ctx, session_id, 0, node.index() as u32)?;
+            let mut result = json!({"backendNodeId":id,"frameId":frame});
+            if ctx.dom_documents.contains_key(session_id) {
+                result["nodeId"] = json!(push_node(ctx, session_id, CdpExecutionWorld::default(), node)?);
+            }
+            Ok(result)
         }
         "querySelector" => {
             let selector = params.get("selector").and_then(Value::as_str).ok_or("selector required")?;
@@ -349,7 +555,7 @@ fn node_value(dom: &DomTree, node_id: NodeId) -> Option<(Value, Vec<NodeId>)> {
             result["localName"] = json!(&*name.local);
             result["nodeValue"] = json!("");
             let cdp_attrs: Vec<String> = attrs.iter()
-                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();
+                .flat_map(|a| [a.qualified_name(), a.value.clone()]).collect();
             result["attributes"] = json!(cdp_attrs);
         }
         NodeData::Text { contents } => {
@@ -451,6 +657,33 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dom_node_tracking_is_released_on_navigation_detach_and_close() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let session = Some(format!("{page}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page.clone());
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<p>first</p>"}),
+            &mut ctx, &session).await.unwrap();
+        handle("getDocument", &json!({"depth":-1}), &mut ctx, &session).await.unwrap();
+        ctx.pending_events.clear();
+        crate::domains::page::handle("navigate", &json!({"url":"data:text/html,<p>second</p>"}),
+            &mut ctx, &session).await.unwrap();
+        assert!(ctx.dom_documents.is_empty(), "navigation must release the old node cache");
+        assert!(ctx.pending_events.iter().any(|event| event.method == "DOM.documentUpdated"
+            && event.session_id == session));
+        handle("getDocument", &json!({}), &mut ctx, &session).await.unwrap();
+        crate::domains::target::handle("detachFromTarget", &json!({"sessionId":session}),
+            &mut ctx, &None).await.unwrap();
+        assert!(ctx.dom_documents.is_empty(), "detach must release session-owned nodes");
+        let closing_session = Some("closing".to_string());
+        ctx.sessions.insert(closing_session.clone().unwrap(), page.clone());
+        handle("getDocument", &json!({}), &mut ctx, &closing_session).await.unwrap();
+        assert_eq!(ctx.dom_documents.len(), 1);
+        ctx.remove_page(&page);
+        assert!(ctx.dom_documents.is_empty(), "close must release the target's node cache");
+    }
 
     // The escaping this file used to own now lives in `util::object_id_literal`,
     // which is where its tests went with it: the three lookup sites here embed

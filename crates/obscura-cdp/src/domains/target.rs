@@ -197,6 +197,7 @@ pub async fn handle(
                 ctx.target_session_parents.remove(session_id);
                 ctx.target_discovery_sessions.remove(&Some(session_id.to_string()));
                 ctx.target_auto_attach_sessions.remove(&Some(session_id.to_string()));
+                ctx.dom_documents.remove(&Some(session_id.to_string()));
                 ctx.runtime_enabled_sessions.remove(session_id);
                 ctx.lifecycle_enabled_sessions.remove(session_id);
                 ctx.preload_scripts.retain(|script| script.session_id != session_id);
