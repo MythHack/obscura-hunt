@@ -115,6 +115,7 @@ async fn js_fetch_emits_network_request_and_response() {
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(&mut ctx, 900, "Network.enable", json!({}), session_id).await;
 
     // An ordinary fetch() is not load-delaying in Chromium: `load` may fire
     // while its response is still pending. Ask for networkidle0 explicitly so
@@ -183,6 +184,7 @@ async fn navigation_without_script_fetch_is_unaffected() {
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
+    cdp(&mut ctx, 900, "Network.enable", json!({}), session_id).await;
 
     cdp(&mut ctx, 1, "Page.navigate", json!({"url": base, "waitUntil": "load"}), session_id).await;
 
@@ -200,12 +202,11 @@ async fn navigation_without_script_fetch_is_unaffected() {
 #[cfg(feature = "stealth")]
 async fn stealth_context() -> (CdpContext, String, String) {
     let mut ctx = CdpContext::new();
-    ctx.default_context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
-        "stealth-events".into(), None, true, None, None, true,
-    ));
+    ctx.default_context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network("stealth-events".into(), None, true, None, None, true,).unwrap());
     let page = ctx.create_page();
     let session = "stealth-session".to_string();
     ctx.sessions.insert(session.clone(), page);
+    cdp(&mut ctx, 900, "Network.enable", json!({}), &session).await;
     let base = serve().await;
     cdp(&mut ctx, 1, "Page.navigate", json!({"url":base,"waitUntil":"networkidle0"}), &session).await;
     (ctx, session, base)
@@ -298,4 +299,119 @@ async fn stealth_http_error_response_keeps_status_and_body() {
     assert_eq!(event.status, 404);
     assert!(event.url.ends_with("/api/missing.json"));
     assert_eq!(cdp(&mut ctx, 3, "Network.getResponseBody", json!({"requestId":event.request_id}), &session).await["body"], r#"{"error":"missing"}"#);
+}
+
+// The interception channel is shared with JS fetch, but a Document-only route
+// must stop the native navigation before transport and leave later fetches alone.
+#[tokio::test(flavor = "current_thread")]
+async fn native_document_continue_keeps_owner_identity_and_request_headers() {
+    use obscura_js::ops::InterceptResolution;
+    use futures_util::FutureExt as _;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let mut ctx = CdpContext::new();
+    ctx.default_context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+        "document-interception".into(), None, false, None, None, true,
+    ).unwrap());
+    let page_id = ctx.create_page();
+    let sid = format!("{page_id}-session");
+    ctx.sessions.insert(sid.clone(), page_id.clone());
+    let frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    ctx.intercept_tx = Some(tx);
+    cdp(&mut ctx, 1, "Fetch.enable", json!({"patterns": [{"resourceType": "Document"}]}), &sid).await;
+    let page = ctx.get_page_mut(&page_id).unwrap();
+    let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel();
+    page.set_network_event_tx(network_tx);
+    page.set_extra_headers(HashMap::from([("X-Existing".into(), "preserved".into())])).await;
+    page.context.cookie_jar.set_cookie("session=logged-in; Path=/", &url::Url::parse(&origin).unwrap());
+    let original = format!("{origin}/original");
+    let rewritten = format!("{origin}/continued");
+    let navigate = page.navigate_with_wait_post(&original, obscura_browser::WaitUntil::Load, "POST", "a=1");
+    let consume = async {
+        let request = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(request.page_id, page_id);
+        assert_eq!(request.frame_id, 0);
+        assert_eq!(request.parent_frame_id, None);
+        assert_eq!(request.resource_type, "Document");
+        assert_eq!(request.url, original);
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.headers.get("x-existing").map(String::as_str), Some("preserved"));
+        assert!(listener.accept().now_or_never().is_none(), "document was sent before Continue");
+        let mut headers = request.headers;
+        headers.insert("x-request-proof".into(), "one-navigation".into());
+        request.resolver.send(InterceptResolution::Continue {
+            url: Some(rewritten.clone()), method: None, headers: Some(headers), body: None,
+        }).unwrap();
+        for index in 0..2 {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+            let mut wire = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                wire.extend_from_slice(&buffer[..count]);
+                if let Some(end) = wire.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&wire[..end]).to_ascii_lowercase();
+                    let length = head.lines().find_map(|line| line.strip_prefix("content-length:").map(str::trim))
+                        .unwrap_or("0").parse::<usize>().unwrap();
+                    if wire.len() >= end + 4 + length { break; }
+                }
+            }
+            let wire = String::from_utf8(wire).unwrap().to_ascii_lowercase();
+            if index == 0 {
+                assert!(wire.starts_with("post /continued http/1.1\r\n"), "{wire}");
+                assert!(wire.contains("x-existing: preserved\r\n"), "{wire}");
+                assert!(wire.contains("x-request-proof: one-navigation\r\n"), "{wire}");
+                assert!(wire.contains("cookie: session=logged-in\r\n"), "{wire}");
+                assert!(wire.ends_with("\r\n\r\na=1"), "{wire}");
+            } else {
+                assert!(wire.starts_with("get /api/session http/1.1\r\n"), "{wire}");
+                assert!(!wire.contains("x-request-proof:"), "navigation override leaked into JS fetch");
+            }
+            let body = if index == 0 { "<script>fetch('/api/session')</script>" } else { "ok" };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        request.request_id
+    };
+    let (result, request_id) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(navigate, consume) }).await.unwrap();
+    result.unwrap();
+    let page = ctx.get_page_mut(&page_id).unwrap();
+    assert_eq!(page.frame_id, frame_id);
+    assert_eq!(page.url_string(), rewritten);
+    let receipts = std::iter::from_fn(|| network_rx.try_recv().ok()).collect::<Vec<_>>();
+    let (owner, document) = receipts.iter().find(|(_, event)|
+        event.resource_type == "Document" && !event.request_started).unwrap();
+    assert_eq!(owner, &page_id);
+    assert_eq!(document.request_id, request_id);
+    assert_eq!(document.method, "POST");
+    assert!(page.get_response_body(&request_id).is_some());
+    assert!(rx.try_recv().is_err(), "Document-only pattern paused a JS fetch");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_document_fail_never_sends_request() {
+    use obscura_js::ops::InterceptResolution;
+    use futures_util::FutureExt as _;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("http://{}/blocked", listener.local_addr().unwrap());
+    let context = std::sync::Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
+        "document-fail".into(), None, false, None, None, true,
+    ).unwrap());
+    let mut page = obscura_browser::Page::new("document-fail".into(), context);
+    let mut rx = page.enable_interception();
+    let consume = async {
+        let request = rx.recv().await.unwrap();
+        assert_eq!(request.page_id, "document-fail");
+        assert_eq!(request.resource_type, "Document");
+        request.resolver.send(InterceptResolution::Fail { reason: "BlockedByClient".into() }).unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(page.navigate(&target), consume) }).await.unwrap();
+    assert!(result.unwrap_err().to_string().contains("BlockedByClient"));
+    assert!(listener.accept().now_or_never().is_none(), "failed document reached transport");
 }

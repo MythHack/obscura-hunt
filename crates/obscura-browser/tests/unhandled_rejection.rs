@@ -37,14 +37,12 @@ fn spawn_page() -> String {
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_background_promise_does_not_stop_the_page_event_loop() {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
-    let context = Arc::new(BrowserContext::with_storage_and_network(
-        "unhandled-rejection".to_owned(),
-        None,
-        false,
-        None,
-        None,
-        true,
-    ));
+    let context = Arc::new(BrowserContext::with_storage_and_network("unhandled-rejection".to_owned(),
+    None,
+    false,
+    None,
+    None,
+    true,).unwrap());
     let mut page = Page::new("unhandled-rejection-page".to_owned(), context);
     page.navigate(&spawn_page()).await.unwrap();
     page.settle(200).await;

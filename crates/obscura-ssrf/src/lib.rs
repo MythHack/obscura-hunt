@@ -25,6 +25,64 @@ pub fn env_allows_private_network() -> bool {
     )
 }
 
+/// A finite address exemption from the shared deny-set, not an egress firewall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NetworkRange {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl std::str::FromStr for NetworkRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = value.trim().split_once('/')
+            .ok_or_else(|| format!("Invalid network CIDR {value:?}: expected address/prefix"))?;
+        let network: IpAddr = address.parse().map_err(|_| format!("Invalid network CIDR {value:?}"))?;
+        let prefix: u8 = prefix.parse().map_err(|_| format!("Invalid network CIDR {value:?}"))?;
+        if prefix > if network.is_ipv4() { 32 } else { 128 } {
+            return Err(format!("Invalid network CIDR {value:?}: prefix out of range"));
+        }
+        Ok(Self { network, prefix })
+    }
+}
+
+impl NetworkRange {
+    pub fn is_unrestricted(&self) -> bool { self.prefix == 0 }
+
+    pub fn contains(&self, address: IpAddr) -> bool {
+        let address = match (self.network, address) {
+            (IpAddr::V4(_), IpAddr::V6(address)) => address.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(address)),
+            (_, address) => address,
+        };
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let mask = u32::MAX.checked_shl(u32::from(32 - self.prefix)).unwrap_or(0);
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = u128::MAX.checked_shl(u32::from(128 - self.prefix)).unwrap_or(0);
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse the same comma-separated values accepted by the CLI. Invalid values
+/// remain errors so callers cannot silently start with a different policy.
+pub fn parse_allowed_networks(value: &str) -> Result<Vec<NetworkRange>, String> {
+    value.split(',').filter(|value| !value.trim().is_empty()).map(str::parse).collect()
+}
+
+pub fn env_allowed_networks() -> Result<Vec<NetworkRange>, String> {
+    std::env::var("OBSCURA_ALLOW_NETWORK").map_or_else(|_| Ok(Vec::new()), |value| parse_allowed_networks(&value))
+}
+
+pub fn address_allowed(address: IpAddr, allow_private: bool, ranges: &[NetworkRange]) -> bool {
+    allow_private || !is_forbidden_ip(address) || ranges.iter().any(|range| range.contains(address))
+}
+
 /// True when `ip` must never be the target of an outbound request from the
 /// engine: loopback, RFC1918 private, link-local (incl. the 169.254.169.254
 /// cloud-metadata endpoint), broadcast, documentation, the unspecified address

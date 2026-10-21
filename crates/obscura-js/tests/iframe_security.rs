@@ -199,7 +199,7 @@ async fn iframe_same_origin_facade_and_native_realm_remain_accessible() {
         return [child.document === iframe.contentDocument, child.document.body.textContent,
             child.sentinel, child.localStorage === localStorage,
             child.sessionStorage === sessionStorage, typeof child.Array,
-            Object.getOwnPropertyDescriptor(child, 'document').value === child.document,
+            Object.getOwnPropertyDescriptor(child, 'document').get.call(child) === child.document,
             parentSeesChild, childSeesParent, parentSeesSession];
     })()"#).unwrap(), json!([true, "updated", 42, false, false, "function", true,
         "stored-by-child", "stored-by-parent", "session-value"]));

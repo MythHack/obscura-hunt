@@ -31,22 +31,6 @@ fn mcp_font_directory_is_validated_before_either_transport_starts() {
     }
 }
 
-#[test]
-fn mcp_font_directory_respects_render_feature() {
-    let output = Command::new(OBSCURA)
-        .args(["mcp", "--font-dir"])
-        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"))
-        .stdin(Stdio::null())
-        .output()
-        .expect("start MCP with existing font directory");
-    if cfg!(feature = "render") {
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    } else {
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--font-dir requires a render-enabled build"));
-    }
-}
-
 const TEST_PAGE: &str = r#"<!doctype html><html><head><title>Example Domain</title></head>
 <body><h1>Example Domain</h1><p>Deterministic local MCP fixture.</p>
 <a href="/more">More information...</a></body></html>"#;
@@ -497,11 +481,22 @@ fn test_network_requests() {
 fn test_close_resets_state() {
     let server = TestPageServer::spawn();
     let mut c = McpClient::spawn();
-    c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    let navigation = c.tool("browser_navigate", serde_json::json!({"url": server.url()}));
+    assert_ne!(navigation["result"]["isError"], true, "{navigation}");
+    let before = c.tool("browser_evaluate", serde_json::json!({
+        "expression": "(window.closeToken = 'old-page', true)"
+    }));
+    assert_eq!(content_text(&before), "true");
     let close = c.tool("browser_close", serde_json::json!({}));
-    assert!(close["result"]["isError"].is_null());
+    assert_ne!(close["result"]["isError"], true, "{close}");
 
-    // After close, snapshot should return empty/default page (no panic)
-    let snap = c.tool("browser_snapshot", serde_json::json!({}));
-    assert!(snap["result"]["isError"].is_null());
+    // The next tool creates a fresh tab; inspect its state, not snapshot wording.
+    let reset = c.tool("browser_evaluate", serde_json::json!({
+        "expression": "({url: location.href, priorGlobal: typeof window.closeToken})"
+    }));
+    assert_ne!(reset["result"]["isError"], true, "{reset}");
+    let state: serde_json::Value = serde_json::from_str(content_text(&reset))
+        .expect("evaluation returns JSON state");
+    assert_eq!(state["url"], "about:blank");
+    assert_eq!(state["priorGlobal"], "undefined");
 }

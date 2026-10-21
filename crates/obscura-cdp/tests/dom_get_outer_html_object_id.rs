@@ -162,9 +162,7 @@ async fn outer_html_uses_the_object_handles_child_document() {
             ).as_bytes()).await.unwrap();
         }
     });
-    let context = obscura_browser::context::BrowserContext::with_storage_and_network(
-        "child-html-test".into(), None, false, None, None, true,
-    );
+    let context = obscura_browser::context::BrowserContext::with_storage_and_network("child-html-test".into(), None, false, None, None, true,).unwrap();
     let mut ctx = CdpContext::new_with_shared_context(std::sync::Arc::new(context));
     let page_id = ctx.create_page();
     let session = "child-html";

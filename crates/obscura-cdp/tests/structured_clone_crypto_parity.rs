@@ -308,3 +308,21 @@ async fn structured_clone_preserves_cryptokey_identity() {
     assert_eq!(val["tag"], "CryptoKey");
     assert_eq!(val["sigLen"], 32, "the shared clone must remain usable by crypto.subtle");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_private_key_clones_keep_their_native_usage_and_extraction_policy() {
+    let (mut ctx, sid) = setup().await;
+    let v = eval(&mut ctx, 2, r#"(async () => {
+        const s = crypto.subtle;
+        const pair = await s.generateKey({name:'ECDSA',namedCurve:'P-256'},false,['sign','verify']);
+        const copy = structuredClone({a:pair.privateKey,b:pair.privateKey});
+        copy.a.algorithm.name = 'ECDH';
+        const message = new Uint8Array([0,255,128,195,40]);
+        const signature = await s.sign({name:'ECDSA',hash:'SHA-256'},copy.a,message);
+        let exportError, usageError;
+        try { await s.exportKey('pkcs8',copy.a); } catch (error) { exportError = error.name; }
+        try { await s.deriveBits({name:'ECDH',public:pair.publicKey},copy.a,128); } catch (error) { usageError = error.name; }
+        return {valid:await s.verify({name:'ECDSA',hash:'SHA-256'},pair.publicKey,signature,message),shared:copy.a===copy.b,distinct:copy.a!==pair.privateKey,exportError,usageError,publicExtractable:pair.publicKey.extractable,privateExtractable:copy.a.extractable};
+    })()"#, &sid).await;
+    assert_eq!(v["result"]["value"], json!({"valid":true,"shared":true,"distinct":true,"exportError":"InvalidAccessError","usageError":"InvalidAccessError","publicExtractable":true,"privateExtractable":false}));
+}

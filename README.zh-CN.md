@@ -85,9 +85,11 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 
 ### 构建要求
 
-- 当前稳定版 Rust 和支持 C++20 的 C/C++ 工具链。
+- 当前稳定版 Rust、支持 C++20 的 C/C++ 工具链，以及编译 vendored OpenSSL（公钥 WebCrypto）所需的 Perl。
 - stealth 构建需要 CMake、Clang 和 libclang/LLVM 开发库。
-- Windows x64 需要 Visual Studio C++ Build Tools、CMake、LLVM/Clang，以及 `PATH` 上的 NASM。
+  Windows 和 macOS 还需在 `PATH` 上安装 Go 1.24 或更新版本，供 btls/BoringSSL
+  内置的原生符号前缀构建使用，将其与 OpenSSL 的符号隔离。
+- Windows x64 需要 Visual Studio C++ Build Tools、CMake、LLVM/Clang、Perl，以及 `PATH` 上的 NASM。
   构建前必须将 `LIBCLANG_PATH` 指向实际包含 `libclang.dll` 的 LLVM 目录。
   已安装 Clang 或 `PATH` 上有 `clang.exe`，不代表 bindgen 能找到该 DLL。
   详见[Windows 构建说明](docs/Build-from-source.md)。
@@ -95,7 +97,7 @@ Obscura-Hunt 值得选择。本项目由 [MythHack](https://github.com/MythHack/
 Ubuntu/Debian 可这样安装原生工具：
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+sudo apt-get install build-essential perl cmake clang libclang-dev llvm-dev
 ```
 
 ### 构建渲染与 stealth 版本

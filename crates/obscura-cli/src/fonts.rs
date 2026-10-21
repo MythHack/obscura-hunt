@@ -1,7 +1,7 @@
 //! Process-wide font policy shared by the CLI and the scrape worker.
 //!
-//! The render layer caches its font database at the first render, so the
-//! policy has to be applied once, before any page is created. Every entry
+//! Native font selection caches its database at the first metric lookup or
+//! render, so policy is applied once before any page is created. Every entry
 //! point validates the requested directories first: an explicit bad path is a
 //! command error, never an ignored option.
 
@@ -32,31 +32,10 @@ pub fn configure(font_dirs: &[PathBuf], no_system_fonts: bool) -> Result<(), Str
         }
     }
 
-    #[cfg(feature = "render")]
-    {
-        if obscura_js::configure_fonts(font_dirs.to_vec(), !no_system_fonts) {
-            return Ok(());
-        }
-        // Every entry point applies the policy exactly once, before any page
-        // exists. A false result means the font database was already
-        // initialized, so the requested policy (including the default
-        // system-font policy) cannot take effect.
-        Err(
-            "Font configuration must be applied before the first render; the font database is \
-             already initialized"
-                .to_string(),
-        )
+    if obscura_js::configure_fonts(font_dirs.to_vec(), !no_system_fonts) {
+        return Ok(());
     }
-    #[cfg(not(feature = "render"))]
-    {
-        if !font_dirs.is_empty() {
-            return Err("--font-dir requires a render-enabled build".to_string());
-        }
-        if no_system_fonts {
-            return Err("--no-system-fonts requires a render-enabled build".to_string());
-        }
-        Ok(())
-    }
+    Err("Font configuration must be applied before the first font lookup; the font database is already initialized".to_string())
 }
 
 /// Read the scrape worker's font policy from the environment and apply it.

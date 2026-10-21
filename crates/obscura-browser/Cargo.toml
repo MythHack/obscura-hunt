@@ -23,7 +23,12 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+maxminddb = "0.26.0"
+roxmltree = "0.21"
+sha2 = "0.11.0"
+hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+lopdf = "0.39"

@@ -7,7 +7,7 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util", "btls"]
 
 [dependencies]
 obscura-ssrf = { workspace = true }
@@ -22,11 +22,19 @@ async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
-futures-util = { version = "0.3", optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "=0.7.1"
+# Certificate parsing/signatures only; all HTTP/TLS remains reqwest or wreq.
+openssl = { version = "0.10.81", features = ["vendored"] }
+btls = { version = "=0.5.6", optional = true }
+futures-util = "0.3"
+tokio-tungstenite = { workspace = true }
 # wreq and wreq-util change API between release candidates. Pin the compatible
 # pair targeted by wreq_client.rs so fresh resolves cannot silently select a
 # different release-candidate API (issue #234).
 wreq-util = { version = "=3.0.0-rc.14", optional = true, features = ["emulation-compression"] }
+# Keep BoringSSL exports separate from the public-key backend on every platform.
+wreq = { version = "=6.0.0-rc.31", optional = true, features = ["prefix-symbols", "socks", "stream", "gzip", "brotli", "deflate", "zstd"] }
 
 [dev-dependencies]
 socket2 = "0.6"
@@ -35,13 +43,3 @@ socket2 = "0.6"
 # aws-lc-rs provider so rustls auto-selection sees a single CryptoProvider.
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
-
-# `prefix-symbols` renames BoringSSL exports to avoid clashes with system OpenSSL,
-# but the renaming is only correct on Linux and Android (per wreq's README).
-# Enabling it on other platforms produces unresolved `build_script_main_*`
-# symbols at link time (see issue #39).
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wreq = { version = "=6.0.0-rc.31", optional = true, features = ["prefix-symbols", "socks", "stream", "gzip", "brotli", "deflate", "zstd"] }
-
-[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
-wreq = { version = "=6.0.0-rc.31", optional = true, features = ["socks", "stream", "gzip", "brotli", "deflate", "zstd"] }

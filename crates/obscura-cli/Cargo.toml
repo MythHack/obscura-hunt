@@ -15,7 +15,7 @@ path = "src/worker.rs"
 
 [features]
 default = []
-stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
+stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth", "obscura-cdp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
 [dependencies]
@@ -24,6 +24,7 @@ obscura-mcp = { workspace = true }
 obscura-cdp = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
+obscura-ssrf = { workspace = true }
 obscura-js = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

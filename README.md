@@ -104,9 +104,11 @@ Obscura-Hunt; commands and executables are still named `obscura` and `obscura-wo
 
 ### Requirements
 
-- Current stable Rust and a C++20 toolchain.
+- Current stable Rust, a C++20 toolchain, and Perl for vendored OpenSSL (public-key WebCrypto).
 - For stealth: CMake, Clang, and the libclang/LLVM development libraries.
-- On Windows x64: Visual Studio C++ Build Tools, CMake, LLVM/Clang, and NASM on
+  On Windows and macOS, also install Go 1.24 or newer on `PATH` for the bundled
+  btls/BoringSSL native symbol-prefix build, which isolates it from OpenSSL.
+- On Windows x64: Visual Studio C++ Build Tools, CMake, LLVM/Clang, Perl, and NASM on
   `PATH`. Before building, set `LIBCLANG_PATH` to the actual LLVM directory
   containing `libclang.dll`. Installing Clang or putting `clang.exe` on `PATH`
   does not by itself make that DLL discoverable by bindgen. See the
@@ -115,7 +117,7 @@ Obscura-Hunt; commands and executables are still named `obscura` and `obscura-wo
 On Ubuntu/Debian, install the native tools with:
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+sudo apt-get install build-essential perl cmake clang libclang-dev llvm-dev
 ```
 
 ### Build with rendering and stealth

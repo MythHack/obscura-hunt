@@ -538,6 +538,9 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     pub text_align: TextAlign,
 
     // Flexbox container properties
+    /// Use CSS inline line-baseline placement in the native inline fallback.
+    #[cfg(feature = "flexbox")]
+    pub inline_line: bool,
     /// Which direction does the main axis flow in?
     #[cfg(feature = "flexbox")]
     pub flex_direction: FlexDirection,
@@ -642,6 +645,8 @@ impl<S: CheapCloneStr> Style<S> {
         #[cfg(feature = "block_layout")]
         text_align: TextAlign::Auto,
         // Flexbox
+        #[cfg(feature = "flexbox")]
+        inline_line: false,
         #[cfg(feature = "flexbox")]
         flex_direction: FlexDirection::Row,
         #[cfg(feature = "flexbox")]
@@ -901,6 +906,10 @@ impl<T: BlockItemStyle> BlockItemStyle for &'_ T {
 #[cfg(feature = "flexbox")]
 impl<S: CheapCloneStr> FlexboxContainerStyle for Style<S> {
     #[inline(always)]
+    fn inline_line(&self) -> bool {
+        self.inline_line
+    }
+    #[inline(always)]
     fn flex_direction(&self) -> FlexDirection {
         self.flex_direction
     }
@@ -928,6 +937,10 @@ impl<S: CheapCloneStr> FlexboxContainerStyle for Style<S> {
 
 #[cfg(feature = "flexbox")]
 impl<T: FlexboxContainerStyle> FlexboxContainerStyle for &'_ T {
+    #[inline(always)]
+    fn inline_line(&self) -> bool {
+        (*self).inline_line()
+    }
     #[inline(always)]
     fn flex_direction(&self) -> FlexDirection {
         (*self).flex_direction()
@@ -1250,6 +1263,8 @@ mod tests {
             overflow: Default::default(),
             scrollbar_width: 0.0,
             position: Default::default(),
+            #[cfg(feature = "flexbox")]
+            inline_line: false,
             #[cfg(feature = "flexbox")]
             flex_direction: Default::default(),
             #[cfg(feature = "flexbox")]

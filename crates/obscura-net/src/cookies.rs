@@ -555,8 +555,6 @@ impl CookieJar {
     /// Serialize all non-expired cookies to a JSON file.
     /// Writes atomically via tempfile then rename.
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-        use std::io::Write;
-
         let cookies = self.read_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -590,27 +588,21 @@ impl CookieJar {
         let json = serde_json::to_string_pretty(&all).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut tmp = tempfile::NamedTempFile::new_in(
-            path.parent().unwrap_or(std::path::Path::new(".")),
-        )?;
-        tmp.write_all(json.as_bytes())?;
-        tmp.persist(path).map_err(|e| e.error)?;
-        Ok(())
+        crate::profile::write_atomically(path, json.as_bytes())
     }
 
     /// Load cookies from a JSON file into the jar.
     /// Merges with existing cookies (does not clear).
     /// Returns the number of cookies loaded.
     pub fn load_from_file(&self, path: &std::path::Path) -> Result<usize, std::io::Error> {
-        if !path.exists() {
-            return Ok(0);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => crate::profile::private_file(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
         }
         let data = std::fs::read_to_string(path)?;
         let cookies: Vec<PersistedCookie> = serde_json::from_str(&data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cookie profile JSON"))?;
         let count = cookies.len();
         self.set_cookies_from_import(
             cookies

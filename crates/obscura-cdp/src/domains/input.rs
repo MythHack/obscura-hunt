@@ -61,7 +61,7 @@ pub async fn handle(
                     .then(|| (page.frame_id.clone(), page.url_string()))
             };
             if let Some((frame_id, url)) = moved_frame {
-                crate::domains::page::emit_same_document_navigation(ctx, session_id, &frame_id, &url);
+                crate::domains::page::emit_same_document_navigation(ctx, session_id, &frame_id, &url, "historyApi");
             }
             Ok(json!({}))
         }
@@ -90,7 +90,7 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
-        "dispatchTouchEvent" => Ok(json!({})),
+        "dispatchTouchEvent" => Err("Input.dispatchTouchEvent is unsupported".into()),
         "setIgnoreInputEvents" => Ok(json!({})),
         _ => Err(format!("Unknown Input method: {method}")),
     }

@@ -5,6 +5,7 @@ pub mod tree;
 pub mod tree_sink;
 pub mod selector;
 pub mod serialize;
+pub mod xml;
 
 pub use tree::{
     AttachShadowError, Attribute, DomTree, Node, NodeData, NodeId, ShadowRoot,

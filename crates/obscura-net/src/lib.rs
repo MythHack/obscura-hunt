@@ -1,9 +1,16 @@
+pub(crate) mod aia;
 pub mod client;
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
+pub mod interception;
+pub use interception::{InterceptPattern, InterceptedRequest, InterceptResolution, RequestInterception};
 pub mod robots;
+pub mod profile;
 pub mod blocklist;
+pub mod websocket;
+mod io_runtime;
+pub use io_runtime::{network_io_handle, on_network_io};
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
 

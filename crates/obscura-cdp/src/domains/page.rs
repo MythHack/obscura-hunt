@@ -44,6 +44,16 @@ fn is_localhost(url: &url::Url) -> bool {
     }
 }
 
+pub(crate) fn is_same_document_fragment(current: &str, target: &str) -> bool {
+    let (Ok(mut current), Ok(mut target)) = (url::Url::parse(current), url::Url::parse(target)) else {
+        return false;
+    };
+    if target.fragment().is_none() { return false; }
+    current.set_fragment(None);
+    target.set_fragment(None);
+    current == target
+}
+
 fn secure_context_type(url: &url::Url) -> &'static str {
     match url.scheme() {
         "https" | "wss" | "file" | "about" => "Secure",
@@ -878,18 +888,7 @@ pub(crate) fn schedule_screencast_frame(
     }
 }
 
-/// Whether a request reported after navigation may be paused for the client.
-/// Chrome only pauses requests that match the `Fetch.enable` URL patterns;
-/// omitted patterns mean every request.
-fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
-    ctx.fetch_intercept.enabled
-        && (ctx.fetch_intercept.patterns.is_empty()
-            || ctx
-                .fetch_intercept
-                .patterns
-                .iter()
-                .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
-}
+
 
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
@@ -906,6 +905,11 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let loader_id = if ctx.server_registry.is_some() { loader_id } else {
+        network_events.iter().find(|event| event.intercepted
+            && event.frame_id == 0 && event.resource_type == "Document" && event.url == page_url)
+            .map_or(loader_id, |event| event.request_id.as_str())
+    };
     ctx.record_native_navigation(page_id);
     let event_start = ctx.pending_events.len();
     ctx.current_loader_ids
@@ -960,25 +964,10 @@ pub fn emit_navigation_events(
     if let Some(idx) = nav_idx {
         let net_event = &network_events[idx];
         let rid = &nav_request_ids[idx];
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
-            session_id: es.clone(),
-        });
-        if fetch_pause_matches(ctx, &net_event.url) {
+        if !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
+                method: "Network.requestWillBeSent".into(),
+                params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
         }
@@ -1014,33 +1003,7 @@ pub fn emit_navigation_events(
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
 
-    if ctx.fetch_intercept.enabled {
-        for (i, net_event) in network_events.iter().enumerate() {
-            if Some(i) == nav_idx
-                || net_event.intercepted
-                || !fetch_pause_matches(ctx, &net_event.url)
-            {
-                continue;
-            }
-            let rid = &nav_request_ids[i];
-            let frame_id = network_frame_id(frame_id, net_event.frame_id);
-            ctx.pending_events.push(CdpEvent {
-                method: "Fetch.requestPaused".into(),
-                params: json!({
-                    "requestId": rid,
-                    "request": {
-                        "url": net_event.url,
-                        "method": net_event.method,
-                        "headers": net_event.headers,
-                    },
-                    "frameId": frame_id,
-                    "resourceType": net_event.resource_type,
-                    "networkId": rid,
-                }),
-                session_id: es.clone(),
-            });
-        }
-    }
+
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
@@ -1154,8 +1117,8 @@ fn fan_out_network_events(
     for observer in observers {
         for index in event_start..event_end {
             let event = &ctx.pending_events[index];
-            if matches!(event.method.as_str(),
-                "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed")
+            if event.session_id == *source && (event.method.starts_with("Network.")
+                || event.method.starts_with("Page."))
             {
                 let copy = CdpEvent {
                     method: event.method.clone(),
@@ -1173,16 +1136,20 @@ pub(crate) fn emit_same_document_navigation(
     session_id: &Option<String>,
     frame_id: &str,
     url: &str,
+    navigation_type: &str,
 ) {
+    let page_id = ctx.get_session_page(session_id).map(|page| page.id.clone());
+    let event_start = ctx.pending_events.len();
     ctx.pending_events.push(CdpEvent {
         method: "Page.navigatedWithinDocument".into(),
         params: json!({
             "frameId": frame_id,
             "url": url,
-            "navigationType": "historyApi",
+            "navigationType": navigation_type,
         }),
         session_id: session_id.clone(),
     });
+    if let Some(page_id) = page_id { fan_out_network_events(ctx, &page_id, session_id, event_start); }
 }
 
 /// Emit completed script-initiated requests after the document lifecycle has
@@ -1285,15 +1252,18 @@ fn network_loading_failed(
 pub(crate) fn emit_aborted_navigation(
     ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
     loader_id: &str, url: &str, method: &str, page_id: &str,
+    request_started: bool,
 ) {
     let start = ctx.pending_events.len();
     let ts = timestamp();
-    ctx.pending_events.push(CdpEvent {
-        method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
-        params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
-            "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
-            "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
-    });
+    if !request_started {
+        ctx.pending_events.push(CdpEvent {
+            method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
+            params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
+                "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
+                "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
+        });
+    }
     ctx.pending_events.push(CdpEvent {
         method: "Network.loadingFailed".into(), session_id: session_id.clone(),
         params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
@@ -1369,13 +1339,17 @@ async fn do_navigate(
     let preload_scripts = ctx.preload_scripts_for_page(
         &ctx.get_session_page(session_id).ok_or("No page for session")?.id,
     );
+    let navigation_loader = format!("loader-{}", uuid::Uuid::new_v4());
+    let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+    if let Some(registry) = &ctx.server_registry { registry.page_route(&page.id, &page.frame_id, &navigation_loader, url); }
+    let live_server = ctx.server_registry.is_some();
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
         let page = ctx
             .get_session_page_mut(session_id)
             .ok_or("No page for session")?;
         let frame_id = page.frame_id.clone();
-        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+        let loader_id = navigation_loader;
 
         // Preloads (addBinding shims, addScriptToEvaluateOnNewDocument sources)
         // must run BEFORE the page's own scripts (CDP contract). Hand them to
@@ -1387,7 +1361,7 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
-        if nav_method == "POST" && !nav_body.is_empty() {
+        if nav_method == "POST" {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1403,6 +1377,11 @@ async fn do_navigate(
         page.sync_js_network_events();
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
+        let loader_id = if live_server { loader_id } else {
+            network_events.iter().find(|event| event.intercepted
+                && event.frame_id == 0 && event.resource_type == "Document" && event.url == page_url)
+                .map(|event| event.request_id.clone()).unwrap_or(loader_id)
+        };
         let page_id = page.id.clone();
         (
             frame_id,
@@ -1440,6 +1419,8 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "enable" => {
+            let session = session_id.as_ref().ok_or("Page.enable requires a page session")?;
+            ctx.page_enabled_sessions.insert(session.clone());
             // Chrome loads a new target's initial about:blank right after
             // createTarget, so by the time a client attaches and calls
             // Page.enable the page has already produced its load events.
@@ -1480,11 +1461,32 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        "disable" => {
+            if let Some(session) = session_id {
+                ctx.page_enabled_sessions.remove(session);
+                ctx.session_announced_frames.remove(session);
+            }
+            Ok(json!({}))
+        }
         "navigate" => {
             let url = params
                 .get("url")
                 .and_then(|v| v.as_str())
                 .ok_or("url required")?;
+            let fragment = {
+                let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                if params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET") != "GET"
+                    || !is_same_document_fragment(&page.url_string(), url) { None }
+                else if let Some(js) = page.js.as_mut() {
+                    js.navigate_fragment(url)?;
+                    page.sync_virtual_url();
+                    Some((page.frame_id.clone(), page.url_string()))
+                } else { None }
+            };
+            if let Some((frame_id, url)) = fragment {
+                emit_same_document_navigation(ctx, session_id, &frame_id, &url, "fragment");
+                return Ok(json!({"frameId": frame_id}));
+            }
             do_navigate(url, params, ctx, session_id).await
         }
         "reload" => {
@@ -1523,10 +1525,12 @@ pub async fn handle(
             let target_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
             let accept = params.get("accept").and_then(|value| value.as_bool()).ok_or("accept required")?;
             let owner = ctx.pending_beforeunload_close.remove(&target_id).ok_or("No dialog is showing")?;
-            ctx.pending_events.push(CdpEvent {
-                method: "Page.javascriptDialogClosed".into(), session_id: owner,
-                params: json!({"result": accept, "userInput": ""}),
-            });
+            if owner.as_ref().is_none_or(|session| ctx.page_enabled_sessions.contains(session)) {
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.javascriptDialogClosed".into(), session_id: owner,
+                    params: json!({"result": accept, "userInput": ""}),
+                });
+            }
             if accept { crate::domains::target::close_target(ctx, &target_id); }
             Ok(json!({}))
         }
@@ -2039,17 +2043,16 @@ mod tests {
         let driver = Some("driver".to_string());
         for (session, target) in [("driver", &page), ("observer-a", &page), ("observer-b", &page), ("unrelated", &unrelated_page)] {
             ctx.sessions.insert(session.into(), target.clone());
+            if target == &page { ctx.network_enabled_sessions.insert(session.into()); }
         }
         let events = [("document-internal", "Document", "https://example.test/", 200),
             ("script-1", "Script", "https://example.test/app.js", 404)]
-            .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
-                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
-                frame_id: 0,
-                frame_generation: 0,
-                resource_type: kind.into(), status, headers: Default::default(),
-                response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
-                error_text: None,
-            }).collect();
+            .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent { request_body: None, request_started: false, request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+            frame_id: 0,
+            frame_generation: 0,
+            resource_type: kind.into(), status, headers: Default::default(),
+            response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
+            error_text: None, }).collect();
         (ctx, page, driver, events)
     }
 
@@ -2069,9 +2072,9 @@ mod tests {
     #[test]
     fn navigation_network_events_reach_all_target_observers_with_identical_ids() {
         let (mut ctx, page, driver, events) = observer_fixture();
-        ctx.fetch_intercept.enabled = true;
         emit_navigation_events(&mut ctx, &driver, "frame-1", "loader-1", "https://example.test/",
             &page, &events, WaitUntil::Load, false);
+        ctx.filter_pending_events();
         assert_observer_network(&ctx);
         let observer = ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).collect::<Vec<_>>();
         assert_eq!(observer.len(), 6);
@@ -2111,6 +2114,7 @@ mod tests {
                 } else {
                     emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[1..]);
                 }
+                ctx.filter_pending_events();
                 assert_observer_network(&ctx);
                 for session in ["driver", "observer-a", "observer-b"] {
                     let network = ctx.pending_events.iter().filter(|event|
@@ -2381,24 +2385,21 @@ mod tests {
             .insert(session_id.clone().unwrap(), page_id.clone());
         ctx.current_loader_ids
             .insert(page_id.clone(), "loader-current".into());
-        let event = obscura_browser::NetworkEvent {
-            request_id: "fetch-7".into(),
-            frame_id: 0,
-            frame_generation: 0,
-            intercepted: false,
-            url: "https://example.test/data.json".into(),
-            method: "GET".into(),
-            resource_type: "Fetch".into(),
-            status: 200,
-            headers: std::collections::HashMap::new(),
-            response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
-                "content-type".into(),
-                "application/json".into(),
-            )])),
-            body_size: 12,
-            timestamp: 42.0,
-            error_text: None,
-        };
+        let event = obscura_browser::NetworkEvent { request_body: None, request_started: false, request_id: "fetch-7".into(), frame_id: 0,
+        frame_generation: 0,
+        intercepted: false,
+        url: "https://example.test/data.json".into(),
+        method: "GET".into(),
+        resource_type: "Fetch".into(),
+        status: 200,
+        headers: std::collections::HashMap::new(),
+        response_headers: std::sync::Arc::new(std::collections::HashMap::from([(
+            "content-type".into(),
+            "application/json".into(),
+        )])),
+        body_size: 12,
+        timestamp: 42.0,
+        error_text: None, };
 
         emit_runtime_network_events(
             &mut ctx,
@@ -2435,7 +2436,6 @@ mod tests {
         assert!(ctx.pending_events.iter().all(|e| e.params["requestId"] == "fetch-7"));
 
         ctx.pending_events.clear();
-        ctx.fetch_intercept.enabled = true;
         emit_navigation_events(
             &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
             &page_id, std::slice::from_ref(&event), WaitUntil::Load, true,
@@ -2471,7 +2471,7 @@ mod tests {
     }
 
     #[test]
-    fn post_navigation_fetch_pauses_follow_enable_patterns() {
+    fn completed_navigation_requests_never_synthesize_fetch_pauses() {
         let page_url = "https://example.test/";
         let events = [
             (page_url, "Document"),
@@ -2481,6 +2481,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, (url, kind))| obscura_browser::NetworkEvent {
+            request_body: None, request_started: false,
             request_id: format!("finished-{index}"),
             frame_id: 0,
             frame_generation: 0,
@@ -2496,22 +2497,19 @@ mod tests {
             timestamp: 1.0,
         })
         .collect::<Vec<_>>();
-        for (patterns, expected) in [
-            (vec!["*never-matches*"], vec![]),
-            (vec!["*/value/*"], vec!["https://example.test/value/1"]),
-            (vec!["*/value/?"], vec!["https://example.test/value/1"]),
-            (vec![r"*/value/\?"], vec![]),
-            (
-                vec!["*"],
-                vec![page_url, "https://example.test/image.png", "https://example.test/value/1"],
-            ),
+        for patterns in [
+            vec!["*never-matches*"], vec!["*/value/*"], vec!["*/value/?"],
+            vec![r"*/value/\?"], vec!["*"],
         ] {
             let mut ctx = CdpContext::new();
             let page_id = ctx.create_page();
             let session_id = Some(format!("{page_id}-session"));
             ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
-            ctx.fetch_intercept.enabled = true;
-            ctx.fetch_intercept.patterns = patterns.iter().map(|p| p.to_string()).collect();
+            let page = ctx.get_page_mut(&page_id).unwrap();
+            page.enable_intercept(true);
+            page.intercept_block_patterns = patterns.iter().map(|pattern| obscura_js::ops::InterceptPattern {
+                url_pattern: (*pattern).into(), resource_type: None,
+            }).collect();
             emit_navigation_events(
                 &mut ctx, &session_id, "frame-1", "loader-1", page_url, &page_id,
                 &events, WaitUntil::Load, true,
@@ -2522,7 +2520,7 @@ mod tests {
                 .filter(|event| event.method == "Fetch.requestPaused")
                 .map(|event| event.params["request"]["url"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>();
-            assert_eq!(paused, expected, "patterns {patterns:?}");
+            assert!(paused.is_empty(), "completed requests cannot pause: {paused:?}, patterns {patterns:?}");
             // Network reporting is independent of interception patterns.
             for method in ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"] {
                 assert_eq!(
@@ -2535,19 +2533,19 @@ mod tests {
     }
 
     #[test]
-    fn intercepted_document_is_paused_before_frame_commit() {
+    fn intercepted_document_completion_keeps_the_live_request_identity() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some(format!("{page_id}-session"));
         ctx.sessions
             .insert(session_id.clone().unwrap(), page_id.clone());
-        ctx.fetch_intercept.enabled = true;
         let page_url = "https://example.test/";
         let event = obscura_browser::NetworkEvent {
+            request_body: None, request_started: false,
             request_id: "document-internal".into(),
             frame_id: 0,
             frame_generation: 0,
-            intercepted: false,
+            intercepted: true,
             url: page_url.into(),
             method: "GET".into(),
             resource_type: "Document".into(),
@@ -2576,15 +2574,13 @@ mod tests {
             .iter()
             .map(|event| event.method.as_str())
             .collect::<Vec<_>>();
-        let paused = methods
-            .iter()
-            .position(|method| *method == "Fetch.requestPaused")
-            .unwrap();
-        let committed = methods
-            .iter()
-            .position(|method| *method == "Page.frameNavigated")
-            .unwrap();
-        assert!(paused < committed, "document pause must precede frame commit: {methods:?}");
+        assert!(!methods.contains(&"Fetch.requestPaused"), "completion must not synthesize a pause: {methods:?}");
+        assert!(!methods.contains(&"Network.requestWillBeSent"), "live request start must not replay: {methods:?}");
+        let response = ctx.pending_events.iter().find(|event| event.method == "Network.responseReceived").unwrap();
+        assert_eq!(response.params["requestId"], "document-internal");
+        assert_eq!(response.params["loaderId"], "document-internal");
+        let committed = ctx.pending_events.iter().find(|event| event.method == "Page.frameNavigated").unwrap();
+        assert_eq!(committed.params["frame"]["loaderId"], "document-internal");
     }
 
     #[tokio::test]
@@ -3353,7 +3349,7 @@ mod tests {
                 None,
                 None,
                 true,
-            ),
+            ).unwrap(),
         );
         let mut ctx = CdpContext::new_with_shared_context(context);
         let page_id = ctx.create_page();

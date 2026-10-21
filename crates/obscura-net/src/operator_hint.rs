@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 const PRIVATE_NETWORK_HINT: &str = "Local/private network access is blocked by the SSRF guard. For your own local services, start Obscura with --allow-private-network or set OBSCURA_ALLOW_PRIVATE_NETWORK=1.";
 
@@ -19,12 +19,20 @@ pub fn private_network_error_hint(mut error: &str) -> Option<&'static str> {
         return (domain == "localhost" || domain.ends_with(".localhost"))
             .then_some(PRIVATE_NETWORK_HINT);
     }
-    let address = error
+    let address = if let Some(address) = error
         .strip_prefix("Access to private/internal IP address ")
-        .or_else(|| error.strip_prefix("Access to private/internal IPv6 address "))?
-        .strip_suffix(" is not allowed")?
-        .parse::<IpAddr>()
-        .ok()?;
+        .or_else(|| error.strip_prefix("Access to private/internal IPv6 address "))
+    {
+        address.strip_suffix(" is not allowed")?.parse::<IpAddr>().ok()?
+    } else if let Some((_, cause)) = error.rsplit_once("SSRF blocked: '") {
+        // The resolver's denial is the terminal transport cause. Classify its
+        // actual address, not the request URL or the originally supplied host.
+        let (_, address) = cause.split_once("' resolves to forbidden address ")?;
+        address.parse::<IpAddr>().ok()?
+    } else {
+        error.strip_prefix("Request blocked: SSRF blocked proxied destination ")?
+            .parse::<SocketAddr>().ok()?.ip()
+    };
     let local = match address {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
         IpAddr::V6(ip) => {

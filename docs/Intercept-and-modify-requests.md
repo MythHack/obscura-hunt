@@ -1,124 +1,99 @@
-CDP `Fetch.enable` lets you inspect, block, or modify every request the page makes.
+# Intercept and modify requests
 
-## Block by resource type
+CDP `Fetch.enable` pauses matching requests **before native I/O**. Continue,
+rewrite, Fulfill and Fail use the selected transport and its network policy.
+Fulfill accepts base64-encoded bytes; it does not send a request to the target.
+Rewritten URLs and redirects still pass the address and file-access checks.
+
+Authentication-challenge and response-stage interception are not implemented
+and are explicitly rejected. Some Puppeteer and Playwright versions enable
+`handleAuthRequests` automatically in `page.setRequestInterception()` or
+`page.route()`. Use their public CDP session API for the supported request-stage
+interception instead of enabling an unsupported mode.
+
+## Open a CDP session
 
 Puppeteer:
 
 ```js
-await page.setRequestInterception(true);
-
-page.on('request', req => {
-  if (['image', 'media', 'font'].includes(req.resourceType())) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
+const client = await page.createCDPSession();
 ```
 
 Playwright:
 
 ```js
-await page.route('**/*', route => {
-  if (['image', 'media', 'font'].includes(route.request().resourceType())) {
-    route.abort();
+const client = await context.newCDPSession(page);
+```
+
+Install one request handler below, then enable interception before navigation:
+
+```js
+await client.send('Fetch.enable', {
+  patterns: [{ urlPattern: '*', requestStage: 'Request' }],
+});
+```
+
+## Block resources
+
+```js
+client.on('Fetch.requestPaused', async ({ requestId, resourceType }) => {
+  if (['Image', 'Media', 'Font'].includes(resourceType)) {
+    await client.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
   } else {
-    route.continue();
+    await client.send('Fetch.continueRequest', { requestId });
   }
 });
 ```
 
-## Block by URL pattern
-
-```js
-// Puppeteer
-page.on('request', req => {
-  const url = req.url();
-  if (url.includes('google-analytics.com') || url.includes('doubleclick.net')) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
-```
-
-```js
-// Playwright
-await page.route(/google-analytics\.com|doubleclick\.net/, route => route.abort());
-```
+For URL selection, supply `urlPattern` in `Fetch.enable`, or inspect
+`event.request.url` in the handler. Only selected requests pause.
 
 ## Modify headers
 
 ```js
-// Puppeteer
-page.on('request', req => {
-  req.continue({
-    headers: { ...req.headers(), 'X-Custom': 'value' },
-  });
+client.on('Fetch.requestPaused', async ({ requestId, request }) => {
+  const headers = Object.entries({ ...request.headers, 'X-Custom': 'value' })
+    .map(([name, value]) => ({ name, value: String(value) }));
+  await client.send('Fetch.continueRequest', { requestId, headers });
 });
 ```
 
-```js
-// Playwright
-await page.route('**/*', route => {
-  route.continue({
-    headers: { ...route.request().headers(), 'X-Custom': 'value' },
-  });
-});
-```
+A continuation may also supply `url`, `method` and base64 `postData`. Omitted
+fields preserve the actual request rather than replacing its method or body.
 
-## Return a fake response
+## Fulfill a local response
 
 ```js
-// Puppeteer
-page.on('request', req => {
-  if (req.url().endsWith('/api/feature-flags')) {
-    req.respond({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ newDashboard: true }),
+client.on('Fetch.requestPaused', async ({ requestId, request }) => {
+  if (new URL(request.url).pathname === '/api/feature-flags') {
+    await client.send('Fetch.fulfillRequest', {
+      requestId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/json' }],
+      body: Buffer.from(JSON.stringify({ newDashboard: true })).toString('base64'),
     });
   } else {
-    req.continue();
+    await client.send('Fetch.continueRequest', { requestId });
   }
 });
 ```
 
-```js
-// Playwright
-await page.route('**/api/feature-flags', route => {
-  route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({ newDashboard: true }),
-  });
-});
-```
+## Release interception
 
-## Strip analytics in production scrapes
+Resolve each paused request once. The native pause deadline is 30 seconds;
+an unanswered pause fails without sending to the target. Disabling Fetch,
+detaching the owning session or cancelling the document also releases pending
+work. A CDP evaluation awaiting that failure needs a longer command timeout
+than the pause itself.
 
 ```js
-const BLOCK = [
-  'google-analytics.com',
-  'googletagmanager.com',
-  'doubleclick.net',
-  'facebook.net',
-  'segment.io',
-  'mixpanel.com',
-  'hotjar.com',
-];
-
-page.on('request', req => {
-  if (BLOCK.some(host => req.url().includes(host))) {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
+await client.send('Fetch.disable');
+await client.detach();
 ```
-
-Built-in: `--stealth` ships with a tracker blocklist that handles most of these without per-script setup. See [Configure stealth and proxies](Configure-stealth-and-proxies.md).
 
 ## From the Rust library
 
-The patterns above drive interception over CDP from Puppeteer or Playwright. If you embed the engine with the `obscura` crate, the same capability is a native API on `Page`: `on_request` / `on_response` callbacks, an `enable_interception()` channel that can block, mock, or rewrite requests, and `add_preload_script` to run code before the page's own scripts. See [Use as a Rust library](Use-as-a-Rust-library.md#intercept-requests).
+The embeddable `obscura::Page` exposes `on_request` / `on_response`, an
+`enable_interception()` channel, and `add_preload_script`. It uses the same
+native request decisions and byte-preserving responses. See
+[Use as a Rust library](Use-as-a-Rust-library.md#intercept-requests).

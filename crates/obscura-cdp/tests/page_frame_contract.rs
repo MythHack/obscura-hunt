@@ -118,6 +118,8 @@ async fn redirected_document_response_is_bound_to_the_committed_loader() {
     let page_id = ctx.create_page();
     let session_id = format!("{page_id}-session");
     ctx.sessions.insert(session_id.clone(), page_id);
+    cdp(&mut ctx, 900, "Page.enable", json!({}), Some(&session_id)).await;
+    cdp(&mut ctx, 901, "Network.enable", json!({}), Some(&session_id)).await;
     let base = serve().await;
     for path in ["child.html", "redirect.html", "redirect-chain.html"] {
         ctx.pending_events.clear();
@@ -170,6 +172,7 @@ async fn every_page_frame_path_uses_the_current_cdp_contract() {
     )
     .await;
     let session_id = attached["sessionId"].as_str().unwrap().to_string();
+    cdp(&mut ctx, 900, "Page.enable", json!({}), Some(&session_id)).await;
 
     let initial_tree = cdp(
         &mut ctx,

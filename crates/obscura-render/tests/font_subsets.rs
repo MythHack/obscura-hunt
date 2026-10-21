@@ -46,7 +46,15 @@ fn a_subset_becomes_required_when_document_text_changes() {
     let tree = parse_html(r#"<style>
         @font-face {font-family:Fixture;src:url(latin.ttf);unicode-range:U+20-7E}
         @font-face {font-family:Fixture;src:url(cyrillic.ttf);unicode-range:U+04??}
-        </style><span id="sample" style="font:40px Fixture">Latin</span>"#);
+        @font-face {font-family:Fixture;src:url(unused-bold.ttf);font-weight:700}
+        @font-face {font-family:Fixture;src:url(unused-italic.ttf);font-style:italic}
+        @font-face {font-family:Unused;src:url(unused-family.ttf)}
+        @media(min-width:1000px) {
+            @font-face {font-family:Fixture;src:url(unused-media.ttf)}
+        }
+        </style><span id="sample" style="font:40px Fixture">Latin</span>
+        <span style="display:none;font-family:Unused">Hidden</span>
+        <span style="font-family:monospace,Unused">Local fallback</span>"#);
     let requests = Rc::new(RefCell::new(Vec::new()));
     let seen = requests.clone();
     let mut resources = RenderResourceCache::with_loader(move |url: &str| {

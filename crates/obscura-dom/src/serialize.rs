@@ -14,12 +14,16 @@ enum SerializeWork {
 
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
+        if self.is_xml_node(node_id) { return self.serialize_xml(node_id); }
         let mut buf = String::new();
         self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
+        if self.is_xml_node(node_id) {
+            return self.children(node_id).into_iter().map(|child| self.serialize_xml(child)).collect();
+        }
         let mut buf = String::new();
         self.serialize_worklist(self.child_work(self.content_source(node_id)), &mut buf);
         buf
@@ -172,6 +176,143 @@ impl DomTree {
                     buf.push('>');
                 }
             }
+        }
+    }
+}
+
+enum XmlWork {
+    Node(NodeId),
+    Close(String, usize),
+}
+
+fn xml_binding<'a>(bindings: &'a [(String, String)], prefix: &str) -> Option<&'a str> {
+    bindings.iter().rev().find(|(p, _)| p == prefix).map(|(_, uri)| uri.as_str())
+}
+
+fn xml_declare(bindings: &mut Vec<(String, String)>, declarations: &mut Vec<(String, String)>, prefix: &str, uri: &str) {
+    if xml_binding(bindings, prefix).unwrap_or("") == uri { return; }
+    if let Some((_, value)) = declarations.iter_mut().find(|(p, _)| p == prefix) { *value = uri.into(); }
+    else { declarations.push((prefix.into(), uri.into())); }
+    bindings.push((prefix.into(), uri.into()));
+}
+
+impl DomTree {
+    /// XML serialization is namespace-aware even for a node imported from HTML.
+    /// Scope restoration and node traversal use a bounded explicit work stack.
+    pub fn serialize_xml(&self, root: NodeId) -> String {
+        let mut output = String::new();
+        let mut bindings = vec![("xml".into(), "http://www.w3.org/XML/1998/namespace".into())];
+        let mut stack = vec![XmlWork::Node(root)];
+        let mut steps = self.node_slot_count().saturating_mul(2).saturating_add(1);
+        let mut generated = 0usize;
+        while let Some(work) = stack.pop() {
+            if steps == 0 {
+                eprintln!("obscura: XML serialize worklist cap hit - tree has a cycle");
+                break;
+            }
+            steps -= 1;
+            let id = match work {
+                XmlWork::Close(name, scope) => {
+                    output.push_str("</"); output.push_str(&name); output.push('>');
+                    bindings.truncate(scope);
+                    continue;
+                }
+                XmlWork::Node(id) => id,
+            };
+            let Some(node) = self.borrow_node(id) else { continue };
+            match &node.data {
+                NodeData::Document => {
+                    for child in self.children(id).into_iter().rev() { stack.push(XmlWork::Node(child)); }
+                }
+                NodeData::Element { name, attrs, .. } => {
+                    let scope = bindings.len();
+                    let mut declarations = Vec::new();
+                    for attr in attrs.iter().filter(|attr| &*attr.name.ns == "http://www.w3.org/2000/xmlns/") {
+                        let prefix = if attr.name.prefix.is_some() { &*attr.name.local } else { "" };
+                        if prefix != "xml" { xml_declare(&mut bindings, &mut declarations, prefix, &attr.value); }
+                    }
+                    let prefix = name.prefix.as_ref().map_or("", |prefix| &**prefix);
+                    xml_declare(&mut bindings, &mut declarations, prefix, &name.ns);
+                    let tag = if prefix.is_empty() { name.local.to_string() } else { format!("{}:{}", prefix, name.local) };
+                    let mut attributes = Vec::with_capacity(attrs.len());
+                    for attr in attrs.iter().filter(|attr| &*attr.name.ns != "http://www.w3.org/2000/xmlns/") {
+                        let mut prefix = attr.name.prefix.as_ref().map_or_else(String::new, |prefix| prefix.to_string());
+                        if !attr.name.ns.is_empty() {
+                            if prefix.is_empty() || xml_binding(&bindings, &prefix).is_some_and(|uri| uri != &*attr.name.ns) {
+                                if let Some((existing, _)) = bindings.iter().rev().find(|(p, uri)| !p.is_empty() && uri == &*attr.name.ns) {
+                                    prefix = existing.clone();
+                                } else {
+                                    loop {
+                                        generated += 1;
+                                        prefix = format!("ns{}", generated);
+                                        if xml_binding(&bindings, &prefix).is_none() { break; }
+                                    }
+                                }
+                            }
+                            xml_declare(&mut bindings, &mut declarations, &prefix, &attr.name.ns);
+                        }
+                        let qualified = if prefix.is_empty() { attr.name.local.to_string() } else { format!("{}:{}", prefix, attr.name.local) };
+                        attributes.push((qualified, attr.value.as_str()));
+                    }
+                    output.push('<'); output.push_str(&tag);
+                    for (prefix, uri) in declarations {
+                        output.push_str(" xmlns");
+                        if !prefix.is_empty() { output.push(':'); output.push_str(&prefix); }
+                        output.push_str("=\""); escape_xml_attr(&uri, &mut output); output.push('"');
+                    }
+                    for (name, value) in attributes {
+                        output.push(' '); output.push_str(&name); output.push_str("=\"");
+                        escape_xml_attr(value, &mut output); output.push('"');
+                    }
+                    let children = self.children(id);
+                    if children.is_empty() {
+                        output.push_str("/>"); bindings.truncate(scope);
+                    } else {
+                        output.push('>'); stack.push(XmlWork::Close(tag, scope));
+                        for child in children.into_iter().rev() { stack.push(XmlWork::Node(child)); }
+                    }
+                }
+                NodeData::Text { contents } => {
+                    if self.is_cdata(id) {
+                        // XMLSerializer uses the non-well-formed serialization mode.
+                        output.push_str("<![CDATA["); output.push_str(contents); output.push_str("]]>");
+                    } else {
+                        for part in contents.split_inclusive('\r') {
+                            if let Some(text) = part.strip_suffix('\r') { escape_text(text, &mut output); output.push_str("&#13;"); }
+                            else { escape_text(part, &mut output); }
+                        }
+                    }
+                }
+                NodeData::Comment { contents } => {
+                    output.push_str("<!--"); output.push_str(contents); output.push_str("-->");
+                }
+                NodeData::ProcessingInstruction { target, data } => {
+                    output.push_str("<?"); output.push_str(target);
+                    if !data.is_empty() { output.push(' '); output.push_str(data); }
+                    output.push_str("?>");
+                }
+                NodeData::Doctype { name, public_id, system_id } => {
+                    output.push_str("<!DOCTYPE "); output.push_str(name);
+                    if !public_id.is_empty() { output.push_str(" PUBLIC \""); output.push_str(public_id); output.push('"'); }
+                    if !system_id.is_empty() {
+                        output.push_str(if public_id.is_empty() { " SYSTEM \"" } else { " \"" });
+                        output.push_str(system_id); output.push('"');
+                    }
+                    output.push('>');
+                }
+            }
+        }
+        output
+    }
+}
+
+fn escape_xml_attr(value: &str, output: &mut String) {
+    for c in value.chars() {
+        match c {
+            '&' => output.push_str("&amp;"), '<' => output.push_str("&lt;"),
+            '"' => output.push_str("&quot;"), '\t' => output.push_str("&#9;"),
+            '\n' => output.push_str("&#10;"), '\r' => output.push_str("&#13;"),
+            c => output.push(c),
         }
     }
 }

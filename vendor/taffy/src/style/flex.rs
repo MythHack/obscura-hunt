@@ -4,6 +4,11 @@ use crate::geometry::Size;
 
 /// The set of styles required for a Flexbox container
 pub trait FlexboxContainerStyle: CoreStyle {
+    /// Whether this row represents CSS inline content rather than a flex container.
+    #[inline(always)]
+    fn inline_line(&self) -> bool {
+        false
+    }
     /// Which direction does the main axis flow in?
     #[inline(always)]
     fn flex_direction(&self) -> FlexDirection {

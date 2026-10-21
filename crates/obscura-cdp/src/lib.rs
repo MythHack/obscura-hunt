@@ -4,6 +4,7 @@ pub mod types;
 pub mod domains;
 pub mod cookie_params;
 pub(crate) mod util;
+pub(crate) mod browser_registry;
 
 pub use server::{
     start, start_with_full_options, start_with_full_serve_options, start_with_host,

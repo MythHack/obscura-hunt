@@ -26,6 +26,8 @@ pub use config::BrowserConfig;
 pub use cookie::{Cookie, CookieStore};
 pub use error::Error;
 pub use page::Page;
+pub use obscura_browser::regional;
+pub use obscura_js::geolocation;
 
 // Request/response interception types (issue #306).
 pub use obscura_browser::{InterceptedRequest, InterceptResolution};

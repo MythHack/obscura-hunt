@@ -8,7 +8,7 @@ obscura serve --port 9222
 ```
 
 ```
-obscura listening on ws://127.0.0.1:9222
+obscura listening on ws://127.0.0.1:9222/devtools/browser
 ```
 
 ## Puppeteer
@@ -21,7 +21,7 @@ npm install puppeteer-core
 const puppeteer = require('puppeteer-core');
 
 const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222',
+  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser',
 });
 
 const page = await browser.newPage();
@@ -42,7 +42,7 @@ npm install playwright
 ```js
 const { chromium } = require('playwright');
 
-const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
+const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222/devtools/browser');
 const context = browser.contexts()[0] || await browser.newContext();
 const page = await context.newPage();
 
@@ -53,6 +53,18 @@ await browser.close();
 ```
 
 Use `connectOverCDP`, not `connect`. Playwright's `connect` speaks Playwright's own protocol, which obscura does not implement.
+
+`Network.setUserAgentOverride` updates the page's selected native transport as
+well as its JavaScript identity, including builds using the `stealth` feature.
+MCP's configured `--user-agent` is inherited from its browser context by new
+tabs and Workers. Worker creation inspects the validated creator's own realm;
+same-origin and Content Security Policy checks still apply.
+
+On an attached page session, `Target.getTargetInfo` without `targetId` returns
+that page and its real browser context. On the browser session it returns the
+browser target, which has no `browserContextId`.
+`DOM.getDocument` also activates a fresh `about:blank` target's existing native
+document before publishing its generation-scoped nodes; no navigation is needed.
 
 ## `waitUntil`
 
@@ -76,11 +88,11 @@ await page.goto('https://example.com', { waitUntil: 'load' });
 - `page.click`, `page.type`, `page.fill`, `page.focus`
 - `page.waitForSelector`, `page.waitForFunction`, `page.waitForNavigation`
 - `page.cookies`, `page.setCookie`, `context.cookies`
-- `page.setRequestInterception`, block / modify
+- Public CDP session request-stage `Fetch` interception: block, rewrite and fulfill
 - `page.exposeFunction`
 - `page.content`, `page.title`, `page.url`
 - `page.screenshot` for viewport, clipped, and full-page capture
-- `page.pdf` for raster-backed print output
+- `page.pdf` for text/vector print output with embedded subset fonts and images
 - raw CDP `Page.startScreencast` with frame acknowledgements (`page.createCDPSession()`
   in Puppeteer; `context.newCDPSession(page)` in Playwright)
 
@@ -99,6 +111,26 @@ Rendering is included in official binaries and requires `--features render`
 for source builds. The client-specific guides cover scrolling, raw CDP
 screencasting, and current output limits.
 
+## Raw CDP auto-attachment and debugger admission
+
+`Target.setAutoAttach` attaches existing related page targets and subscribes to
+new targets without moving their native pages between owner threads. Browser
+subscriptions see page targets; page-session subscriptions see native popups
+opened by that page.
+
+With `waitForDebuggerOnStart: true`, a newly attached target reports
+`waitingForDebugger: true`. Its initial native document navigation stays queued
+until the owning attached session sends `Runtime.runIfWaitingForDebugger`.
+Existing, already-running targets attach with `waitingForDebugger: false`.
+
+Debugger admission belongs to the attachment, not to the WebSocket or the
+target's other sessions. Resuming a different session does not release it;
+multiple waiting attachments must each release their own wait. Detaching the
+attachment, disabling its parent's auto-attachment, or disconnecting its client
+releases that attachment's wait without closing the target or discarding the
+committed document. `Runtime.runIfWaitingForDebugger` is routed to the native
+owner, rather than answered by a transport-only acknowledgement.
+
 ## Raw CDP node queries
 
 `DOM.getAttributes`, `DOM.requestNode`, `DOM.requestChildNodes`, and
@@ -113,17 +145,21 @@ object handles from the main frame's default or isolated worlds. Forged `_nid`
 objects and handles to child-frame or detached nodes cannot publish nodes into
 the requested main light-DOM document.
 
-Live mutation events are not implemented yet. Request the document again to
-publish newly inserted children of an already-published parent. `requestChildNodes` accepts
-`pierce: true` on plain light-DOM subtrees, but rejects requests that would
-require frame or shadow-tree traversal. Detached-node publication and
-`ignorePointerEventsNone: true` hit testing are not supported. The remaining work is tracked in
-[#1291](https://github.com/h4ckf0r0day/obscura/issues/1291).
+Published light-DOM children emit insertion and removal events. Removed frontend
+node IDs are retired without destroying retained JavaScript objects or backend
+identity. Navigation still invalidates the old document's IDs. `requestChildNodes`
+accepts `pierce: true` on plain light-DOM subtrees, but rejects requests requiring
+unsupported frame or shadow-tree traversal. Detached-node publication and
+`ignorePointerEventsNone: true` hit testing remain unsupported.
 
 ## Current limits
 
 - Pages share one V8 isolate. CPU-bound JavaScript on one page can delay others.
-- PDF output is raster-backed; text is not selectable and tagged PDF,
+- Authentication-challenge interception is unsupported. Client versions that
+  automatically enable it in `page.route()` or `page.setRequestInterception()`
+  must use the public CDP session request-stage examples in
+  [Intercept and modify requests](Intercept-and-modify-requests.md).
+- PDF uses shaped text, subset fonts, vector paint and images; tagged PDF,
   headers/footers, outlines, and full CSS paged media are not implemented.
 - Service workers, native media playback, some Web APIs, and long-tail CSS or
   compositor effects are still incomplete relative to Chromium.

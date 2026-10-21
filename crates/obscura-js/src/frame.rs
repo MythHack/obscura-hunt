@@ -156,6 +156,9 @@ impl FrameRealm {
         state.referrer = creator_referrer;
         parent.share_resources_with(&mut state);
         state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
+        if !inherits_creator { state.content_security_policy = realms.borrow().frame_content_security_policy(frame_id); }
+        crate::websocket::capture_meta_policy(&mut state);
+        state.geolocation_policy = realms.borrow().frame_geolocation_policy(frame_id);
 
         let state = Rc::new(std::cell::RefCell::new(state));
         let modules = parent.attach_document_module_realm(&context, &state);
@@ -273,6 +276,9 @@ impl FrameRealm {
         state.referrer = referrer;
         parent.share_resources_with(&mut state);
         state.referrer_policy = realms.borrow().frame_referrer_policy(frame_id).unwrap_or_default();
+        if !inherits_creator { state.content_security_policy = realms.borrow().frame_content_security_policy(frame_id); }
+        crate::websocket::capture_meta_policy(&mut state);
+        state.geolocation_policy = realms.borrow().frame_geolocation_policy(frame_id);
         let state = Rc::new(std::cell::RefCell::new(state));
 
         realms.borrow_mut().retire_frame_realm(&self.context, frame_id);

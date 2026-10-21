@@ -1,0 +1,3550 @@
+{
+  "baseline": "208608215a42f2c392b13ccce62f433a4441155a",
+  "rootUnits": [
+    {
+      "id": "RC-01",
+      "group": 1,
+      "title": "请求身份与元数据",
+      "capability": "network-request-contracts",
+      "issues": [
+        1292,
+        1278,
+        481,
+        777
+      ],
+      "files": [
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-cli/src/main.rs",
+        "crates/obscura-browser/src/context.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-browser/src/profiles.rs",
+        "crates/obscura-cdp/src/domains/network.rs",
+        "crates/obscura-cdp/src/domains/emulation.rs"
+      ],
+      "root": "请求模式、来源与显式 UA/platform/language 在构造和传播时丢失；统一同一请求的可观察身份，不把 same-origin 改写成 cors。",
+      "primaryTask": "1.1",
+      "consumers": [
+        "CLI fetch/serve/scrape/mcp 与工作进程的身份配置、普通/stealth 原生请求、两个 CDP UA override 命令及既有/新建文档、world/frame/popup 的 navigator。"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-01 请求身份与元数据",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-02",
+      "group": 1,
+      "title": "原生传输选择",
+      "capability": "network-request-contracts",
+      "issues": [
+        977
+      ],
+      "files": [
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs"
+      ],
+      "root": "脚本、表单和 OPTIONS 绕过已选传输；在发送前选择拥有页面策略的现有客户端，保留 CORS、重定向和非重放语义。",
+      "primaryTask": "1.1",
+      "consumers": [
+        "经典脚本、原生表单（含空体 POST/重定向）、JS OPTIONS 预检；保留现有导航、模块、render 资源的所选客户端。"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-04"
+      ],
+      "requirement": "RC-02 原生传输选择",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-03",
+      "group": 1,
+      "title": "请求前拦截与字节保真",
+      "capability": "network-request-contracts",
+      "issues": [
+        643,
+        569,
+        716
+      ],
+      "files": [
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-cdp/src/domains/page.rs",
+        "crates/obscura-cdp/src/domains/fetch.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/runtime.rs"
+      ],
+      "root": "暂停事件晚于 I/O、重写/二进制转换分叉；所有生产请求在发送前受 Continue/Fail/Fulfill 决策，统一字节所有权并迁移所有调用者。",
+      "primaryTask": "1.1",
+      "consumers": [
+        "公共 Page interception、CDP Fetch/Puppeteer、根/子文档、表单、classic/module、CSS/@import、图像/font、fetch/XHR；原始字节的发送/响应消费者。"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-02",
+        "RC-04"
+      ],
+      "requirement": "RC-03 请求前拦截与字节保真",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-04",
+      "group": 1,
+      "title": "文件与地址访问权限",
+      "capability": "network-request-contracts",
+      "issues": [
+        857,
+        856
+      ],
+      "files": [
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs",
+        "crates/obscura-ssrf/src/lib.rs",
+        "crates/obscura-browser/src/context.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-cli/src/main.rs",
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-cdp/src/domains/page.rs",
+        "crates/obscura-cdp/src/domains/target.rs"
+      ],
+      "root": "底层文件读缺少自身授权、内网仅布尔开关；复用共享 deny-set，在文件元数据读取前及 URL/DNS/redirect 上执行明确权限。",
+      "primaryTask": "1.1",
+      "consumers": [
+        "普通/stealth 底层文件与网络加载、BrowserContext/Page、CLI/env CIDR、CDP 导航/target、DNS 结果与每跳 redirect 的发送边界。"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-04 文件与地址访问权限",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-05",
+      "group": 2,
+      "title": "证书链缺失恢复",
+      "capability": "network-request-contracts",
+      "issues": [
+        1216
+      ],
+      "files": [
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs",
+        "crates/obscura-js/src/ops.rs"
+      ],
+      "root": "可用中间证书缺失不能变成放弃证书验证；仅受限补链并重新完整验证，不发送验证关闭的应用请求。",
+      "primaryTask": "2.1",
+      "consumers": [
+        "普通/stealth 导航、脚本 fetch、需 TLS 的 OPTIONS；既有 CA、TLS persona、显式/环境代理和 CONNECT；真实应用请求与受限 AIA 证书获取。"
+      ],
+      "dependsOn": [
+        "RC-02",
+        "RC-04"
+      ],
+      "requirement": "RC-05 证书链缺失恢复",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-06",
+      "group": 3,
+      "title": "控制面路由与敏感产物边界",
+      "capability": "cdp-browser-lifecycle",
+      "issues": [
+        855
+      ],
+      "files": [
+        "crates/obscura-cdp/src/server.rs",
+        ".gitignore",
+        "build.log"
+      ],
+      "root": "请求头全文子串路由混淆请求目标；严格解析请求行和支持的路径；敏感构建日志不作为公开交付。Cookie 权限/持久化子项由 RC-26 联合完成。",
+      "primaryTask": "3.1",
+      "consumers": [
+        "CDP discovery HTTP、页面与浏览器 WebSocket、控制面 Host/Origin/auth/bind 拒绝；公开源码/Release 归档清单；#855 的 Cookie 子项由 RC-26 联合承接。"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-06 控制面路由与敏感产物边界",
+      "specPath": "specs/cdp-browser-lifecycle/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-07",
+      "group": 1,
+      "title": "网络事件与响应来源",
+      "capability": "cdp-browser-lifecycle",
+      "issues": [
+        1246,
+        1124
+      ],
+      "files": [
+        "crates/obscura-cdp/src/domains/network.rs",
+        "crates/obscura-cdp/src/domains/page.rs",
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs"
+      ],
+      "root": "真实请求/重定向方法、headers/body 与 CDP 序列化脱节；事件在请求发生时关联真实发送及最终响应，不伪造 GET 或等待无关 timer。",
+      "primaryTask": "1.1",
+      "consumers": [
+        "普通/stealth 真正发送请求、CDP request/ExtraInfo/response/loading、原始 WebSocket 及时事件、Playwright 最终导航 Response 与双会话订阅。"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-08"
+      ],
+      "requirement": "RC-07 网络事件与响应来源",
+      "specPath": "specs/cdp-browser-lifecycle/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-08",
+      "group": 3,
+      "title": "浏览器目标与会话所有权",
+      "capability": "cdp-browser-lifecycle",
+      "issues": [
+        543,
+        570,
+        680
+      ],
+      "files": [
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-cdp/src/dispatch.rs",
+        "crates/obscura-cdp/src/domains/target.rs",
+        "crates/obscura-cdp/src/domains/network.rs",
+        "crates/obscura-cdp/src/domains/page.rs",
+        "crates/obscura-cdp/src/domains/runtime.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-browser/src/context.rs"
+      ],
+      "root": "目标被错误限制在连接内，端点未绑定页面，单会话 disable 删除共享响应；分离浏览器目标身份、owner-thread 路由和会话订阅。",
+      "primaryTask": "3.1",
+      "consumers": [
+        "HTTP discovery、跨连接 browser/page WebSocket、managed/flattened sessions、Puppeteer/Playwright；Page/lifecycle/Runtime/Network 订阅、响应体、frame、导航与关闭。"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-08 浏览器目标与会话所有权",
+      "specPath": "specs/cdp-browser-lifecycle/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-09",
+      "group": 3,
+      "title": "实时 DOM 发布",
+      "capability": "cdp-browser-lifecycle",
+      "issues": [
+        1291
+      ],
+      "files": [
+        "crates/obscura-cdp/src/domains/dom.rs",
+        "crates/obscura-cdp/src/dispatch.rs",
+        "crates/obscura-js/src/runtime.rs"
+      ],
+      "root": "查询快照未跟随已发布节点变动；在现有 scoped u64 节点和文档代次上发布真实 mutation，不回退原始 NodeId 或 JS 对象表。",
+      "primaryTask": "3.1",
+      "consumers": [
+        "已发布 DOM 的 raw CDP/chromedp 式 live tree、两个独立发布深度会话、主/隔离 world、现有四查询方法和 scoped node/object 验证。"
+      ],
+      "dependsOn": [
+        "RC-08"
+      ],
+      "requirement": "RC-09 实时 DOM 发布",
+      "specPath": "specs/cdp-browser-lifecycle/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-10",
+      "group": 4,
+      "title": "导航与等待取消边界",
+      "capability": "navigation-cancellation",
+      "issues": [
+        921
+      ],
+      "files": [
+        "crates/obscura-mcp/src/lib.rs",
+        "crates/obscura-mcp/src/http.rs",
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-cdp/src/domains/input.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-js/src/runtime.rs"
+      ],
+      "root": "可取消轮询包住不可丢失的导航提交，输入回复等待整个导航；分开任务推进/提交与短轮询，保留输入语义及硬 watchdog。",
+      "primaryTask": "4.1",
+      "consumers": [
+        "MCP stdio/HTTP 的 selector/text/function wait、根/子 frame 导航、CDP 键盘/鼠标真实输入与及时回复、stopLoading/close/新导航；V8/process 硬期限。"
+      ],
+      "dependsOn": [
+        "RC-08"
+      ],
+      "requirement": "RC-10 导航与等待取消边界",
+      "specPath": "specs/navigation-cancellation/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-11",
+      "group": 4,
+      "title": "Document 与脚本资源生命周期",
+      "capability": "dom-worker-resource-semantics",
+      "issues": [
+        1302,
+        1245,
+        1244
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-browser/src/page.rs"
+      ],
+      "root": "公开 document 可替换、frame javascript 导航与 preload 终态丢失；在拥有它的 Window/document/resource 状态机修复，不做站点包装。",
+      "primaryTask": "4.1",
+      "consumers": [
+        "各 Window 的公开 document 属性与导航重绑定",
+        "iframe 初始扫描/动态连接/src 变化",
+        "动态 preload as=style 等待者与 stylesheet 切换消费者",
+        "CLI/CDP 页面求值与自动化"
+      ],
+      "dependsOn": [
+        "RC-02",
+        "RC-03"
+      ],
+      "requirement": "RC-11 Document 与脚本资源生命周期",
+      "specPath": "specs/dom-worker-resource-semantics/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-12",
+      "group": 4,
+      "title": "Worker realm 与可转移消息",
+      "capability": "dom-worker-resource-semantics",
+      "issues": [
+        1247,
+        827
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/src/runtime.rs"
+      ],
+      "root": "Worker 作用域不是独立完整全局，importScripts 和 ports 丢失；原生隔离 realm 内有序导入、结构化克隆和所有权转移，保留来源校验。",
+      "primaryTask": "4.1",
+      "consumers": [
+        "Worker constructor 与独立 Worker 全局",
+        "classic importScripts 同步调用者",
+        "页面/Worker 双向 postMessage 与 MessageEvent.ports",
+        "MessageChannel 和 ArrayBuffer transferable",
+        "Worker 终止/页面文档取消"
+      ],
+      "dependsOn": [
+        "RC-14",
+        "RC-15"
+      ],
+      "requirement": "RC-12 Worker realm 与可转移消息",
+      "specPath": "specs/dom-worker-resource-semantics/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-13",
+      "group": 5,
+      "title": "XML 文档解析",
+      "capability": "dom-worker-resource-semantics",
+      "issues": [
+        883
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-dom/src/tree.rs",
+        "crates/obscura-dom/src/selector.rs",
+        "crates/obscura-dom/src/serialize.rs"
+      ],
+      "root": "XML MIME 被 HTML parser 消费；使用真实 XML 树、命名空间和文档所有权，移除伪 HTML 包装但保留 HTML 与 parsererror 语义。",
+      "primaryTask": "5.1",
+      "consumers": [
+        "DOMParser 四类 XML MIME 与既有 text/html",
+        "OData 根和 namespace 检查",
+        "XML DOM 查询/属性/修改/import/adopt",
+        "XMLSerializer 与再解析",
+        "parsererror 检测消费者"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-13 XML 文档解析",
+      "specPath": "specs/dom-worker-resource-semantics/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-14",
+      "group": 5,
+      "title": "流式文本解码",
+      "capability": "dom-worker-resource-semantics",
+      "issues": [],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-net/src/encoding.rs"
+      ],
+      "root": "跨 chunk 的编码状态丢失；按解码器实例保留不完整序列，覆盖 fatal/BOM/flush/reset，合法默认替换与 fatal 错误分别按标准。",
+      "primaryTask": "5.1",
+      "consumers": [
+        "TextDecoder UTF-8 与已支持显式编码",
+        "TextDecoderStream",
+        "Response/Blob 字节文本消费者",
+        "Worker 内的同类编码 API"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-14 流式文本解码",
+      "specPath": "specs/dom-worker-resource-semantics/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-15",
+      "group": 4,
+      "title": "本地 scheme 与同步 XHR",
+      "capability": "dom-worker-resource-semantics",
+      "issues": [
+        907,
+        908
+      ],
+      "files": [
+        "crates/obscura-js/src/module_loader.rs",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs"
+      ],
+      "root": "本地字节资源被当 HTTP、async=false 被忽略；在现有加载边界处理 bytes/MIME/revocation 和同步完成，所有 transport/权限保持一致。",
+      "primaryTask": "4.1",
+      "consumers": [
+        "fetch data/blob",
+        "classic/module script 与 dynamic import 本地模块",
+        "Blob Worker 与对象 URL 生命周期",
+        "同步/异步 XHR",
+        "既有请求拦截/代理/凭据/重定向与安全策略"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-14"
+      ],
+      "requirement": "RC-15 本地 scheme 与同步 XHR",
+      "specPath": "specs/dom-worker-resource-semantics/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-16",
+      "group": 6,
+      "title": "真实 WebSocket 客户端",
+      "capability": "websocket-client",
+      "issues": [
+        1038
+      ],
+      "files": [
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-net/src/lib.rs",
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs"
+      ],
+      "root": "页面制造 OPEN 并丢弃 send；连接状态由真实握手/帧驱动，代理/Origin/取消/二进制及错误都执行实际传输。",
+      "primaryTask": "6.1",
+      "consumers": [
+        "页面 WebSocket constructor/send/close",
+        "open/message/error/close 与 binaryType/bufferedAmount",
+        "真实 ws/wss 服务和 HTTP/SOCKS5 代理",
+        "页面网络权限与文档取消"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-02"
+      ],
+      "requirement": "RC-16 真实 WebSocket 客户端",
+      "specPath": "specs/websocket-client/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-17",
+      "group": 7,
+      "title": "完整公钥 WebCrypto",
+      "capability": "public-key-webcrypto",
+      "issues": [
+        1289,
+        1077
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-js/Cargo.toml"
+      ],
+      "root": "只支持对称算法；原生密钥与操作补齐七类公钥算法，保持 CryptoKey usages/extractable/格式/错误约束，不伪造密钥。",
+      "primaryTask": "7.1",
+      "consumers": [
+        "页面crypto.subtle的generate/import/export/encrypt/decrypt/sign/verify/deriveBits/deriveKey/wrap/unwrap全部适用入口及CryptoKey元数据和usage消费者。",
+        "已有CryptoKey structuredClone/postMessage和内存序列化消费者，包含非导出材料限制；不新增磁盘密钥存储。",
+        "CLI --eval、CDP Runtime.evaluate(awaitPromise)、真实页面DPoP请求准备和独立浏览器公钥互操作消费者。"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-17 完整公钥 WebCrypto",
+      "specPath": "specs/public-key-webcrypto/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-18",
+      "group": 8,
+      "title": "GeoIP 配置和权限一致性",
+      "capability": "regional-profile-permissions",
+      "issues": [
+        1284,
+        1207
+      ],
+      "files": [
+        "crates/obscura-cli/src/main.rs",
+        "crates/obscura-browser/src/context.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-browser/src/profiles.rs",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/js/windows.js",
+        "crates/obscura-net/src/client.rs",
+        "crates/obscura-net/src/wreq_client.rs",
+        "crates/obscura-cdp/src/domains/browser.rs",
+        "crates/obscura-cdp/src/domains/network.rs",
+        "crates/obscura-cdp/src/domains/emulation.rs",
+        "crates/obscura-mcp/src/lib.rs",
+        "crates/obscura-mcp/src/http.rs",
+        "crates/obscura/src/config.rs"
+      ],
+      "root": "区域字段各自设置且权限与位置脱节；自动有效出口或显式 IP 解析一次，稳定加权语言，传播真实 native Intl/permission/RTC 地址策略。",
+      "primaryTask": "8.1",
+      "consumers": [
+        "CLI fetch/serve及已有scrape worker区域配置、MCP stdio/HTTP和公开BrowserConfig入口。",
+        "BrowserContext/Page的初始请求身份、普通/stealth HTTP、fetch/XHR/module默认Accept-Language、各新document/frame/window及适用worker的navigator/native Intl/Date。",
+        "origin+browserContext权限状态、PermissionStatus、get/watch/clearWatch与Browser.grantPermissions/resetPermissions真实状态修改。",
+        "RTCPeerConnection/SDP/candidate事件/stats和真实ICE/datachannel传输，包括STUN、TURN、有效proxy路由与地址隐私策略。"
+      ],
+      "dependsOn": [
+        "RC-01",
+        "RC-02",
+        "RC-04",
+        "RC-08",
+        "RC-10",
+        "RC-12"
+      ],
+      "requirement": "RC-18 GeoIP 配置和权限一致性",
+      "specPath": "specs/regional-profile-permissions/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-19",
+      "group": 9,
+      "title": "选择器与 typed custom properties",
+      "capability": "render-css-input-contracts",
+      "issues": [
+        1295
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-dom/src/tree.rs",
+        "crates/obscura-dom/src/selector.rs",
+        "crates/obscura-render/src/style.rs"
+      ],
+      "root": "选择器状态和 typed property 注册未进入统一查询/级联；五项 Issue 中解码由 RC-14 联合完成，其余同步 DOM 查询与真实计算样式。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "querySelector/All、matches、closest",
+        "已编译 CSS 规则匹配与实时焦点/target 状态",
+        "CSS.registerProperty、var 引用、继承及计算样式",
+        "CLI/CDP 选择器与自动化消费者"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-19 选择器与 typed custom properties",
+      "specPath": "specs/render-css-input-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-20",
+      "group": 9,
+      "title": "原生激活与输入能力契约",
+      "capability": "render-css-input-contracts",
+      "issues": [
+        1294,
+        1096,
+        1101,
+        1086
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-cdp/src/domains/input.rs",
+        "crates/obscura-cdp/src/domains/emulation.rs",
+        "crates/obscura-cdp/src/server.rs",
+        "crates/obscura-render/src/paint.rs"
+      ],
+      "root": "脚本/native 默认激活分叉和成功 no-op；summary/range 使用浏览器取消/焦点/事件语义；未实现 touch/media 明确报错而非假成功。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "Element.click 与 CDP 真实鼠标/键盘",
+        "details.open 与 toggle 事件等待者",
+        "水平 range value/valueAsNumber、pointer/drag/key 默认行为及 native paint",
+        "CDP touch 能力请求",
+        "matchMedia/CSS 的已有媒体偏好与不支持参数处理"
+      ],
+      "dependsOn": [
+        "RC-21"
+      ],
+      "requirement": "RC-20 原生激活与输入能力契约",
+      "specPath": "specs/render-css-input-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-21",
+      "group": 9,
+      "title": "布局与盒几何保真",
+      "capability": "render-css-input-contracts",
+      "issues": [
+        1293,
+        933,
+        767,
+        764,
+        757,
+        737,
+        722
+      ],
+      "files": [
+        "crates/obscura-render/src/dom.rs",
+        "crates/obscura-render/src/inline.rs",
+        "crates/obscura-render/src/style.rs",
+        "crates/obscura-render/src/paint.rs"
+      ],
+      "root": "display/百分比/基线/inline owner 信息在早期布局分支丢失；修拥有边界，贯通 paint/rect/hit，不用固定尺寸或按站点特判。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "retained layout 与行内 text shaper",
+        "真实 DOM rect/client rect/visibility/offsetParent",
+        "native float/clearfix/table/intrinsic flex sizing",
+        "paint/screenshot 与 elementFromPoint/CDP coordinate hit"
+      ],
+      "dependsOn": [],
+      "requirement": "RC-21 布局与盒几何保真",
+      "specPath": "specs/render-css-input-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-22",
+      "group": 9,
+      "title": "UA 样式与 CSSOM 值",
+      "capability": "render-css-input-contracts",
+      "issues": [
+        936,
+        771
+      ],
+      "files": [
+        "crates/obscura-render/src/style.rs",
+        "crates/obscura-render/src/paint.rs",
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-render/src/dom.rs"
+      ],
+      "root": "UA 缺省和已建模属性未贯通真实 cascade/serialization；覆盖 picture/code 及完整文本元素默认值、smaller/larger 和计算值，不填无语义空默认。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "UA/作者级联与 inherited font size",
+        "文本装饰/引号/subsuper 的 paint 和 geometry",
+        "picture/anchor 百分比替换图像",
+        "getComputedStyle 属性/getPropertyValue、运行动画与 table display",
+        "outline computed 与 used paint 分离"
+      ],
+      "dependsOn": [
+        "RC-21"
+      ],
+      "requirement": "RC-22 UA 样式与 CSSOM 值",
+      "specPath": "specs/render-css-input-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-23",
+      "group": 9,
+      "title": "Canvas SVG 与字体度量",
+      "capability": "render-css-input-contracts",
+      "issues": [
+        1085,
+        1084,
+        1100,
+        1087
+      ],
+      "files": [
+        "crates/obscura-js/js/bootstrap.js",
+        "crates/obscura-js/src/ops.rs",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-render/src/dom.rs",
+        "crates/obscura-render/src/inline.rs",
+        "crates/obscura-render/src/paint.rs",
+        "crates/obscura-browser/src/page.rs"
+      ],
+      "root": "颜色/几何/字体与 fallback capture 使用不同真实数据；保留 live surfaces，真实 SVG 几何和同一 font shaper，补像素与几何反例。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "Canvas2D fill/stroke 的真实像素",
+        "prepared/region/ad-hoc screen 与 print fallback capture",
+        "SVGGeometryElement.getTotalLength 与 stroke-dash 页面代码",
+        "原生 auto-sized button 的固有测量、同字体绘制和命中"
+      ],
+      "dependsOn": [
+        "RC-21",
+        "RC-22"
+      ],
+      "requirement": "RC-23 Canvas SVG 与字体度量",
+      "specPath": "specs/render-css-input-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-24",
+      "group": 9,
+      "title": "级联选中资源的加载",
+      "capability": "network-request-contracts",
+      "issues": [
+        662
+      ],
+      "files": [
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-js/src/runtime.rs",
+        "crates/obscura-render/src/dom.rs",
+        "crates/obscura-render/src/css.rs",
+        "crates/obscura-render/src/style.rs",
+        "crates/obscura-render/src/lib.rs"
+      ],
+      "root": "原始 CSS 文本 URL 被无条件请求；从无网络副作用的有效级联生成真实所需资源集合，保留使用的图像/伪元素/font/native transport。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "导航资源 warmup、首/后续截图、动态样式/媒体改变、实际背景/pseudo/SVG/font；既有 page transport、代理、安全、Fetch 拦截与响应容量。"
+      ],
+      "dependsOn": [
+        "RC-02",
+        "RC-03",
+        "RC-04"
+      ],
+      "requirement": "RC-24 级联选中资源的加载",
+      "specPath": "specs/network-request-contracts/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-25",
+      "group": 9,
+      "title": "矢量和文字 PDF",
+      "capability": "document-export",
+      "issues": [
+        870
+      ],
+      "files": [
+        "crates/obscura-browser/src/pdf.rs",
+        "crates/obscura-browser/src/lib.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-cdp/src/domains/pdf.rs",
+        "crates/obscura-cdp/src/domains/page.rs",
+        "crates/obscura-mcp/src/lib.rs",
+        "crates/obscura-render/src/paint.rs",
+        "crates/obscura-render/src/inline.rs"
+      ],
+      "root": "PDF 把所有页面内容压为 JPEG，丢掉文本；从布局/绘制数据导出真实矢量和子集字体，不能把放大栅格当文字层。",
+      "primaryTask": "9.1",
+      "consumers": [
+        "嵌入式 Page PDF 导出与公开 options/error/range 导出",
+        "CDP Page.printToPDF base64/stream 及 IO.read/close",
+        "MCP browser_pdf application/pdf 资源",
+        "独立 PDF 阅读/字体/文本/对象解析工具",
+        "既有 print-media/分页/选页/固定内容与资源边界"
+      ],
+      "dependsOn": [
+        "RC-21",
+        "RC-22",
+        "RC-23",
+        "RC-24"
+      ],
+      "requirement": "RC-25 矢量和文字 PDF",
+      "specPath": "specs/document-export/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    },
+    {
+      "id": "RC-26",
+      "group": 10,
+      "title": "已有 profile 的耐久与权限",
+      "capability": "profile-persistence-boundaries",
+      "issues": [
+        629
+      ],
+      "files": [
+        "crates/obscura-browser/src/context.rs",
+        "crates/obscura-browser/src/page.rs",
+        "crates/obscura-net/src/cookies.rs",
+        "crates/obscura-cli/src/main.rs",
+        "crates/obscura-mcp/src/lib.rs",
+        "crates/obscura-mcp/src/http.rs",
+        "crates/obscura-cdp/src/server.rs"
+      ],
+      "root": "现有 cookie/localStorage 载入与提交边界不一致且失败不显式；按 navigation/clean shutdown 原子持久化并执行平台私有权限，不以此宣称 IndexedDB/CacheStorage 已持久化。",
+      "primaryTask": "10.1",
+      "consumers": [
+        "已有CLI fetch/serve profile、CDP导航/存储修改/关闭、MCP stdio EOF及HTTP正常关闭的profile载入和提交。",
+        "BrowserContext现有save_local_storage/save_cookies/save_storage及CookieJar文件存储；全部save_storage调用方和Page导航的save_local_storage边界。",
+        "CLI退出码/标准错误、MCP/CDP操作错误及HTTP/stdio关闭结果，平台实际文件权限与重启会话消费者。"
+      ],
+      "dependsOn": [
+        "RC-08",
+        "RC-10"
+      ],
+      "requirement": "RC-26 已有 profile 的耐久与权限",
+      "specPath": "specs/profile-persistence-boundaries/spec.md",
+      "implementationPolicy": "优先复用对应PR实现与有效测试；仅补本分支冲突及确有证据的遗漏。"
+    }
+  ],
+  "issueAssignments": [
+    {
+      "issue": 1302,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1302",
+      "title": "window.document is writable, unlike Chrome's non-configurable getter-only attribute",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-11",
+      "secondaryTasks": [],
+      "requirements": "Window.document getter-only/non-configurable descriptor and strict/sloppy assignment invariants",
+      "evidence": "Local CLI window-document.json; upstream issue1302."
+    },
+    {
+      "issue": 1295,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1295",
+      "title": "Missing CSS selectors and APIs: :nth-child(An+B of S), :focus-within, :target, CSS.registerProperty, streaming TextDecoder",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-19",
+      "secondaryTasks": [
+        "5.1"
+      ],
+      "requirements": "All five: nth-child(of selector), focus-within, target query/style matching, typed CSS.registerProperty, streaming UTF-8 TextDecoder",
+      "evidence": "Local selectors-decoder.json; upstream issue1295."
+    },
+    {
+      "issue": 1294,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1294",
+      "title": "Clicking <summary> does not toggle its <details>",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-20",
+      "secondaryTasks": [],
+      "requirements": "First-summary activation via script/CDP, cancellation, details.open, toggle event",
+      "evidence": "Local summary-activation.json; upstream issue1294 and PR1299."
+    },
+    {
+      "issue": 1293,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1293",
+      "title": "A display:none table row still has a box: non-zero getBoundingClientRect, checkVisibility() true",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "display:none tr zero rect, false visibility, null offsetParent and correct automation visibility",
+      "evidence": "Local hidden-table-row.json; upstream issue1293."
+    },
+    {
+      "issue": 1292,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1292",
+      "title": "fetch() and XMLHttpRequest send no Sec-Fetch-* headers",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-01",
+      "secondaryTasks": [],
+      "requirements": "Correct Fetch Metadata on fetch and XHR, including mode/site/destination and redirects",
+      "evidence": "Local network-top.json/network-subcommand.json; https://w3c.github.io/webappsec-fetch-metadata/"
+    },
+    {
+      "issue": 1291,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1291",
+      "title": "CDP DOM domain: requestNode, getNodeForLocation, requestChildNodes and getAttributes are unimplemented (breaks go-rod, ferrum, chromedp)",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "3.1",
+      "rootId": "RC-09",
+      "secondaryTasks": [],
+      "requirements": "Four DOM methods plus live childNodeInserted notifications after document retrieval",
+      "evidence": "Merge2086082 and docs/Testing-and-debugging.md upstream-sync-a754dce; issue1291 body."
+    },
+    {
+      "issue": 1289,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1289",
+      "title": "WebCrypto public-key algorithms (RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, ECDH, Ed25519): which backend?",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "7.1",
+      "rootId": "RC-17",
+      "secondaryTasks": [],
+      "requirements": "RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, ECDH, Ed25519, X25519, applicable generation/import/export/encrypt/decrypt/sign/verify/derive/wrap semantics",
+      "evidence": "Issue1289; Cargo.lock aws-lc-rs1.18.2; local public-key-crypto.json."
+    },
+    {
+      "issue": 1284,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1284",
+      "title": "add geoIP=true feature",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "8.1",
+      "rootId": "RC-18",
+      "secondaryTasks": [],
+      "requirements": "Automatic egress-IP or explicit-IP GeoIP; coordinates/timezone/country/locale; weighted regional language; coherent RTC address behavior",
+      "evidence": "Issue1284; source comparison agentGeoIPScope; CloakBrowser and Camoufox references."
+    },
+    {
+      "issue": 1283,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1283",
+      "title": "0.2.5: \"ReferenceError: cdApi is not defined\" logged 14x during login submit — uppopi SDK still never inserted",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Post-submit missing later SDK insertion and repeated cdApi errors; login/transactions still succeed",
+      "evidence": "Issue1283 body/comments.",
+      "investigationId": "INV-1283",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1278,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1278",
+      "title": "Top-level --user-agent is accepted but ignored (and scrape has no way to set a UA)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-01",
+      "secondaryTasks": [],
+      "requirements": "Top-level UA reaches HTTP and navigator consistently; include scrape and preserve override precedence",
+      "evidence": "Local network-top.json/network-subcommand.json; issue1278/PR1279."
+    },
+    {
+      "issue": 1247,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1247",
+      "title": "Worker global scope doesn't expose built-ins on self",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-12",
+      "secondaryTasks": [],
+      "requirements": "Worker built-ins reachable via self.Object/self.Uint8Array and membership checks, within correct worker realm",
+      "evidence": "Local worker-port-transfer.json; issue1247/PR1249."
+    },
+    {
+      "issue": 1246,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1246",
+      "title": "Network.requestWillBeSent has no request headers or post data",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-07",
+      "secondaryTasks": [],
+      "requirements": "Network.requestWillBeSent headers/postData, actual requestWillBeSentExtraInfo headers, prompt non-stealth emission, both transports",
+      "evidence": "Local network-cdp.json; issue1246/PR1250."
+    },
+    {
+      "issue": 1245,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1245",
+      "title": "<iframe src=\"javascript:...\"> is never run, the frame stays empty",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-11",
+      "secondaryTasks": [],
+      "requirements": "javascript iframe navigation executes in child Window, callsparent as allowed, string completion installs child document, does not become networkfetch",
+      "evidence": "Local javascript-iframe.json; issue1245/PR1251."
+    },
+    {
+      "issue": 1244,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1244",
+      "title": "<link rel=\"preload\"> never fires load or error",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-11",
+      "secondaryTasks": [],
+      "requirements": "Dynamic preload-as-style emits load/error and preserves stylesheet lifecycle, unblocking dependent application loading",
+      "evidence": "Local preload-event.json; issue1244/PR1248."
+    },
+    {
+      "issue": 1242,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1242",
+      "title": "CDP replies stall for up to 1.7 s after page load on script-heavy pages",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Eliminate measured postload CDP stalls/idle latency across awaitPromise modes without removing watchdogs",
+      "evidence": "Issue1242 body; no new latency measurements.",
+      "investigationId": "INV-1242",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1240,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1240",
+      "title": "Add an opt-in Parallel Search MCP example for web discovery and browsing",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Opt-in runnable third-party search-to-browser MCP client example, declared deps/validation, no engine search integration",
+      "evidence": "Issue1240 body/comments.",
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 1222,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1222",
+      "title": "Module scripts log 0 bytes and intermittently fail to execute, stranding SPAs on their boot splash",
+      "sourceStatus": "partial",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Accurate decoded module body sizes and CDP body lookup",
+        "Reliable initial and dynamic module execution with native transport and private-network policy preserved"
+      ],
+      "evidence": [
+        "crates/obscura-js/src/module_loader.rs:289-425",
+        "crates/obscura-cdp/tests/module_network_events.rs:110-178",
+        "https://github.com/h4ckf0r0day/obscura/pull/1226"
+      ],
+      "investigationId": "INV-1222",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1220,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1220",
+      "title": "failed to perform detect tests",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Windows render+stealth diagnostic pages finish their asynchronous checks; reported canvas/WebGL/font checks and screenshots become explainable."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1220",
+        "crates/obscura-js/js/bootstrap.js:17159-17165",
+        "docs/Configure-stealth-and-proxies.md:82"
+      ],
+      "investigationId": "INV-1220",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1216,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1216",
+      "title": "TLS: servers that omit an intermediate certificate fail to load",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "2.1",
+      "rootId": "RC-05",
+      "secondaryTasks": [],
+      "requirements": [
+        "Recover missing intermediates without making them trust anchors or disabling normal certificate validation",
+        "Bound AIA URL/DNS/redirect requests, size, timeout and cache; honor explicit proxy and private-network policy in both clients"
+      ],
+      "evidence": [
+        "crates/obscura-net/src/client.rs:19-78",
+        "crates/obscura-net/src/client.rs:1119-1150",
+        "crates/obscura-net/src/wreq_client.rs:215-280",
+        "https://github.com/h4ckf0r0day/obscura/pull/1217"
+      ]
+    },
+    {
+      "issue": 1207,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1207",
+      "title": "geolocation: getCurrentPosition() resolves with coordinates while the permission is still \"prompt\" (spoofing tell)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "8.1",
+      "rootId": "RC-18",
+      "secondaryTasks": [],
+      "requirements": [
+        "Coordinates must not be returned while the effective geolocation permission remains undecided/prompt or denied.",
+        "Keep getCurrentPosition/watchPosition, permissions.query and CDP grant/reset behavior consistent; configured coordinates are not themselves a permission grant.",
+        "Preserve configurable coordinate values separately from permission policy."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1207",
+        "https://github.com/h4ckf0r0day/obscura/pull/1228",
+        "crates/obscura-js/js/bootstrap.js:8602-8642",
+        "crates/obscura-cdp/src/domains/browser.rs:34-39",
+        "C:/Users/forxu/AppData/Local/Temp/obscura-upstream-triage-t9mxvoyg/geolocation-permission.json"
+      ]
+    },
+    {
+      "issue": 1157,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1157",
+      "title": "RFC: Persistent storage architecture (localStorage disk sync, ACID IndexedDB via redb, CacheStorage)",
+      "sourceStatus": "partial",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Origin-scoped localStorage disk persistence under --storage-dir with navigation/shutdown flushing.",
+        "Durable transactional IndexedDB including key ranges and cursor operations; RFC proposes pure-Rust redb.",
+        "Real persistent CacheStorage request/response headers and bodies."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1157",
+        "https://github.com/h4ckf0r0day/obscura/pull/1158",
+        "crates/obscura-browser/src/context.rs:77-109",
+        "crates/obscura-browser/src/context.rs:297-350",
+        "crates/obscura-browser/src/page.rs:4563-4565",
+        "docs/Persist-cookies-and-storage.md:84-110",
+        "crates/obscura-js/js/bootstrap.js:17373-17374"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 1155,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1155",
+      "title": "DOM mutations from JS are slow (3 to 9 us per call, mostly bridge and bootstrap overhead)",
+      "sourceStatus": "partial",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Reduce JS DOM mutation and scalar-read bridge overhead without changing mutation, observer, script, stylesheet or named-property semantics",
+        "Avoid eager style allocation and unnecessary insertion scans"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:805",
+        "crates/obscura-js/js/bootstrap.js:4159",
+        "crates/obscura-js/js/bootstrap.js:2799-2852",
+        "crates/obscura-js/js/bootstrap.js:11634-11722",
+        "https://github.com/h4ckf0r0day/obscura/pull/1156"
+      ],
+      "investigationId": "INV-1155",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1153,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1153",
+      "title": "text layout of large pages allocates far more than it keeps",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Additional optional performance scope: avoid cloning full LayoutStyle per word, trim shaped buffer spare capacity, release finalized shape glyphs while supporting reshape on demand; shaping-plan caching alone is insufficient.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:11050-11056",
+        "crates/obscura-render/src/inline.rs:2760-2854",
+        "https://github.com/h4ckf0r0day/obscura/pull/1154"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 1151,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1151",
+      "title": "page loads on real sites are network-bound by serial subresource fetching",
+      "sourceStatus": "partial",
+      "action": "investigation",
+      "primaryTask": "4.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Enable HTTP/2 for regular reqwest transport",
+        "Overlap stylesheet and script download phases",
+        "Run ready scripts without waiting for the slowest unrelated script"
+      ],
+      "evidence": [
+        "Cargo.toml:49",
+        "crates/obscura-browser/src/page.rs:3205-3235",
+        "crates/obscura-browser/src/page.rs:3410-3438",
+        "crates/obscura-browser/src/page.rs:4483-4562",
+        "https://github.com/h4ckf0r0day/obscura/pull/1152"
+      ],
+      "investigationId": "INV-1151",
+      "deliveryGate": "confirmed-local-divergence"
+    },
+    {
+      "issue": 1141,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1141",
+      "title": "DOM mutation, MutationObserver, Range and node documents differ from the DOM spec",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Validate Node arguments, document child constraints and pre-insertion exception order",
+        "Complete MutationRecord siblings/namespace, fragment batching, move removals, removeAttribute records and observer option validation",
+        "Implement Range delete/extract/clone/surround over actual DOM",
+        "Return real detached Documents and correct ownerDocument",
+        "Expose CSSMediaRule nested mutation and invalidate computed style",
+        "Return empty computed style for detached elements",
+        "Correct IO callback this, entry interface, thresholds and inline-block child geometry"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:2533-2678 argument and document validity",
+        "crates/obscura-js/js/bootstrap.js:2780-2896 removal/move/fragment records",
+        "crates/obscura-js/js/bootstrap.js:3000-3029 removeChild/insertBefore validation",
+        "crates/obscura-js/js/bootstrap.js:2509-2520 detached native Document construction; 7022-7045 document factories",
+        "crates/obscura-js/js/bootstrap.js:11220-11244 MutationRecord fields; 11303-11348 observer validation",
+        "crates/obscura-js/tests/platform_behavior.rs:629-718 ownership, mutation records and validity assertions; 783-805 actual Range mutation assertions (read, not executed)",
+        "crates/obscura-js/js/bootstrap.js:15635-15678 Range clone/extract/delete; 15702-15723 surround",
+        "crates/obscura-js/js/bootstrap.js:10685-10765 CSSGroupingRule/CSSMediaRule; 10888-10924 rule-change cache invalidation",
+        "crates/obscura-js/js/bootstrap.js:10450-10500 detached computed style",
+        "crates/obscura-js/js/bootstrap.js:11657-11664 IO callback receiver; 11796-11811 entry interface; 11919-11940 threshold-aware entry",
+        "crates/obscura-render/tests/layout_test.rs:2622-2643 inline-block stacking and whitespace fixture assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1142"
+      ]
+    },
+    {
+      "issue": 1124,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1124",
+      "title": "Native form POST navigations: missing response after redirect and events sent to an observer session",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-07",
+      "secondaryTasks": [],
+      "requirements": [
+        "Report loaded final Document URL and actual final HTTP method including redirect semantics",
+        "Route page-initiated navigation events deterministically to the owning client rather than an arbitrary observer"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:4420-4451",
+        "crates/obscura-cdp/src/server.rs:1820-1845",
+        "crates/obscura-cdp/src/domains/page.rs:919-976",
+        "https://github.com/h4ckf0r0day/obscura/pull/1118"
+      ]
+    },
+    {
+      "issue": 1103,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1103",
+      "title": "Track Playwright engine compatibility and performance verification",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Correct external IntersectionObserver obstacle fixture without changing engine semantics to satisfy it",
+        "Run paired deterministic Chromium render verification",
+        "Run matched successful Playwright workloads and report wall time, median/p95, peak process-tree memory, concurrency and success rate"
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1103",
+        "crates/obscura-cdp/src/domains/emulation.rs:160-169",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-js/src/runtime.rs:4735-4790",
+        "crates/obscura-cdp/src/domains/page.rs:1883-1950"
+      ],
+      "investigationId": "INV-1103",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1102,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1102",
+      "title": "getBoundingClientRect() returns a fixed placeholder box for every element except <html>/<body>",
+      "sourceStatus": "partial",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Expose actual element layout geometry rather than fixed synthetic100x20 dimensions",
+        "Distinguish missing CSS boxes from a build without a renderer"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:5743-5765",
+        "crates/obscura-js/js/bootstrap.js:5933-5976",
+        "crates/obscura-js/src/ops.rs:9077-9090",
+        "crates/obscura-js/src/frame.rs:829-844"
+      ],
+      "investigationId": "INV-1102",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1101,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1101",
+      "title": "CDP Emulation.setTouchEmulationEnabled is a no-op; Emulation.setEmulatedMedia not implemented",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-20",
+      "secondaryTasks": [],
+      "requirements": [
+        "Apply or explicitly reject touch capability emulation instead of false success",
+        "Apply supported media-feature overrides to JS/CSS and retain them across navigation",
+        "Avoid swallowing unsupported media overrides"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/emulation.rs:68-99",
+        "crates/obscura-cdp/src/domains/emulation.rs:171-174",
+        "crates/obscura-cdp/src/domains/emulation.rs:180-217",
+        "crates/obscura-cdp/src/server.rs:2575-2576",
+        "https://github.com/h4ckf0r0day/obscura/issues/1101#issuecomment-6000166858"
+      ]
+    },
+    {
+      "issue": 1100,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1100",
+      "title": "SVGGeometryElement.getTotalLength() not implemented (prototype chain exists, method throws)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-23",
+      "secondaryTasks": [],
+      "requirements": [
+        "Real SVGGeometryElement.getTotalLength for paths and basic shapes",
+        "Compute geometric lengths with mutations, curves/arcs and units rather than fake prototype-only methods"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:14935-14951 empty geometry classes",
+        "crates/obscura-js/src/runtime.rs:9821-9864 prototype-chain regression does not assert lengths",
+        "Parent supplemental receipt additional-canvas-controls-svg.json: path M0 0 L3 4 getTotalLength TypeError (parent-reported exercised evidence)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1204",
+        "https://github.com/h4ckf0r0day/obscura/issues/1100#issuecomment-5998711803"
+      ]
+    },
+    {
+      "issue": 1096,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1096",
+      "title": "Native horizontal range controls do not paint or respond to CDP input",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-20",
+      "secondaryTasks": [],
+      "requirements": "Additional native-control scope: default midpoint value, shared min/max/step sanitization, horizontal track/thumb paint, pointer click/drag and keyboard defaults with trusted input/change events, cancellation/disabled/RTL/appearance:none behavior. Vertical controls, authored slider pseudo-elements and touch are outside the bounded upstream candidate.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:7093-7100",
+        "crates/obscura-js/js/bootstrap.js:4881-4914",
+        "crates/obscura-js/js/bootstrap.js:4960-4968",
+        "crates/obscura-js/js/bootstrap.js:19985-20025",
+        "crates/obscura-js/js/bootstrap.js:20125-20180",
+        "https://github.com/h4ckf0r0day/obscura/pull/1097"
+      ]
+    },
+    {
+      "issue": 1087,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1087",
+      "title": "Auto-sized native buttons measure labels differently from their paint font",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-23",
+      "secondaryTasks": [],
+      "requirements": "Existing font/control work overlaps: auto-sized buttons must measure labels using the selected paint shaper, preserving generated icons, edges, spacing, font weight/style and transforms; establish exact Save and sign in fixture parity rather than assuming a font-policy change fixes every button.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:31-52",
+        "crates/obscura-render/src/dom.rs:6898-6978",
+        "crates/obscura-render/src/inline.rs:1738-1805",
+        "docs/Testing-and-debugging.md:452-456",
+        "https://github.com/h4ckf0r0day/obscura/pull/1092"
+      ]
+    },
+    {
+      "issue": 1086,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1086",
+      "title": "Input.dispatchTouchEvent reports success without dispatching events",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-20",
+      "secondaryTasks": [],
+      "requirements": [
+        "Return an explicit unsupported protocol error until real touch lifecycle/contact semantics exist",
+        "Do not fabricate touch/pointer/click events or silently return success"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:93",
+        "https://github.com/h4ckf0r0day/obscura/pull/1091"
+      ]
+    },
+    {
+      "issue": 1085,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1085",
+      "title": "Canvas2D HSL colors are not parsed",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-23",
+      "secondaryTasks": [],
+      "requirements": "Additional Canvas2D color scope: comma and space HSL/HSLA, valid CSS decimal/exponent/percentage alpha, rejecting JavaScript hexadecimal/binary/octal alpha syntax; verify pixels through the Canvas2D path.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:16783-16802",
+        "crates/obscura-js/js/bootstrap.js:16818-16830",
+        "crates/obscura-render/src/style.rs:5242-5274",
+        "https://github.com/h4ckf0r0day/obscura/pull/1090"
+      ]
+    },
+    {
+      "issue": 1084,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1084",
+      "title": "Fallback screenshot reconstruction loses live Canvas2D surfaces",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-23",
+      "secondaryTasks": [],
+      "requirements": "Existing live-canvas work is incomplete at the fallback boundary: carry retained live Canvas2D surfaces through ad-hoc viewport/base and print-media reconstruction, not just normal prepared captures; require fallback pixel regression.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:5100-5129",
+        "crates/obscura-js/src/runtime.rs:2705-2743",
+        "crates/obscura-js/src/runtime.rs:2747-2781",
+        "https://github.com/h4ckf0r0day/obscura/pull/1089"
+      ]
+    },
+    {
+      "issue": 1077,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1077",
+      "title": "WebCrypto ECDSA P-256 support: missing generateKey blocks Mercari DPoP API requests",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "7.1",
+      "rootId": "RC-17",
+      "secondaryTasks": [],
+      "requirements": [
+        "Standards-compatible ECDSA P-256 generateKey",
+        "Public-key JWK export and ECDSA signing for DPoP",
+        "Real key/signature behavior, not API-presence or fake output"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:18092-18124 symmetric export and generateKey unsupported branch",
+        "crates/obscura-js/js/bootstrap.js:18127-18133 signing only handles HMAC at entry",
+        "https://github.com/h4ckf0r0day/obscura/issues/1289",
+        "https://github.com/h4ckf0r0day/obscura/issues/1077"
+      ]
+    },
+    {
+      "issue": 1067,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1067",
+      "title": "checkVisibility() returns true inside a display:none ancestor and ignores visibilityProperty",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Already covered for the reported render-enabled behavior: display:none ancestors return false; requested inherited visibility checks return false; honor opacity aliases and display:contents without using positive area as visibility.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:5994-6021",
+        "crates/obscura-js/tests/platform_behavior.rs:67-98",
+        "https://github.com/h4ckf0r0day/obscura/pull/1071"
+      ]
+    },
+    {
+      "issue": 1056,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1056",
+      "title": "op_fetch_url: SSRF gate skipped when a Continue interception URL override fails to parse",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Fail closed for malformed Continue URL rewrites before either transport sends",
+        "Revalidate parsed rewrites using the same fetch/private-network/origin policy as the original request"
+      ],
+      "evidence": [
+        "crates/obscura-js/src/ops.rs:4770-4805",
+        "AGENTS.md:94-100"
+      ]
+    },
+    {
+      "issue": 1051,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1051",
+      "title": "Packaging: Official Fedora & CentOS Stream Copr repositories available",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Document/install Fedora and CentOS RPM packages through the submitter's renich/obscura Copr repository, reportedly built with render,stealth and tracking releases."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1051",
+        "https://copr.fedorainfracloud.org/coprs/renich/obscura/"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 1050,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1050",
+      "title": "Layout: Flexbox auto-sizing collapses unconstrained nested containers and <dialog> to 0px height / 3px width",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Diagnostic rendering scope: derive an authorized self-contained nested-flex/dialog intrinsic-sizing repro preserving the reported zero-height/3px-width collapse before attributing a root cause.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1050",
+        "crates/obscura-render/tests/layout_test.rs:1089-1105",
+        "crates/obscura-render/src/dom.rs:2992-2995"
+      ],
+      "investigationId": "INV-1050",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 1040,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1040",
+      "title": "Dependency audit fails after the V8 upgrade removes active renderer exceptions",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Restore only rustybuzz RUSTSEC-2026-0206 and ttf-parser RUSTSEC-2026-0192 maintenance-notice exceptions while required by rendering; do not restore bincode or weaken vulnerability/license/source/bans checks."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1040",
+        "https://github.com/h4ckf0r0day/obscura/pull/1042",
+        "deny.toml:4-13",
+        "deny.toml:15-50"
+      ]
+    },
+    {
+      "issue": 1039,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1039",
+      "title": "innerHTML/textContent/subtree removal leaks native external_stylesheets entries for removed <link>s",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Release native linked stylesheet entries for all links in removed subtrees",
+        "Cover innerHTML, textContent, removeChild ancestor, replaceChild and replaceChildren paths"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:11025-11046 _releaseLinkedStylesheet and subtree cleanup",
+        "crates/obscura-js/js/bootstrap.js:2780-2796 remove path; 2887-2896 replace-all path",
+        "crates/obscura-js/js/bootstrap.js:4232-4237 innerHTML pre-removal cleanup",
+        "crates/obscura-js/src/ops.rs:2306-2328 native remove_external_stylesheet and render invalidation",
+        "crates/obscura-js/src/runtime.rs:20846-20894 replacing_a_subtree_releases_its_linked_stylesheets native-count regression (not executed)"
+      ]
+    },
+    {
+      "issue": 1038,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1038",
+      "title": "page WebSocket opens without a connection; send silently discards",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "6.1",
+      "rootId": "RC-16",
+      "secondaryTasks": [],
+      "requirements": [
+        "Real in-page ws/wss client handshake, send/receive and ready-state lifecycle",
+        "Protocol negotiation, binaryType and close/error behavior tied to actual socket",
+        "Preserve proxy/origin/network authority and cancellation; no fake open or discarded frames"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:18753-18793 in-page WebSocket fake-open/drop implementation",
+        "Parent assignment explicitly states actual local confirmation of1038 missing; raw receipt path not provided to this scout",
+        "https://github.com/h4ckf0r0day/obscura/issues/1038"
+      ]
+    },
+    {
+      "issue": 1021,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1021",
+      "title": "Two DOM/Canvas correctness bugs in bootstrap.js: stroke() is a no-op and innerText is aliased to textContent",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Rasterize Canvas stroke paths honoring lineWidth/strokeStyle",
+        "Retain and interpolate linear-gradient stops and rasterize polygon fill",
+        "Return rendered innerText excluding hidden/script/style content and adding block breaks"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:16939-16986 polygon/arc fill; 16993-17037 actual stroke",
+        "crates/obscura-js/js/bootstrap.js:17047-17080 retained gradient stops and interpolation",
+        "crates/obscura-js/js/bootstrap.js:4090-4135 rendered text walk; 4262-4266 innerText getter",
+        "crates/obscura-browser/src/page.rs:11227-11265 inner_text_matches_rendered_text_semantics (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/issues/1021"
+      ]
+    },
+    {
+      "issue": 1011,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1011",
+      "title": "is it possible to support realtime rendering feature?",
+      "sourceStatus": "partial",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Realtime visual output, suggested SIXEL terminal/framebuffer display, with a human-input path."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1011",
+        "crates/obscura-cdp/src/domains/page.rs:1820-1852",
+        "crates/obscura-cdp/src/server.rs:1266-1270",
+        "crates/obscura-cdp/src/domains/input.rs:34-66",
+        "tools/live-view.mjs:1-21"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 1001,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1001",
+      "title": "HTML element interfaces are aliases of Element, so every brand check matches: style-loader cannot install any stylesheet",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Tag/namespace-correct HTML interface brands",
+        "Do not misroute head/div through iframe handling",
+        "Keep interface-specific prototype patches and behavioral native setters"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:14858-14910 distinct interfaces and Symbol.hasInstance tag/namespace checks",
+        "crates/obscura-js/tests/platform_behavior.rs:744-775 style-loader target, prototype separation, native setter and subclass assertions (not executed)",
+        "crates/obscura-js/src/runtime.rs:10827-10850 iframe brand regression",
+        "https://github.com/h4ckf0r0day/obscura/pull/1002"
+      ]
+    },
+    {
+      "issue": 993,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/993",
+      "title": "CL search pages: browser UA gets JS shell that never hydrates under V8",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Browser navigation/hydration completes; reported network-idle timeout and CDP No page for session are separately diagnosable.",
+        "Issue alternatively requests plain raw HTTP and user-agent selection."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/993",
+        "crates/obscura-cli/src/main.rs:255-269",
+        "crates/obscura-cli/src/main.rs:618-628"
+      ],
+      "investigationId": "INV-993",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 992,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/992",
+      "title": "error: unexpected argument '--font-dir' found",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Accept --font-dir on serve and actually load operator-supplied fonts; provide correct feature/build behavior rather than an unknown argument."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/992",
+        "crates/obscura-cli/src/main.rs:54-60",
+        "crates/obscura-cli/src/main.rs:479-480",
+        "crates/obscura-cli/src/fonts.rs:25-56",
+        "crates/obscura-render/src/inline.rs:583-587",
+        "crates/obscura-cli/tests/mcp_client.rs:12-46",
+        "https://github.com/h4ckf0r0day/obscura/pull/880"
+      ]
+    },
+    {
+      "issue": 977,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/977",
+      "title": "Stealth mode uses other HTTP clients for classic scripts, form POSTs and CORS preflights",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-02",
+      "secondaryTasks": [],
+      "requirements": [
+        "Select the installed native stealth transport for classic scripts, form POSTs and OPTIONS when compiled and enabled",
+        "Preserve CORS status/permissions, intermediate redirect checks, cookie/credential stripping, 303/307 semantics and non-replay of POST",
+        "Preserve ordinary mode and explicit proxy/private-network boundaries"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:3168-3220",
+        "crates/obscura-browser/src/page.rs:4420-4426",
+        "crates/obscura-js/src/ops.rs:4852-4875",
+        "crates/obscura-js/src/ops.rs:4952-4980",
+        "https://github.com/h4ckf0r0day/obscura/pull/981"
+      ]
+    },
+    {
+      "issue": 952,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/952",
+      "title": "Support Escape dismissal of native modal dialogs",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Native automation Escape requests closure of the active modal",
+        "Honor canceled keydown/cancel and closedBy none",
+        "Share native browser input behavior across MCP/CDP without granting author synthetic events native defaults"
+      ],
+      "evidence": [
+        "crates/obscura-mcp/src/lib.rs:1147-1160 native key route",
+        "crates/obscura-cdp/src/domains/input.rs:73-95 dispatchKeyEvent native route",
+        "crates/obscura-js/js/bootstrap.js:19913-19939 requestClose and Escape default",
+        "crates/obscura-js/js/bootstrap.js:4848-4871 showModal/close shared state",
+        "crates/obscura-cdp/tests/input_modal.rs:112-132 Escape/cancel/closedBy/focus assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1026"
+      ]
+    },
+    {
+      "issue": 936,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/936",
+      "title": "UA stylesheet has no rules for small/big/sub/sup, code/kbd/samp/pre, blockquote, mark, u/ins, s/del/strike or q (and font-size: smaller|larger is unimplemented)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-22",
+      "secondaryTasks": [],
+      "requirements": "Additional broad UA-default scope, not only code fonts: small/big/sub/sup relative sizes and sub/super position; code/kbd/samp/pre monospace; blockquote margins; mark highlight; u/ins underline; s/del/strike line-through; q generated quotes; implement authored smaller/larger. Coordinate with #933 and decoration paint rather than adding UA declarations alone.",
+      "evidence": [
+        "crates/obscura-render/src/style.rs:27-348",
+        "crates/obscura-render/src/style.rs:7198-7211",
+        "crates/obscura-render/src/style.rs:1710-1717",
+        "https://github.com/h4ckf0r0day/obscura/issues/936"
+      ]
+    },
+    {
+      "issue": 933,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/933",
+      "title": "vertical-align: only top and bottom work — baseline (the initial value) behaves as top, and sub/super/text-top/lengths/percentages are ignored",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Extend existing inline baseline work to actual shared baseline placement of unequal atomic inlines, correct line descent/growth, sub/super/text-top/text-bottom and length/percentage shifts, independently of CSSOM reporting and #936 UA rules.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:10836-10889",
+        "crates/obscura-render/tests/layout_test.rs:747-775",
+        "crates/obscura-render/src/style.rs:1710-1717",
+        "crates/obscura-render/src/lib.rs:2303-2314",
+        "https://github.com/h4ckf0r0day/obscura/issues/933"
+      ]
+    },
+    {
+      "issue": 925,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/925",
+      "title": "DDoS-Guard challenge still doesn't complete after #285 fix (stealth render)",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Explain stalled loading/redirect after earlier DOM insertion fix; determine whether generic JS/timer/navigation behavior is defective."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/925"
+      ],
+      "investigationId": "INV-925",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 921,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/921",
+      "title": "cdp: Input.dispatch* commands are not read while a page-triggered navigation (Enter submit, link click) loads; the next command times out",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-10",
+      "secondaryTasks": [],
+      "requirements": [
+        "Answer input commands promptly during document-initiated navigation",
+        "Keep queued navigation/event processing live without a follow-up Runtime.evaluate",
+        "Preserve event-dispatch semantics rather than claiming concurrency from message receipt alone"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:55-66",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-cdp/src/server.rs:2151-2178",
+        "crates/obscura-cdp/src/server.rs:2224-2272",
+        "https://github.com/h4ckf0r0day/obscura/pull/922",
+        "https://github.com/h4ckf0r0day/obscura/issues/921#issuecomment-5702454061"
+      ]
+    },
+    {
+      "issue": 908,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/908",
+      "title": "Synchronous XMLHttpRequest never issues the request: open(..., false) is ignored and status stays 0",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-15",
+      "secondaryTasks": [],
+      "requirements": [
+        "Respect XMLHttpRequest.open async=false",
+        "Complete request and populate status/body/headers/readyState before send returns",
+        "Preserve browser transport, origin and network security semantics"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:9161-9175 open ignores async_",
+        "crates/obscura-js/js/bootstrap.js:9197-9217 send always calls _fetch(...).then",
+        "crates/obscura-js/js/bootstrap.js:9259-9280 asynchronous DONE/error state",
+        "https://github.com/h4ckf0r0day/obscura/pull/909"
+      ]
+    },
+    {
+      "issue": 907,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/907",
+      "title": "data: and blob: URLs are rejected for dynamic import(), module/classic scripts, and fetch()",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-15",
+      "secondaryTasks": [],
+      "requirements": [
+        "Dynamic import of literal/base64/percent-encoded data and blob modules",
+        "Classic blob script and module data/blob script execution",
+        "Local data/blob fetch with real bytes, revocation and MIME behavior",
+        "Retain file/private-network authority guards"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:355-410 classic data URL decode/fetch branch",
+        "crates/obscura-js/src/ops.rs:4640-4647 fetch data early local branch; 6814-6836 fetch_data_url byte processor",
+        "crates/obscura-js/src/ops.rs:6838-6848 HTTP/HTTPS gate still rejects blob",
+        "crates/obscura-js/src/module_loader.rs:199-423 load has only network context/transport response path; 302-351 transport call",
+        "crates/obscura-net/src/client.rs:679-686 transport scheme gate",
+        "crates/obscura-js/js/bootstrap.js:17560-17602 object URL store contains decoded text and revoke deletes entry",
+        "https://github.com/h4ckf0r0day/obscura/pull/909",
+        "https://github.com/h4ckf0r0day/obscura/issues/907#issuecomment-5600653644"
+      ]
+    },
+    {
+      "issue": 888,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/888",
+      "title": "Obscura v0.2.2 : standalone test to parse url is failing with error \"Script error\"",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "CLI title evaluation completes without process segmentation fault.",
+        "Reduce jQuery-triggered Element.replaceWith parentNode errors, later chartbeat type errors, watchdog overrun and response-decoding error separately."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/888",
+        "crates/obscura-js/js/bootstrap.js:9627-9636"
+      ],
+      "investigationId": "INV-888",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 886,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/886",
+      "title": "Native <form> submission produces no CDP navigation/network events at all",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Route native form document navigation through CDP network/frame/lifecycle emission",
+        "Preserve POST method/body and distinguish same-document changes from document replacement"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:55-66",
+        "crates/obscura-cdp/src/server.rs:1820-1844",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-cdp/src/server.rs:2301-2373",
+        "crates/obscura-cdp/src/domains/runtime.rs:88-139",
+        "https://github.com/h4ckf0r0day/obscura/pull/889"
+      ]
+    },
+    {
+      "issue": 883,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/883",
+      "title": "DOMParser ignores XML mime types: valid XML parses as HTML with an <html> root",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "5.1",
+      "rootId": "RC-13",
+      "secondaryTasks": [],
+      "requirements": [
+        "Parse valid XML MIME types into true XML Documents",
+        "Preserve root identity, source case, namespaces and XML node semantics",
+        "Keep text/html parsing and malformed-XML parsererror behavior"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:12923-12942 MIME branch and explicit no-XML-parser comment",
+        "crates/obscura-js/js/bootstrap.js:12969-12974 valid input sent to HTML innerHTML",
+        "crates/obscura-js/js/bootstrap.js:12991-13002 docNode returns wrapper HTML documentElement",
+        "https://github.com/h4ckf0r0day/obscura/pull/1206"
+      ]
+    },
+    {
+      "issue": 878,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/878",
+      "title": "Download binaries (guarded by cloudflare turnstile) through obscura crash with shadowroot error",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Diagnose reported ShadowRoot.appendChild HierarchyRequestError and later null addEventListener; distinguish console errors from a native process crash and from binary-download delivery."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/878",
+        "crates/obscura-js/js/bootstrap.js:2595-2621",
+        "crates/obscura-cli/src/main.rs:263-269"
+      ],
+      "investigationId": "INV-878",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 875,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/875",
+      "title": "fetch() omits the default Referer on same-origin requests",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Default same-origin fetch Referer to the document URL",
+        "Honor explicit referrer and policy, strip fragment/credentials and suppress downgrade leakage in both transports"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:8949-8963",
+        "crates/obscura-js/js/bootstrap.js:8999-9022",
+        "crates/obscura-js/src/ops.rs:4401-4420",
+        "crates/obscura-js/src/ops.rs:5034-5037",
+        "crates/obscura-js/src/ops.rs:5385-5387",
+        "crates/obscura-net/src/client.rs:493-523",
+        "https://github.com/h4ckf0r0day/obscura/pull/932"
+      ]
+    },
+    {
+      "issue": 870,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/870",
+      "title": "Page.printToPDF emits a rasterized JPEG page instead of vector text — no embedded fonts, no text layer, capped at 800px (~97 DPI)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-25",
+      "secondaryTasks": [],
+      "requirements": "Additional document-output capability: vector text/drawing operations, embedded subset fonts and selectable/searchable/extractable text. Separately assess raster quality/scale; a larger raster or pagination fix cannot satisfy the text-layer requirement, and full tagged-PDF accessibility is an additional requirement beyond merely selectable text.",
+      "evidence": [
+        "crates/obscura-browser/src/pdf.rs:1-22",
+        "crates/obscura-browser/src/pdf.rs:320-435",
+        "crates/obscura-browser/src/pdf.rs:478-481",
+        "crates/obscura-cdp/src/domains/pdf.rs:217-249",
+        "https://github.com/h4ckf0r0day/obscura/issues/870"
+      ]
+    },
+    {
+      "issue": 866,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/866",
+      "title": "Google Maps SPA repeatedly self-navigates and hangs CDP evaluate calls under render+stealth",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": "3.1",
+      "rootId": null,
+      "secondaryTasks": [
+        "4.1"
+      ],
+      "requirements": [
+        "Same-document SPA routing preserves execution context after initial settle.",
+        "Scrolling/lazy-loading errors do not leave every Runtime.callFunctionOn stalled at 30000 ms until connection reset."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/866",
+        "crates/obscura-cdp/src/server.rs:1777-1796",
+        "crates/obscura-cdp/src/domains/runtime.rs:318-320",
+        "crates/obscura-browser/src/page.rs:4170-4174"
+      ],
+      "investigationId": "INV-866",
+      "deliveryGate": "confirmed-local-divergence"
+    },
+    {
+      "issue": 863,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/863",
+      "title": "Feature: Chrome extension support (adblock/tracker-blocking first) for agent workflows",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "MV2/MV3 extension host with background/service-worker functionality, declarativeNetRequest and eventually content scripts/messaging.",
+        "Ad/tracker blocking, session manager and privacy/enterprise integration use cases."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/863",
+        "crates/obscura-net/src/blocklist.rs:5-38",
+        "crates/obscura-browser/src/context.rs:182-184",
+        "docs/Persist-cookies-and-storage.md:1-16"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 857,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/857",
+      "title": "`fetch_file_url` has no `--allow-file-access` gate of its own; the check lives only in its callers",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-04",
+      "secondaryTasks": [],
+      "requirements": [
+        "Gate file reads in the loader before filesystem metadata/read",
+        "Propagate explicit file permission through both transports and context copies",
+        "Keep operator CLI local-file opt-in distinct from remote CDP authority; retain existing caller gates"
+      ],
+      "evidence": [
+        "crates/obscura-net/src/client.rs:735-778",
+        "crates/obscura-net/src/client.rs:1441-1442",
+        "crates/obscura-net/src/wreq_client.rs:334-338",
+        "crates/obscura-cdp/src/server.rs:2102-2107",
+        "https://github.com/h4ckf0r0day/obscura/pull/1280"
+      ]
+    },
+    {
+      "issue": 856,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/856",
+      "title": "`--allow-private-network` is all-or-nothing; a scoped `--allow-network <CIDR>` would keep the metadata endpoints closed",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-04",
+      "secondaryTasks": [],
+      "requirements": [
+        "Repeatable/comma-separated CIDR opt-in and environment equivalent with startup errors for invalid prefixes",
+        "Exempt only named denied addresses while retaining the single shared deny-set and existing blanket opt-in semantics",
+        "Apply literal/DNS/redirect checks consistently across native transports including IPv4-mapped IPv6, localhost resolution and /0 warning"
+      ],
+      "evidence": [
+        "crates/obscura-ssrf/src/lib.rs:11-35",
+        "crates/obscura-net/src/client.rs:644-686",
+        "crates/obscura-net/src/wreq_client.rs:35-57",
+        "crates/obscura-browser/src/context.rs:132-145",
+        "https://github.com/h4ckf0r0day/obscura/issues/856"
+      ]
+    },
+    {
+      "issue": 855,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/855",
+      "title": "Cookie store permissions are incidental and persistence failures are silent; control-plane routing matches substrings of the whole request head; `build.log` is committed",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "3.1",
+      "rootId": "RC-06",
+      "secondaryTasks": [
+        "10.1"
+      ],
+      "requirements": [
+        "Explicit private cookie-store directory/file permissions and observable persistence errors",
+        "Route discovery endpoints by exact request-line target, not header-value substring or near-miss path",
+        "Remove committed build transcript and ignore logs"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/context.rs:343-353",
+        "crates/obscura-net/src/cookies.rs:590-601",
+        "crates/obscura-cdp/src/server.rs:1131-1142",
+        "build.log",
+        ".gitignore:1-6",
+        "https://github.com/h4ckf0r0day/obscura/issues/855"
+      ]
+    },
+    {
+      "issue": 852,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/852",
+      "title": "SSRF guard hard-blocks 198.18.0.0/15, breaks on Clash fake-ip / WSL2 NAT",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Explicit private-network opt-in must bypass the benchmarking-range deny-set at URL and DNS checks in both transports",
+        "Keep 198.18.0.0/15 denied by default"
+      ],
+      "evidence": [
+        "crates/obscura-net/src/client.rs:654-686",
+        "crates/obscura-net/src/wreq_client.rs:35-57",
+        "crates/obscura-ssrf/src/lib.rs:47-55"
+      ]
+    },
+    {
+      "issue": 844,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/844",
+      "title": "WebGL returns null + Turnstile challenge iframe never created (breaks CF challenge flows)",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Distinguish true WebGL rendering support from Canvas2D and constructor names.",
+        "Diagnose script-created iframe and cross-origin classic-script request behavior independently of a third-party challenge outcome."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/844",
+        "crates/obscura-js/js/bootstrap.js:17159-17165",
+        "crates/obscura-js/js/bootstrap.js:2429-2455",
+        "crates/obscura-browser/src/page.rs:6019-6023"
+      ],
+      "investigationId": "INV-844",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 843,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/843",
+      "title": "fix(js): interpolate console/release objectIds via js_string_literal (defense-in-depth)",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "JSON-escape console object-ID retrieval and release-object generated scripts",
+        "Use existing js_string_literal helper consistently"
+      ],
+      "evidence": [
+        "crates/obscura-js/src/runtime.rs:425-427 serde_json helper",
+        "crates/obscura-js/src/runtime.rs:2308-2326 pending runtime object retrieval escaping",
+        "crates/obscura-js/src/runtime.rs:4039-4047 release object escaping",
+        "crates/obscura-js/src/runtime.rs:20831-20843 hostile-ID source-injection regression (not executed)"
+      ]
+    },
+    {
+      "issue": 828,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/828",
+      "title": "body inner_text includes raw <script> source text (CDP parity: ~100x vs Chromium)",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Connected rendered body innerText excludes script/style and hidden content",
+        "Do not conflate text-extraction defect with Worker app boot failures"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:4090-4135 computed-style text collection",
+        "crates/obscura-js/js/bootstrap.js:4262-4266 rendered innerText getter with browser-like detached/display-none fallback",
+        "crates/obscura-browser/src/page.rs:11227-11265 rendered text regression (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1023"
+      ]
+    },
+    {
+      "issue": 827,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/827",
+      "title": "Web Workers: importScripts() not implemented -> Yahoo Finance app dies and redirects to /lookup",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "4.1",
+      "rootId": "RC-12",
+      "secondaryTasks": [],
+      "requirements": [
+        "Real synchronous classic Worker importScripts fetching and ordered execution in worker global scope",
+        "Resolve imported globals and relative URLs using worker script context",
+        "Preserve script loading failures, origin/CSP/network authority and worker termination semantics"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:17414-17491 Worker loading and scope properties without importScripts",
+        "crates/obscura-js/js/bootstrap.js:17494-17515 with(scope) eval Worker execution",
+        "Parent receipt worker-importscripts.json under parent triage temp root: undefined plus ReferenceError importing data JS (parent-reported exercised evidence)",
+        "https://github.com/h4ckf0r0day/obscura/issues/827"
+      ]
+    },
+    {
+      "issue": 807,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/807",
+      "title": "fill/click/selectOption via Playwright CDP hang despite element reporting visible/enabled/editable",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Implement Playwright fill's Input.insertText path",
+        "Remove fake success geometry on failed native node resolution",
+        "Use reporter's corrected protocol trace rather than the initial box-model hypothesis"
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/807#issuecomment-5504613210",
+        "crates/obscura-cdp/src/domains/input.rs:68-73",
+        "crates/obscura-cdp/src/domains/dom.rs:469-487",
+        "crates/obscura-cdp/tests/textarea_enter_selection.rs:210-215",
+        "https://github.com/h4ckf0r0day/obscura/pull/808"
+      ]
+    },
+    {
+      "issue": 783,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/783",
+      "title": "v0.2.1 serve: RSS leaks to ~2.3 GB with sustained 50-100% CPU on long-running CDP server",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Maintain bounded retained resources across long-lived CDP/page lifecycle workloads",
+        "Avoid idle runtime CPU spin",
+        "Diagnose abrupt RSS jump with workload, memory and task evidence"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/dispatch.rs:589-635",
+        "crates/obscura-cdp/src/server.rs:1269-1280",
+        "crates/obscura-cdp/src/server.rs:2623",
+        "crates/obscura-browser/src/page.rs:5640-5658",
+        "crates/obscura-browser/src/page.rs:12863-12875",
+        "crates/obscura-js/src/runtime.rs:4752-4871",
+        "https://github.com/h4ckf0r0day/obscura/issues/783#issuecomment-5553768809"
+      ],
+      "investigationId": "INV-783",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 777,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/777",
+      "title": "Emulation.setUserAgentOverride is a silent no-op, and Network.setUserAgentOverride drops acceptLanguage",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-01",
+      "secondaryTasks": [],
+      "requirements": [
+        "Honor userAgent and acceptLanguage through both command spellings",
+        "Keep regular/native transport and live navigator identity coherent",
+        "Account separately for dropped platform and Intl locale lifecycle"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/emulation.rs:156-169",
+        "crates/obscura-cdp/src/domains/network.rs:27-53",
+        "crates/obscura-cdp/src/domains/network.rs:86-89",
+        "crates/obscura-cdp/tests/network_pr_ports.rs:281-285",
+        "https://github.com/h4ckf0r0day/obscura/pull/778"
+      ]
+    },
+    {
+      "issue": 771,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/771",
+      "title": "getComputedStyle: 41 properties return '' and a few return wrong values",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-22",
+      "secondaryTasks": [],
+      "requirements": "Complete existing CSSOM work: all 41 listed properties must have meaningful defaults or real modeled values, running animation names must survive, and table display/flex stand-ins, min-height, transition-property and outline-width differences must be reconciled explicitly rather than claiming blanket PR coverage.",
+      "evidence": [
+        "crates/obscura-render/src/paint.rs:2095-2180",
+        "crates/obscura-render/src/style.rs:45-59",
+        "crates/obscura-js/js/bootstrap.js:10400-10455",
+        "crates/obscura-render/src/paint.rs:1989-1991",
+        "crates/obscura-render/src/paint.rs:16290-16301",
+        "https://github.com/h4ckf0r0day/obscura/pull/773"
+      ]
+    },
+    {
+      "issue": 769,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/769",
+      "title": "Default (non-stealth) client can't reach servers that only offer legacy TLS 1.2 CBC cipher suites — rustls-tls has no CBC support",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Decide explicit support policy for legacy CBC-only TLS endpoints without disabling certificate validation",
+        "If supported, preserve selected native client, proxy and SSRF boundaries rather than silently retrying through another backend"
+      ],
+      "evidence": [
+        "crates/obscura-net/src/client.rs:1119-1128",
+        "crates/obscura-net/src/wreq_client.rs:217-238",
+        "https://github.com/h4ckf0r0day/obscura/issues/769"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 767,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/767",
+      "title": "width:calc(100% - 32px) resolves to 0 inside a flex subtree",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Complete existing cyclic-flex sizing work: cyclic non-replaced preferred widths need intrinsic auto behavior, then resolve calc against final containing-block width; preserve replaced-element handling and native-control intrinsic contribution. Compare the reduced input fixture rather than only unrelated flex examples.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:13122-13247",
+        "crates/obscura-render/src/dom.rs:13268-13313",
+        "https://github.com/h4ckf0r0day/obscura/pull/774",
+        "https://github.com/h4ckf0r0day/obscura/issues/767"
+      ]
+    },
+    {
+      "issue": 764,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/764",
+      "title": "A display:none float still contributes its width when the line contains an atomic inline",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Additional narrow layout repair: hidden floats must not select the legacy float-zone path; preserve the issue's atomic-inline plus hidden-float matrix, not just hidden-only or inline-block-only cases.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:14185-14191",
+        "crates/obscura-render/src/dom.rs:14223-14226",
+        "crates/obscura-render/src/dom.rs:15518-15522",
+        "https://github.com/h4ckf0r0day/obscura/pull/775"
+      ]
+    },
+    {
+      "issue": 757,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/757",
+      "title": "A floated element with a percentage width ignores it once it also has a margin (breaks the Bootstrap 3 grid)",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Complete existing percentage-margin work for floated percentage widths with both percentage and px margins, clearfix parent height and following-flow hit targets; do not infer all four original cases from ordinary block/flex/grid margin coverage.",
+      "evidence": [
+        "docs/Testing-and-debugging.md:446-450",
+        "crates/obscura-render/tests/layout_test.rs:853-1080",
+        "crates/obscura-render/src/dom.rs:15417-15423",
+        "crates/obscura-render/src/dom.rs:15521-15533",
+        "https://github.com/h4ckf0r0day/obscura/pull/758"
+      ]
+    },
+    {
+      "issue": 738,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/738",
+      "title": "elementFromPoint ignores z-index among positioned siblings",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Already covered in render-enabled native hit testing: higher-z close button must beat later lower-z overlay, with DOM hit APIs and CDP pointer targeting using the same stacking decision.",
+      "evidence": [
+        "crates/obscura-render/src/paint.rs:1584-1640",
+        "crates/obscura-js/src/runtime.rs:6755-6777",
+        "crates/obscura-cdp/src/domains/input.rs:39-57",
+        "crates/obscura-browser/src/page.rs:2220-2228"
+      ]
+    },
+    {
+      "issue": 737,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/737",
+      "title": "Article text collapses to one character per line on en.wikipedia.org at >=1150px viewport",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Additional reduced layout candidate from PR #750: cap auto inline-block max-content lines at available space, and measure table min-content with wrap enabled; validate inline-block list/pseudo list inside a width-constrained table. Live Wikipedia output requires separately matched captured page state.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:13633-13674",
+        "crates/obscura-render/tests/layout_test.rs:2580-2640",
+        "https://github.com/h4ckf0r0day/obscura/pull/750",
+        "https://github.com/h4ckf0r0day/obscura/issues/737"
+      ]
+    },
+    {
+      "issue": 726,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/726",
+      "title": "HTMLElement.click() does not honor the click in progress flag",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Per-element click-in-progress guard preventing self/mutual recursive activation",
+        "Release guard in finally so sequential clicks and throwing listeners remain usable",
+        "Retain disabled-control and other-element activation behavior"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:3603-3604 private click state",
+        "crates/obscura-js/js/bootstrap.js:4638-4645 disabled and reentrancy guard; 4724-4725 finally cleanup",
+        "crates/obscura-js/tests/platform_behavior.rs:722-742 click reentrancy and cancellation assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/729"
+      ]
+    },
+    {
+      "issue": 722,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/722",
+      "title": "getBoundingClientRect returns 0x0 for inline elements in a run that cannot fold (replaced, inline-block, block, float or out-of-flow sibling)",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-21",
+      "secondaryTasks": [],
+      "requirements": "Complete existing inline-geometry work across original atomic-sibling fallback and second pre-flattened/block-segment path; preserve margins/padding and paint positions, per-line client rects, nested ownership, exclusion of floats/out-of-flow descendants, empty/replaced-only inline struts and CDP hit targets.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:10551-10580",
+        "crates/obscura-render/src/dom.rs:10789-10821",
+        "crates/obscura-render/src/dom.rs:15066-15099",
+        "crates/obscura-render/tests/layout_test.rs:179-214",
+        "https://github.com/h4ckf0r0day/obscura/issues/722#issuecomment-5601628752",
+        "https://github.com/h4ckf0r0day/obscura/pull/727"
+      ]
+    },
+    {
+      "issue": 716,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/716",
+      "title": "Binary fetch and interception bodies are corrupted by UTF-8 conversion",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-03",
+      "secondaryTasks": [],
+      "requirements": [
+        "Byte-preserving fetch/XHR body serialization for Blob, buffers, sliced views, multipart files and inherited Request body",
+        "Byte-native public Continue/Fulfill API and exact CDP base64 decoding with invalid-input pause retention"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:8920-8947",
+        "crates/obscura-js/js/bootstrap.js:8987-8994",
+        "crates/obscura-js/src/ops.rs:40-61",
+        "crates/obscura-js/src/ops.rs:4553-4574",
+        "crates/obscura-cdp/src/server.rs:1965-1988",
+        "crates/obscura-js/src/runtime.rs:23396-23472",
+        "crates/obscura-browser/tests/binary_fetch_body.rs:78-143",
+        "https://github.com/h4ckf0r0day/obscura/pull/718"
+      ]
+    },
+    {
+      "issue": 694,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/694",
+      "title": "Feature: persistent profile / user-data-dir for fetch & scrape (storage is lost between CLI invocations)",
+      "sourceStatus": "partial",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Reuse cookies/localStorage and requested IndexedDB between CLI invocations for fetch/scrape through a persistent profile or equivalent workflow.",
+        "Provide recommended persistent CDP workflow; distinguish within-run sessionStorage lifetime from restart persistence."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/694",
+        "crates/obscura-cli/src/main.rs:649-668",
+        "crates/obscura-cli/src/main.rs:1624-1625",
+        "crates/obscura-cli/src/main.rs:220-253",
+        "crates/obscura-cli/src/main.rs:672-692",
+        "docs/Persist-cookies-and-storage.md:1-34",
+        "docs/Persist-cookies-and-storage.md:63-68",
+        "docs/Persist-cookies-and-storage.md:84-110"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 684,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/684",
+      "title": "Support `scoop` as a way to install in Windows",
+      "sourceStatus": "optional",
+      "action": "defer-new-scope",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Install, update and manage Windows Obscura through Scoop."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/684",
+        "https://github.com/h4ckf0r0day/obscura/pull/923"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 683,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/683",
+      "title": "`browser_navigate` never returns on ad-heavy pages — renderer spins at ~100% CPU indefinitely (v0.2.0)",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Bound MCP navigation with success or error",
+        "Ensure continuously ready async page work cannot monopolize navigation/event-loop polling",
+        "Keep misbehaving background JS bounded without treating distant idle timers as overruns"
+      ],
+      "evidence": [
+        "crates/obscura-mcp/src/lib.rs:1009-1040",
+        "crates/obscura-browser/src/page.rs:2980-2997",
+        "crates/obscura-browser/src/page.rs:3947-3983",
+        "crates/obscura-js/src/runtime.rs:4735-4871",
+        "crates/obscura-js/src/cdp_watchdog.rs:1-14",
+        "https://github.com/h4ckf0r0day/obscura/issues/683"
+      ],
+      "investigationId": "INV-683",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 680,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/680",
+      "title": "Runtime.evaluate returns 'No page' on freshly created tab via CDP",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "3.1",
+      "rootId": "RC-08",
+      "secondaryTasks": [],
+      "requirements": [
+        "Bind advertised /devtools/page/{id} WebSocket commands lacking sessionId to the correct page",
+        "Keep browser-scoped and explicit-session routing intact"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1191-1196",
+        "crates/obscura-cdp/src/server.rs:1427-1432",
+        "crates/obscura-cdp/src/server.rs:2608-2627",
+        "crates/obscura-cdp/src/dispatch.rs:888-923",
+        "https://github.com/h4ckf0r0day/obscura/pull/686"
+      ]
+    },
+    {
+      "issue": 662,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/662",
+      "title": "prepare_screenshot_resources fetches CSS resources from the stylesheet text instead of the render tree",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "9.1",
+      "rootId": "RC-24",
+      "secondaryTasks": [],
+      "requirements": "High-value additional correctness scope: replace raw stylesheet URL warmup with a no-network cascade-selected request set, including used backgrounds, matched pseudo backgrounds, external SVG use and fonts actually needed. Keep normal page transport/policy and prove unused protected URLs are never requested in a local OAuth-state fixture; disabling all CSS backgrounds is not a repair.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:4772-4863",
+        "crates/obscura-browser/src/page.rs:4951-4988",
+        "crates/obscura-browser/src/page.rs:5002-5010",
+        "https://github.com/h4ckf0r0day/obscura/pull/814",
+        "https://github.com/h4ckf0r0day/obscura/issues/662"
+      ]
+    },
+    {
+      "issue": 643,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/643",
+      "title": "Fetch interception blocks every matched subresource outright instead of pausing and asking the client",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-03",
+      "secondaryTasks": [],
+      "requirements": [
+        "Keep Network.setBlockedURLs distinct from Fetch pause patterns",
+        "Actually pause static scripts/styles/imports before I/O and apply Continue/Fail/Fulfill",
+        "Bound abandoned interception without treating unapproved private URLs as authorized"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:1701-1705",
+        "crates/obscura-browser/src/page.rs:3168-3220",
+        "crates/obscura-browser/src/page.rs:7848-7860",
+        "crates/obscura-cdp/src/domains/page.rs:1015-1045",
+        "https://github.com/h4ckf0r0day/obscura/pull/644"
+      ]
+    },
+    {
+      "issue": 635,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/635",
+      "title": "getComputedStyle() methods throw this._owner.getAttribute is not a function on every element",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Computed getPropertyValue/item/cssText/length must not invoke declaration methods with corrupt proxy this",
+        "Serve computed method lookups before generic target passthrough"
+      ],
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:10450-10471 direct computed method/field branches before target passthrough at10483",
+        "crates/obscura-js/js/bootstrap.js:1774-1794 owner-backed declaration explains original failure path",
+        "https://github.com/h4ckf0r0day/obscura/pull/636"
+      ]
+    },
+    {
+      "issue": 629,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/629",
+      "title": "Request: support --storage-dir in `obscura mcp` for persistent cookies/session",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "10.1",
+      "rootId": "RC-26",
+      "secondaryTasks": [],
+      "requirements": [
+        "Pass a persistent profile into both stdio and HTTP MCP contexts.",
+        "Load/save cookies and origin localStorage after navigation and clean exit, including volume-mounted container use."
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/629",
+        "https://github.com/h4ckf0r0day/obscura/issues/629#issuecomment-5250392532",
+        "https://github.com/h4ckf0r0day/obscura/pull/926",
+        "crates/obscura-cli/src/main.rs:695-716",
+        "crates/obscura-mcp/src/lib.rs:85-108",
+        "crates/obscura-mcp/src/lib.rs:317-319",
+        "crates/obscura-mcp/src/lib.rs:1009-1043",
+        "crates/obscura-mcp/src/lib.rs:2236-2238",
+        "crates/obscura-mcp/src/http.rs:275-310",
+        "crates/obscura-browser/src/page.rs:4563-4565",
+        "crates/obscura-browser/src/context.rs:335-350",
+        "docs/Persist-cookies-and-storage.md:28-34",
+        "docs/Persist-cookies-and-storage.md:59-64"
+      ]
+    },
+    {
+      "issue": 606,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/606",
+      "title": "In the screenshot, Chinese text cannot be displayed properly",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": "Already covered for fork font discovery/configuration and shared text/control/SVG fallback when CJK fonts are available; preserve readable painted glyphs, not just nonzero advance. Do not imply a fontless container has bundled CJK fonts or that all Baidu layout is browser-identical.",
+      "evidence": [
+        "crates/obscura-render/src/inline.rs:301-338",
+        "crates/obscura-render/src/inline.rs:585-605",
+        "docs/Testing-and-debugging.md:452-456",
+        "docs/Testing-and-debugging.md:481-500",
+        "https://github.com/h4ckf0r0day/obscura/issues/606#issuecomment-6098699509"
+      ]
+    },
+    {
+      "issue": 571,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/571",
+      "title": "`setExtraHTTPHeaders` not working with stealth",
+      "sourceStatus": "covered",
+      "action": "preserve-regression",
+      "primaryTask": "11.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "CDP extra page headers reach native stealth document requests",
+        "Keep page header ownership and credential stripping intact"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/domains/network.rs:73-84",
+        "crates/obscura-browser/src/page.rs:1315-1319",
+        "crates/obscura-net/src/wreq_client.rs:365-410"
+      ]
+    },
+    {
+      "issue": 570,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/570",
+      "title": "serve mode: Target.getTargets empty on fresh browser connection — puppeteer.connect sees no pages",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "3.1",
+      "rootId": "RC-08",
+      "secondaryTasks": [],
+      "requirements": [
+        "Expose an initial real about:blank page consistently through HTTP discovery and browser Target.getTargets",
+        "Emit existing targetCreated notifications when discovery starts"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/dispatch.rs:181-190",
+        "crates/obscura-cdp/src/server.rs:1191-1196",
+        "crates/obscura-cdp/src/server.rs:1427-1432",
+        "crates/obscura-cdp/src/domains/target.rs:14-39",
+        "https://github.com/h4ckf0r0day/obscura/issues/570"
+      ]
+    },
+    {
+      "issue": 569,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/569",
+      "title": "`request.continue()` overrides are silently dropped for all intercepted requests",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-03",
+      "secondaryTasks": [],
+      "requirements": [
+        "Apply URL/method/header/body overrides before network I/O for top-level navigation and every intercepted resource",
+        "Decode CDP postData as bytes and revalidate rewritten URL at existing private-network/origin gate"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1959-1971",
+        "crates/obscura-js/src/ops.rs:4747-4759",
+        "crates/obscura-js/src/ops.rs:4770-4825",
+        "crates/obscura-browser/src/page.rs:2483-2496",
+        "crates/obscura-browser/src/page.rs:4420-4426",
+        "crates/obscura-cdp/src/domains/page.rs:958-982",
+        "crates/obscura-cdp/src/server.rs:3750-3887"
+      ]
+    },
+    {
+      "issue": 543,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/543",
+      "title": "Target.getTargets returns empty for new connections — pages not globally visible (CDP spec violation)",
+      "sourceStatus": "proposed",
+      "action": "implementation",
+      "primaryTask": "3.1",
+      "rootId": "RC-08",
+      "secondaryTasks": [],
+      "requirements": [
+        "Expose shared browser target identity/visibility across connections without sharing cookies or other context state",
+        "Route operations to owning page/context and preserve V8 thread affinity"
+      ],
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1234-1248",
+        "crates/obscura-cdp/src/dispatch.rs:71-73",
+        "crates/obscura-cdp/src/dispatch.rs:134-143",
+        "crates/obscura-cdp/src/domains/target.rs:36-39",
+        "crates/obscura-cdp/src/domains/target.rs:128-137",
+        "https://github.com/h4ckf0r0day/obscura/issues/543"
+      ]
+    },
+    {
+      "issue": 531,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/531",
+      "title": "[Feature] Configurable module evaluation timeout, DOM.scrollIntoViewIfNeeded CDP support, and V8 watchdog tuning for complex SPA hydration",
+      "sourceStatus": "partial",
+      "action": "investigation",
+      "primaryTask": "4.1",
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Configurable module evaluation budget for Vite/SPA boot",
+        "Tune synchronous watchdog without disabling runaway-JS safety",
+        "Implement DOM.scrollIntoViewIfNeeded",
+        "Provide screenshots when render-enabled"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:2980-2997",
+        "crates/obscura-browser/src/page.rs:3260-3303",
+        "crates/obscura-cdp/src/domains/dom.rs:411-429",
+        "crates/obscura-cdp/src/domains/page.rs:1883-1950",
+        "crates/obscura-js/src/runtime.rs:524-525",
+        "crates/obscura-js/src/runtime.rs:4474-4480",
+        "https://github.com/h4ckf0r0day/obscura/issues/531"
+      ],
+      "investigationId": "INV-531",
+      "deliveryGate": "confirmed-local-divergence"
+    },
+    {
+      "issue": 527,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/527",
+      "title": "canvas / WebGL / AudioContext fingerprint support",
+      "sourceStatus": "diagnostic",
+      "action": "investigation",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Issue body requests JavaScript rendering of gongkaoleida template variables, not a concrete Canvas/WebGL/Audio requirement",
+        "Obtain authorized reduced offline reproduction and failing script/network boundary before choosing a repair"
+      ],
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/527 complete body in shared corpus",
+        "https://github.com/h4ckf0r0day/obscura/issues/527#issuecomment-5461736003 explicitly distinguishes title and body"
+      ],
+      "investigationId": "INV-527",
+      "deliveryGate": "requires-current-repro"
+    },
+    {
+      "issue": 491,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/491",
+      "title": "Obscura doesn't automatically fallback to direct access when server on `HTTP_PROXY`/`HTTPS_PROXY` is down",
+      "sourceStatus": "not-recommended",
+      "action": "reject-behavior",
+      "primaryTask": null,
+      "rootId": null,
+      "secondaryTasks": [],
+      "requirements": [
+        "Assess requested automatic direct fallback against explicit proxy confidentiality",
+        "Keep proxy failure closed; improve diagnostics separately only if requested"
+      ],
+      "evidence": [
+        "crates/obscura-net/src/client.rs:1142-1149",
+        "crates/obscura-net/src/wreq_client.rs:273-280",
+        "https://github.com/h4ckf0r0day/obscura/issues/491"
+      ],
+      "dispositionPath": "scope-decisions.md"
+    },
+    {
+      "issue": 481,
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/481",
+      "title": "navigator.userAgent contradicts the User-Agent request header on every platform",
+      "sourceStatus": "partial",
+      "action": "implementation",
+      "primaryTask": "1.1",
+      "rootId": "RC-01",
+      "secondaryTasks": [],
+      "requirements": [
+        "Keep HTTP UA, client hints, navigator UA/platform coherent across ordinary and native transports and overrides",
+        "Separate coherence from a product decision to default persona to actual host OS"
+      ],
+      "evidence": [
+        "crates/obscura-browser/src/context.rs:185-211",
+        "crates/obscura-browser/src/profiles.rs:1-24",
+        "crates/obscura-browser/src/page.rs:1176-1192",
+        "crates/obscura-browser/src/page.rs:2535-2564",
+        "crates/obscura-cdp/src/domains/network.rs:27-52",
+        "https://github.com/h4ckf0r0day/obscura/issues/481#issuecomment-5356914234",
+        "https://github.com/h4ckf0r0day/obscura/issues/481#issuecomment-5454459842"
+      ]
+    }
+  ],
+  "investigations": [
+    {
+      "issue": 1283,
+      "id": "INV-1283",
+      "missingEvidence": "保留 post-submit 的阶段、脚本请求和 Worker/loader 调用链，构造授权的本地 SDK 后续插入反例；不得把日志错误改写成登录失败。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1242,
+      "id": "INV-1242",
+      "missingEvidence": "用同一 release/页面/网络/视口/settle 和 awaitPromise 两种模式，测空闲及脚本密集页 CDP median/p95 与任务轨迹，区分轮询、布局和同步脚本。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1222,
+      "id": "INV-1222",
+      "missingEvidence": "用保留的 Android/模块图或等价局部夹具分离真实字节记录已修与间歇执行未定，记录依赖状态及首个失败请求，不以自动重试闭合。",
+      "sourceStatus": "partial",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1220,
+      "id": "INV-1220",
+      "missingEvidence": "拆为局部 canvas、字体、脚本/iframe 和真实支持的图形能力反例；不以第三方诊断站绿灯或伪造 WebGL 接口作为验收。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1155,
+      "id": "INV-1155",
+      "missingEvidence": "保持 DOM、observer、脚本和样式副作用等价，测当前逐节点桥接/分配成本及内存；旧 PR 的收益不代替当前基线。",
+      "sourceStatus": "partial",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1151,
+      "id": "INV-1151",
+      "missingEvidence": "保持 parser/module 有序语义，测 CSS 与 script 关键路径、已存在的 HTTP/2 和 readiness；只对实测剩余串行部分作最小改动。",
+      "sourceStatus": "partial",
+      "relatedRootUnits": [],
+      "relatedTasks": [
+        "4.1"
+      ],
+      "deliveryGate": "confirmed-local-divergence",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1103,
+      "id": "INV-1103",
+      "missingEvidence": "逐项核对当前外部 obstacle 夹具、配对渲染和成功工作负载证据；历史 Rust 测试通过不证明 Chromium 相对性能。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1102,
+      "id": "INV-1102",
+      "missingEvidence": "先记录实际构建 render feature，分别重现真实有盒/无盒布局与 no-render 能力契约；不得把合成 no-render 几何误报为 renderer 缺陷。",
+      "sourceStatus": "partial",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 1050,
+      "id": "INV-1050",
+      "missingEvidence": "提取保留嵌套 flex/dialog 零高或 3px 宽现象的无站点 HTML/CSS，与 Chromium 同条件比较，不从通用正高度测试推断关闭。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 993,
+      "id": "INV-993",
+      "missingEvidence": "分离 hydration 脚本/API 请求、network-idle 和 No page session 路由，本地保留启动 shell 与请求图，不通过改变站点身份取替代内容。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 925,
+      "id": "INV-925",
+      "missingEvidence": "只定位通用 timer/DOM/location 的局部不一致；没有可归因反例时保留未知，不将挑战答案、OCR 或站点特判加入引擎任务。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 888,
+      "id": "INV-888",
+      "missingEvidence": "获取匹配 macOS/x86_64 构建的崩溃栈或等价隔离复现，将 native segfault 与 jQuery/ChildNode 异常拆分；不要吞异常或放松树约束。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 878,
+      "id": "INV-878",
+      "missingEvidence": "保存合法/非法 host-including shadow 插入和下载字节的独立本地反例；区分 JS 异常与 native crash，保留循环/层次保护。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 866,
+      "id": "INV-866",
+      "missingEvidence": "用 history/scroll/异步任务局部夹具测同文档 context 保留、callFunctionOn 截止后可恢复性，不能用重建会话掩盖状态丢失。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [
+        "3.1",
+        "4.1"
+      ],
+      "deliveryGate": "confirmed-local-divergence",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 844,
+      "id": "INV-844",
+      "missingEvidence": "用两源脚本创建 frame 的本地夹具捕获完整请求与事件；真实 WebGL 后端是独立能力决定，不以空构造器或目标站结果关闭。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 783,
+      "id": "INV-783",
+      "missingEvidence": "长时本地建销 page/session、network body/backpressure 工作负载采集进程树 RSS、堆/缓存/队列和 idle CPU；区分存活对象增长与 allocator 保留，不凭 entry cap 声称总内存上限。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 683,
+      "id": "INV-683",
+      "missingEvidence": "构造连续 ready 的任务/host-call 和远期 timer 两类夹具，验证导航完成或明确超时以及之后连接仍可用；不得关闭 watchdog 或误判等待中的合法 timer。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 531,
+      "id": "INV-531",
+      "missingEvidence": "分离现有 module/phase 配置和固定 classic-script watchdog，先建立合法慢脚本与失控脚本的对照；只有证据要求时调整有界策略，不提供无 watchdog 模式。",
+      "sourceStatus": "partial",
+      "relatedRootUnits": [],
+      "relatedTasks": [
+        "4.1"
+      ],
+      "deliveryGate": "confirmed-local-divergence",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    },
+    {
+      "issue": 527,
+      "id": "INV-527",
+      "missingEvidence": "从模板变量未解析的 HTML/脚本/请求保留材料建立最小反例；标题所称 Canvas/WebGL/Audio 与正文不一致，禁止据此新增伪接口。",
+      "sourceStatus": "diagnostic",
+      "relatedRootUnits": [],
+      "relatedTasks": [],
+      "deliveryGate": "requires-current-repro",
+      "admissionRule": "已有当前可归因反例或影响本次改动的安全/生命周期风险才进入交付；缺材料和未知根因不冒充已修复。"
+    }
+  ],
+  "pullRequestCrosswalk": [
+    {
+      "pr": 1301,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1301",
+      "rootId": "RC-01",
+      "primaryTask": "1.1",
+      "note": "采用正确 Fetch Metadata，不原样映射 same-origin/opaque origin",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "92d7c42c26425b27c94a23be495659e8982c36dc",
+      "recordedBase": "a754dcebe2476713cf30e1b9f9428ee9fbfb4e99"
+    },
+    {
+      "pr": 1279,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1279",
+      "rootId": "RC-01",
+      "primaryTask": "1.1",
+      "note": "全局 UA 与 scrape",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "1949e9bd46aad47c199f8798b113c2fb1b8286de",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 981,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/981",
+      "rootId": "RC-02",
+      "primaryTask": "1.1",
+      "note": "原生传输候选，未通过的性能门不能忽略",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "34bfcb42924229173455dcc29dc6997f8d210a4e",
+      "recordedBase": "4b7028830222175ca812a5caef04f9d802e64c23"
+    },
+    {
+      "pr": 644,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/644",
+      "rootId": "RC-03",
+      "primaryTask": "1.1",
+      "note": "真实 pre-I/O 暂停，不默认 fail-open",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "d386bc79ede1cecd8e1b530eac0c6cb9af6ae437",
+      "recordedBase": "3a6b7afc15e15a6b281d065632938b24ae7f8d0a"
+    },
+    {
+      "pr": 718,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/718",
+      "rootId": "RC-03",
+      "primaryTask": "1.1",
+      "note": "字节 API clean cutover",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "0b82aed7d5289604e514f5a490666e03c221b049",
+      "recordedBase": "89964b3ef9b4132f679558e6b6685e086648b955"
+    },
+    {
+      "pr": 1280,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1280",
+      "rootId": "RC-04",
+      "primaryTask": "1.1",
+      "note": "文件底层权限",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "e217e9939513c705f6eddd67b5618c15e6031c54",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 1217,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1217",
+      "rootId": "RC-05",
+      "primaryTask": "2.1",
+      "note": "补链候选，拒绝无验证应用探测",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "209b87261fc25f6b8cb56cb1d9c668cfffb669f4",
+      "recordedBase": "8edfe480133b383f70e17f9d4ea55e3592cdfd24"
+    },
+    {
+      "pr": 1250,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1250",
+      "rootId": "RC-07",
+      "primaryTask": "1.1",
+      "note": "headers/body/ExtraInfo",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "f6c770dd2baaed0ed8010d4ee3b54b7a50a162c4",
+      "recordedBase": "2bda71a557247bd2d6fabf01fa66eb4b07dcb2e8"
+    },
+    {
+      "pr": 1118,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1118",
+      "rootId": "RC-07",
+      "primaryTask": "1.1",
+      "note": "保留 307/308 实际方法",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "748810a36659e977476cf73263c9a9ac7d60b1cc",
+      "recordedBase": "a005d16bbbd6111c6108991f37fde7a18b042ece"
+    },
+    {
+      "pr": 829,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/829",
+      "rootId": "RC-08",
+      "primaryTask": "3.1",
+      "note": "会话禁用不能破坏其他订阅",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "b51013f6a2433ca9ffe6405b5604910f9c2e2cf3",
+      "recordedBase": "0cdd42e63bee6c5c7702039a675579cbfd545f5d"
+    },
+    {
+      "pr": 686,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/686",
+      "rootId": "RC-08",
+      "primaryTask": "3.1",
+      "note": "端点绑定与共享目标一起验收",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "95d9a7eb0280e84f544149ab97f315de15c6a047",
+      "recordedBase": "13198fd66e4224d1f927cd290b9188ddd8c76564"
+    },
+    {
+      "pr": 1300,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1300",
+      "rootId": "RC-09",
+      "primaryTask": "3.1",
+      "note": "已合入查询保留，补实时 mutation",
+      "sourceStatus": "merged-baseline",
+      "evidence": "evidence/merged-pull-requests.json",
+      "mergedAt": "2026-10-19T18:20:08Z",
+      "mergeCommit": "a754dcebe2476713cf30e1b9f9428ee9fbfb4e99"
+    },
+    {
+      "pr": 1298,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1298",
+      "rootId": "RC-10",
+      "primaryTask": "4.1",
+      "note": "已修函数等待保留，修 selector/text 同类取消",
+      "sourceStatus": "merged-baseline",
+      "evidence": "evidence/merged-pull-requests.json",
+      "mergedAt": "2026-10-19T09:55:24Z",
+      "mergeCommit": "9cf73d861058f9cbd853919227eccf9d1ac19bcc"
+    },
+    {
+      "pr": 1251,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1251",
+      "rootId": "RC-11",
+      "primaryTask": "4.1",
+      "note": "child javascript 导航",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "0c132ff8aaf3a9d2a1bb44724cd331c1d2cf4ad2",
+      "recordedBase": "2bda71a557247bd2d6fabf01fa66eb4b07dcb2e8"
+    },
+    {
+      "pr": 1248,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1248",
+      "rootId": "RC-11",
+      "primaryTask": "4.1",
+      "note": "preload 终态",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "1698aa4b9bdaeebda6ef6774a7da8e08b8ce1610",
+      "recordedBase": "2bda71a557247bd2d6fabf01fa66eb4b07dcb2e8"
+    },
+    {
+      "pr": 1249,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1249",
+      "rootId": "RC-12",
+      "primaryTask": "4.1",
+      "note": "真实 Worker globals",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "6c0cab6379366dd4faea89cd12d18c9f7d1ab690",
+      "recordedBase": "2bda71a557247bd2d6fabf01fa66eb4b07dcb2e8"
+    },
+    {
+      "pr": 1256,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1256",
+      "rootId": "RC-12",
+      "primaryTask": "4.1",
+      "note": "MessagePort 转移和既有 buffer/来源约束",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "ec457ca5028d5b4ea807a09f9a29f7ae2726ed8a",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 1206,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1206",
+      "rootId": "RC-13",
+      "primaryTask": "5.1",
+      "note": "真实 XML，不留 HTML 假路径",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "297c6cde79deaa9787da559a1e53157f74172268",
+      "recordedBase": "a754dcebe2476713cf30e1b9f9428ee9fbfb4e99"
+    },
+    {
+      "pr": 909,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/909",
+      "rootId": "RC-15",
+      "primaryTask": "4.1",
+      "note": "scheme/syncXHR 候选，保持当前原生权限",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "77c73131a104c276bdcaca934864a6121a23461a",
+      "recordedBase": "727cc46d56290995245fbe790caed52fc699452a"
+    },
+    {
+      "pr": 1080,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1080",
+      "rootId": "RC-16",
+      "primaryTask": "6.1",
+      "note": "真实 WebSocket，代理场景不可丢弃",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "3e51589f2769dfb58d11fb48436c24cbc29bcc41",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 1228,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1228",
+      "rootId": "RC-18",
+      "primaryTask": "8.1",
+      "note": "权限与坐标配置分离，不直接采用其 conflation",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "f626bfde955fa8a7ab894d3e23d1d2ea8b6f088d",
+      "recordedBase": "1f8eb76437f4da4ac7ccb301986e71059e3ea497"
+    },
+    {
+      "pr": 1299,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1299",
+      "rootId": "RC-20",
+      "primaryTask": "9.1",
+      "note": "summary 激活/toggle",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "2e0b63f94a1f59a028ab13fda1b3f73907d287d1",
+      "recordedBase": "8b49681223cca2a1c6f1150ece6d0f5ac5cc2cae"
+    },
+    {
+      "pr": 1097,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1097",
+      "rootId": "RC-20",
+      "primaryTask": "9.1",
+      "note": "真实 range 控件",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "edf3d818165d4425137a2f037b9549974b286710",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 1091,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1091",
+      "rootId": "RC-20",
+      "primaryTask": "9.1",
+      "note": "未实现 touch 明确报错",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "ea56c9c40c5dadcd4aeeb0c9edbf88e74f135584",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 1285,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1285",
+      "rootId": "RC-22",
+      "primaryTask": "9.1",
+      "note": "picture/透明背景默认修复",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "3fb9e3ce4b860b7ce8c5202e39565e1ca6cf2368",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 1257,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1257",
+      "rootId": "RC-22",
+      "primaryTask": "9.1",
+      "note": "monospace 与更广 UA 规则",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "f8949ad86ba1cd1503d05c3956cd4ee2ff991873",
+      "recordedBase": "9414bf5b19189afb33414bc8d1c70bd9d0cf2f34"
+    },
+    {
+      "pr": 1090,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1090",
+      "rootId": "RC-23",
+      "primaryTask": "9.1",
+      "note": "Canvas HSL",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "43a9191bb425f62d9efceb8f5ce768ae8fd4a67d",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 1089,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1089",
+      "rootId": "RC-23",
+      "primaryTask": "9.1",
+      "note": "fallback live surfaces",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "311b44915d4582bc0fa7a8b31b8cfbbd249fa1a7",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 1204,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1204",
+      "rootId": "RC-23",
+      "primaryTask": "9.1",
+      "note": "真实 SVG geometry",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "68113c2095386cd102223239220ab969e4e4ca43",
+      "recordedBase": "a754dcebe2476713cf30e1b9f9428ee9fbfb4e99"
+    },
+    {
+      "pr": 1092,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/1092",
+      "rootId": "RC-23",
+      "primaryTask": "9.1",
+      "note": "字体度量与绘制",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "8583026615c139fc5b22a02f2cfd5fc83dfc3fd0",
+      "recordedBase": "79b16710fe33d001293c87a60c5d81ccad9f6511"
+    },
+    {
+      "pr": 814,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/814",
+      "rootId": "RC-24",
+      "primaryTask": "9.1",
+      "note": "有效级联选择资源",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "0e4167457755e08f633be5c4e964c531ee524ac3",
+      "recordedBase": "6393af1e8291395505fea65e2dedb8bf1a0ad952"
+    },
+    {
+      "pr": 926,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/926",
+      "rootId": "RC-26",
+      "primaryTask": "10.1",
+      "note": "已有 profile 耐久，不等于新增 IDB/CacheStorage",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "ad632bda00a0c6c3876c70f94a94d168280911d4",
+      "recordedBase": "727cc46d56290995245fbe790caed52fc699452a"
+    },
+    {
+      "pr": 775,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/775",
+      "rootId": "RC-21",
+      "primaryTask": "9.1",
+      "note": "隐藏float不能触发旧float-zone路径",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "6a7bbf3258de1db9eba3493dae3de8fb1d4a0abb",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 774,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/774",
+      "rootId": "RC-21",
+      "primaryTask": "9.1",
+      "note": "循环inline尺寸按intrinsic auto处理；保留已记录input度量缺口",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "b223a2c1c3e4e159c72cb084cfa6c02dc81fc24f",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 758,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/758",
+      "rootId": "RC-21",
+      "primaryTask": "9.1",
+      "note": "float百分比宽度与margin；不泛化为全部margin案例已修复",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "423e58affbd0290369d25b55f2e721d166ed4e9b",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 750,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/750",
+      "rootId": "RC-21",
+      "primaryTask": "9.1",
+      "note": "inline-block按可用宽度换行和table min-content",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "ca67b102be6a61596fa5e8d9ce3bb3c0daa59a64",
+      "recordedBase": "bd9529418b7fa975b50eabeac415cfaaa865a588"
+    },
+    {
+      "pr": 727,
+      "url": "https://github.com/h4ckf0r0day/obscura/pull/727",
+      "rootId": "RC-21",
+      "primaryTask": "9.1",
+      "note": "inline wrapper几何；保留block-fragment及空strut已知缺口",
+      "sourceStatus": "open-candidate",
+      "evidence": "evidence/open-pull-requests.json",
+      "recordedHead": "a5ee12f0625045e45edf6b8552bf2c50cd503fe9",
+      "recordedBase": "727cc46d56290995245fbe790caed52fc699452a"
+    }
+  ],
+  "deferredPRs": [
+    {
+      "pr": 1158,
+      "reason": "不得用旧整体存储实现替换现有事务/typed keys/structured clone；新增持久化另案。"
+    },
+    {
+      "pr": 1182,
+      "reason": "作者记录未解决绘制/命中顺序回归，不直接合入。"
+    },
+    {
+      "pr": 1154,
+      "reason": "内存优化为可选工作，先匹配基线。"
+    },
+    {
+      "pr": 1152,
+      "reason": "只针对 INV-1151 证明的剩余关键路径，不覆盖原生 readiness。"
+    },
+    {
+      "pr": 1156,
+      "reason": "只针对 INV-1155 证明的剩余成本，不恢复旧 observer 路径。"
+    }
+  ],
+  "taskCount": 11,
+  "taskIds": [
+    "1.1",
+    "2.1",
+    "3.1",
+    "4.1",
+    "5.1",
+    "6.1",
+    "7.1",
+    "8.1",
+    "9.1",
+    "10.1",
+    "11.1"
+  ],
+  "deliveryGroups": [
+    {
+      "task": "1.1",
+      "title": "请求决策、原生传输与网络事实",
+      "rootUnits": [
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-07"
+      ]
+    },
+    {
+      "task": "2.1",
+      "title": "TLS 缺链恢复与信任边界",
+      "rootUnits": [
+        "RC-05"
+      ]
+    },
+    {
+      "task": "3.1",
+      "title": "CDP 目标、会话与 DOM 发布所有权",
+      "rootUnits": [
+        "RC-06",
+        "RC-08",
+        "RC-09"
+      ]
+    },
+    {
+      "task": "4.1",
+      "title": "文档、Worker 与异步任务生命周期",
+      "rootUnits": [
+        "RC-10",
+        "RC-11",
+        "RC-12",
+        "RC-15"
+      ]
+    },
+    {
+      "task": "5.1",
+      "title": "XML 解析与流式解码",
+      "rootUnits": [
+        "RC-13",
+        "RC-14"
+      ]
+    },
+    {
+      "task": "6.1",
+      "title": "真实 WebSocket 连接生命周期",
+      "rootUnits": [
+        "RC-16"
+      ]
+    },
+    {
+      "task": "7.1",
+      "title": "原生公钥 WebCrypto",
+      "rootUnits": [
+        "RC-17"
+      ]
+    },
+    {
+      "task": "8.1",
+      "title": "区域配置、权限与真实 RTC 路由",
+      "rootUnits": [
+        "RC-18"
+      ]
+    },
+    {
+      "task": "9.1",
+      "title": "共享级联、布局、字体与绘制结果",
+      "rootUnits": [
+        "RC-19",
+        "RC-20",
+        "RC-21",
+        "RC-22",
+        "RC-23",
+        "RC-24",
+        "RC-25"
+      ]
+    },
+    {
+      "task": "10.1",
+      "title": "已有 profile 的提交、隔离与权限",
+      "rootUnits": [
+        "RC-26"
+      ]
+    },
+    {
+      "task": "11.1",
+      "title": "统一集成验证与交付",
+      "rootUnits": []
+    }
+  ],
+  "executionPolicy": {
+    "implementation": "PR-first",
+    "acceptance": "根因最小充分验证；实现与验收同项；已有消费者证据复用，不做全排列。",
+    "investigations": "保留19项登记；只有当前可归因反例进入交付阻塞。",
+    "scopeChange": "用户明确要求按根因收敛、优先合并现成PR、避免过度工程与重复自我证明。"
+  }
+}

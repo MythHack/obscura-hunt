@@ -437,15 +437,44 @@ async fn native_popup_auto_attachment_and_discovery_use_browser_session() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn native_popup_debugger_start_pause_is_not_falsely_advertised() {
-    let mut ctx = CdpContext::new();
-    let response = dispatch(&CdpRequest {
-        id: 1, method: "Target.setAutoAttach".to_string(),
-        params: json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
-        session_id: None,
-    }, &mut ctx).await;
-    assert!(response.error.is_some(), "unsupported admission must not claim debugger pause semantics");
-    assert!(ctx.pending_events.is_empty());
+async fn native_popup_debugger_start_waits_for_owning_session_resume() {
+    let (mut ctx, _, session, _) = window_setup().await;
+    cdp(&mut ctx, 3, "Target.setAutoAttach", json!({
+        "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
+    }), "browser").await;
+    ctx.pending_events.clear();
+    eval(&mut ctx, 4, "window.popup = window.open('/popup', 'debugger-popup'); true", &session).await;
+    let attached = ctx.pending_events.iter().find(|event| event.method == "Target.attachedToTarget"
+        && event.params["targetInfo"]["openerId"].is_string()).unwrap();
+    assert_eq!(attached.params["waitingForDebugger"], true);
+    let popup = attached.params["targetInfo"]["targetId"].as_str().unwrap().to_string();
+    let paused_session = attached.params["sessionId"].as_str().unwrap().to_string();
+    for id in 20..23 { eval(&mut ctx, id, "new Promise(resolve => setTimeout(() => resolve(true), 10))", &session).await; }
+    assert_eq!(ctx.get_page(&popup).unwrap().url_string(), "about:blank");
+    assert_eq!(eval(&mut ctx, 5, "popup.document.title", &session).await["result"]["value"], "");
+    // A different target's session cannot release this debugger admission.
+    cdp(&mut ctx, 6, "Runtime.runIfWaitingForDebugger", json!({}), &session).await;
+    eval(&mut ctx, 24, "new Promise(resolve => setTimeout(() => resolve(true), 10))", &session).await;
+    assert_eq!(ctx.get_page(&popup).unwrap().url_string(), "about:blank");
+    cdp(&mut ctx, 7, "Runtime.runIfWaitingForDebugger", json!({}), &paused_session).await;
+    let loaded = eval(&mut ctx, 8, "new Promise(resolve => { if (popup.document.title === 'Native popup') resolve(true); else addEventListener('message', e => { if (e.data === 'popup-ready') resolve(e.source === popup); }, {once:true}); })", &session).await;
+    assert_eq!(loaded["result"]["value"], true);
+    assert_eq!(eval(&mut ctx, 9, "document.title", &paused_session).await["result"]["value"], "Native popup");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_popup_debugger_detach_releases_pending_navigation() {
+    let (mut ctx, _, session, _) = window_setup().await;
+    cdp(&mut ctx, 3, "Target.setAutoAttach", json!({
+        "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
+    }), "browser").await;
+    ctx.pending_events.clear();
+    eval(&mut ctx, 4, "window.popup = window.open('/popup', 'detached-debugger-popup'); true", &session).await;
+    let paused_session = ctx.pending_events.iter().find(|event| event.method == "Target.attachedToTarget"
+        && event.params["waitingForDebugger"] == true).unwrap().params["sessionId"].as_str().unwrap().to_string();
+    cdp(&mut ctx, 5, "Target.detachFromTarget", json!({"sessionId": paused_session}), "browser").await;
+    let loaded = eval(&mut ctx, 6, "new Promise(resolve => { if (popup.document.title === 'Native popup') resolve(true); else addEventListener('message', e => { if (e.data === 'popup-ready') resolve(e.source === popup); }, {once:true}); })", &session).await;
+    assert_eq!(loaded["result"]["value"], true);
 }
 
 type WindowSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -468,7 +497,7 @@ async fn window_socket_command(ws: &mut WindowSocket, id: u64, method: &str, par
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn native_popup_load_and_message_advance_while_client_is_silent() {
+async fn native_popup_debugger_resume_then_load_advances_while_client_is_silent() {
     let fixture = window_fixture().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -487,11 +516,14 @@ async fn native_popup_load_and_message_advance_while_client_is_silent() {
         let session = format!("{opener}-session");
         window_socket_command(&mut ws, 2, "Target.setDiscoverTargets", json!({"discover": true}), None).await;
         window_socket_command(&mut ws, 3, "Runtime.enable", json!({}), Some(&session)).await;
+        window_socket_command(&mut ws, 5, "Target.setAutoAttach", json!({
+            "autoAttach": true, "flatten": true, "waitForDebuggerOnStart": true,
+        }), None).await;
         window_socket_command(&mut ws, 4, "Runtime.evaluate", json!({
             "expression": "window.addEventListener('message', e => { if (e.data === 'popup-ready') console.log('native-popup-ready', e.source === popup, e.origin === location.origin); }); setTimeout(() => { window.popup = window.open('/popup', 'silent-popup'); }, 50); true",
             "returnByValue": true, "awaitPromise": false,
         }), Some(&session)).await;
-        // No subsequent command is allowed to drive this load or posted task.
+        // Only the debugger release may precede the autonomous load/message.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut popup = None;
             let mut received_message = false;
@@ -503,6 +535,11 @@ async fn native_popup_load_and_message_advance_while_client_is_silent() {
                     assert_eq!(info["openerId"], opener);
                     assert_eq!(info["canAccessOpener"], true);
                     popup = info["targetId"].as_str().map(str::to_string);
+                }
+                if event["method"] == "Target.attachedToTarget" && event["params"]["targetInfo"]["openerId"] == opener {
+                    assert_eq!(event["params"]["waitingForDebugger"], true);
+                    ws.send(Message::Text(json!({"id": 6, "method": "Runtime.runIfWaitingForDebugger",
+                        "params": {}, "sessionId": event["params"]["sessionId"]}).to_string().into())).await.unwrap();
                 }
                 if event["method"] == "Runtime.consoleAPICalled" && event["params"]["args"][0]["value"] == "native-popup-ready" {
                     assert_eq!(event["sessionId"], session);

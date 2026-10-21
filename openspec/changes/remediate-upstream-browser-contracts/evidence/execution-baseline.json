@@ -1,0 +1,42 @@
+{
+  "sourceRevision": "208608215a42f2c392b13ccce62f433a4441155a",
+  "sourceStateBeforeImplementation": {
+    "modified": ["docs/README.md", "docs/SUMMARY.md"],
+    "untracked": ["%SystemDrive%/", "docs/Upstream-remediation-plan.md", "openspec/"],
+    "policy": "Preserve user changes; no source repairs were present at baseline."
+  },
+  "platform": "x86_64-pc-windows-msvc",
+  "cargoTargetDir": "E:/rust/target",
+  "executables": [
+    {
+      "path": "E:/rust/target/release/obscura.exe",
+      "frozenCopy": "D:/temp/obscura-remediation/baseline.exe",
+      "sha256": "e88dbfbd9ea00d25aa91ad186e57bf81995346ff4fa1165f3f837684cdca0d3f",
+      "hashCommand": "certutil.exe -hashfile E:/rust/target/release/obscura.exe SHA256",
+      "hashExitCode": 0,
+      "buildInfoCommand": "E:/rust/target/release/obscura.exe --build-info",
+      "buildInfoExitCode": 0,
+      "buildInfo": {
+        "name": "obscura",
+        "version": "0.1.2-dev+425b765",
+        "target": "x86_64-pc-windows-msvc",
+        "source": {"repository": "https://github.com/MythHack/obscura-hunt.git", "commit": "425b765baafa887edd812f79e91dd62908dd2eb6", "dirty": true},
+        "features": {"render": true, "stealth": false}
+      }
+    },
+    {
+      "path": "E:/rust/target/release/obscura-worker.exe",
+      "sha256": "0e04803db825d88d2483747055e1265a9b0b9f141429d7e5e95d6c8f33817a4f",
+      "hashCommand": "certutil.exe -hashfile E:/rust/target/release/obscura-worker.exe SHA256",
+      "hashExitCode": 0,
+      "buildInfo": null
+    }
+  ],
+  "fixtures": {
+    "deterministicRender": "render-repros/",
+    "benchmarkCheckout": "D:/code/.tools/obscura-benchmark-2d7bc30",
+    "disposableOutputs": "D:/temp/obscura-remediation"
+  },
+  "provenanceLimit": "The existing executable identifies an older dirty source revision. It is a diagnostic baseline only and does not verify the current source or any new repair. Historical local-observations receipts remain unchanged and are not used to close implementation tasks.",
+  "planningValidation": {"command": "openspec validate remediate-upstream-browser-contracts --strict", "exitCode": 0, "result": "Change is valid; no behavioral acceptance implied."}
+}

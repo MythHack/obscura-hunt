@@ -611,6 +611,7 @@ fn compute_inner(
         #[cfg(feature = "content_size")]
         content_size,
         first_baselines: Point::NONE,
+        last_baselines: Point::NONE,
         top_margin,
         bottom_margin,
         margins_can_collapse_through: can_be_collapsed_through,

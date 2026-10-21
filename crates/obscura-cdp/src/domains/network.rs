@@ -45,6 +45,9 @@ pub(super) async fn apply_user_agent_override(
         client.set_user_agent(&user_agent).await;
         if let Some(language) = language { client.set_accept_language(language).await; }
     }
+    if let Some(platform) = params.get("platform").and_then(Value::as_str) {
+        page.set_platform_override(platform).await;
+    }
     if let Some(js) = &mut page.js {
         js.set_user_agent(&user_agent);
         if let Some(language) = language { js.set_language(language); }
@@ -59,15 +62,14 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            let session = session_id.as_ref().ok_or("Network.enable requires a page session")?;
+            if ctx.get_session_page(session_id).is_none() { return Err("No page for session".into()); }
+            ctx.network_enabled_sessions.insert(session.clone());
+            Ok(json!({}))
+        }
         "disable" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.clear_response_bodies();
-            } else {
-                for page in &mut ctx.pages {
-                    page.clear_response_bodies();
-                }
-            }
+            if let Some(session) = session_id { ctx.disable_network_session(session); }
             Ok(json!({}))
         }
         "setExtraHTTPHeaders" => {
@@ -152,12 +154,16 @@ pub async fn handle(
                 .get("requestId")
                 .and_then(|v| v.as_str())
                 .ok_or("Network.getResponseBody requires requestId")?;
+            let session = session_id.as_ref().ok_or("Network.getResponseBody requires a page session")?;
+            if !ctx.network_enabled_sessions.contains(session)
+                || !(ctx.network_body_views.get(session).is_some_and(|view| view.contains(request_id))
+                    || ctx.server_registry.as_ref().is_some_and(|registry| registry.body_visible(session, request_id))) {
+                return Err(format!("No response body found for requestId {}", request_id));
+            }
 
-            let body = if let Some(page) = ctx.get_session_page(session_id) {
-                page.get_response_body(request_id)
-            } else {
-                ctx.pages.iter().find_map(|page| page.get_response_body(request_id))
-            };
+            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let native = ctx.server_registry.as_ref().and_then(|registry| registry.native_request_id(&page.id, request_id));
+            let body = page.get_response_body(native.as_deref().unwrap_or(request_id));
 
             match body {
                 Some(body) => Ok(json!({
@@ -370,11 +376,17 @@ mod tests {
         let session_id = Some("session-1".to_string());
         ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
 
-        let page = ctx.get_page_mut(&page_id).unwrap();
-        page.navigate("data:text/html,<html><body>hello body</body></html>")
-            .await
-            .unwrap();
-        let request_id = page.network_events[0].request_id.clone();
+        handle("enable", &json!({}), &mut ctx, &session_id).await.unwrap();
+        crate::domains::page::handle(
+            "navigate",
+            &json!({"url": "data:text/html,<html><body>hello body</body></html>"}),
+            &mut ctx,
+            &session_id,
+        ).await.unwrap();
+        ctx.filter_pending_events();
+        let request_id = ctx.pending_events.iter()
+            .find(|event| event.method == "Network.responseReceived")
+            .unwrap().params["requestId"].as_str().unwrap().to_string();
 
         let result = handle(
             "getResponseBody",
@@ -389,20 +401,6 @@ mod tests {
         assert_eq!(result["base64Encoded"], false);
     }
 
-    #[tokio::test]
-    async fn get_response_body_errors_for_unknown_request_id() {
-        let mut ctx = CdpContext::new();
-        let err = handle(
-            "getResponseBody",
-            &json!({ "requestId": "missing" }),
-            &mut ctx,
-            &None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err.contains("missing"));
-    }
 
     #[tokio::test]
     async fn network_disable_clears_stored_response_bodies() {

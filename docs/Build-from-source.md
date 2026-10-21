@@ -3,6 +3,13 @@
 - Current stable Rust ([rustup.rs](https://rustup.rs)); the V8 dependency uses Rust 2024
 - C++20 compiler (GCC, Clang, or Visual Studio C++ Build Tools)
 - Several GB of free disk space for native dependencies and release artifacts
+- Public-key WebCrypto builds maintained vendored OpenSSL 3 sources. Windows
+  builds need Perl, NASM and the MSVC C/C++ environment; Unix builds need Perl and
+  a supported C compiler. Secret-key algorithms retain their existing RustCrypto
+  implementations.
+- Stealth additionally needs CMake, Clang and libclang/LLVM development libraries.
+  Its btls/BoringSSL symbol-prefix build needs Go 1.24 or newer on `PATH` on
+  Windows and macOS.
 
 Build time depends on the machine and cache state. Cargo reuses unchanged
 dependencies, but a release source edit can still require substantial compilation
@@ -14,6 +21,22 @@ branch. Older tagged release archives do not acquire later engine changes.
 See [Installation](Installation.md) for public package availability and
 [upgrade validation](Testing-and-debugging.md#upgrade-validation-october-19)
 for the exercised source revision.
+
+JavaScript `crypto.subtle` supports RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS,
+ECDSA/ECDH (P-256/P-384/P-521), Ed25519 and X25519: native key generation,
+SPKI/PKCS8/JWK import/export (plus raw EC/OKP public keys), signatures,
+encryption/agreement, derived AES/HMAC keys and existing AES/RSA wrapping paths.
+Private material and immutable key policy remain in native garbage-collected
+handles, including structured clones. Native key generation is admission-bounded
+and runs off the V8 callback thread; key and message sizes are bounded separately
+from script watchdogs.
+RSA keys are capped at 16,384 bits, encoded key imports at 64 KiB, and signed or
+verified messages and OAEP labels at 16 MiB. Two native key-generation jobs may
+run concurrently; admission and result waits each have a 15-second deadline.
+Raw private keys, raw RSA keys, unsupported algorithms/curves/hashes, invalid
+key usages, incompatible JWK policy and non-extractable export/wrap requests are
+rejected rather than emulated. These are implementation resource bounds, not a
+claim that every WebCrypto extension or arbitrary-size native key is supported.
 
 ## Build
 
@@ -41,9 +64,10 @@ blocklist. See [Configure stealth and proxies](Configure-stealth-and-proxies.md)
 
 ### Windows (PowerShell)
 
-Install the Visual Studio C++ Build Tools, CMake, and LLVM. The stealth transport
-uses bindgen, which must load `libclang.dll`; having `clang.exe` on `PATH` alone
-does not guarantee that the DLL can be found. Set `LIBCLANG_PATH` to the directory
+Install the Visual Studio C++ Build Tools, CMake, LLVM, Perl and NASM. For
+stealth, also install Go 1.24 or newer on `PATH`. The stealth transport uses
+bindgen, which must load `libclang.dll`; having `clang.exe` on `PATH` alone does
+not guarantee that the DLL can be found. Set `LIBCLANG_PATH` to the directory
 containing the DLL, not to the DLL file. For an LLVM installation at `E:\LLVM`:
 
 ```powershell
@@ -88,6 +112,18 @@ an upstream interface can replace it without losing those browser semantics.
 raw `v8` package to `=152.2.0` for both `deno_core` and `serde_v8`; keep it together
 with the browser-realm patch. The following section describes the matching SDK,
 native ABI and snapshots.
+
+The network patches are `vendor/rustls-platform-verifier-0.7.1`,
+`vendor/wreq-6.0.0-rc.31` and `vendor/btls-sys-0.5.6`. They retain the selected
+transport's certificate validation and bounded missing-intermediate recovery.
+With stealth enabled, BoringSSL symbols are isolated from the OpenSSL backend
+used by public-key WebCrypto. On Windows (PE) and Apple targets (Mach-O), the
+btls build first compiles bootstrap archives, uses the bundled Go
+`read_symbols.go` utility to collect symbols, then rebuilds through BoringSSL's
+native CMake prefix mechanism, including assembly symbols. No external
+`objcopy` replacement is used on those platforms. Linux/Android retain the
+existing `nm`/`objcopy` path. This describes the build implementation, not a
+claim of runtime verification on each platform.
 
 ### V8 version, SDK and snapshots
 
@@ -155,11 +191,12 @@ to the default requirements, install CMake, Clang, and the libclang/LLVM
 development libraries. On Ubuntu/Debian:
 
 ```bash
-sudo apt-get install build-essential cmake clang libclang-dev llvm-dev
+sudo apt-get install build-essential perl cmake clang libclang-dev llvm-dev
 ```
 
-On macOS, install the Xcode Command Line Tools and CMake. For the Windows toolchain
-and DLL search path, see [Windows (PowerShell)](#windows-powershell).
+On macOS, install the Xcode Command Line Tools, CMake, Perl, and, for stealth,
+Go 1.24 or newer. For the Windows toolchain and DLL search path, see
+[Windows (PowerShell)](#windows-powershell).
 
 On macOS 26 with the standalone Command Line Tools, Apple Clang may not find
 libc++ while compiling BoringSSL. Use the active SDK for that build:

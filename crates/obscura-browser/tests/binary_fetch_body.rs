@@ -82,14 +82,12 @@ fn spawn_echo_server() -> (String, mpsc::Receiver<Vec<u8>>) {
 async fn assert_binary_fetch_body(stealth: bool) {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let (base_url, body_rx) = spawn_echo_server();
-    let context = Arc::new(BrowserContext::with_storage_and_network(
-        "binary-fetch".to_string(),
-        None,
-        stealth,
-        None,
-        None,
-        true,
-    ));
+    let context = Arc::new(BrowserContext::with_storage_and_network("binary-fetch".to_string(),
+    None,
+    stealth,
+    None,
+    None,
+    true,).unwrap());
     let mut page = Page::new("binary-fetch-page".to_string(), context);
     page.navigate(&base_url).await.unwrap();
 

@@ -12,15 +12,19 @@ mkdir -p "$OUT"
 status=0
 for f in "$DIR"/*.html; do
   n=$(basename "$f" .html)
+  file_url="file://$f"
+  if command -v cygpath >/dev/null 2>&1; then
+    file_url="file:///$(cygpath -am "$f")"
+  fi
   if ! OBSCURA_SHOT_W=900 OBSCURA_SHOT_H=1000 OBSCURA_ALLOW_PRIVATE_NETWORK=1 \
-    timeout 60 "$BIN" fetch "file://$f" --screenshot "$OUT/$n.obscura.png" \
+    timeout 60 "$BIN" --allow-file-access fetch "$file_url" --screenshot "$OUT/$n.obscura.png" \
       --timeout 30000 --wait 2 >"$OUT/$n.obscura.log" 2>&1 || [[ ! -s "$OUT/$n.obscura.png" ]]; then
     echo "FAILED obscura: $n (see $OUT/$n.obscura.log)" >&2
     status=1
     continue
   fi
 
-  chrome_args=("$DIR/capture_chromium.py" "file://$f" "$OUT/$n.chrome.png")
+  chrome_args=("$DIR/capture_chromium.py" "$file_url" "$OUT/$n.chrome.png")
   if [[ -n "$CHROME" ]]; then
     chrome_args+=(--executable "$CHROME")
   fi

@@ -545,7 +545,7 @@ mod tests {
         let host = tree.get_element_by_id("host").unwrap();
         let template = tree.get_element_by_id("invalid").unwrap();
         let contents = tree.template_contents(template).unwrap();
-        let inside = tree.get_element_by_id("inside").unwrap();
+        let inside = tree.query_selector_from(contents, "#inside").unwrap().unwrap();
 
         assert_eq!(tree.shadow_root(host), None);
         assert_eq!(element_children(&tree, host), vec![template]);
@@ -574,7 +574,7 @@ mod tests {
         let light = tree.get_element_by_id("light").unwrap();
         let duplicate = tree.get_element_by_id("duplicate").unwrap();
         let duplicate_contents = tree.template_contents(duplicate).unwrap();
-        let second = tree.get_element_by_id("second").unwrap();
+        let second = tree.query_selector_from(duplicate_contents, "#second").unwrap().unwrap();
         let root = tree.shadow_root(host).unwrap();
 
         assert_eq!(tree.shadow_root_info(root).unwrap().mode, ShadowRootMode::Open);
@@ -631,7 +631,7 @@ mod tests {
         );
         let template = tree.get_element_by_id("shadow").unwrap();
         let contents = tree.template_contents(template).unwrap();
-        let inside = tree.get_element_by_id("inside").unwrap();
+        let inside = tree.query_selector_from(contents, "#inside").unwrap().unwrap();
 
         assert!(!tree.allows_declarative_shadow_roots());
         assert_eq!(element_children(&tree, contents), vec![inside]);
@@ -650,7 +650,7 @@ mod tests {
         let host = tree.get_element_by_id("host").unwrap();
         let template = tree.get_element_by_id("ordinary").unwrap();
         let contents = tree.template_contents(template).unwrap();
-        let inside = tree.get_element_by_id("inside").unwrap();
+        let inside = tree.query_selector_from(contents, "#inside").unwrap().unwrap();
         let outside = tree.get_element_by_id("outside").unwrap();
         let element_children = |parent| {
             tree.children(parent)

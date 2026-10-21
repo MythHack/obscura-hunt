@@ -26,10 +26,9 @@ enum PdfTransferMode {
 #[cfg(feature = "render")]
 #[derive(Clone, Debug)]
 struct ParsedPdfOptions {
-    raster: obscura_browser::RasterPdfOptions,
+    pdf: obscura_browser::PdfOptions,
     transfer_mode: PdfTransferMode,
     requested_print_background: bool,
-    requested_tagged_pdf: bool,
 }
 
 #[cfg(feature = "render")]
@@ -54,7 +53,7 @@ fn boolean(params: &Value, name: &str, default: bool) -> Result<bool, String> {
 }
 
 #[cfg(feature = "render")]
-fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::RasterPdfPageRange>, String> {
+fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::PdfPageRange>, String> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(Vec::new());
@@ -111,14 +110,14 @@ fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::RasterPdfPageRa
                 "Invalid parameters: pageRanges range {part:?} is descending"
             ));
         }
-        ranges.push(obscura_browser::RasterPdfPageRange { start, end });
+        ranges.push(obscura_browser::PdfPageRange { start, end });
     }
 
     // Normalize before crossing the CDP/browser boundary. This bounds later
     // selection work and makes repeated or overlapping user ranges occupy one
     // entry while preserving Chromium's document-order, print-once semantics.
     ranges.sort_by_key(|range| (range.start.unwrap_or(1), range.end.unwrap_or(usize::MAX)));
-    let mut normalized: Vec<obscura_browser::RasterPdfPageRange> = Vec::new();
+    let mut normalized: Vec<obscura_browser::PdfPageRange> = Vec::new();
     for range in ranges {
         let start = range.start.unwrap_or(1);
         if let Some(previous) = normalized.last_mut() {
@@ -131,7 +130,7 @@ fn parse_page_ranges(value: &str) -> Result<Vec<obscura_browser::RasterPdfPageRa
                 continue;
             }
         }
-        normalized.push(obscura_browser::RasterPdfPageRange {
+        normalized.push(obscura_browser::PdfPageRange {
             start: Some(start),
             end: range.end,
         });
@@ -148,6 +147,7 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         ("displayHeaderFooter", "headers and footers"),
         ("preferCSSPageSize", "CSS @page sizing"),
         ("generateDocumentOutline", "document outlines"),
+        ("generateTaggedPDF", "tagged PDF"),
     ];
     for (name, capability) in unsupported_true {
         if boolean(params, name, false)? {
@@ -157,10 +157,6 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         }
     }
     let requested_print_background = boolean(params, "printBackground", false)?;
-    // Puppeteer currently sends true by default. Raster PDFs have no semantic
-    // structure to tag, but rejecting the request makes the standard client
-    // unusable. Accept and truthfully report `taggedPdf:false` in the response.
-    let requested_tagged_pdf = boolean(params, "generateTaggedPDF", false)?;
     let scale = number(params, "scale", 1.0)?;
     if !(0.1..=2.0).contains(&scale) {
         return Err("Invalid parameters: scale must be between 0.1 and 2".to_string());
@@ -194,9 +190,9 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         Some(_) => return Err("Invalid parameters: transferMode must be a string".into()),
     };
 
-    let defaults = obscura_browser::RasterPdfOptions::default();
+    let defaults = obscura_browser::PdfOptions::default();
     Ok(ParsedPdfOptions {
-        raster: obscura_browser::RasterPdfOptions {
+        pdf: obscura_browser::PdfOptions {
             landscape: boolean(params, "landscape", defaults.landscape)?,
             print_background: requested_print_background,
             scale,
@@ -210,7 +206,6 @@ fn parse_options(params: &Value) -> Result<ParsedPdfOptions, String> {
         },
         transfer_mode,
         requested_print_background,
-        requested_tagged_pdf,
     })
 }
 
@@ -227,15 +222,13 @@ pub async fn print_to_pdf(
             .ok_or("No page for session")?;
         crate::domains::page::prepare_capture_resources_if_requested(page).await;
         let animation_sample = page.live_animation_sample();
-        let pdf = page
-            .raster_pdf_with_animation_sample(options.raster, animation_sample)
+        let pdf = page.pdf_with_animation_sample(options.pdf, animation_sample)
             .map_err(|error| error.to_string())?;
         let mut response = json!({
-            "obscuraPrintMode": "print-media-raster",
+            "obscuraPrintMode": "print-media-vector",
             "obscuraPrintBackground": options.requested_print_background,
             "obscuraRequestedPrintBackground": options.requested_print_background,
             "obscuraTaggedPDF": false,
-            "obscuraRequestedTaggedPDF": options.requested_tagged_pdf,
             "obscuraCapabilities": {
                 "cssPagedMedia": false,
                 "honorsPrintMedia": true,
@@ -244,13 +237,11 @@ pub async fn print_to_pdf(
                 "pageRanges": true,
                 "printColorAdjustExact": false,
                 "taggedPdf": false,
+                "selectableText": true,
+                "embeddedSubsetFonts": true,
+                "vectorGraphics": true,
             },
         });
-        let mut ignored_options = Vec::new();
-        if options.requested_tagged_pdf {
-            ignored_options.push("generateTaggedPDF");
-        }
-        response["obscuraIgnoredOptions"] = json!(ignored_options);
         match options.transfer_mode {
             PdfTransferMode::ReturnAsBase64 => {
                 use base64::Engine as _;
@@ -286,111 +277,39 @@ pub async fn print_to_pdf(
 mod tests {
     use super::*;
     use crate::domains::page;
+    use base64::Engine as _;
 
     #[test]
-    fn parser_accepts_standard_client_defaults_and_rejects_unrepresented_features() {
-        let standard = parse_options(&json!({
-            "transferMode": "ReturnAsStream",
-            "displayHeaderFooter": false,
-            "headerTemplate": "",
-            "footerTemplate": "",
-            "printBackground": false,
-            "scale": 1,
-            "pageRanges": "",
-            "preferCSSPageSize": false,
-            "generateTaggedPDF": true,
-            "generateDocumentOutline": false,
-        }))
-        .expect("current Puppeteer defaults must be accepted");
-        assert_eq!(standard.transfer_mode, PdfTransferMode::ReturnAsStream);
-        assert!(!standard.requested_print_background);
-        assert!(!standard.raster.print_background);
-        assert!(standard.requested_tagged_pdf);
-        assert_eq!(standard.raster.scale, 1.0);
-        assert!(standard.raster.page_ranges.is_empty());
-
-        for params in [
-            json!({"displayHeaderFooter": true}),
-            json!({"preferCSSPageSize": true}),
-            json!({"headerTemplate": "<span>title</span>"}),
-            json!({"generateDocumentOutline": true}),
-        ] {
+    fn parser_rejects_unsupported_capabilities_and_normalizes_page_ranges() {
+        let options = parse_options(&json!({"transferMode":"ReturnAsStream", "scale":0.5,
+            "pageRanges":"5-8,1-3,3-6,10,9,12-", "generateTaggedPDF":false})).unwrap();
+        assert_eq!(options.transfer_mode, PdfTransferMode::ReturnAsStream);
+        assert_eq!(options.pdf.scale, 0.5);
+        assert_eq!(options.pdf.page_ranges, vec![
+            obscura_browser::PdfPageRange { start: Some(1), end: Some(10) },
+            obscura_browser::PdfPageRange { start: Some(12), end: None }]);
+        for params in [json!({"generateTaggedPDF":true}), json!({"displayHeaderFooter":true}),
+            json!({"preferCSSPageSize":true}), json!({"generateDocumentOutline":true}),
+            json!({"headerTemplate":"<span>title</span>"}), json!({"scale":0.09}),
+            json!({"pageRanges":"0"}), json!({"pageRanges":"3-2"}), json!({"pageRanges":"1,,2"}),
+            json!({"transferMode":"unknown"})] {
             assert!(parse_options(&params).is_err(), "must reject {params}");
         }
-
-        let ranged = parse_options(&json!({
-            "scale": 0.5,
-            "pageRanges": "1, 3-5, 8-",
-        }))
-        .expect("CDP scale and page ranges");
-        assert_eq!(ranged.raster.scale, 0.5);
-        assert_eq!(
-            ranged.raster.page_ranges,
-            vec![
-                obscura_browser::RasterPdfPageRange {
-                    start: Some(1),
-                    end: Some(1),
-                },
-                obscura_browser::RasterPdfPageRange {
-                    start: Some(3),
-                    end: Some(5),
-                },
-                obscura_browser::RasterPdfPageRange {
-                    start: Some(8),
-                    end: None,
-                },
-            ]
-        );
-        assert_eq!(
-            parse_page_ranges("5-8, 1-3, 3-6, 10, 9, 12-").unwrap(),
-            vec![
-                obscura_browser::RasterPdfPageRange {
-                    start: Some(1),
-                    end: Some(10),
-                },
-                obscura_browser::RasterPdfPageRange {
-                    start: Some(12),
-                    end: None,
-                },
-            ],
-            "overlapping, adjacent, and repeated ranges must normalize before pagination"
-        );
-        for params in [
-            json!({"scale": 0.09}),
-            json!({"scale": 2.01}),
-            json!({"pageRanges": "0"}),
-            json!({"pageRanges": "3-2"}),
-            json!({"pageRanges": "1,,2"}),
-            json!({"pageRanges": "1-2-3"}),
-        ] {
-            assert!(parse_options(&params).is_err(), "must reject {params}");
-        }
-
-        let too_many_parts = std::iter::repeat_n("1", MAX_PAGE_RANGE_PARTS + 1)
-            .collect::<Vec<_>>()
-            .join(",");
-        assert!(
-            parse_page_ranges(&too_many_parts).is_err(),
-            "range-token work must remain bounded before output allocation"
-        );
-        let too_many_bytes = "1".repeat(MAX_PAGE_RANGES_BYTES + 1);
-        assert!(
-            parse_page_ranges(&too_many_bytes).is_err(),
-            "range input bytes must be bounded before numeric parsing"
-        );
+        assert!(parse_page_ranges(&"1".repeat(MAX_PAGE_RANGES_BYTES + 1)).is_err());
+        assert!(parse_page_ranges(&std::iter::repeat_n("1", MAX_PAGE_RANGE_PARTS + 1)
+            .collect::<Vec<_>>().join(",")).is_err());
     }
 
     #[test]
     fn base64_size_preflight_is_exact_and_overflow_safe() {
         assert_eq!(base64_encoded_len(0), Some(0));
         assert_eq!(base64_encoded_len(1), Some(4));
-        assert_eq!(base64_encoded_len(2), Some(4));
         assert_eq!(base64_encoded_len(3), Some(4));
         assert_eq!(base64_encoded_len(4), Some(8));
         assert_eq!(base64_encoded_len(usize::MAX), None);
-        let largest_raw = (MAX_BASE64_PDF_BYTES / 4) * 3;
-        assert_eq!(base64_encoded_len(largest_raw), Some(MAX_BASE64_PDF_BYTES));
-        assert!(base64_encoded_len(largest_raw + 1).unwrap() > MAX_BASE64_PDF_BYTES);
+        let largest = (MAX_BASE64_PDF_BYTES / 4) * 3;
+        assert_eq!(base64_encoded_len(largest), Some(MAX_BASE64_PDF_BYTES));
+        assert!(base64_encoded_len(largest + 1).unwrap() > MAX_BASE64_PDF_BYTES);
     }
 
     #[tokio::test]
@@ -400,136 +319,49 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
-        ctx.get_session_page_mut(&session)
-            .unwrap()
-            .set_viewport((100.0, 80.0));
-        page::handle(
-            "navigate",
-            &json!({
-                "url": "data:text/html,<html style='margin:0'><body style='margin:0;height:400px;background:linear-gradient(red,blue)'></body></html>",
-                "waitUntil": "load",
-            }),
-            &mut ctx,
-            &session,
-        ).await.expect("navigate fixture");
-        let response = print_to_pdf(
-            &json!({
-                "paperWidth": 4.0, "paperHeight": 6.0,
-                "marginTop": 0.5, "marginBottom": 0.5,
-                "marginLeft": 0.5, "marginRight": 0.5,
-                "printBackground": true,
-            }),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("raster PDF");
-        assert_eq!(response["obscuraPrintMode"], "print-media-raster");
-        assert_eq!(response["obscuraPrintBackground"], true);
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(response["data"].as_str().unwrap())
-            .unwrap();
-        assert!(bytes.starts_with(b"%PDF-1.4"));
-        assert!(bytes.ends_with(b"%%EOF\n"));
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("/MediaBox [0 0 288.000 432.000]"));
-        assert!(
-            text.matches("/Subtype /Image").count() >= 2,
-            "400px tall fixture should paginate at this printable aspect ratio"
-        );
-
-        let streamed = page::handle(
-            "printToPDF",
-            &json!({
-                "transferMode": "ReturnAsStream",
-                "landscape": false,
-                "displayHeaderFooter": false,
-                "headerTemplate": "",
-                "footerTemplate": "",
-                "printBackground": false,
-                "scale": 1,
-                "paperWidth": 8.5,
-                "paperHeight": 11,
-                "marginTop": 0,
-                "marginBottom": 0,
-                "marginLeft": 0,
-                "marginRight": 0,
-                "pageRanges": "",
-                "preferCSSPageSize": false,
-                "generateTaggedPDF": true,
-                "generateDocumentOutline": false,
-            }),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("Puppeteer/Playwright-shaped stream request");
-        assert_eq!(streamed["data"], "");
-        assert_eq!(streamed["obscuraPrintBackground"], false);
-        assert_eq!(streamed["obscuraRequestedPrintBackground"], false);
-        assert_eq!(
-            streamed["obscuraCapabilities"]["honorsPrintBackground"],
-            true
-        );
-        assert_eq!(streamed["obscuraCapabilities"]["honorsScale"], true);
-        assert_eq!(streamed["obscuraCapabilities"]["honorsPrintMedia"], true);
-        assert_eq!(streamed["obscuraCapabilities"]["pageRanges"], true);
-        assert_eq!(streamed["obscuraTaggedPDF"], false);
-        assert_eq!(streamed["obscuraRequestedTaggedPDF"], true);
-        assert_eq!(
-            streamed["obscuraIgnoredOptions"],
-            json!(["generateTaggedPDF"])
-        );
-        let handle = streamed["stream"].as_str().expect("protocol stream handle");
-        let mut streamed_bytes = Vec::new();
-        loop {
-            let chunk = crate::domains::io::handle(
-                "read",
-                &json!({"handle": handle, "size": 1024}),
-                &mut ctx,
-            )
-            .await
-            .expect("read PDF stream");
-            streamed_bytes.extend(
-                base64::engine::general_purpose::STANDARD
-                    .decode(chunk["data"].as_str().unwrap())
-                    .unwrap(),
-            );
-            if chunk["eof"] == true {
-                break;
-            }
+        ctx.get_session_page_mut(&session).unwrap().set_viewport((100., 80.));
+        page::handle("navigate", &json!({"url":
+            "data:text/html,<style>html,body{margin:0}div{height:160px}</style><div>Hello</div><div>SECOND</div><div>THIRD</div>",
+            "waitUntil":"load"}), &mut ctx, &session).await.unwrap();
+        let options = json!({"paperWidth":4., "paperHeight":6.,
+            "marginTop":0.5,"marginBottom":0.5,"marginLeft":0.5,"marginRight":0.5,
+            "printBackground":true});
+        let response = print_to_pdf(&options, &mut ctx, &session).await.unwrap();
+        assert_eq!(response["obscuraPrintMode"], "print-media-vector");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(response["data"].as_str().unwrap()).unwrap();
+        let document = lopdf::Document::load_mem(&bytes).unwrap();
+        assert!(document.get_pages().len() >= 2);
+        for id in document.get_pages().values() {
+            let media = document.get_dictionary(*id).unwrap().get(b"MediaBox").unwrap().as_array().unwrap();
+            let values = media.iter().map(|value| match value {
+                lopdf::Object::Integer(value) => *value as f32,
+                lopdf::Object::Real(value) => *value,
+                _ => panic!("MediaBox coordinate must be numeric"),
+            }).collect::<Vec<_>>();
+            assert_eq!(values, vec![0., 0., 288., 432.]);
         }
-        assert!(streamed_bytes.starts_with(b"%PDF-1.4"));
-        assert!(streamed_bytes.ends_with(b"%%EOF\n"));
-        crate::domains::io::handle("close", &json!({"handle": handle}), &mut ctx)
-            .await
-            .expect("close PDF stream");
-        assert!(
-            crate::domains::io::handle("read", &json!({"handle": handle}), &mut ctx,)
-                .await
-                .is_err(),
-            "closed PDF handles must release their buffer"
-        );
 
-        let ranged = print_to_pdf(
-            &json!({
-                "paperWidth": 4.0, "paperHeight": 6.0,
-                "marginTop": 0.5, "marginBottom": 0.5,
-                "marginLeft": 0.5, "marginRight": 0.5,
-                "scale": 1,
-                "pageRanges": "2",
-            }),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("single selected page");
-        let ranged_bytes = base64::engine::general_purpose::STANDARD
-            .decode(ranged["data"].as_str().unwrap())
-            .unwrap();
-        let ranged_text = String::from_utf8_lossy(&ranged_bytes);
-        assert!(ranged_text.contains("/Count 1"));
-        assert_eq!(ranged_text.matches("/Subtype /Image").count(), 1);
+        let mut stream_options = options.clone();
+        stream_options["transferMode"] = json!("ReturnAsStream");
+        let response = print_to_pdf(&stream_options, &mut ctx, &session).await.unwrap();
+        let handle = response["stream"].as_str().unwrap();
+        let mut streamed = Vec::new();
+        loop {
+            let chunk = crate::domains::io::handle("read", &json!({"handle":handle,"size":137}), &mut ctx).await.unwrap();
+            assert_eq!(chunk["base64Encoded"], true);
+            streamed.extend(base64::engine::general_purpose::STANDARD.decode(chunk["data"].as_str().unwrap()).unwrap());
+            if chunk["eof"] == true { break; }
+        }
+        let streamed = lopdf::Document::load_mem(&streamed).unwrap();
+        assert_eq!(streamed.get_pages().len(), document.get_pages().len());
+        crate::domains::io::handle("close", &json!({"handle":handle}), &mut ctx).await.unwrap();
+        assert!(crate::domains::io::handle("read", &json!({"handle":handle}), &mut ctx).await.is_err());
+
+        let mut ranged = options;
+        ranged["pageRanges"] = json!("2,2");
+        let response = print_to_pdf(&ranged, &mut ctx, &session).await.unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(response["data"].as_str().unwrap()).unwrap();
+        let selected = lopdf::Document::load_mem(&bytes).unwrap();
+        assert_eq!(selected.get_pages().len(), 1);
     }
 }

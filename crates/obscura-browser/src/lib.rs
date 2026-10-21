@@ -7,6 +7,7 @@ pub mod page;
 #[cfg(feature = "render")]
 pub mod pdf;
 pub mod profiles;
+pub mod regional;
 pub mod window;
 
 pub use context::BrowserContext;
@@ -20,7 +21,7 @@ pub use obscura_js::{
 pub use page::{url_matches_cdp_pattern, NetworkEvent, Page, PageError};
 pub use window::{WindowEvent, WindowId, WindowInfo};
 #[cfg(feature = "render")]
-pub use pdf::{RasterPdfError, RasterPdfOptions, RasterPdfPageRange};
+pub use pdf::{PdfError, PdfOptions, PdfPageRange};
 // Re-exported so the embeddable `obscura` crate (which depends on obscura-browser,
 // not obscura-js) can surface the interception channel types.
-pub use obscura_js::ops::{InterceptResolution, InterceptedRequest};
+pub use obscura_js::ops::{InterceptPattern, InterceptResolution, InterceptedRequest};

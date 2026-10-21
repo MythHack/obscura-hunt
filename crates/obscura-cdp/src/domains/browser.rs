@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
+pub async fn handle(method: &str, params: &Value, ctx: &mut crate::dispatch::CdpContext) -> Result<Value, String> {
     match method {
         "getVersion" => Ok(json!({
             "protocolVersion": "1.3",
@@ -31,12 +31,23 @@ pub async fn handle(method: &str, _params: &Value) -> Result<Value, String> {
         // lets the client's setup sequence complete instead of tearing down
         // the page on an unknown-method error.
         "setWindowBounds" => Ok(json!({})),
-        // Playwright grants permissions (geolocation, notifications, ...) per
-        // browser context during setup. obscura does not gate any API on a
-        // permission grant today, so the honest answer is to accept and
-        // remember nothing; an unknown-method error would abort the client's
-        // whole context initialization.
-        "grantPermissions" | "resetPermissions" => Ok(json!({})),
+        "grantPermissions" => {
+            let id = params.get("browserContextId").and_then(Value::as_str);
+            let context = match id { Some(id) => ctx.browser_context(id).ok_or("Unknown browserContextId")?, None => &ctx.default_context };
+            let permissions = params.get("permissions").and_then(Value::as_array).ok_or("Browser.grantPermissions requires permissions")?;
+            if permissions.iter().any(|permission| permission.as_str() != Some("geolocation")) {
+                return Err("Only geolocation permission grants are implemented".into());
+            }
+            let origin = params.get("origin").map(|value| value.as_str().ok_or("Permission origin must be a string")).transpose()?;
+            context.geolocation_permissions.set(origin, if permissions.is_empty() { obscura_js::geolocation::Decision::Denied } else { obscura_js::geolocation::Decision::Granted })?;
+            Ok(json!({}))
+        }
+        "resetPermissions" => {
+            let id = params.get("browserContextId").and_then(Value::as_str);
+            let context = match id { Some(id) => ctx.browser_context(id).ok_or("Unknown browserContextId")?, None => &ctx.default_context };
+            context.geolocation_permissions.reset()?;
+            Ok(json!({}))
+        }
         _ => Err(format!("Unknown Browser method: {}", method)),
     }
 }

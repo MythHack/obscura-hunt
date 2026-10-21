@@ -14,5 +14,6 @@ cssparser = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 precomputed-hash = "0.1"
+roxmltree = "=0.21.1"
 
 [dev-dependencies]

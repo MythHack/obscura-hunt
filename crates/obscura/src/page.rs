@@ -50,6 +50,13 @@ impl Page {
         self.inner.borrow_mut().evaluate(expression)
     }
 
+    /// Override coordinates for this page and its child realms without a
+    /// permission grant. None restores the resolved regional position.
+    pub fn set_geolocation(&self, position: Option<obscura_js::geolocation::Position>) -> Result<(), Error> {
+        self.inner.borrow_mut().set_geolocation_override(position.map(Some)).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
     /// URLs of the page's child frames, in creation order.
     pub fn frame_urls(&self) -> Vec<String> {
         self.inner.borrow().frame_urls()
@@ -123,8 +130,8 @@ impl Page {
         self.inner.get_mut().add_preload_script(script);
     }
 
-    /// Enable CDP-Fetch-style interception of every JS `fetch()`/XHR. Returns a
-    /// receiver yielding each request; resolve it through its `resolver` with
+    /// Enable CDP-Fetch-style interception of native HTTP(S) document
+    /// navigations and JS fetch()/XHR. Resolve each request through its `resolver` with
     /// [`obscura::InterceptResolution`] (`Continue`, `Fulfill`, `Fail`) to pass,
     /// mock, or block it. Works in stealth and non-stealth.
     pub fn enable_interception(

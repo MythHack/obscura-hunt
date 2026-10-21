@@ -23,14 +23,22 @@ impl Browser {
     }
 
     pub fn build(config: BrowserConfig) -> Result<Self, Error> {
-        let context = if let Some(ref dir) = config.storage_dir {
+        let regional = match config.regional {
+            Some(regional) => {
+                let profile = regional.resolve_blocking(config.proxy.clone(), config.stealth, false)
+                    .map_err(anyhow::Error::msg)?;
+                Some(obscura_browser::regional::install_process_region(profile).map_err(anyhow::Error::msg)?)
+            }
+            None => None,
+        };
+        let mut context = if let Some(dir) = &config.storage_dir {
             BrowserContext::with_storage_full(
                 "api".to_string(),
                 config.proxy,
                 config.stealth,
                 config.user_agent,
                 Some(dir.clone()),
-            )
+            ).map_err(|error| Error::Internal(error.into()))?
         } else {
             BrowserContext::with_full_options(
                 "api".to_string(),
@@ -39,6 +47,11 @@ impl Browser {
                 config.user_agent,
             )
         };
+        if let Some(regional) = regional {
+            *context.http_client.accept_language.try_write().map_err(|_| anyhow::anyhow!("Regional language configuration is in use"))? = regional.accept_language();
+            context.regional = Ok(regional);
+        }
+        context.regional.as_ref().map_err(|error| anyhow::anyhow!(error.clone()))?;
 
         let context = Arc::new(context);
         let cookie_jar = context.cookie_jar.clone();
@@ -59,6 +72,21 @@ impl Browser {
         Ok(Page {
             inner: RefCell::new(page),
         })
+    }
+    /// Grant, deny, or return geolocation to prompt for one tuple origin or
+    /// every origin in this browser context. Coordinates do not imply a grant.
+    pub fn set_geolocation_permission(&self, origin: Option<&str>, decision: obscura_js::geolocation::Decision) -> Result<(), Error> {
+        self.context.geolocation_permissions.set(origin, decision).map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    pub fn reset_geolocation_permissions(&self) -> Result<(), Error> {
+        self.context.geolocation_permissions.reset().map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
+
+    pub fn regional_profile(&self) -> Result<Arc<obscura_browser::regional::ResolvedRegion>, Error> {
+        self.context.regional.clone().map_err(|error| anyhow::Error::msg(error).into())
     }
 
     /// Access the cookie store for this browser session.
@@ -87,6 +115,10 @@ impl BrowserBuilder {
     }
     pub fn storage_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+    pub fn regional(mut self, regional: obscura_browser::regional::RegionalConfig) -> Self {
+        self.config.regional = Some(regional);
         self
     }
     pub fn build(self) -> Result<Browser, Error> {

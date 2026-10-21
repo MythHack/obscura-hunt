@@ -63,14 +63,21 @@ pub async fn handle(
             }
 
             let page_id = ctx.create_page_in_context(context_id)?;
+            let managed_attachment = !ctx.auto_attached_sessions.iter().any(|(session, (client, parent))|
+                *client == ctx.server_client && parent == parent_session_id && ctx.sessions.get(session) == Some(&page_id));
             let session_id = format!("{}-session", page_id);
+            let waiting = ctx.waiting_for_debugger(&page_id);
 
             let committed_document = if let Some(page) = ctx.get_page_mut(&page_id) {
                 if url == "about:blank" || url.is_empty() {
-                    page.navigate_blank();
                     // Chrome keeps the new tab's about:blank as the first
                     // session history entry, so history.back() can return to it.
                     page.push_history(page.url_string());
+                    None
+                } else if waiting {
+                    // Queue the actual initial navigation behind the native
+                    // debugger gate; no target document script runs yet.
+                    page.evaluate(&format!("location.href = {}", serde_json::to_string(url).unwrap()));
                     None
                 } else {
                     page.navigate(url).await.ok().map(|_| {
@@ -84,23 +91,20 @@ pub async fn handle(
                 ctx.commit_default_context(&page_id, &frame_id, &origin);
             }
 
-            ctx.sessions.insert(session_id.clone(), page_id.clone());
-            ctx.target_session_parents.insert(session_id.clone(), parent_session_id.clone());
-
+            if managed_attachment {
+                ctx.sessions.insert(session_id.clone(), page_id.clone());
+                ctx.target_session_parents.insert(session_id.clone(), parent_session_id.clone());
+            }
             if let Some(page) = ctx.get_page(&page_id) {
                 let info = ctx.page_target_info(page);
                 ctx.pending_events.push(CdpEvent::new("Target.targetCreated", json!({"targetInfo": info})));
-            }
-
-            if let Some(page) = ctx.get_page(&page_id) {
-                ctx.pending_events.push(CdpEvent::new(
-                    "Target.attachedToTarget",
-                    json!({
-                        "sessionId": session_id,
-                        "targetInfo": ctx.page_target_info(page),
-                        "waitingForDebugger": false,
-                    }),
-                ));
+                if managed_attachment {
+                    ctx.pending_events.push(CdpEvent {
+                        method: "Target.attachedToTarget".into(),
+                        params: json!({"sessionId": session_id, "targetInfo": info, "waitingForDebugger": false}),
+                        session_id: parent_session_id.clone(),
+                    });
+                }
             }
 
             Ok(json!({ "targetId": page_id }))
@@ -176,47 +180,22 @@ pub async fn handle(
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => {
-            if params.get("autoAttach").and_then(Value::as_bool) == Some(true)
-                && params.get("waitForDebuggerOnStart").and_then(Value::as_bool) == Some(true)
-            {
-                return Err("Target.setAutoAttach waitForDebuggerOnStart is not supported".to_string());
-            }
-            if params.get("autoAttach").and_then(Value::as_bool).unwrap_or(false) {
-                ctx.target_auto_attach_sessions.insert(parent_session_id.clone());
-                let targets = ctx.pages.iter().filter(|page| page.window_info().created_by_script)
-                    .map(|page| page.id.clone()).collect::<Vec<_>>();
-                for target in targets { ctx.auto_attach_native_target(&target); }
-            } else {
-                ctx.target_auto_attach_sessions.remove(parent_session_id);
-            }
+            let target = parent_session_id.as_ref().and_then(|session| ctx.sessions.get(session))
+                .filter(|target| target.as_str() != "browser").cloned();
+            ctx.set_auto_attach(crate::dispatch::AutoAttachSubscription {
+                client: ctx.server_client, parent: parent_session_id.clone(), target,
+                wait_for_debugger: params.get("waitForDebuggerOnStart").and_then(Value::as_bool).unwrap_or(false),
+            }, params.get("autoAttach").and_then(Value::as_bool).unwrap_or(false));
             Ok(json!({}))
         }
         "detachFromTarget" => {
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                let page_id = ctx.sessions.remove(session_id);
-                ctx.target_session_parents.remove(session_id);
-                ctx.target_discovery_sessions.remove(&Some(session_id.to_string()));
-                ctx.target_auto_attach_sessions.remove(&Some(session_id.to_string()));
-                ctx.dom_documents.remove(&Some(session_id.to_string()));
-                ctx.runtime_enabled_sessions.remove(session_id);
-                ctx.lifecycle_enabled_sessions.remove(session_id);
-                ctx.preload_scripts.retain(|script| script.session_id != session_id);
-                ctx.binding_sessions.retain(|_, owners| {
-                    owners.retain(|owner| owner != session_id);
-                    !owners.is_empty()
-                });
+                let page_id = ctx.sessions.get(session_id).cloned();
+                detach_session(ctx, session_id);
                 if let Some(page_id) = page_id {
-                    ctx.refresh_runtime_event_collection(&page_id);
-                    ctx.refresh_preload_scripts(&page_id);
-                    let params = json!({"sessionId": session_id, "targetId": page_id});
-                    let event = match parent_session_id {
-                        Some(parent) => CdpEvent::with_session("Target.detachedFromTarget", params, parent.clone()),
-                        None => CdpEvent::new("Target.detachedFromTarget", params),
-                    };
-                    ctx.pending_events.push(event);
+                    ctx.pending_events.push(CdpEvent { method: "Target.detachedFromTarget".into(),
+                        params: json!({"sessionId":session_id,"targetId":page_id}), session_id: parent_session_id.clone() });
                 }
-                #[cfg(feature = "render")]
-                ctx.screencasts.remove(session_id);
             }
             Ok(json!({}))
         }
@@ -239,7 +218,7 @@ pub async fn handle(
             Ok(json!({ "browserContextIds": ids }))
         }
         "createBrowserContext" => {
-            let id = ctx.create_browser_context();
+            let id = ctx.create_browser_context()?;
             Ok(json!({ "browserContextId": id }))
         }
         "disposeBrowserContext" => {
@@ -267,6 +246,9 @@ pub async fn handle(
                     Ok(json!({"targetInfo": ctx.page_target_info(page)}))
                 }
                 None => {
+                    if let Some(page) = ctx.get_session_page(parent_session_id) {
+                        return Ok(json!({"targetInfo": ctx.page_target_info(page)}));
+                    }
                     // canAccessOpener is required on every TargetInfo per the
                     // CDP spec. Strict clients (chromiumoxide) panic if it's
                     // missing. The browser target itself has no opener.
@@ -284,6 +266,34 @@ pub async fn handle(
             }
         }
         _ => Err(format!("Unknown Target method: {}", method)),
+    }
+}
+
+pub(crate) fn detach_session(ctx: &mut CdpContext, session: &str) {
+    if let Some(registry) = &ctx.server_registry { registry.detach_auto_attach_parent(session); }
+    let subscriptions = ctx.target_auto_attach_sessions.values()
+        .filter(|subscription| subscription.parent.as_deref() == Some(session)).cloned().collect::<Vec<_>>();
+    for subscription in subscriptions { ctx.set_auto_attach(subscription, false); }
+    ctx.resume_debugger_session(session);
+    ctx.auto_attached_sessions.remove(session);
+    ctx.disable_network_session(session);
+    let page = ctx.sessions.remove(session);
+    ctx.target_session_parents.remove(session);
+    ctx.target_discovery_sessions.remove(&Some(session.into()));
+    ctx.refresh_popup_debugger_wait();
+    ctx.dom_documents.remove(&Some(session.into()));
+    ctx.runtime_enabled_sessions.remove(session);
+    ctx.lifecycle_enabled_sessions.remove(session);
+    ctx.page_enabled_sessions.remove(session);
+    ctx.session_announced_frames.remove(session);
+    ctx.session_frame_documents.remove(session);
+    ctx.preload_scripts.retain(|script| script.session_id != session);
+    ctx.binding_sessions.retain(|_, owners| { owners.retain(|owner| owner != session); !owners.is_empty() });
+    #[cfg(feature = "render")]
+    ctx.screencasts.remove(session);
+    if let Some(page) = page {
+        ctx.refresh_runtime_event_collection(&page);
+        ctx.refresh_preload_scripts(&page);
     }
 }
 
@@ -328,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn disposing_context_removes_only_its_pages() {
         let mut ctx = CdpContext::new();
-        let context_id = ctx.create_browser_context();
+        let context_id = ctx.create_browser_context().unwrap();
         let isolated_page = ctx.create_page_in_context(Some(&context_id)).unwrap();
         let default_page = ctx.create_page();
 

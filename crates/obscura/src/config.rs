@@ -10,6 +10,8 @@ pub struct BrowserConfig {
     pub user_agent: Option<String>,
     /// Directory for persistent cookie storage
     pub storage_dir: Option<PathBuf>,
+    /// Local GeoIP, native Intl and language configuration, resolved before pages.
+    pub regional: Option<obscura_browser::regional::RegionalConfig>,
 }
 
 impl Default for BrowserConfig {
@@ -19,6 +21,7 @@ impl Default for BrowserConfig {
             stealth: false,
             user_agent: None,
             storage_dir: None,
+            regional: None,
         }
     }
 }
@@ -52,6 +55,11 @@ impl BrowserConfigBuilder {
 
     pub fn storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.storage_dir = Some(dir.into());
+        self
+    }
+
+    pub fn regional(mut self, regional: obscura_browser::regional::RegionalConfig) -> Self {
+        self.config.regional = Some(regional);
         self
     }
 

@@ -16,6 +16,29 @@ use taffy::prelude::*;
 pub mod css;
 pub use css::{CssMediaType, Stylesheet, StylesheetCache};
 
+
+/// Decoded native font resource plus its authored CSS face descriptors. Font
+/// bodies are shared with shaping and metadata consumers rather than copied.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WebFont {
+    pub data: std::sync::Arc<Vec<u8>>,
+    pub family: Option<String>,
+    pub weight: Option<(u16, u16)>,
+    pub italic: Option<bool>,
+}
+
+#[cfg(feature = "font-metadata")]
+pub mod fonts;
+#[cfg(feature = "font-metadata")]
+pub use fonts::configure_fonts;
+#[cfg(feature = "font-metadata")]
+mod font_resources;
+#[cfg(feature = "font-metadata")]
+pub use font_resources::{decode_font_bytes, font_face_source_urls, font_data_url_bytes, loaded_web_fonts, DynamicFontFace};
+#[cfg(feature = "font-metadata")]
+mod resources;
+#[cfg(feature = "font-metadata")]
+pub use resources::{ImageRequestProfile, RenderResourceCache, RenderResourceLoader};
 pub mod style;
 pub use style::compute_style;
 
@@ -96,11 +119,15 @@ mod image_capability_tests {
 #[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
+mod pdf;
+#[cfg(feature = "paint")]
+pub use pdf::{PdfDocument, PdfPaintError};
+#[cfg(feature = "paint")]
 pub use tiny_skia::Pixmap;
 #[cfg(feature = "paint")]
 pub use paint::{
+    paint_prepared_pdf_region,
     image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
-    decode_font_bytes, font_face_source_urls, font_data_url_bytes,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color_and_resources,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
@@ -129,8 +156,8 @@ pub use paint::{
     screenshot_prepared_with_scroll,
     screenshot_prepared_with_scroll_and_surface_color,
     screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces,
-    validate_capture_region, CaptureError, CaptureRegion, DynamicFontFace, ElementScrollMetrics,
-    CanvasSurface, CanvasSurfaceSource, ImageRequestProfile, PreparedRender, RenderResourceCache, RenderResourceLoader,
+    validate_capture_region, CaptureError, CaptureRegion, ElementScrollMetrics,
+    CanvasSurface, CanvasSurfaceSource, PreparedRender,
     ResolvedScrollState, SelectedImage,
     MAX_CAPTURE_DIMENSION, MAX_CAPTURE_PIXELS,
 };
@@ -140,20 +167,19 @@ pub use paint::{
 // `dom.rs` name `inline::TextEngine` and call `try_build` unconditionally.
 #[cfg(feature = "paint")]
 pub mod inline;
-#[cfg(feature = "paint")]
-pub use inline::configure_fonts;
 
 #[cfg(not(feature = "paint"))]
 pub mod inline {
     use obscura_dom::tree::{DomTree, NodeId};
     use std::collections::HashMap;
 
-    #[derive(Clone)]
-    pub(crate) struct WebFont {}
+    use crate::WebFont;
 
     #[derive(Default)]
     pub struct TextEngine {
         controls: Vec<(taffy::Size<f32>, bool)>,
+        #[cfg(feature = "font-metadata")]
+        fonts: Vec<WebFont>,
     }
 
     pub(crate) fn text_may_need_emoji_font(_text: &str) -> bool {
@@ -166,11 +192,21 @@ pub mod inline {
         }
 
         pub(crate) fn new_with_web_fonts_and_emoji(_fonts: &[WebFont], _load_emoji: bool) -> Self {
-            Self::default()
+            Self {
+                #[cfg(feature = "font-metadata")]
+                fonts: _fonts.to_vec(),
+                ..Self::default()
+            }
+        }
+
+        #[cfg(feature = "font-metadata")]
+        pub fn selected_font_metrics(&self, style: &crate::LayoutStyle) -> crate::fonts::FontMetrics {
+            crate::fonts::selected_font_metrics(style.font_family.as_deref(),
+                crate::style::used_font_weight(style), style.font_style_italic.unwrap_or(false), &self.fonts)
         }
 
         pub(crate) fn register_native_control(
-            &mut self, width: f32, height: f32, style: &crate::LayoutStyle,
+            &mut self, width: f32, height: f32, style: &crate::LayoutStyle, _text_baseline: bool,
         ) -> usize {
             let index = self.controls.len();
             let zero_min_content = matches!(style.width, crate::Dimension::Percent(_))
@@ -1280,6 +1316,7 @@ pub enum GeneratedCounterStyle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneratedContentItem {
     Text(String),
+    Quote { open: bool, emit: bool },
     Counter {
         name: String,
         style: GeneratedCounterStyle,
@@ -1307,9 +1344,14 @@ pub(crate) struct WaapiSampleState {
 #[derive(Debug, Clone, Default)]
 pub struct LayoutStyle {
     pub display: Display,
+    pub(crate) flex_or_grid_item: bool,
     /// Computed inline base direction. `None` is the inherited specified
     /// state before the DOM top-down pass resolves it.
     pub direction: Option<taffy::Direction>,
+    /// Validated computed-value longhands which do not alter box sizing.
+    pub(crate) cssom_properties: Vec<(&'static str, String)>,
+    pub appearance: Option<&'static str>,
+    pub(crate) quote_pairs: Option<Vec<(String, String)>>,
     /// The specified `display` value was the CSS-wide `inherit` keyword.
     ///
     /// `display` is normally non-inherited, so the cascade cannot resolve this
@@ -1923,6 +1965,8 @@ pub struct LayoutStyle {
     pub underline: Option<bool>,
     pub overline: Option<bool>,
     pub line_through: Option<bool>,
+    /// Explicit decoration color. `None` retains the `currentcolor` initial value.
+    pub text_decoration_color: Option<[u8; 4]>,
 
     /// `font-style: italic|oblique`. Inherited. Selects an available oblique
     /// face when shaping; the bundled Linux `system-ui` face synthesizes its
@@ -2300,15 +2344,18 @@ impl Default for ObjectPosition {
     }
 }
 
-/// `vertical-align` positions for table-cell content. `baseline` (and the
-/// text-level values like sub/super, which do not apply to cells) map to
-/// `Top` as an approximation: real per-row baseline alignment needs shared
-/// ascent metrics across the row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Inline and table alignment retain distinct baseline and text-edge semantics.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VerticalAlign {
+    Baseline,
     Top,
     Middle,
     Bottom,
+    TextTop,
+    TextBottom,
+    Sub,
+    Super,
+    Length(Dimension),
 }
 
 /// `clear`: which floated side(s) an element moves below. Ends the float

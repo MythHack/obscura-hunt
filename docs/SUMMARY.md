@@ -34,3 +34,4 @@
 * [Architecture overview](Architecture-overview.md)
 * [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 * [Testing and debugging](Testing-and-debugging.md)
+* [Upstream browser remediation plan (OpenSpec)](Upstream-remediation-plan.md)

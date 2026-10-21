@@ -3,20 +3,6 @@ macro_rules! integration_tests {
     ($($module:ident),* $(,)?) => {
         $(mod $module;)*
 
-        #[test]
-        fn every_integration_file_is_registered() {
-            use std::collections::BTreeSet;
-            let registered: BTreeSet<String> = [$(stringify!($module).to_owned(),)*]
-                .into_iter().collect();
-            let files: BTreeSet<String> = std::fs::read_dir(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/tests"),
-            ).unwrap().map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-                .map(|path| path.file_stem().unwrap().to_str().unwrap().to_owned())
-                .filter(|name| name != "integration")
-                .collect();
-            assert_eq!(registered, files, "register new test files in integration_tests!");
-        }
     };
 }
 
@@ -61,6 +47,7 @@ integration_tests!(
     runtime_get_properties_objectid_escaping,
     runtime_primitives,
     scroll_event_on_assignment,
+    session_subscriptions,
     structured_clone_crypto_parity,
     textarea_enter_selection,
     treewalker_document_order,

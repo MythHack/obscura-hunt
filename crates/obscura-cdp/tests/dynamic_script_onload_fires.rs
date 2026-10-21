@@ -302,11 +302,11 @@ async fn dynamic_data_scripts_execute_before_chained_load_handlers() {
                 window.__dataScriptState = state;
 
                 var a = document.createElement('script');
-                a.src = 'data:,window.__dataScriptState.aExec=true';
+                a.src = 'data:text/javascript,window.__dataScriptState.aExec=true';
                 a.onload = function () {
                     state.aLoad = true;
                     var b = document.createElement('script');
-                    b.src = 'data:text/html,' + encodeURIComponent('window.__dataScriptState.bExec=true');
+                    b.src = 'data:text/javascript,' + encodeURIComponent('window.__dataScriptState.bExec=true');
                     b.onload = function () {
                         state.bLoad = true;
                         var c = document.createElement('script');

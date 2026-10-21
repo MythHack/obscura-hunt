@@ -5,6 +5,22 @@ pub struct BrowserProfile {
     pub ua_platform_version: &'static str,
 }
 
+pub(crate) fn ua_platform(platform: &str) -> &str {
+    if platform.contains("Win") { "Windows" }
+    else if platform.contains("Mac") { "macOS" }
+    else if platform.contains("Android") { "Android" }
+    else if platform.contains("Linux") { "Linux" }
+    else { platform }
+}
+
+pub(crate) fn platform_from_user_agent(user_agent: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    if user_agent.contains("Windows") { Some(("Win32", "Windows", "10.0.0")) }
+    else if user_agent.contains("Android") { Some(("Linux armv8l", "Android", "")) }
+    else if user_agent.contains("Macintosh") { Some(("MacIntel", "macOS", "10.15.7")) }
+    else if user_agent.contains("Linux") { Some(("Linux x86_64", "Linux", "")) }
+    else { None }
+}
+
 pub static PROFILES: &[BrowserProfile] = &[
     BrowserProfile {
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",

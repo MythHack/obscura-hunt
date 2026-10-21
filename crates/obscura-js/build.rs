@@ -22,7 +22,11 @@ enum ArtifactSource {
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
+    println!("cargo:rerun-if-changed=js/webcrypto.js");
     println!("cargo:rerun-if-changed=js/windows.js");
+    println!("cargo:rerun-if-changed=js/worker.js");
+    println!("cargo:rerun-if-changed=js/text_decoder.js");
+    println!("cargo:rerun-if-changed=js/streams.js");
     println!("cargo:rerun-if-changed=snapshot_generation.rs");
     println!("cargo:rerun-if-changed=src/native_window.rs");
     println!("cargo:rerun-if-changed=build.rs");

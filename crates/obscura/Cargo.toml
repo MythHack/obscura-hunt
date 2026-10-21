@@ -9,13 +9,14 @@ license = "Apache-2.0"
 
 [features]
 default = ["api"]
-api = ["obscura-browser", "obscura-net", "tokio"]
+api = ["obscura-browser", "obscura-net", "obscura-js", "tokio"]
 stealth = ["api", "obscura-browser/stealth"]
 render = ["api", "obscura-browser/render"]
 
 [dependencies]
 obscura-browser = { path = "../obscura-browser", optional = true }
 obscura-net = { path = "../obscura-net", optional = true }
+obscura-js = { path = "../obscura-js", optional = true }
 anyhow = "1"
 tokio = { version = "1", features = ["rt"], optional = true }
 thiserror = { workspace = true }

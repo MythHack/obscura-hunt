@@ -107,7 +107,7 @@ OBSCURA_BLOCK_TRACKERS=0 obscura --stealth fetch https://example.com
 
 ### `OBSCURA_TIMEZONE`
 
-Pins the process timezone before V8/ICU reads it, so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report one consistent zone. Default `Europe/Berlin`. Set it to match the exit IP's region.
+Pins the native process timezone before the first isolate, so `Date` and `Intl.DateTimeFormat` use one zone on Windows and Unix. CLI inherited default is `Europe/Berlin` when no timezone/GeoIP result is selected. Nonblank values are trimmed. An incompatible later context or CDP override returns an error instead of changing other live realms.
 
 ```bash
 OBSCURA_TIMEZONE=America/New_York obscura serve
@@ -115,11 +115,27 @@ OBSCURA_TIMEZONE=America/New_York obscura serve
 
 ### `OBSCURA_GEOLOCATION`
 
-Override the coordinates the `navigator.geolocation` shim reports, as `lat,lon`. Without it the shim reports a fixed default. Keep it consistent with `OBSCURA_TIMEZONE` and the proxy region.
+Configure native coordinates as `latitude,longitude[,accuracy_m]`. The explicit operator override defaults accuracy to 100 meters; that is not a GeoIP precision claim. Values must be finite and in range. No location is fabricated when unset, and setting coordinates never grants permission. See [regional configuration and routing](Configure-stealth-and-proxies.md#regional-identity-location-permission-and-rtc-routing).
 
 ```bash
 OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 ```
+
+### Regional configuration and local data
+
+- `OBSCURA_REGIONAL_CONFIG`: JSON matching `RegionalConfig`; CLI `--regional-config FILE` is the file form.
+- `OBSCURA_GEOIP`: `off`, `auto`, or a literal IPv4/IPv6 address.
+- `OBSCURA_GEOIP_DB` / `OBSCURA_GEOIP_MANIFEST`: licensed local MMDB and its source/version/licence/SHA-256 manifest.
+- `OBSCURA_TERRITORY_DATA` / `OBSCURA_TERRITORY_MANIFEST`: official local CLDR territory XML and manifest.
+- `OBSCURA_GEOIP_DISCOVERY_URL`: explicit literal-IP echo endpoint for `auto`; no provider is implicit.
+- `OBSCURA_REGIONAL_SEED`: unsigned 64-bit stable population-weighted language seed.
+- `OBSCURA_LOCALE` / `OBSCURA_LANGUAGES`: explicit native locale and comma-separated navigator/request languages. Explicit fields override derived fields; languages supply locale only when locale is absent.
+- `OBSCURA_RTC_DOH_URL`: RFC 8484 resolver with literal bootstrap IP for proxy-routed RTC endpoint DNS; no ambient destination DNS or direct fallback.
+
+`OBSCURA_RESOLVED_REGION` is the validated launch profile inherited by CLI workers;
+applications should configure `RegionalConfig`, not manufacture resolved profiles.
+See the [manifest, accuracy, consent and routing contract](Configure-stealth-and-proxies.md#regional-identity-location-permission-and-rtc-routing).
+
 
 ### `OBSCURA_PROFILE`
 

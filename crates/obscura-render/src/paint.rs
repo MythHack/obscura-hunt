@@ -6,11 +6,12 @@
 //! dependencies, so a screenshot is reproducible across hosts.
 
 use obscura_dom::tree::DomTree;
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::pdf::PdfPaint as _;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, LinearGradient, Paint, PathBuilder, Pattern,
-    Pixmap, Point, RadialGradient, Rect, SpreadMode, Transform,
+    Color, FillRule, FilterQuality, GradientStop, Paint, PathBuilder, Pattern,
+    Pixmap, Point, Rect, SpreadMode, Transform,
 };
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
@@ -25,52 +26,32 @@ use crate::dom::{
     RetainedStyleMaps, layout_dom_with_query_seed,
     layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state,
 };
+use crate::resources::{CachedResource, image_resource_key, network_resource_url, MISSING_RESOURCE_RETRY_AFTER};
+use crate::{ImageRequestProfile, RenderResourceCache, RenderResourceLoader};
+use crate::font_resources::collect_web_fonts;
+use crate::DynamicFontFace;
+#[cfg(test)]
+use crate::font_resources::{font_face_family, font_face_italic, font_face_ranges,
+    font_face_urls, font_face_weight};
+#[cfg(test)]
+use crate::resources::DEFAULT_RESOURCE_CACHE_BYTES;
 
-const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
-const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Match the page transport's image response budget, including uncached reads.
 /// Set this explicitly rather than inheriting ureq's 10 MiB convenience limit.
 const MAX_RESOURCE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 /// CSS `content:url(...)` is only discoverable after cascade. Remember a
 /// bounded set of successful selections so repeated prepares can seed their
 /// intrinsic geometry before that cascade instead of always laying out twice.
-const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
-const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES: usize = 256;
 /// Exact formats the renderer can decode. Do not use `image/*` or `*/*` here:
 /// either wildcard permits a content-negotiating server to choose AVIF,
 /// JPEG-XL, or another format that this build cannot rasterize.
 const IMAGE_ACCEPT: &str = "image/webp,image/apng,image/svg+xml,image/png,image/jpeg,image/gif,image/bmp,image/x-icon,image/vnd.microsoft.icon";
 
-/// Synchronous byte loader used by [`RenderResourceCache`]. The default
-/// implementation uses Obscura's pooled image agent; tests and embedding
-/// callers can provide a local loader without changing preparation or paint.
-pub trait RenderResourceLoader {
-    fn load(&mut self, url: &str) -> Option<Vec<u8>>;
-}
 
-/// One script-created `FontFace` registered with the document's
-/// `FontFaceSet`. The JS runtime owns the registry and supplies this snapshot
-/// alongside the DOM when preparing a render; keeping it out of the DOM avoids
-/// exposing an implementation-only `<style>` element to page selectors.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DynamicFontFace {
-    pub family: String,
-    pub source: String,
-    pub style: String,
-    pub weight: String,
-    pub unicode_range: String,
-}
 
-impl<F> RenderResourceLoader for F
-where
-    F: FnMut(&str) -> Option<Vec<u8>>,
-{
-    fn load(&mut self, url: &str) -> Option<Vec<u8>> {
-        self(url)
-    }
-}
 
-struct HttpResourceLoader;
+pub(crate) struct HttpResourceLoader;
 
 impl RenderResourceLoader for HttpResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>> {
@@ -78,15 +59,6 @@ impl RenderResourceLoader for HttpResourceLoader {
     }
 }
 
-enum CachedResource {
-    Bytes {
-        bytes: Arc<[u8]>,
-        intrinsic: std::sync::OnceLock<Option<crate::ReplacedIntrinsic>>,
-        static_raster: std::sync::OnceLock<bool>,
-        decoded_font: Option<Arc<Vec<u8>>>,
-    },
-    Missing(std::time::Instant),
-}
 
 impl CachedResource {
     fn image_intrinsic(&self) -> Option<crate::ReplacedIntrinsic> {
@@ -101,15 +73,6 @@ impl CachedResource {
     }
 }
 
-/// Fetch credentials/CORS identity for an HTML image request. No-CORS uses
-/// the ordinary URL cache key so CSS images can share the same response;
-/// CORS variants use private keys and can never contaminate one another.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ImageRequestProfile {
-    NoCorsInclude,
-    CorsSameOrigin,
-    CorsInclude,
-}
 
 fn image_request_profile(tree: &DomTree, id: obscura_dom::tree::NodeId) -> ImageRequestProfile {
     match tree
@@ -124,258 +87,25 @@ fn image_request_profile(tree: &DomTree, id: obscura_dom::tree::NodeId) -> Image
     }
 }
 
-fn image_resource_key(url: &str, profile: ImageRequestProfile) -> String {
-    let url = network_resource_url(url);
-    match profile {
-        ImageRequestProfile::NoCorsInclude => url,
-        ImageRequestProfile::CorsSameOrigin => format!("\0obscura-img-cors\0{url}"),
-        ImageRequestProfile::CorsInclude => format!("\0obscura-img-credentials\0{url}"),
-    }
-}
-
-fn network_resource_url(url: &str) -> String {
-    if url.starts_with('\0') || url.starts_with("data:") {
-        return url.to_string();
-    }
-    let Ok(mut parsed) = url::Url::parse(url) else {
-        return url.to_string();
-    };
-    parsed.set_fragment(None);
-    parsed.to_string()
-}
 
 #[derive(Clone, Debug, PartialEq)]
-struct RememberedContentImageIntrinsic {
-    resolved_url: String,
-    intrinsic: crate::ReplacedIntrinsic,
+pub(crate) struct RememberedContentImageIntrinsic {
+    pub(crate) resolved_url: String,
+    pub(crate) intrinsic: crate::ReplacedIntrinsic,
 }
 
 const RASTER_PAINT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const RASTER_PAINT_CACHE_ENTRIES: usize = 64;
 const RASTER_PAINT_CACHE_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 
-struct CachedRasterPaint {
-    resource_key: String,
-    bytes: Arc<[u8]>,
-    raster: Arc<Pixmap>,
+pub(crate) struct CachedRasterPaint {
+    pub(crate) resource_key: String,
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) raster: Arc<Pixmap>,
 }
 
-/// Page-scoped raw resource bytes shared by layout preparation and repeated
-/// paints. Entries are FIFO-bounded by both count and retained byte size.
-/// Successful bytes use `Arc` so consumers never clone an image/font body.
-pub struct RenderResourceCache {
-    entries: HashMap<String, CachedResource>,
-    // Cancellation belongs to the document, not the retryable byte cache.
-    stopped: HashSet<String>,
-    order: VecDeque<String>,
-    retained_bytes: usize,
-    raster_paints: VecDeque<CachedRasterPaint>,
-    raster_paint_bytes: usize,
-    max_entries: usize,
-    max_bytes: usize,
-    content_image_intrinsics: HashMap<obscura_dom::tree::NodeId, RememberedContentImageIntrinsic>,
-    content_image_intrinsic_order: VecDeque<obscura_dom::tree::NodeId>,
-    max_content_image_intrinsics: usize,
-    #[cfg(test)]
-    content_image_layout_retries: usize,
-    sync_loading_enabled: bool,
-    /// Resources a cache-only lookup missed since the last `take_sync_misses`,
-    /// with the request identity layout used (image CORS profile or none) and
-    /// whether the consumer is a font.
-    /// Deduplicated so repeated layouts do not grow the list.
-    sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
-    sync_miss_keys: HashSet<String>,
-    loader: Box<dyn RenderResourceLoader>,
-}
-
-impl Default for RenderResourceCache {
-    fn default() -> Self {
-        Self::with_loader_and_limits(
-            HttpResourceLoader,
-            DEFAULT_RESOURCE_CACHE_ENTRIES,
-            DEFAULT_RESOURCE_CACHE_BYTES,
-        )
-    }
-}
 
 impl RenderResourceCache {
-    pub fn with_loader(loader: impl RenderResourceLoader + 'static) -> Self {
-        Self::with_loader_and_limits(
-            loader,
-            DEFAULT_RESOURCE_CACHE_ENTRIES,
-            DEFAULT_RESOURCE_CACHE_BYTES,
-        )
-    }
-
-    pub fn with_loader_and_limits(
-        loader: impl RenderResourceLoader + 'static,
-        max_entries: usize,
-        max_bytes: usize,
-    ) -> Self {
-        Self {
-            entries: HashMap::new(),
-            stopped: HashSet::new(),
-            order: VecDeque::new(),
-            retained_bytes: 0,
-            raster_paints: VecDeque::new(),
-            raster_paint_bytes: 0,
-            max_entries,
-            max_bytes,
-            content_image_intrinsics: HashMap::new(),
-            content_image_intrinsic_order: VecDeque::new(),
-            max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
-            #[cfg(test)]
-            content_image_layout_retries: 0,
-            sync_loading_enabled: true,
-            sync_misses: Vec::new(),
-            sync_miss_keys: HashSet::new(),
-            loader: Box::new(loader),
-        }
-    }
-
-    /// Temporarily control the compatibility loader used by synchronous
-    /// layout and paint. Capture callers disable it so a screenshot observes
-    /// only bytes already prepared by the page transport. Unknown URLs remain
-    /// unknown and can still be fetched by a later navigation/settle warmup.
-    pub fn set_sync_loading_enabled(&mut self, enabled: bool) -> bool {
-        std::mem::replace(&mut self.sync_loading_enabled, enabled)
-    }
-
-    /// Whether layout and paint may still open synchronous compatibility
-    /// requests. Page-owned caches disable this permanently and are fed by
-    /// the page transport instead.
-    pub fn sync_loading_enabled(&self) -> bool {
-        self.sync_loading_enabled
-    }
-
-    /// Take the resources that cache-only layout or paint asked for and did
-    /// not have, exactly as they were resolved (network URL plus the image
-    /// request profile, or `None` for CSS images and fonts). The owning page
-    /// loads them through its asynchronous transport; nothing is
-    /// reconstructed from the DOM, so script-registered fonts, shadow roots
-    /// and every other renderer-only source are covered.
-    pub fn take_sync_misses(&mut self, limit: usize) -> Vec<(String, Option<ImageRequestProfile>, bool)> {
-        if limit >= self.sync_misses.len() {
-            self.sync_miss_keys.clear();
-            return std::mem::take(&mut self.sync_misses);
-        }
-        let misses: Vec<_> = self.sync_misses.drain(..limit).collect();
-        for (url, profile, _) in &misses {
-            let key = profile.map_or_else(|| url.clone(), |profile| image_resource_key(url, profile));
-            self.sync_miss_keys.remove(&key);
-        }
-        misses
-    }
-
-    /// Whether any cache-only miss is waiting to be taken.
-    pub fn has_sync_misses(&self) -> bool {
-        !self.sync_misses.is_empty()
-    }
-
-    fn record_sync_miss(
-        &mut self,
-        key: String,
-        url: String,
-        profile: Option<ImageRequestProfile>,
-        is_font: bool,
-    ) {
-        // Bound a hostile document's per-layout queue to the number of
-        // entries this cache could retain. A later layout reports skipped
-        // misses again after the current batch has been drained.
-        if self.sync_misses.len() >= self.max_entries {
-            return;
-        }
-        if self.sync_miss_keys.insert(key) {
-            self.sync_misses.push((url, profile, is_font));
-        }
-    }
-
-    pub fn retained_entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn retained_byte_len(&self) -> usize {
-        self.retained_bytes
-    }
-
-    pub fn has_live_outcome(&self, url: &str) -> bool {
-        let key = network_resource_url(url);
-        if self.stopped.contains(&key) { return true; }
-        match self.entries.get(&key) {
-            Some(CachedResource::Bytes { .. }) => true,
-            Some(CachedResource::Missing(at)) => at.elapsed() < MISSING_RESOURCE_RETRY_AFTER,
-            None => false,
-        }
-    }
-
-    /// Whether this URL currently retains usable bytes (as opposed to a
-    /// short-lived negative-cache entry). Profile-specific HTML image loads
-    /// use this to avoid replacing paint bytes from another credential mode.
-    pub fn has_cached_bytes(&self, url: &str) -> bool {
-        matches!(
-            self.entries.get(&network_resource_url(url)),
-            Some(CachedResource::Bytes { .. })
-        )
-    }
-
-    pub fn has_live_image_outcome(&self, url: &str, profile: ImageRequestProfile) -> bool {
-        self.has_live_outcome(&image_resource_key(url, profile))
-    }
-
-    pub fn seed_image(&mut self, url: String, profile: ImageRequestProfile, bytes: Vec<u8>) {
-        self.seed_shared(image_resource_key(&url, profile), Arc::from(bytes));
-    }
-
-    pub fn seed_image_shared(
-        &mut self,
-        url: String,
-        profile: ImageRequestProfile,
-        bytes: Arc<[u8]>,
-    ) {
-        self.seed_shared(image_resource_key(&url, profile), bytes);
-    }
-
-    pub fn seed_image_missing(&mut self, url: String, profile: ImageRequestProfile) {
-        self.seed_missing(image_resource_key(&url, profile));
-    }
-
-    /// Seed bytes fetched by the owning page's asynchronous browser transport.
-    ///
-    /// Layout and paint are synchronous, so letting them open their own HTTP
-    /// requests serializes every image/font behind the capture call.  The page
-    /// layer uses this entry point to fetch a bounded resource batch through
-    /// its cookie/proxy/CORS-aware connection pool before entering layout.
-    pub fn seed(&mut self, url: String, bytes: Vec<u8>) {
-        self.seed_shared(url, Arc::from(bytes));
-    }
-
-    /// Seed already-shared bytes without copying a complete response body.
-    pub fn seed_shared(&mut self, url: String, bytes: Arc<[u8]>) {
-        let url = network_resource_url(&url);
-        self.stopped.remove(&url);
-        self.remove(&url);
-        self.insert_bytes(url, bytes);
-    }
-
-    /// Keep a canceled request stopped until this document's cache is replaced.
-    pub fn stop_resource(&mut self, url: &str, profile: Option<ImageRequestProfile>) {
-        let key = match profile {
-            Some(profile) => image_resource_key(url, profile),
-            None => network_resource_url(url),
-        };
-        if self.has_cached_bytes(&key) { return; }
-        self.remove(&key);
-        self.stopped.insert(key);
-    }
-
-    /// Retain a page-transport failure so capture does not immediately repeat
-    /// the same slow request through the renderer's compatibility loader.
-    pub fn seed_missing(&mut self, url: String) {
-        let url = network_resource_url(&url);
-        self.remove(&url);
-        self.insert_missing(url);
-    }
-
     /// Resolve, fetch, and inspect one image through the exact byte cache used
     /// by layout and paint. The JS image-element lifecycle calls this narrow
     /// bridge so `complete`/`naturalWidth` and the eventual screenshot are
@@ -554,130 +284,6 @@ impl RenderResourceCache {
         }
     }
 
-    fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
-        let url = network_resource_url(url);
-        if self.stopped.contains(&url) { return None; }
-        if let Some(entry) = self.entries.get(&url) {
-            match entry {
-                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
-                    return None;
-                }
-                CachedResource::Missing(_) => {}
-            }
-        }
-        if !self.sync_loading_enabled {
-            self.record_sync_miss(url.clone(), url, None, is_font);
-            return None;
-        }
-        self.remove(&url);
-
-        let loaded = self.loader.load(&url).map(Arc::<[u8]>::from);
-        match loaded {
-            Some(bytes) => {
-                self.insert_bytes(url, Arc::clone(&bytes));
-                Some(bytes)
-            }
-            None => {
-                self.insert_missing(url);
-                None
-            }
-        }
-    }
-
-    fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
-        let key = image_resource_key(url, profile);
-        if self.stopped.contains(&key) { return None; }
-        if let Some(entry) = self.entries.get(&key) {
-            match entry {
-                CachedResource::Bytes { bytes, .. } => return Some(Arc::clone(bytes)),
-                CachedResource::Missing(at) if at.elapsed() < MISSING_RESOURCE_RETRY_AFTER => {
-                    return None;
-                }
-                CachedResource::Missing(_) => {}
-            }
-        }
-        if !self.sync_loading_enabled {
-            self.record_sync_miss(key, network_resource_url(url), Some(profile), false);
-            return None;
-        }
-        self.remove(&key);
-        // The private profile key is cache identity only and must never escape
-        // into a network loader.
-        let loaded = self
-            .loader
-            .load(&network_resource_url(url))
-            .map(Arc::<[u8]>::from);
-        match loaded {
-            Some(bytes) => {
-                self.insert_bytes(key, Arc::clone(&bytes));
-                Some(bytes)
-            }
-            None => {
-                self.insert_missing(key);
-                None
-            }
-        }
-    }
-
-    fn insert_bytes(&mut self, url: String, bytes: Arc<[u8]>) {
-        if self.max_entries == 0 || bytes.len() > self.max_bytes {
-            return;
-        }
-        while self.entries.len() >= self.max_entries
-            || self.retained_bytes.saturating_add(bytes.len()) > self.max_bytes
-        {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.remove_entry(&oldest);
-        }
-        self.retained_bytes = self.retained_bytes.saturating_add(bytes.len());
-        self.order.push_back(url.clone());
-        self.entries.insert(url, CachedResource::Bytes {
-            bytes,
-            intrinsic: std::sync::OnceLock::new(),
-            static_raster: std::sync::OnceLock::new(),
-            decoded_font: None,
-        });
-    }
-
-    fn insert_missing(&mut self, url: String) {
-        if self.max_entries == 0 {
-            return;
-        }
-        while self.entries.len() >= self.max_entries {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.remove_entry(&oldest);
-        }
-        self.order.push_back(url.clone());
-        self.entries
-            .insert(url, CachedResource::Missing(std::time::Instant::now()));
-    }
-
-    fn remove(&mut self, url: &str) {
-        if self.entries.contains_key(url) {
-            self.order.retain(|key| key != url);
-            self.remove_entry(url);
-        }
-    }
-
-    fn remove_entry(&mut self, url: &str) {
-        if let Some(CachedResource::Bytes { bytes, decoded_font, .. }) = self.entries.remove(url) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(bytes.len()
-                + decoded_font.as_ref().map_or(0, |font| font.len()));
-        }
-        self.raster_paints.retain(|entry| {
-            if entry.resource_key == url {
-                self.raster_paint_bytes -= entry.raster.data().len();
-                false
-            } else {
-                true
-            }
-        });
-    }
 
     fn raster_paint(
         &mut self,
@@ -1201,6 +807,74 @@ impl PreparedRender {
 
     pub fn layout(&self) -> &crate::DomLayout {
         &self.layout
+    }
+
+    /// Discover and return resource misses from this render's effective cascade.
+    /// The page owns all transport and policy decisions; discovery is cache-only.
+    pub fn discover_resource_requests(&self, tree: &DomTree, cache: &mut RenderResourceCache,
+        dynamic_fonts: &[DynamicFontFace], media_type: crate::CssMediaType)
+        -> Vec<(String, Option<ImageRequestProfile>, bool)> {
+        // Unadmitted misses from an older class/media/style snapshot are not
+        // authority to fetch. Rebuild them from this render; in-flight loads
+        // and retained byte outcomes remain owned by the page cache.
+        cache.take_sync_misses(usize::MAX);
+        let previous = cache.set_sync_loading_enabled(false);
+        for source in self.selected_images.values() {
+            if source.resolved_url.starts_with("data:") { continue; }
+            let url = network_resource_url(&source.resolved_url);
+            if !cache.has_live_image_outcome(&url, source.profile) {
+                let _ = cache.get_or_load_image(&url, source.profile);
+            }
+        }
+        let mut hidden = HashSet::new();
+        let mut svg_roots = HashSet::new();
+        for id in crate::dom::rendered_descendants(tree, tree.document()) {
+            let parent = crate::dom::rendered_parent(tree, id);
+            if parent.is_some_and(|parent| hidden.contains(&parent))
+                || self.layout.styles.get(&id).is_some_and(|style| style.display == crate::Display::None) {
+                hidden.insert(id);
+                continue;
+            }
+            let Some(style) = self.layout.styles.get(&id) else { continue; };
+            let mut select = |style: &crate::LayoutStyle| {
+                if style.display == crate::Display::None { return; }
+                for src in [style.background_image.as_deref(), style.mask_image.as_deref(),
+                    style.content_image.as_deref()].into_iter().flatten() {
+                    if src.starts_with('#') || src.starts_with("data:") { continue; }
+                    let Some(url) = resolve_resource_url(src, self.base_url.as_deref()) else { continue; };
+                    let url = network_resource_url(&url);
+                    if !cache.has_live_outcome(&url) {
+                        let _ = cache.get_or_load(&url, false);
+                    }
+                }
+            };
+            if !style.display_contents { select(style); }
+            for pseudo in [style.before_pseudo.as_deref(), style.after_pseudo.as_deref()].into_iter().flatten() {
+                select(pseudo);
+            }
+            if tree.with_node(id, |node| node.as_element().is_some_and(|element| &*element.local == "svg")) == Some(true)
+                && !parent.is_some_and(|parent| svg_roots.contains(&parent)) {
+                for use_id in selected_svg_uses(tree, id, Some(&self.layout.styles)) {
+                    let href = tree.with_node(use_id, |node| node.get_attribute("href")
+                        .or_else(|| node.get_attribute("xlink:href")).map(str::to_owned)).flatten();
+                    let Some(href) = href else { continue; };
+                    let Some((src, fragment)) = href.split_once('#') else { continue; };
+                    if src.is_empty() || fragment.is_empty() || src.starts_with("data:") { continue; }
+                    let Some(url) = resolve_resource_url(src, self.base_url.as_deref()) else { continue; };
+                    let url = network_resource_url(&url);
+                    if !cache.has_live_outcome(&url) {
+                        let _ = cache.get_or_load(&url, false);
+                    }
+                }
+                svg_roots.insert(id);
+            } else if parent.is_some_and(|parent| svg_roots.contains(&parent)) {
+                svg_roots.insert(id);
+            }
+        }
+        let _ = collect_web_fonts(tree, self.base_url.as_deref(), cache, dynamic_fonts,
+            self.viewport, media_type, &self.layout.styles);
+        cache.set_sync_loading_enabled(previous);
+        cache.take_sync_misses(usize::MAX)
     }
 
     pub fn content_size(&self) -> (f32, f32) {
@@ -1761,11 +1435,16 @@ impl PreparedRender {
             });
         }
         out.insert("vertical-align", match style.vertical_align {
-            Some(crate::VerticalAlign::Top) => "top",
-            Some(crate::VerticalAlign::Middle) => "middle",
-            Some(crate::VerticalAlign::Bottom) => "bottom",
-            None => "baseline",
-        }.to_string());
+            Some(crate::VerticalAlign::Top) => "top".to_string(),
+            Some(crate::VerticalAlign::Middle) => "middle".to_string(),
+            Some(crate::VerticalAlign::Bottom) => "bottom".to_string(),
+            Some(crate::VerticalAlign::TextTop) => "text-top".to_string(),
+            Some(crate::VerticalAlign::TextBottom) => "text-bottom".to_string(),
+            Some(crate::VerticalAlign::Sub) => "sub".to_string(),
+            Some(crate::VerticalAlign::Super) => "super".to_string(),
+            Some(crate::VerticalAlign::Length(value)) => dimension_css(unzoom(value), "0px"),
+            _ => "baseline".to_string(),
+        });
         out.insert("text-transform", match style.text_transform {
             Some(crate::TextTransform::Uppercase) => "uppercase",
             Some(crate::TextTransform::Lowercase) => "lowercase",
@@ -1893,8 +1572,9 @@ impl PreparedRender {
             out.insert("width", dimension_css(unzoom(style.width), "auto"));
             out.insert("height", dimension_css(unzoom(style.height), "auto"));
         }
-        out.insert("min-width", dimension_css(unzoom(style.min_width), "auto"));
-        out.insert("min-height", dimension_css(unzoom(style.min_height), "auto"));
+        let automatic_minimum = if style.flex_or_grid_item { "auto" } else { "0px" };
+        out.insert("min-width", dimension_css(unzoom(style.min_width), automatic_minimum));
+        out.insert("min-height", dimension_css(unzoom(style.min_height), automatic_minimum));
         out.insert("max-width", dimension_css(unzoom(style.max_width), "none"));
         out.insert("max-height", dimension_css(unzoom(style.max_height), "none"));
         out.insert(
@@ -1986,7 +1666,7 @@ impl PreparedRender {
             radius.y.length /= zoom;
             out.insert(name, corner_radius_css(radius));
         }
-        out.insert("outline-width", css_px(style.outline.used_width() / zoom));
+        out.insert("outline-width", css_px(style.outline.specified_width / zoom));
         out.insert("outline-style", style.outline.style.css_name().to_string());
         out.insert(
             "outline-color",
@@ -2104,9 +1784,9 @@ impl PreparedRender {
             }
         }
         if decoration.is_empty() { decoration.push_str("none"); }
-        out.insert("text-decoration", format!("{decoration} solid {}", css_color(current_color)));
+        out.insert("text-decoration", format!("{decoration} solid {}", css_color(style.text_decoration_color.unwrap_or(current_color))));
         out.insert("text-decoration-line", decoration);
-        out.insert("text-decoration-color", css_color(current_color));
+        out.insert("text-decoration-color", css_color(style.text_decoration_color.unwrap_or(current_color)));
         out.insert("caret-color", css_color(current_color));
         out.insert("text-indent", dimension_css(unzoom(style.text_indent.unwrap_or(crate::Dimension::Px(0.0))), "0px"));
         out.insert("border-spacing", match style.border_spacing {
@@ -2175,6 +1855,18 @@ impl PreparedRender {
         out.insert("animation-play-state", match style.animation_timing.play_state {
             crate::AnimationPlayState::Running => "running", crate::AnimationPlayState::Paused => "paused",
         }.to_string());
+        for (property, value) in &style.cssom_properties { out.insert(*property, value.clone()); }
+        out.insert("flex-flow", format!("{} {}", out["flex-direction"], out["flex-wrap"]));
+        out.insert("flex", format!("{} {} {}", out["flex-grow"], out["flex-shrink"], out["flex-basis"]));
+        for (shorthand, start, end) in [("grid-column", "grid-column-start", "grid-column-end"), ("grid-row", "grid-row-start", "grid-row-end")] {
+            let value = out[shorthand].clone();
+            let mut parts = value.split('/').map(str::trim);
+            out.insert(start, parts.next().unwrap_or("auto").to_string());
+            out.insert(end, parts.next().unwrap_or("auto").to_string());
+        }
+        out.insert("transition", format!("{} {} {} {}", out["transition-property"], out["transition-duration"], out["transition-timing-function"], out["transition-delay"]));
+        out.insert("animation", format!("{} {} {} {} {} {} {} {}", out["animation-duration"], out["animation-timing-function"], out["animation-delay"], out["animation-iteration-count"], out["animation-direction"], out["animation-fill-mode"], out["animation-play-state"], out["animation-name"]));
+        out.insert("background", format!("{} {} {} {} {} / {} {} {}", out["background-color"], out["background-image"], out["background-repeat"], out["background-attachment"], out["background-position"], out["background-size"], out["background-origin"], out["background-clip"]));
         Some(out)
     }
 
@@ -2492,6 +2184,10 @@ pub(crate) fn non_geometric_computed_style(style: &crate::LayoutStyle) -> HashMa
         .to_string(),
     );
     out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+    out.insert("appearance", style.appearance.unwrap_or("none").to_string());
+    out.insert("-webkit-appearance", style.appearance.unwrap_or("none").to_string());
+    for &(name, initial, _) in crate::style::CSSOM_LONGHANDS { out.entry(name).or_insert_with(|| initial.to_string()); }
+    for (name, value) in &style.cssom_properties { out.insert(*name, value.clone()); }
     out
 }
 
@@ -3336,22 +3032,35 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .collect::<HashMap<_, _>>();
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts, viewport, media_type);
-    // Most framework pages use web fonts and many decorative SVG icons, but
-    // only SVG text needs the page font faces. Avoid cloning/loading the page
-    // font database for ordinary icons and HTML-only text.
+    let (retained, mutations) = retained.map_or((None, &[][..]), |(styles, mutations)| {
+        (Some(styles), mutations)
+    });
+    let mut laid = layout_dom_with_query_seed(
+        tree, viewport, &intrinsic, &[], stylesheet_cache, retained, mutations,
+        media_type, animation_sample, animation_timeline, &mut query_seed,
+    );
+    // Font discovery needs the effective inherited family, face and generated
+    // text, not every face mentioned by a stylesheet. The first layout gives
+    // container queries their real geometry without opening any font request.
+    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts, viewport,
+        media_type, &laid.styles);
+    if !fonts.is_empty() {
+        // The cascade is unchanged. Reuse its normalized styles while shaping
+        // with the selected faces; the existing query loop still converges
+        // again if their metrics change a query container.
+        let retained_fonts = RetainedStyleMaps {
+            styles: std::mem::take(&mut laid.styles),
+            custom_properties: std::mem::take(&mut laid.custom_properties),
+        };
+        laid = layout_dom_with_query_seed(tree, viewport, &intrinsic, &fonts,
+            stylesheet_cache, Some(retained_fonts), &[crate::dom::RetainedStyleMutation::Resource],
+            media_type, animation_sample, animation_timeline, &mut query_seed);
+    }
     let svg_fonts = if has_inline_svg_text(tree) {
         svg_font_database_with_web_fonts(&fonts)
     } else {
         svg_font_database()
     };
-    let (retained, mutations) = retained.map_or((None, &[][..]), |(styles, mutations)| {
-        (Some(styles), mutations)
-    });
-    let mut laid = layout_dom_with_query_seed(
-        tree, viewport, &intrinsic, &fonts, stylesheet_cache, retained, mutations,
-        media_type, animation_sample, animation_timeline, &mut query_seed,
-    );
     // `content:url(...)` is computed by the author cascade, whereas ordinary
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
@@ -3463,8 +3172,8 @@ fn paint_prepared_with_surface_color(
     ))
     .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
-    let mut pixmap = Pixmap::new(w, h)?;
-    pixmap.fill(Color::from_rgba8(
+    let mut pixmap = crate::pdf::new_pixmap(w, h)?;
+    pixmap.pdf_fill(Color::from_rgba8(
         surface_color[0],
         surface_color[1],
         surface_color[2],
@@ -3553,8 +3262,8 @@ pub fn paint_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
     ))
     .ok()?;
     let (w, h) = (prepared.viewport.0 as u32, prepared.viewport.1 as u32);
-    let mut pixmap = Pixmap::new(w, h)?;
-    pixmap.fill(Color::from_rgba8(
+    let mut pixmap = crate::pdf::new_pixmap(w, h)?;
+    pixmap.pdf_fill(Color::from_rgba8(
         surface_color[0],
         surface_color[1],
         surface_color[2],
@@ -3673,6 +3382,19 @@ fn paint_prepared_region_with_scroll_with_print_economy(
     )
 }
 
+pub fn paint_prepared_pdf_region(
+    tree: &DomTree,
+    prepared: &mut PreparedRender,
+    resources: &mut RenderResourceCache,
+    scroll: &ResolvedScrollState,
+    region: CaptureRegion,
+    paint_backgrounds: bool,
+    canvas_surfaces: &dyn CanvasSurfaceSource,
+) -> Result<Pixmap, CaptureError> {
+    paint_prepared_region_with_scroll_policy(tree, prepared, resources, scroll,
+        region, !paint_backgrounds, [255, 255, 255, 255], canvas_surfaces)
+}
+
 fn paint_prepared_region_with_scroll_policy(
     tree: &DomTree,
     prepared: &mut PreparedRender,
@@ -3701,8 +3423,8 @@ fn paint_prepared_region_with_scroll_policy(
         (native_width, native_height, 1.0)
     };
     let mut pixmap =
-        Pixmap::new(paint_width, paint_height).ok_or(CaptureError::AllocationLimitExceeded)?;
-    pixmap.fill(Color::from_rgba8(
+        crate::pdf::new_pixmap(paint_width, paint_height).ok_or(CaptureError::AllocationLimitExceeded)?;
+    pixmap.pdf_fill(Color::from_rgba8(
         surface_color[0],
         surface_color[1],
         surface_color[2],
@@ -3766,7 +3488,7 @@ fn paint_prepared_region_with_scroll_policy(
     );
     let size = tiny_skia::IntSize::from_wh(output_width, output_height)
         .ok_or(CaptureError::AllocationLimitExceeded)?;
-    Pixmap::from_vec(scaled.into_raw(), size).ok_or(CaptureError::PaintFailed)
+    crate::pdf::pixmap_from_vec(scaled.into_raw(), size).ok_or(CaptureError::PaintFailed)
 }
 
 /// Whether a retained display list can currently be rasterized directly at a
@@ -4104,6 +3826,19 @@ fn source_over_pixel(destination:&mut [u8], color:[f32;4]) {
 
 fn composite_projected_plane(destination:&mut Pixmap, source:&Pixmap, transform:crate::VisualTransform,
     source_scale:f32, destination_scale:f32, mask:Option<&tiny_skia::Mask>) {
+    if crate::pdf::active() {
+        if destination.data().len().saturating_mul(2).saturating_add(source.data().len()) as u64 > MAX_CAPTURE_PEAK_BYTES {
+            crate::pdf::resource_limit(); return;
+        }
+        let scope = crate::pdf::raster_effect(true);
+        let Some(mut local) = crate::pdf::new_pixmap(destination.width(), destination.height()) else {
+            crate::pdf::resource_limit(); return;
+        };
+        composite_projected_plane(&mut local, source, transform, source_scale, destination_scale, mask);
+        drop(scope);
+        crate::pdf::draw_local_effect(destination, &local);
+        return;
+    }
     let Some(inverse)=transform.inverse() else { return; };
     let target=crate::Rect { x:0.,y:0.,width:destination.width() as f32/destination_scale,
         height:destination.height() as f32/destination_scale };
@@ -4143,6 +3878,19 @@ struct ProjectivePaintPlane {
 /// centre-depth painter sort or a nearest-only opaque z buffer.
 fn composite_preserved_planes(destination: &mut Pixmap, planes: &[ProjectivePaintPlane],
     destination_scale: f32, mask: Option<&tiny_skia::Mask>) {
+    if crate::pdf::active() {
+        let live = planes.iter().fold(destination.data().len().saturating_mul(2),
+            |bytes, plane| bytes.saturating_add(plane.source.data().len()));
+        if live as u64 > MAX_CAPTURE_PEAK_BYTES { crate::pdf::resource_limit(); return; }
+        let scope = crate::pdf::raster_effect(true);
+        let Some(mut local) = crate::pdf::new_pixmap(destination.width(), destination.height()) else {
+            crate::pdf::resource_limit(); return;
+        };
+        composite_preserved_planes(&mut local, planes, destination_scale, mask);
+        drop(scope);
+        crate::pdf::draw_local_effect(destination, &local);
+        return;
+    }
     let Some(bounds) = planes.iter().map(|plane| plane.polygon.bounds()).reduce(|a, b| a.union(&b)) else { return; };
     let width = destination.width() as usize;
     let x0 = (bounds.x * destination_scale).floor().max(0.) as usize;
@@ -4361,13 +4109,11 @@ fn paint_canvas_background(
     if let Some(color) = style.background_color {
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-        pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            raster_transform(raster_scale),
-            None,
-        );
+        pixmap.pdf_fill_path(&path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        None,);
     }
 
     if !style.background_gradient_layers.is_empty() {
@@ -4739,6 +4485,7 @@ fn paint_laid_dom_scrolled(
     }
 
     for (paint_index, nid) in paint_order.into_iter().enumerate() {
+        if crate::pdf::cancelled() { return None; }
         if svg_subtree_skip.contains(&nid) || replaced_subtree_skip.contains(&nid) {
             continue;
         }
@@ -4922,7 +4669,8 @@ fn paint_laid_dom_scrolled(
                         let pixels = u64::from(layer_width) * u64::from(layer_height);
                         live_bytes = live_bytes.checked_add(pixels.checked_mul(4)?)?;
                         if pixels > MAX_CAPTURE_PIXELS || live_bytes > MAX_CAPTURE_PEAK_BYTES { return None; }
-                        let layer = Pixmap::new(layer_width, layer_height)?;
+                        let raster_effect = crate::pdf::raster_effect(true);
+                        let layer = crate::pdf::new_pixmap(layer_width, layer_height)?;
                         let layer = paint_laid_dom_scrolled(
                             tree, viewport, base_url, scroll, resolved_scroll, Some(&scroll_state), layer,
                             image_cache, selected_images, canvas_surfaces, svg_fonts, content_size,
@@ -4931,6 +4679,7 @@ fn paint_laid_dom_scrolled(
                             (surface_offset.0 - translation.0 - left, surface_offset.1 - translation.1 - top),
                             raster_scale, print_economy, canvas_background, Some(&excluded),
                         )?;
+                        drop(raster_effect);
                         let transform = display.then(crate::VisualTransform::translate(left, top));
                         let Some(inverse) = transform.inverse() else { continue; };
                         let source_rect = crate::Rect { x: 0., y: 0.,
@@ -5054,7 +4803,8 @@ fn paint_laid_dom_scrolled(
                 continue;
             }
             let layer_delta = (-left, -top);
-            let Some(layer) = Pixmap::new(layer_width, layer_height) else {
+            let raster_effect = crate::pdf::raster_effect(display_transform.affine().is_none());
+            let Some(layer) = crate::pdf::new_pixmap(layer_width, layer_height) else {
                 continue;
             };
             let layer = paint_laid_dom_scrolled(
@@ -5089,6 +4839,7 @@ fn paint_laid_dom_scrolled(
                 canvas_background,
                 excluded_planes,
             )?;
+            drop(raster_effect);
             let transform = display_transform.then(crate::VisualTransform::translate(-layer_delta.0, -layer_delta.1));
             let clip_mask = outside_overflow_clip.as_ref().and_then(|clip| {
                 cached_overflow_clip_mask(
@@ -5100,7 +4851,7 @@ fn paint_laid_dom_scrolled(
                 )
             });
             if let Some(transform) = transform.affine() {
-                pixmap.draw_pixmap(0,0,layer.as_ref(),&tiny_skia::PixmapPaint::default(),
+                pixmap.pdf_draw_pixmap(0,0,layer.as_ref(),&tiny_skia::PixmapPaint::default(),
                     Transform::from_row(transform.a,transform.b,transform.c,transform.d,transform.e,transform.f),
                     clip_mask.as_deref());
             } else {
@@ -5124,7 +4875,7 @@ fn paint_laid_dom_scrolled(
             // Opacity is applied to the finished stacking context, never to
             // each primitive. Otherwise two opaque overlapping children at
             // opacity:.5 incorrectly become .75 alpha in their overlap.
-            let layer = Pixmap::new(pixmap.width(), pixmap.height())?;
+            let layer = crate::pdf::new_pixmap(pixmap.width(), pixmap.height())?;
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -5158,14 +4909,12 @@ fn paint_laid_dom_scrolled(
                 opacity: own_opacity,
                 ..tiny_skia::PixmapPaint::default()
             };
-            pixmap.draw_pixmap(
-                0,
-                0,
-                layer.as_ref(),
-                &group_paint,
-                Transform::identity(),
-                None,
-            );
+            pixmap.pdf_draw_pixmap(0,
+            0,
+            layer.as_ref(),
+            &group_paint,
+            Transform::identity(),
+            None,);
             continue;
         }
 
@@ -5320,7 +5069,7 @@ fn paint_laid_dom_scrolled(
         let background = background_geometry(&rect, style);
         let background_path = background_clip_path(background);
         let combined_clip_mask = clip_path_mask.as_ref().and_then(|polygon| {
-            intersect_clip_masks(ancestor_clip_mask.as_deref().cloned(), Some(polygon))
+            intersect_clip_masks(crate::pdf::clone_optional_mask(ancestor_clip_mask.as_deref()), Some(polygon))
         });
         let element_clip_mask = combined_clip_mask
             .as_ref()
@@ -5341,13 +5090,11 @@ fn paint_laid_dom_scrolled(
                     let mut paint = Paint::default();
                     paint.set_color(Color::from_rgba8(bg[0], bg[1], bg[2], bg[3]));
                     paint.anti_alias = !background.clip_radii.is_zero();
-                    pixmap.fill_path(
-                        path,
-                        &paint,
-                        FillRule::Winding,
-                        raster_transform(raster_scale),
-                        background_mask,
-                    );
+                    pixmap.pdf_fill_path(path,
+                    &paint,
+                    FillRule::Winding,
+                    raster_transform(raster_scale),
+                    background_mask,);
                 }
             }
             if !style.background_gradient_layers.is_empty() {
@@ -5669,12 +5416,10 @@ fn paint_laid_dom_scrolled(
                             if visible_rect.width >= 4.0 && visible_rect.height >= 4.0 {
                                 let mut ph = Paint::default();
                                 ph.set_color(Color::from_rgba8(0xE9, 0xEA, 0xEC, 0xFF));
-                                pixmap.fill_rect(
-                                    box_rect,
-                                    &ph,
-                                    raster_transform(raster_scale),
-                                    None,
-                                );
+                                pixmap.pdf_fill_rect(box_rect,
+                                &ph,
+                                raster_transform(raster_scale),
+                                None,);
                             }
                         }
                     }
@@ -5731,7 +5476,7 @@ fn paint_laid_dom_scrolled(
                     rect.height as u32,
                     &svg_fonts,
                 ) {
-                    let mut mask = element_clip_mask.cloned();
+                    let mut mask = crate::pdf::clone_optional_mask(element_clip_mask);
                     if has_radius {
                         let own = rounded_box_clip_mask_radii(
                             pixmap.width(),
@@ -5741,14 +5486,12 @@ fn paint_laid_dom_scrolled(
                         );
                         mask = intersect_clip_masks(mask, own.as_ref());
                     }
-                    pixmap.draw_pixmap(
-                        rect.x as i32,
-                        rect.y as i32,
-                        content.as_ref(),
-                        &tiny_skia::PixmapPaint::default(),
-                        Transform::identity(),
-                        mask.as_ref(),
-                    );
+                    pixmap.pdf_draw_pixmap(rect.x as i32,
+                    rect.y as i32,
+                    content.as_ref(),
+                    &tiny_skia::PixmapPaint::default(),
+                    Transform::identity(),
+                    mask.as_ref(),);
                 }
             }
             for child in crate::dom::rendered_descendants(tree, nid) {
@@ -5895,13 +5638,11 @@ fn paint_laid_dom_scrolled(
                     let color = style.color.unwrap_or([0, 0, 0, 255]);
                     arrow_paint
                         .set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-                    pixmap.fill_path(
-                        &arrow,
-                        &arrow_paint,
-                        FillRule::Winding,
-                        raster_transform(raster_scale),
-                        element_clip_mask,
-                    );
+                    pixmap.pdf_fill_path(&arrow,
+                    &arrow_paint,
+                    FillRule::Winding,
+                    raster_transform(raster_scale),
+                    element_clip_mask,);
                 }
             }
         }
@@ -5911,6 +5652,42 @@ fn paint_laid_dom_scrolled(
         let checkable = input_type.is_some_and(|kind| {
             kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
         });
+        let range_control = input_type.is_some_and(|kind| kind.eq_ignore_ascii_case("range"));
+        if range_control && style.appearance.as_deref() != Some("none") && rect.width > 0.0 && rect.height > 0.0 {
+            if let Some(range) = tree.input_range_state(nid) {
+                let radius = 8.0_f32.min(rect.height / 2.0).min(rect.width / 2.0);
+                let start = rect.x + radius;
+                let end = rect.x + rect.width - radius;
+                let center_y = rect.y + rect.height / 2.0;
+                let mut fraction = if range.max > range.min {
+                    let span = range.max - range.min;
+                    if span.is_finite() { ((range.value - range.min) / span) as f32 }
+                    else { ((range.value / 2.0 - range.min / 2.0) / (range.max / 2.0 - range.min / 2.0)) as f32 }
+                } else { 0.0 };
+                let rtl = style.direction == Some(taffy::Direction::Rtl);
+                if rtl { fraction = 1.0 - fraction; }
+                let center_x = start + (end - start) * fraction;
+                let disabled = node.get_attribute("disabled").is_some();
+                let accent = if disabled { [160, 160, 160, 255] } else { [0, 117, 255, 255] };
+                let mut control_paint = Paint::default();
+                control_paint.anti_alias = true;
+                let stroke = tiny_skia::Stroke { width: 4.0_f32.min(rect.height), line_cap: tiny_skia::LineCap::Round, ..Default::default() };
+                for (left, right, color) in [(start, end, [190, 190, 190, 255]),
+                    (if rtl { center_x } else { start }, if rtl { end } else { center_x }, accent)] {
+                    let mut track = PathBuilder::new();
+                    track.move_to(left, center_y);
+                    track.line_to(right, center_y);
+                    if let Some(track) = track.finish() {
+                        control_paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+                        pixmap.pdf_stroke_path(&track, &control_paint, &stroke, raster_transform(raster_scale), element_clip_mask);
+                    }
+                }
+                if let Some(thumb) = PathBuilder::from_circle(center_x, center_y, radius) {
+                    control_paint.set_color(Color::from_rgba8(accent[0], accent[1], accent[2], accent[3]));
+                    pixmap.pdf_fill_path(&thumb, &control_paint, FillRule::Winding, raster_transform(raster_scale), element_clip_mask);
+                }
+            }
+        }
         if checkable && rect.width > 0.0 && rect.height > 0.0 {
             let checked = tree
                 .form_control_checked(nid)
@@ -5953,34 +5730,28 @@ fn paint_laid_dom_scrolled(
                     ..Default::default()
                 };
                 if !is_radio && selected {
-                    pixmap.fill_path(
-                        &shape,
-                        &control_paint,
-                        FillRule::Winding,
-                        raster_transform(raster_scale),
-                        element_clip_mask,
-                    );
+                    pixmap.pdf_fill_path(&shape,
+                    &control_paint,
+                    FillRule::Winding,
+                    raster_transform(raster_scale),
+                    element_clip_mask,);
                 } else {
-                    pixmap.stroke_path(
-                        &shape,
-                        &control_paint,
-                        &stroke,
-                        raster_transform(raster_scale),
-                        element_clip_mask,
-                    );
+                    pixmap.pdf_stroke_path(&shape,
+                    &control_paint,
+                    &stroke,
+                    raster_transform(raster_scale),
+                    element_clip_mask,);
                 }
                 if selected {
                     if is_radio {
                         if let Some(dot) =
                             PathBuilder::from_circle(x + size / 2.0, y + size / 2.0, size * 0.25)
                         {
-                            pixmap.fill_path(
-                                &dot,
-                                &control_paint,
-                                FillRule::Winding,
-                                raster_transform(raster_scale),
-                                element_clip_mask,
-                            );
+                            pixmap.pdf_fill_path(&dot,
+                            &control_paint,
+                            FillRule::Winding,
+                            raster_transform(raster_scale),
+                            element_clip_mask,);
                         }
                     } else {
                         let mut mark = PathBuilder::new();
@@ -5997,13 +5768,11 @@ fn paint_laid_dom_scrolled(
                                 width: (size * 0.14).max(1.0),
                                 ..Default::default()
                             };
-                            pixmap.stroke_path(
-                                &mark,
-                                &control_paint,
-                                &stroke,
-                                raster_transform(raster_scale),
-                                element_clip_mask,
-                            );
+                            pixmap.pdf_stroke_path(&mark,
+                            &control_paint,
+                            &stroke,
+                            raster_transform(raster_scale),
+                            element_clip_mask,);
                         }
                     }
                 }
@@ -6014,7 +5783,7 @@ fn paint_laid_dom_scrolled(
         // attribute as muted text; there is no DOM text node for it (it is
         // not real content), so paint it directly from the attribute instead
         // of going through `paint_text_node`.
-        if !checkable && (&*name.local == "input" || &*name.local == "textarea") {
+        if !checkable && !range_control && (&*name.local == "input" || &*name.local == "textarea") {
             let live_value = tree
                 .form_control_state(nid)
                 .and_then(|control| control.value);
@@ -6337,7 +6106,7 @@ fn paint_inline_fragment_decorations(
         let background_origin = background_geometry(&union, style).origin_rect;
         let background_path = background_clip_path(background);
         let element_clip_mask = background_extra_clip(ancestor_clip_mask, clip_path_mask.as_ref());
-        let background_mask = element_clip_mask.clone();
+        let background_mask = crate::pdf::clone_optional_mask(element_clip_mask.as_ref());
 
         if let Some(shadow) = fragment_style.box_shadow {
             paint_box_shadow(
@@ -6355,13 +6124,11 @@ fn paint_inline_fragment_decorations(
                 let mut paint = Paint::default();
                 paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
                 paint.anti_alias = !background.clip_radii.is_zero();
-                pixmap.fill_path(
-                    path,
-                    &paint,
-                    FillRule::Winding,
-                    raster_transform(raster_scale),
-                    background_mask.as_ref(),
-                );
+                pixmap.pdf_fill_path(path,
+                &paint,
+                FillRule::Winding,
+                raster_transform(raster_scale),
+                background_mask.as_ref(),);
             }
             if !fragment_style.background_gradient_layers.is_empty() {
                 if let Some(path) = background_path.as_ref() {
@@ -7192,7 +6959,7 @@ fn stroke_rounded_border_path(
         }
         _ => {}
     }
-    pixmap.stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
+    pixmap.pdf_stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
 }
 
 fn fill_solid_border_side(
@@ -7211,13 +6978,11 @@ fn fill_solid_border_side(
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
     paint.anti_alias = !radii.is_zero();
-    pixmap.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        raster_transform(raster_scale),
-        mask,
-    );
+    pixmap.pdf_fill_path(&path,
+    &paint,
+    FillRule::Winding,
+    raster_transform(raster_scale),
+    mask,);
 }
 
 fn arc_point(center: (f32, f32), radius: (f32, f32), degrees: f32) -> (f32, f32) {
@@ -7380,7 +7145,7 @@ fn paint_straight_border_side(
         stroke.dash = tiny_skia::StrokeDash::new(vec![0.0, stroke_width * 2.0], 0.0);
         stroke.line_cap = tiny_skia::LineCap::Round;
     }
-    pixmap.stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
+    pixmap.pdf_stroke_path(&path, &paint, &stroke, raster_transform(raster_scale), mask);
 }
 
 fn shade_border_color(color: [u8; 4], amount: f32) -> [u8; 4] {
@@ -7451,7 +7216,7 @@ fn paint_box_shadow(
     let bottom = (shadow_bounds.y + shadow_bounds.height)
         .ceil()
         .min(pixmap.height() as f32) as i32;
-    let Some(mut shadow_pixmap) = Pixmap::new((right - left) as u32, (bottom - top) as u32) else {
+    let Some(mut shadow_pixmap) = crate::pdf::new_pixmap((right - left) as u32, (bottom - top) as u32) else {
         return;
     };
     let local_rect = crate::Rect {
@@ -7508,14 +7273,12 @@ fn paint_box_shadow(
         }
     }
     // Ancestor overflow clip is already the complete rect/rounded chain.
-    pixmap.draw_pixmap(
-        left,
-        top,
-        shadow_pixmap.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        Transform::identity(),
-        ancestor_clip,
-    );
+    pixmap.pdf_draw_pixmap(left,
+    top,
+    shadow_pixmap.as_ref(),
+    &tiny_skia::PixmapPaint::default(),
+    Transform::identity(),
+    ancestor_clip,);
 }
 
 /// Fill one (possibly rounded) shadow rectangle with a flat color, optionally
@@ -7554,13 +7317,11 @@ fn fill_shadow_rect(
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
     paint.anti_alias = true;
-    pixmap.fill_path(
-        &path,
-        &paint,
-        FillRule::Winding,
-        Transform::identity(),
-        mask,
-    );
+    pixmap.pdf_fill_path(&path,
+    &paint,
+    FillRule::Winding,
+    Transform::identity(),
+    mask,);
 }
 
 /// The marker text for a list item, or `None` when markers are suppressed
@@ -8126,13 +7887,6 @@ fn fetch_bytes(
     fetch_bytes_with_kind(src, base_url, cache, false)
 }
 
-fn fetch_font_bytes(
-    src: &str,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-) -> Option<Arc<[u8]>> {
-    fetch_bytes_with_kind(src, base_url, cache, true)
-}
 
 fn fetch_bytes_with_kind(
     src: &str,
@@ -8187,917 +7941,7 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
     }
 }
 
-/// Select the subsets needed by document text, then decode WOFF/WOFF2 into
-/// the sfnt bytes consumed by fontdb/cosmic-text. The text repertoire is a
-/// Unicode-sized bounded bitset, not an ASCII heuristic or a fetch-all policy.
-fn collect_web_fonts(
-    tree: &DomTree,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-    dynamic_fonts: &[DynamicFontFace],
-    viewport: (f32, f32),
-    media_type: crate::CssMediaType,
-) -> Vec<crate::inline::WebFont> {
-    struct FontRule {
-        sources: Vec<(String, String)>,
-        family: Option<String>,
-        weight: Option<(u16, u16)>,
-        italic: Option<bool>,
-    }
 
-    let mut seen = std::collections::HashSet::new();
-    let mut fonts = Vec::new();
-    let mut rules = Vec::new();
-    let points = document_font_codepoints(tree);
-
-    let mut collect_rules = |css: &str| {
-        for face in font_face_blocks(css) {
-            if !font_face_covers_text(face, &points) {
-                continue;
-            }
-            let sources: Vec<_> = font_face_urls(face)
-                .into_iter()
-                .filter(|src| font_source_may_be_supported(src))
-                .map(|src| (font_resource_key(&src, base_url), src))
-                .collect();
-            if sources.is_empty() {
-                continue;
-            }
-            rules.push(FontRule {
-                sources,
-                family: font_face_family(face),
-                weight: font_face_weight(face),
-                italic: font_face_italic(face),
-            });
-        }
-    };
-    let external = tree.external_stylesheets();
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let Some(node) = tree.borrow_node(nid) else { continue };
-        let Some(element) = node.as_element() else { continue };
-        let inline = &*element.local == "style";
-        let linked = &*element.local == "link" && node.get_attribute("disabled").is_none()
-            && node.get_attribute("rel").is_some_and(|rel| rel.split_ascii_whitespace()
-                .any(|part| part.eq_ignore_ascii_case("stylesheet")));
-        if (!inline && !linked) || !node.get_attribute("media").is_none_or(|media|
-            media.trim().is_empty() || crate::css::media_query_applies_for_viewport_and_type(
-                media, viewport, media_type)) { continue; }
-        drop(node);
-        if let Some(sheet) = external.get(&nid) {
-            if let Some(cssom) = &sheet.cssom_rules {
-                if inline { for source in &sheet.sources { collect_rules(source); } }
-                for rule in cssom { collect_rules(rule); }
-                continue;
-            }
-            for source in &sheet.sources { collect_rules(source); }
-        }
-        if inline { collect_rules(&tree.text_content(nid)); }
-    }
-    drop(collect_rules);
-    for face in dynamic_fonts {
-        let descriptor_block = format!(
-            "src:{};font-weight:{};font-style:{};unicode-range:{}",
-            face.source, face.weight, face.style, face.unicode_range
-        );
-        if !font_face_covers_text(&descriptor_block, &points) {
-            continue;
-        }
-        let sources: Vec<_> = font_face_urls(&descriptor_block)
-            .into_iter()
-            .filter(|src| font_source_may_be_supported(src))
-            .map(|src| (font_resource_key(&src, base_url), src))
-            .collect();
-        if sources.is_empty() {
-            continue;
-        }
-        rules.push(FontRule {
-            sources,
-            family: (!face.family.is_empty()).then(|| face.family.clone()),
-            weight: font_face_weight(&descriptor_block),
-            italic: font_face_italic(&descriptor_block),
-        });
-    }
-
-    // Critical web fonts are normally preloaded from the document with a URL
-    // already resolved relative to the HTML. Fetch those first, while retaining
-    // the matching @font-face descriptors needed for CSS family/weight lookup.
-    let mut preloads = Vec::new();
-    for nid in crate::dom::rendered_descendants(tree, tree.document()) {
-        let preload = tree.with_node(nid, |node| {
-            if &*node.as_element()?.local != "link" {
-                return None;
-            }
-            let rel = node.get_attribute("rel").unwrap_or("");
-            let as_value = node.get_attribute("as").unwrap_or("");
-            if rel.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("preload"))
-                && as_value.eq_ignore_ascii_case("font")
-            {
-                node.get_attribute("href").map(str::to_owned)
-            } else {
-                None
-            }
-        }).flatten();
-        if let Some(href) = preload {
-            preloads.push(href);
-        }
-    }
-    for src in preloads.iter().take(16) {
-        let key = font_resource_key(src, base_url);
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        if let Some(decoded) = fetch_and_decode_font(src, base_url, cache) {
-            let metadata = rules.iter().find(|rule| {
-                rule.sources
-                    .iter()
-                    .any(|(source_key, _)| *source_key == key)
-            });
-            fonts.push(crate::inline::WebFont {
-                data: decoded,
-                family: metadata.and_then(|rule| rule.family.clone()),
-                weight: metadata.and_then(|rule| rule.weight),
-                italic: metadata.and_then(|rule| rule.italic),
-            });
-        }
-    }
-
-    for rule in rules {
-        if fonts.len() >= 16 {
-            break;
-        }
-        for (key, src) in rule.sources {
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Some(decoded) = fetch_and_decode_font(&src, base_url, cache) {
-                fonts.push(crate::inline::WebFont {
-                    data: decoded,
-                    family: rule.family,
-                    weight: rule.weight,
-                    italic: rule.italic,
-                });
-                break;
-            }
-        }
-    }
-    fonts
-}
-
-/// Exclude source formats that fontdb cannot consume before issuing a request.
-/// Unknown and extensionless URLs are retained because their response bytes can
-/// still identify a supported sfnt, WOFF, or WOFF2 resource.
-fn font_source_may_be_supported(src: &str) -> bool {
-    let path = src
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(src)
-        .to_ascii_lowercase();
-    !path.ends_with(".eot") && !path.ends_with(".svg")
-}
-
-fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
-    url::Url::parse(src)
-        .ok()
-        .or_else(|| {
-            base_url
-                .and_then(|base| url::Url::parse(base).ok())
-                .and_then(|base| base.join(src).ok())
-        })
-        .map(|url| url.to_string())
-        .unwrap_or_else(|| src.to_string())
-}
-
-fn fetch_and_decode_font(
-    src: &str,
-    base_url: Option<&str>,
-    cache: &mut RenderResourceCache,
-) -> Option<std::sync::Arc<Vec<u8>>> {
-    let key = font_resource_key(src, base_url);
-    if let Some(decoded) = cache.cached_decoded_font(&key) { return Some(decoded); }
-    let compressed = if src.starts_with("obscura-font:") {
-        cache.cached_font_bytes(src)?
-    } else if src.starts_with("data:") {
-        Arc::from(font_data_url_bytes(src)?)
-    } else {
-        fetch_font_bytes(src, base_url, cache)?
-    };
-    let decoded = Arc::new(decode_font_bytes(&compressed)?.into_owned());
-    if !cache.has_cached_bytes(&key) { cache.seed_shared(key.clone(), compressed); }
-    cache.cache_decoded_font(&key, decoded.clone());
-    Some(decoded)
-}
-
-/// Decode and validate the same real fonts used by shaping. Raw sfnt data is
-/// borrowed so a lifecycle check does not copy a complete font body.
-pub fn decode_font_bytes(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-    if bytes.len() > FONT_MAX_DECODED {
-        return None;
-    }
-    let decoded = match bytes.get(..4) {
-        Some(b"wOF2") => {
-            let bounds = woff2_allocation_bounds(bytes)?;
-            let decoded = wuff::decompress_woff2_with_custom_brotli(bytes, &mut |compressed, size| {
-                let invalid = || Box::new(wuff::WuffErr::GenericError) as Box<dyn std::error::Error>;
-                if size != bounds.stream_size || size > FONT_MAX_DECODED {
-                    return Err(invalid());
-                }
-                use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
-                let mut output = vec![0; size];
-                let mut available_in = compressed.len();
-                let mut input_offset = 0;
-                let mut available_out = size;
-                let mut output_offset = 0;
-                let mut total_out = 0;
-                let mut state = BrotliState::new(StandardAlloc::default(), StandardAlloc::default(), StandardAlloc::default());
-                let result = BrotliDecompressStream(&mut available_in, &mut input_offset, compressed,
-                    &mut available_out, &mut output_offset, &mut output, &mut total_out, &mut state);
-                if !matches!(result, BrotliResult::ResultSuccess) || output_offset != size
-                    || woff2_reconstruction_bounds(&bounds, &output).is_none() {
-                    return Err(invalid());
-                }
-                Ok(output)
-            }).ok()?;
-            std::borrow::Cow::Owned(decoded)
-        }
-        Some(b"wOFF") => {
-            woff1_allocation_bounds(bytes)?;
-            std::borrow::Cow::Owned(wuff::decompress_woff1(bytes).ok()?)
-        }
-        Some(b"\0\x01\0\0" | b"OTTO" | b"ttcf") => std::borrow::Cow::Borrowed(bytes),
-        _ => return None,
-    };
-    if decoded.len() > FONT_MAX_DECODED {
-        return None;
-    }
-    let count = cosmic_text::ttf_parser::fonts_in_collection(&decoded).unwrap_or(1);
-    // Collections must have genuine sfnt faces, not just the right magic.
-    if count == 0 || count > 64 || !(0..count).all(|index| {
-        cosmic_text::ttf_parser::Face::parse(&decoded, index).is_ok_and(|face| {
-            let tables = face.tables();
-            face.number_of_glyphs() > 0 && tables.cmap.is_some()
-                && (tables.glyf.is_some() || tables.cff.is_some() || tables.cff2.is_some())
-        })
-    }) {
-        return None;
-    }
-    Some(decoded)
-}
-
-const FONT_MAX_COMPRESSED: usize = 8 * 1024 * 1024;
-const FONT_MAX_DECODED: usize = 32 * 1024 * 1024;
-
-fn font_take<'a>(input: &mut &'a [u8], size: usize) -> Option<&'a [u8]> {
-    let (value, rest) = input.split_at_checked(size)?;
-    *input = rest;
-    Some(value)
-}
-
-fn font_u16(input: &mut &[u8]) -> Option<usize> {
-    Some(u16::from_be_bytes(font_take(input, 2)?.try_into().ok()?) as usize)
-}
-
-fn font_u32(input: &mut &[u8]) -> Option<usize> {
-    Some(u32::from_be_bytes(font_take(input, 4)?.try_into().ok()?) as usize)
-}
-
-fn font_base128(input: &mut &[u8]) -> Option<usize> {
-    let mut value = 0u32;
-    for index in 0..5 {
-        let byte = font_take(input, 1)?[0];
-        if index == 0 && byte == 0x80 || value & 0xfe000000 != 0 {
-            return None;
-        }
-        value = (value << 7) | u32::from(byte & 0x7f);
-        if byte & 0x80 == 0 { return Some(value as usize); }
-    }
-    None
-}
-
-fn font_255(input: &mut &[u8]) -> Option<usize> {
-    match font_take(input, 1)?[0] {
-        253 => font_u16(input),
-        254 => Some(506 + usize::from(font_take(input, 1)?[0])),
-        255 => Some(253 + usize::from(font_take(input, 1)?[0])),
-        value => Some(usize::from(value)),
-    }
-}
-
-fn font_padded(size: usize) -> Option<usize> {
-    Some(size.checked_add(3)? & !3)
-}
-
-fn font_bounded_add(total: &mut usize, size: usize) -> Option<()> {
-    *total = total.checked_add(size)?;
-    (*total <= FONT_MAX_DECODED).then_some(())
-}
-
-fn woff1_allocation_bounds(bytes: &[u8]) -> Option<()> {
-    if bytes.len() > FONT_MAX_COMPRESSED || bytes.len() < 44 { return None; }
-    let mut header = &bytes[8..];
-    if font_u32(&mut header)? != bytes.len() { return None; }
-    let count = font_u16(&mut header)?;
-    if count == 0 || font_u16(&mut header)? != 0 { return None; }
-    let advertised = font_u32(&mut header)?;
-    if advertised == 0 || advertised > FONT_MAX_DECODED { return None; }
-    let mut directory = bytes.get(44..44usize.checked_add(count.checked_mul(20)?)?)?;
-    let mut reconstructed = 12 + count * 16;
-    for _ in 0..count {
-        font_take(&mut directory, 4)?;
-        let offset = font_u32(&mut directory)?;
-        let compressed = font_u32(&mut directory)?;
-        let original = font_u32(&mut directory)?;
-        font_take(&mut directory, 4)?;
-        if compressed > original || offset < 44 + count * 20 {
-            return None;
-        }
-        bytes.get(offset..offset.checked_add(compressed)?)?;
-        font_bounded_add(&mut reconstructed, font_padded(original)?)?;
-    }
-    (reconstructed == advertised).then_some(())
-}
-
-struct Woff2BoundTable {
-    tag: Option<[u8; 4]>,
-    transformed: bool,
-    original: usize,
-    offset: usize,
-    length: usize,
-}
-
-struct Woff2AllocationBounds {
-    tables: Vec<Woff2BoundTable>,
-    fonts: Vec<Vec<usize>>,
-    stream_size: usize,
-    header_size: usize,
-}
-
-fn woff2_allocation_bounds(bytes: &[u8]) -> Option<Woff2AllocationBounds> {
-    if bytes.len() > FONT_MAX_COMPRESSED || bytes.len() < 48 { return None; }
-    let mut header = &bytes[8..];
-    if font_u32(&mut header)? != bytes.len() { return None; }
-    let count = font_u16(&mut header)?;
-    font_u16(&mut header)?;
-    let advertised = font_u32(&mut header)?;
-    if count == 0 || advertised == 0 || advertised > FONT_MAX_DECODED { return None; }
-    let compressed_size = font_u32(&mut header)?;
-    let mut directory = &bytes[48..];
-    let mut tables = Vec::with_capacity(count.min(directory.len() / 2));
-    let mut stream_size = 0;
-    let mut original_size = 0;
-    for _ in 0..count {
-        let flags = font_take(&mut directory, 1)?[0];
-        let tag = match flags & 63 {
-            2 => Some(*b"hhea"), 3 => Some(*b"hmtx"),
-            10 => Some(*b"glyf"), 11 => Some(*b"loca"),
-            63 => Some(font_take(&mut directory, 4)?.try_into().ok()?),
-            _ => None,
-        };
-        let version = flags >> 6;
-        let transformed = if matches!(tag.as_ref(), Some(b"glyf" | b"loca")) {
-            version == 0
-        } else { version != 0 };
-        let original = font_base128(&mut directory)?;
-        let length = if transformed { font_base128(&mut directory)? } else { original };
-        if transformed && (tag == Some(*b"loca") && length != 0
-            || !matches!(tag.as_ref(), Some(b"glyf" | b"loca" | b"hmtx"))) {
-            return None;
-        }
-        let offset = stream_size;
-        font_bounded_add(&mut stream_size, length)?;
-        font_bounded_add(&mut original_size, font_padded(original)?)?;
-        tables.push(Woff2BoundTable { tag, transformed, original, offset, length });
-    }
-    let mut fonts = Vec::new();
-    let mut header_size;
-    let capacity_header;
-    if bytes.get(4..8)? == b"ttcf" {
-        let version = font_u32(&mut directory)?;
-        if version != 0x10000 && version != 0x20000 { return None; }
-        let font_count = font_255(&mut directory)?;
-        if font_count == 0 || font_count > 64 { return None; }
-        header_size = 12 + font_count * 4 + if version == 0x20000 { 12 } else { 0 };
-        capacity_header = header_size;
-        for _ in 0..font_count {
-            let table_count = font_255(&mut directory)?;
-            font_take(&mut directory, 4)?;
-            if table_count == 0 || table_count > count { return None; }
-            font_bounded_add(&mut header_size, 12 + table_count * 16)?;
-            let mut indices = Vec::with_capacity(table_count.min(directory.len()));
-            for _ in 0..table_count {
-                let index = font_255(&mut directory)?;
-                if index >= count { return None; }
-                indices.push(index);
-            }
-            fonts.push(indices);
-        }
-    } else {
-        // wuff's synthetic single-font directory includes a collection-header
-        // capacity hint although the emitted sfnt header has only 12 bytes.
-        header_size = 12 + count * 16;
-        capacity_header = 16;
-        fonts.push((0..count).collect());
-    }
-    font_bounded_add(&mut original_size, header_size)?;
-    let capacity_size = original_size.checked_add(capacity_header)?;
-    if capacity_size > FONT_MAX_DECODED && !(stream_size <= advertised && advertised <= capacity_size) {
-        return None;
-    }
-    font_take(&mut directory, compressed_size)?;
-    Some(Woff2AllocationBounds { tables, fonts, stream_size, header_size })
-}
-
-fn woff2_reconstruction_bounds(bounds: &Woff2AllocationBounds, stream: &[u8]) -> Option<()> {
-    let mut sizes = Vec::with_capacity(bounds.tables.len());
-    let mut glyphs = Vec::with_capacity(bounds.tables.len());
-    for table in &bounds.tables {
-        let data = stream.get(table.offset..table.offset.checked_add(table.length)?)?;
-        if table.transformed && table.tag == Some(*b"glyf") {
-            let (glyf, loca, count) = woff2_glyf_allocation_bounds(data)?;
-            sizes.push(glyf);
-            glyphs.push(Some((loca, count)));
-        } else {
-            sizes.push(table.length);
-            glyphs.push(None);
-        }
-    }
-    for indices in &bounds.fonts {
-        let find = |tag| indices.iter().copied().find(|index| bounds.tables[*index].tag == Some(tag));
-        if let Some(glyf_index) = find(*b"glyf") {
-            if let Some((loca_size, count)) = glyphs[glyf_index] {
-                let loca_index = find(*b"loca")?;
-                let loca = &bounds.tables[loca_index];
-                if !loca.transformed || loca.original != loca_size { return None; }
-                sizes[loca_index] = loca_size;
-                if let Some(hmtx_index) = find(*b"hmtx") {
-                    if bounds.tables[hmtx_index].transformed {
-                        let hhea = &bounds.tables[find(*b"hhea")?];
-                        let mut metrics = stream.get(hhea.offset.checked_add(34)?..hhea.offset.checked_add(hhea.length)?)?;
-                        let metrics = font_u16(&mut metrics)?;
-                        if metrics == 0 || metrics > count { return None; }
-                        let actual = count * 2 + metrics * 2;
-                        if bounds.tables[hmtx_index].original != actual { return None; }
-                        sizes[hmtx_index] = actual;
-                    }
-                }
-            }
-        }
-    }
-    let mut total = bounds.header_size;
-    for size in sizes { font_bounded_add(&mut total, font_padded(size)?)?; }
-    Some(())
-}
-
-// This scanner does not decode a font. It accounts for the exact bytes wuff
-// will reconstruct and rejects oversized scratch/output allocations before
-// entering its glyf transformer, including dishonest origLength values.
-fn woff2_glyf_allocation_bounds(data: &[u8]) -> Option<(usize, usize, usize)> {
-    let mut header = data;
-    font_u16(&mut header)?;
-    let flags = font_u16(&mut header)?;
-    let count = font_u16(&mut header)?;
-    let index_format = font_u16(&mut header)?;
-    if index_format > 1 { return None; }
-    let mut lengths = [0; 7];
-    for length in &mut lengths { *length = font_u32(&mut header)?; }
-    let mut payload = data.get(36..)?;
-    let mut contours = font_take(&mut payload, lengths[0])?;
-    let mut points = font_take(&mut payload, lengths[1])?;
-    let mut point_flags = font_take(&mut payload, lengths[2])?;
-    let mut triplets = font_take(&mut payload, lengths[3])?;
-    let mut composites = font_take(&mut payload, lengths[4])?;
-    let mut bbox = font_take(&mut payload, lengths[5])?;
-    let mut instructions = font_take(&mut payload, lengths[6])?;
-    let bitmap = font_take(&mut bbox, count.div_ceil(32) * 4)?;
-    let overlap = if flags & 1 != 0 { Some(font_take(&mut payload, count.div_ceil(8))?) } else { None };
-    let mut output = 0;
-    for glyph in 0..count {
-        let contour_count = font_u16(&mut contours)?;
-        let has_bbox = bitmap[glyph / 8] & (0x80 >> (glyph % 8)) != 0;
-        let mut glyph_size = 0;
-        if contour_count == 0xffff {
-            if !has_bbox { return None; }
-            font_take(&mut bbox, 8)?;
-            glyph_size = 10;
-            let mut has_instructions = false;
-            loop {
-                let flags = font_u16(&mut composites)?;
-                has_instructions |= flags & 0x100 != 0;
-                let size = 2 + if flags & 1 != 0 { 4 } else { 2 }
-                    + if flags & 8 != 0 { 2 } else if flags & 0x40 != 0 { 4 }
-                      else if flags & 0x80 != 0 { 8 } else { 0 };
-                font_take(&mut composites, size)?;
-                font_bounded_add(&mut glyph_size, 2 + size)?;
-                if flags & 0x20 == 0 { break; }
-            }
-            if has_instructions {
-                let size = font_255(&mut triplets)?;
-                font_take(&mut instructions, size)?;
-                font_bounded_add(&mut glyph_size, 2 + size)?;
-            }
-        } else if contour_count > 0 {
-            let mut point_count = 0usize;
-            for _ in 0..contour_count {
-                point_count = point_count.checked_add(font_255(&mut points)?)?;
-                // wuff allocates its point vector before validating endPts.
-                if point_count > 65536 { return None; }
-            }
-            let source_flags = font_take(&mut point_flags, point_count)?;
-            glyph_size = 12 + contour_count * 2;
-            let mut last_flag = None;
-            let mut run = 0;
-            let mut x = 0i32;
-            let mut y = 0i32;
-            for (point, &source_flag) in source_flags.iter().enumerate() {
-                let (dx, dy) = woff2_triplet_delta(source_flag & 0x7f, &mut triplets)?;
-                x = x.checked_add(dx)?;
-                y = y.checked_add(dy)?;
-                let axis = |delta: i32, short, same| {
-                    if delta == 0 { (same, 0) }
-                    else if (-255..=255).contains(&delta) { (short | if delta > 0 { same } else { 0 }, 1) }
-                    else { (0, 2) }
-                };
-                let (x_flag, x_bytes) = axis(dx, 2, 16);
-                let (y_flag, y_bytes) = axis(dy, 4, 32);
-                let flag = u8::from(source_flag & 0x80 == 0) | x_flag | y_flag
-                    | if point == 0 && overlap.is_some_and(|bitmap| bitmap[glyph / 8] & (0x80 >> (glyph % 8)) != 0) { 64 } else { 0 };
-                font_bounded_add(&mut glyph_size, x_bytes + y_bytes)?;
-                if last_flag == Some(flag) && run < 256 { run += 1; }
-                else {
-                    if run > 0 { font_bounded_add(&mut glyph_size, if run == 1 { 1 } else { 2 })?; }
-                    last_flag = Some(flag);
-                    run = 1;
-                }
-            }
-            if run > 0 { font_bounded_add(&mut glyph_size, if run == 1 { 1 } else { 2 })?; }
-            let instruction_size = font_255(&mut triplets)?;
-            font_take(&mut instructions, instruction_size)?;
-            font_bounded_add(&mut glyph_size, instruction_size)?;
-            if has_bbox { font_take(&mut bbox, 8)?; }
-            // Account for the transformer's per-glyph reserve, not only the
-            // tighter encoded output size calculated above.
-            if 12 + contour_count * 2 + point_count * 5 + instruction_size > FONT_MAX_DECODED { return None; }
-        } else if has_bbox { return None; }
-        font_bounded_add(&mut output, font_padded(glyph_size)?)?;
-    }
-    if index_format == 0 && output > 0x1fffe { return None; }
-    Some((output, (count + 1) * if index_format == 0 { 2 } else { 4 }, count))
-}
-
-fn woff2_triplet_delta(flag: u8, input: &mut &[u8]) -> Option<(i32, i32)> {
-    let sign = |flag: u8, value: i32| if flag & 1 != 0 { value } else { -value };
-    let length = if flag < 84 { 1 } else if flag < 120 { 2 } else if flag < 124 { 3 } else { 4 };
-    let data = font_take(input, length)?;
-    let (x, y) = if flag < 10 {
-        (0, (i32::from(flag & 14) << 7) + i32::from(data[0]))
-    } else if flag < 20 {
-        ((i32::from((flag - 10) & 14) << 7) + i32::from(data[0]), 0)
-    } else if flag < 84 {
-        let bits = flag - 20;
-        (1 + i32::from(bits & 0x30) + i32::from(data[0] >> 4),
-         1 + i32::from((bits & 0x0c) << 2) + i32::from(data[0] & 0x0f))
-    } else if flag < 120 {
-        let bits = flag - 84;
-        (1 + (i32::from(bits / 12) << 8) + i32::from(data[0]),
-         1 + (i32::from((bits % 12) >> 2) << 8) + i32::from(data[1]))
-    } else if flag < 124 {
-        ((i32::from(data[0]) << 4) + i32::from(data[1] >> 4),
-         (i32::from(data[1] & 0x0f) << 8) + i32::from(data[2]))
-    } else {
-        ((i32::from(data[0]) << 8) + i32::from(data[1]),
-         (i32::from(data[2]) << 8) + i32::from(data[3]))
-    };
-    Some((sign(flag, x), sign(if flag < 10 { flag } else { flag >> 1 }, y)))
-}
-
-impl RenderResourceCache {
-    /// Lifecycle consumers only inspect retained page-transport bytes here;
-    /// this lookup never opens the renderer's compatibility HTTP loader.
-    pub fn cached_font_bytes(&self, url: &str) -> Option<Arc<[u8]>> {
-        match self.entries.get(&network_resource_url(url))? {
-            CachedResource::Bytes { bytes, .. } => Some(Arc::clone(bytes)),
-            CachedResource::Missing(_) => None,
-        }
-    }
-
-    pub fn cached_decoded_font(&self, url: &str) -> Option<Arc<Vec<u8>>> {
-        match self.entries.get(&network_resource_url(url))? {
-            CachedResource::Bytes { decoded_font, .. } => decoded_font.clone(),
-            CachedResource::Missing(_) => None,
-        }
-    }
-
-    /// Decoded font bodies count against the existing page cache byte budget.
-    /// The caller still owns the font if this cache cannot retain both forms.
-    pub fn cache_decoded_font(&mut self, url: &str, font: Arc<Vec<u8>>) {
-        let key = network_resource_url(url);
-        let Some(CachedResource::Bytes { bytes, decoded_font, .. }) = self.entries.get(&key) else { return };
-        if decoded_font.is_some() || bytes.len().saturating_add(font.len()) > self.max_bytes { return; }
-        while self.retained_bytes.saturating_add(font.len()) > self.max_bytes {
-            let Some(index) = self.order.iter().position(|entry| entry != &key) else { return };
-            let Some(oldest) = self.order.remove(index) else { return };
-            self.remove_entry(&oldest);
-        }
-        if let Some(CachedResource::Bytes { decoded_font, .. }) = self.entries.get_mut(&key) {
-            self.retained_bytes += font.len();
-            *decoded_font = Some(font);
-        }
-    }
-}
-
-/// Resolve FontFace sources with the renderer's source-order/format policy.
-pub fn font_face_source_urls(source: &str, base_url: Option<&str>) -> Vec<String> {
-    font_face_urls(&format!("src:{source}"))
-        .into_iter()
-        .filter(|src| font_source_may_be_supported(src))
-        .take(32)
-        .filter_map(|src| url::Url::parse(&src).ok().or_else(|| {
-            base_url.and_then(|base| url::Url::parse(base).ok())
-                .and_then(|base| base.join(&src).ok())
-        }))
-        .map(|mut url| { url.set_fragment(None); url.to_string() })
-        .collect()
-}
-
-/// Decode data-backed fonts without allocating beyond the compressed limit.
-pub fn font_data_url_bytes(source: &str) -> Option<Vec<u8>> {
-    const MAX: usize = 8 * 1024 * 1024;
-    let rest = source.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if meta.split(';').any(|label| label.eq_ignore_ascii_case("base64")) {
-        if data.len() > MAX.div_ceil(3) * 4 {
-            return None;
-        }
-        use base64::Engine;
-        let mut bytes = vec![0; (data.len().div_ceil(4) * 3).min(MAX)];
-        let length = base64::engine::general_purpose::STANDARD.decode_slice(data, &mut bytes).ok()?;
-        bytes.truncate(length);
-        Some(bytes)
-    } else {
-        if data.len() > MAX * 3 {
-            return None;
-        }
-        let input = data.as_bytes();
-        let mut bytes = Vec::with_capacity(input.len().min(MAX));
-        let mut index = 0;
-        while index < input.len() {
-            if bytes.len() == MAX { return None; }
-            if input[index] == b'%' && index + 2 < input.len() {
-                let hi = (input[index + 1] as char).to_digit(16);
-                let lo = (input[index + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    bytes.push((hi * 16 + lo) as u8);
-                    index += 3;
-                    continue;
-                }
-            }
-            bytes.push(input[index]);
-            index += 1;
-        }
-        Some(bytes)
-    }
-}
-
-fn font_face_blocks(css: &str) -> Vec<&str> {
-    let lower = css.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find("@font-face") {
-        let at = cursor + relative;
-        let Some(open_relative) = lower[at..].find('{') else {
-            break;
-        };
-        let open = at + open_relative;
-        let mut depth = 1i32;
-        let mut quote = None;
-        let mut escaped = false;
-        let mut close = None;
-        for (offset, ch) in css[open + 1..].char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if let Some(active) = quote {
-                if ch == active {
-                    quote = None;
-                }
-                continue;
-            }
-            if matches!(ch, '"' | '\'') {
-                quote = Some(ch);
-                continue;
-            }
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(open + 1 + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(close) = close else { break };
-        out.push(&css[open + 1..close]);
-        cursor = close + 1;
-    }
-    out
-}
-
-fn font_face_declaration<'a>(face: &'a str, name: &str) -> Option<&'a str> {
-    split_css_top_level(face, ';')
-        .into_iter()
-        .filter_map(|declaration| {
-            let (property, value) = declaration.split_once(':')?;
-            property
-                .trim()
-                .eq_ignore_ascii_case(name)
-                .then_some(value.trim())
-        })
-        .last()
-}
-
-fn font_face_family(face: &str) -> Option<String> {
-    font_face_declaration(face, "font-family")
-        .map(|family| {
-            family
-                .trim()
-                .trim_matches(|ch| matches!(ch, '"' | '\''))
-                .to_string()
-        })
-        .filter(|family| !family.is_empty())
-}
-
-fn font_face_weight(face: &str) -> Option<(u16, u16)> {
-    fn parse(value: &str) -> Option<u16> {
-        match value.to_ascii_lowercase().as_str() {
-            "normal" => Some(400),
-            "bold" => Some(700),
-            value => value
-                .parse::<f32>()
-                .ok()
-                .filter(|weight| weight.is_finite() && (1.0..=1000.0).contains(weight))
-                .map(|weight| weight.round() as u16),
-        }
-    }
-    let mut values = font_face_declaration(face, "font-weight")?
-        .split_ascii_whitespace()
-        .filter_map(parse);
-    let first = values.next()?;
-    let second = values.next().unwrap_or(first);
-    Some((first.min(second), first.max(second)))
-}
-
-fn font_face_italic(face: &str) -> Option<bool> {
-    font_face_declaration(face, "font-style").and_then(|style| {
-        let style = style.trim().to_ascii_lowercase();
-        if style == "normal" {
-            Some(false)
-        } else if style == "italic" || style.starts_with("oblique") {
-            Some(true)
-        } else {
-            None
-        }
-    })
-}
-
-fn font_face_covers_text(face: &str, points: &[u64]) -> bool {
-    let Some(range) = font_face_declaration(face, "unicode-range") else {
-        return true;
-    };
-    range.split(',').any(|part| {
-        let token = part.trim().to_ascii_lowercase();
-        let Some(value) = token.strip_prefix("u+") else {
-            return false;
-        };
-        let (start, end) = if value.contains('?') {
-            (
-                u32::from_str_radix(&value.replace('?', "0"), 16).ok(),
-                u32::from_str_radix(&value.replace('?', "f"), 16).ok(),
-            )
-        } else if let Some((start, end)) = value.split_once('-') {
-            (
-                u32::from_str_radix(start, 16).ok(),
-                u32::from_str_radix(end, 16).ok(),
-            )
-        } else {
-            let point = u32::from_str_radix(value, 16).ok();
-            (point, point)
-        };
-        matches!((start, end), (Some(start), Some(end)) if start <= end && start <= 0x10ffff
-            && font_codepoints_intersect(points, start, end.min(0x10ffff)))
-    })
-}
-
-fn font_codepoints_intersect(points: &[u64], start: u32, end: u32) -> bool {
-    let first = start as usize / 64;
-    let last = (end as usize / 64).min(points.len().saturating_sub(1));
-    if first > last || points.is_empty() {
-        return false;
-    }
-    (first..=last).any(|index| {
-        let low = if index == first { u64::MAX << (start % 64) } else { u64::MAX };
-        let high = if index == end as usize / 64 { u64::MAX >> (63 - end % 64) } else { u64::MAX };
-        points[index] & low & high != 0
-    })
-}
-
-fn add_font_codepoints(points: &mut Vec<u64>, text: &str) {
-    for ch in text.chars() {
-        let point = ch as usize;
-        if points.len() <= point / 64 {
-            points.resize(point / 64 + 1, 0);
-        }
-        points[point / 64] |= 1u64 << (point % 64);
-    }
-}
-
-fn document_font_codepoints(tree: &DomTree) -> Vec<u64> {
-    let mut points = Vec::new();
-    for id in crate::dom::rendered_descendants(tree, tree.document()) {
-        tree.with_node(id, |node| {
-            let obscura_dom::tree::NodeData::Text { contents } = &node.data else { return };
-            let inert = node.parent.and_then(|parent| tree.with_node(parent, |parent| {
-                parent.as_element().is_some_and(|element| {
-                    matches!(&*element.local, "script" | "style" | "template" | "noscript")
-                })
-            })).unwrap_or(false);
-            if !inert {
-                add_font_codepoints(&mut points, contents);
-            }
-        });
-    }
-    points
-}
-
-fn font_face_urls(face: &str) -> Vec<String> {
-    let Some(src) = font_face_declaration(face, "src") else {
-        return Vec::new();
-    };
-    let lower = src.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find("url(") {
-        let start = cursor + relative + 4;
-        let Some(end_relative) = src[start..].find(')') else {
-            break;
-        };
-        let end = start + end_relative;
-        let value = src[start..end]
-            .trim()
-            .trim_matches(|ch| ch == '"' || ch == '\'')
-            .trim();
-        if !value.is_empty() {
-            out.push(value.to_string());
-        }
-        cursor = end + 1;
-    }
-    out
-}
-
-fn split_css_top_level(value: &str, separator: char) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut depth = 0i32;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, ch) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            }
-            continue;
-        }
-        if matches!(ch, '"' | '\'') {
-            quote = Some(ch);
-            continue;
-        }
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = (depth - 1).max(0),
-            ch if ch == separator && depth == 0 => {
-                out.push(&value[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    out.push(&value[start..]);
-    out
-}
 
 /// Fetch `url` with a descriptive User-Agent and a bounded timeout, retrying on
 /// rate-limit / transient errors with backoff. Real pages pull dozens of images
@@ -9308,7 +8152,7 @@ fn raster_to_pixmap(bytes: &[u8], w: u32, h: u32) -> Option<Pixmap> {
         pixel[2] = ((pixel[2] as u32 * a) / 255) as u8;
     }
     let size = tiny_skia::IntSize::from_wh(w, h)?;
-    Pixmap::from_vec(raw, size)
+    crate::pdf::pixmap_from_vec(raw, size)
 }
 
 /// Read an image's intrinsic pixel dimensions from its header only, without
@@ -9347,24 +8191,20 @@ fn paint_linear_gradient(
             .clamp(0.0, 1.0)
             .max(last);
         last = p;
-        gs.push(GradientStop::new(
-            p,
-            Color::from_rgba8(c[0], c[1], c[2], c[3]),
-        ));
+        gs.push(crate::pdf::gradient_stop(p,
+        Color::from_rgba8(c[0], c[1], c[2], c[3]),));
     }
     if let Some(shader) =
-        LinearGradient::new(start, end, gs, SpreadMode::Pad, Transform::identity())
+        crate::pdf::linear_gradient(start, end, gs, SpreadMode::Pad, Transform::identity())
     {
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(
-            path,
-            &paint,
-            FillRule::Winding,
-            raster_transform(raster_scale),
-            clip,
-        );
+        pixmap.pdf_fill_path(path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        clip,);
     }
 }
 
@@ -9446,13 +8286,11 @@ fn paint_linear_gradient_layer(
         let color = gradient_stop_color(stops, last_index);
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-        pixmap.fill_path(
-            path,
-            &paint,
-            FillRule::Winding,
-            raster_transform(raster_scale),
-            clip,
-        );
+        pixmap.pdf_fill_path(path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        clip,);
         return;
     }
     let (start, end, spread, normalize) = if repeating {
@@ -9483,24 +8321,20 @@ fn paint_linear_gradient_layer(
         }
         .max(monotonic);
         monotonic = position;
-        gradient_stops.push(GradientStop::new(
-            position,
-            Color::from_rgba8(color[0], color[1], color[2], color[3]),
-        ));
+        gradient_stops.push(crate::pdf::gradient_stop(position,
+        Color::from_rgba8(color[0], color[1], color[2], color[3]),));
     }
     if let Some(shader) =
-        LinearGradient::new(start, end, gradient_stops, spread, Transform::identity())
+        crate::pdf::linear_gradient(start, end, gradient_stops, spread, Transform::identity())
     {
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(
-            path,
-            &paint,
-            FillRule::Winding,
-            raster_transform(raster_scale),
-            clip,
-        );
+        pixmap.pdf_fill_path(path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        clip,);
     }
 }
 
@@ -9591,7 +8425,7 @@ fn background_extra_clip(
     ancestor_clip: Option<&tiny_skia::Mask>,
     polygon_clip: Option<&tiny_skia::Mask>,
 ) -> Option<tiny_skia::Mask> {
-    intersect_clip_masks(ancestor_clip.cloned(), polygon_clip)
+    intersect_clip_masks(crate::pdf::clone_optional_mask(ancestor_clip), polygon_clip)
 }
 
 fn paint_radial_gradient(
@@ -9623,10 +8457,8 @@ fn paint_radial_gradient(
     let gradient_stops = normalized
         .into_iter()
         .map(|(position, color)| {
-            GradientStop::new(
-                position,
-                Color::from_rgba8(color[0], color[1], color[2], color[3]),
-            )
+            crate::pdf::gradient_stop(position,
+            Color::from_rgba8(color[0], color[1], color[2], color[3]),)
         })
         .collect();
     // tiny-skia's native radial shader is circular. Keep the established CSS
@@ -9641,25 +8473,21 @@ fn paint_radial_gradient(
         0.0,
         center.y * (1.0 - ellipse_scale),
     );
-    if let Some(shader) = RadialGradient::new(
-        center,
-        0.0,
-        center,
-        radius_x,
-        gradient_stops,
-        SpreadMode::Pad,
-        gradient_transform,
-    ) {
+    if let Some(shader) = crate::pdf::radial_gradient(center,
+    0.0,
+    center,
+    radius_x,
+    gradient_stops,
+    SpreadMode::Pad,
+    gradient_transform,) {
         let mut paint = Paint::default();
         paint.shader = shader;
         paint.anti_alias = true;
-        pixmap.fill_path(
-            path,
-            &paint,
-            FillRule::Winding,
-            raster_transform(raster_scale),
-            clip,
-        );
+        pixmap.pdf_fill_path(path,
+        &paint,
+        FillRule::Winding,
+        raster_transform(raster_scale),
+        clip,);
     }
 }
 
@@ -9768,7 +8596,7 @@ fn paint_background_gradient_layers(
         debug_assert_eq!(raster_scale, 1.0);
         let width = tile_size.0.ceil().clamp(1.0, 4096.0) as u32;
         let height = tile_size.1.ceil().clamp(1.0, 4096.0) as u32;
-        if let Some(mut tile) = Pixmap::new(width, height) {
+        if let Some(mut tile) = crate::pdf::new_pixmap(width, height) {
             let tile_rect = crate::Rect {
                 x: 0.0,
                 y: 0.0,
@@ -9816,12 +8644,12 @@ fn paint_background_gradient_layers(
                         1.0,
                         Transform::from_translate(tile_x, tile_y),
                     );
-                    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
+                    pixmap.pdf_fill_path(path, &paint, FillRule::Winding, Transform::identity(), clip);
                     return;
                 }
 
-                let mut owner_clip = clip.cloned().or_else(|| {
-                    let mut mask = tiny_skia::Mask::new(pixmap.width(), pixmap.height())?;
+                let mut owner_clip = crate::pdf::clone_optional_mask(clip).or_else(|| {
+                    let mut mask = crate::pdf::new_mask(pixmap.width(), pixmap.height())?;
                     mask.fill_path(path, FillRule::Winding, true, Transform::identity());
                     Some(mask)
                 });
@@ -9854,14 +8682,12 @@ fn paint_background_gradient_layers(
                 while y < end_y {
                     let mut x = start_x;
                     while x < end_x {
-                        pixmap.draw_pixmap(
-                            x.floor() as i32,
-                            y.floor() as i32,
-                            tile.as_ref(),
-                            &tiny_skia::PixmapPaint::default(),
-                            Transform::identity(),
-                            owner_clip.as_ref(),
-                        );
+                        pixmap.pdf_draw_pixmap(x.floor() as i32,
+                        y.floor() as i32,
+                        tile.as_ref(),
+                        &tiny_skia::PixmapPaint::default(),
+                        Transform::identity(),
+                        owner_clip.as_ref(),);
                         if !repeats.0 {
                             break;
                         }
@@ -10024,7 +8850,7 @@ fn paint_conic_gradient_sampled(
     }
     let width = rect.width.ceil() as u32;
     let height = rect.height.ceil() as u32;
-    let Some(mut layer) = Pixmap::new(width, height) else {
+    let Some(mut layer) = crate::pdf::new_pixmap(width, height) else {
         return;
     };
     let normalized = normalized_stops(stops);
@@ -10041,7 +8867,7 @@ fn paint_conic_gradient_sampled(
             layer.pixels_mut()[(y * width + x) as usize] = premultiplied(color);
         }
     }
-    let mut clip = extra_clip.cloned();
+    let mut clip = crate::pdf::clone_optional_mask(extra_clip);
     if !border_radius.is_zero() {
         let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, border_radius);
         match (clip.as_mut(), path) {
@@ -10059,17 +8885,15 @@ fn paint_conic_gradient_sampled(
             _ => {}
         }
     }
-    pixmap.draw_pixmap(
-        rect.x.floor() as i32,
-        rect.y.floor() as i32,
-        layer.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        Transform::identity(),
-        clip.as_ref(),
-    );
+    pixmap.pdf_draw_pixmap(rect.x.floor() as i32,
+    rect.y.floor() as i32,
+    layer.as_ref(),
+    &tiny_skia::PixmapPaint::default(),
+    Transform::identity(),
+    clip.as_ref(),);
 }
 
-fn normalized_stops(stops: &[([u8; 4], Option<f32>)]) -> Vec<(f32, [u8; 4])> {
+pub(crate) fn normalized_stops(stops: &[([u8; 4], Option<f32>)]) -> Vec<(f32, [u8; 4])> {
     let count = stops.len();
     let mut normalized = Vec::with_capacity(count);
     let mut last = 0.0f32;
@@ -10450,19 +9274,17 @@ fn paint_in_flow_generated_box(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = crate::pdf::clone_optional_mask(element_clip_mask.as_ref());
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
             paint.anti_alias = !background.clip_radii.is_zero();
-            pixmap.fill_path(
-                path,
-                &paint,
-                FillRule::Winding,
-                raster_transform(raster_scale),
-                background_mask.as_ref(),
-            );
+            pixmap.pdf_fill_path(path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            background_mask.as_ref(),);
         }
         if !style.background_gradient_layers.is_empty() {
             if let Some(path) = background_path.as_ref() {
@@ -10726,18 +9548,16 @@ fn paint_positioned_pseudo(
     let background_path = background_clip_path(background);
     let element_clip_mask =
         background_extra_clip(ancestor_clip_mask.as_ref(), clip_path_mask.as_ref());
-    let background_mask = element_clip_mask.clone();
+    let background_mask = crate::pdf::clone_optional_mask(element_clip_mask.as_ref());
     if style.mask_image.is_none() && !style.background_clip_text {
         if let (Some(color), Some(path)) = (style.background_color, background_path.as_ref()) {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-            pixmap.fill_path(
-                path,
-                &paint,
-                FillRule::Winding,
-                raster_transform(raster_scale),
-                background_mask.as_ref(),
-            );
+            pixmap.pdf_fill_path(path,
+            &paint,
+            FillRule::Winding,
+            raster_transform(raster_scale),
+            background_mask.as_ref(),);
         }
         if !style.background_gradient_layers.is_empty() {
             if let Some(path) = background_path.as_ref() {
@@ -11369,7 +10189,7 @@ fn paint_canvas_surface(
         || dest.height > visible_rect.height + 0.5
         || dest.x < visible_rect.x - 0.5
         || dest.y < visible_rect.y - 0.5;
-    let mut clip = extra_clip.cloned();
+    let mut clip = crate::pdf::clone_optional_mask(extra_clip);
     if needs_box_clip {
         let path = if has_radius {
             rounded_rect_path_radii(
@@ -11407,6 +10227,10 @@ fn paint_canvas_surface(
             _ => {}
         }
     }
+    // A borrowed canvas buffer can reuse an SVG scratch pixmap's address.
+    // Its pixels must not inherit that surface's retained vector operations.
+    crate::pdf::register_raster(content);
+
 
     let transform = Transform::from_row(
         dest.width / surface.width as f32,
@@ -11416,17 +10240,15 @@ fn paint_canvas_surface(
         dest.x,
         dest.y,
     );
-    pixmap.draw_pixmap(
-        0,
-        0,
-        content,
-        &tiny_skia::PixmapPaint {
-            quality: FilterQuality::Bilinear,
-            ..tiny_skia::PixmapPaint::default()
-        },
-        transform,
-        clip.as_ref(),
-    );
+    pixmap.pdf_draw_pixmap(0,
+    0,
+    content,
+    &tiny_skia::PixmapPaint {
+        quality: FilterQuality::Bilinear,
+        ..tiny_skia::PixmapPaint::default()
+    },
+    transform,
+    clip.as_ref(),);
     true
 }
 
@@ -11524,7 +10346,7 @@ fn paint_image(
         || dest.height > visible_rect.height + 0.5
         || dest.x < visible_rect.x - 0.5
         || dest.y < visible_rect.y - 0.5;
-    let mut clip = extra_clip.cloned();
+    let mut clip = crate::pdf::clone_optional_mask(extra_clip);
     if needs_box_clip {
         let path = if has_radius {
             rounded_rect_path_radii(
@@ -11575,14 +10397,12 @@ fn paint_image(
         })
         .unwrap_or_else(Transform::identity);
     if (rw, rh) == (dw, dh) {
-        pixmap.draw_pixmap(
-            dest.x as i32,
-            dest.y as i32,
-            content.as_ref().as_ref(),
-            &tiny_skia::PixmapPaint::default(),
-            base,
-            clip.as_ref(),
-        );
+        pixmap.pdf_draw_pixmap(dest.x as i32,
+        dest.y as i32,
+        content.as_ref().as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        base,
+        clip.as_ref(),);
     } else {
         let paint = tiny_skia::PixmapPaint {
             quality: tiny_skia::FilterQuality::Bilinear,
@@ -11591,7 +10411,7 @@ fn paint_image(
         let scaled = base
             .pre_translate(dest.x as i32 as f32, dest.y as i32 as f32)
             .pre_scale(dw as f32 / rw as f32, dh as f32 / rh as f32);
-        pixmap.draw_pixmap(0, 0, content.as_ref().as_ref(), &paint, scaled, clip.as_ref());
+        pixmap.pdf_draw_pixmap(0, 0, content.as_ref().as_ref(), &paint, scaled, clip.as_ref());
     }
     true
 }
@@ -11830,7 +10650,7 @@ fn svg_image_intrinsic_metadata(bytes: &[u8]) -> Option<crate::ReplacedIntrinsic
 /// A full-pixmap clip mask admitting only the pixels inside `rect`, used to
 /// crop an `object-fit: cover|none` image to its element box.
 fn box_clip_mask(pw: u32, ph: u32, rect: &crate::Rect) -> Option<tiny_skia::Mask> {
-    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let mut mask = crate::pdf::new_mask(pw, ph)?;
     let r = Rect::from_xywh(rect.x, rect.y, rect.width, rect.height)?;
     let mut pb = PathBuilder::new();
     pb.push_rect(r);
@@ -11943,7 +10763,7 @@ fn intersect_clip_masks(
             }
             first
         }
-        (None, Some(second)) => Some(second.clone()),
+        (None, Some(second)) => Some(crate::pdf::clone_mask(second)),
         _ => first,
     }
 }
@@ -11957,7 +10777,7 @@ fn rounded_box_clip_mask_radii(
     if radii.is_zero() {
         return box_clip_mask(pw, ph, rect);
     }
-    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let mut mask = crate::pdf::new_mask(pw, ph)?;
     let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, radii)?;
     mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
     Some(mask)
@@ -12002,7 +10822,7 @@ fn polygon_clip_mask(
         crate::ClipPathFillRule::Nonzero => FillRule::Winding,
         crate::ClipPathFillRule::Evenodd => FillRule::EvenOdd,
     };
-    let mut mask = tiny_skia::Mask::new(pw, ph)?;
+    let mut mask = crate::pdf::new_mask(pw, ph)?;
     // Degenerate polygons are valid CSS basic shapes but have no enclosed
     // area. Keep the newly zeroed mask in that case: treating it as "no mask"
     // would incorrectly reveal the whole element.
@@ -12033,7 +10853,7 @@ fn render_svg(bytes: &[u8], width: u32, height: u32) -> Option<Pixmap> {
 /// aliases, so `font-family: Arial` fell back to Liberation Serif even though
 /// the HTML document renders it as Liberation Sans.
 fn svg_font_resolver() -> usvg::FontResolver<'static> {
-    let system_ui = crate::inline::system_ui_family().to_string();
+    let system_ui = crate::fonts::system_ui_family().to_string();
     usvg::FontResolver {
         select_font: Box::new(move |font, database| {
             let mut families = Vec::new();
@@ -12051,9 +10871,9 @@ fn svg_font_resolver() -> usvg::FontResolver<'static> {
                                 .any(|(family, _)| family.eq_ignore_ascii_case(name))
                         }) {
                             usvg::fontdb::Family::Name(name)
-                        } else if crate::inline::is_system_ui_family_token(name) {
+                        } else if crate::fonts::is_system_ui_family_token(name) {
                             usvg::fontdb::Family::Name(&system_ui)
-                        } else if let Some(alias) = crate::inline::bundled_family_alias(name) {
+                        } else if let Some(alias) = crate::fonts::bundled_family_alias(name) {
                             usvg::fontdb::Family::Name(alias)
                         } else {
                             usvg::fontdb::Family::Name(name)
@@ -12120,7 +10940,8 @@ fn render_svg_with_font_database(
     if size.width() <= 0.0 || size.height() <= 0.0 {
         return None;
     }
-    let mut svg_pixmap = Pixmap::new(width, height)?;
+    let mut svg_pixmap = crate::pdf::new_pixmap(width, height)?;
+    crate::pdf::record_svg(&svg_pixmap, &viewport_svg, &tree, width, height);
     let transform =
         Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
     resvg::render(&tree, transform, &mut svg_pixmap.as_mut());
@@ -12164,12 +10985,12 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
         std::sync::OnceLock::new();
     std::sync::Arc::clone(DATABASE.get_or_init(|| {
         let mut database = bundled_svg_font_database();
-        for directory in crate::inline::configured_font_directories() {
+        for directory in crate::fonts::configured_font_directories() {
             if directory.is_dir() {
                 database.load_fonts_dir(directory);
             }
         }
-        if crate::inline::effective_system_fonts() {
+        if crate::fonts::effective_system_fonts() {
             database.load_system_fonts();
             // `load_system_fonts` updates the platform generic families via
             // fontconfig. Keep the generics on the same bundled faces as HTML
@@ -12184,7 +11005,7 @@ fn svg_font_database() -> std::sync::Arc<usvg::fontdb::Database> {
 }
 
 fn svg_font_database_with_web_fonts(
-    web_fonts: &[crate::inline::WebFont],
+    web_fonts: &[crate::WebFont],
 ) -> std::sync::Arc<usvg::fontdb::Database> {
     let base = svg_font_database();
     if web_fonts.is_empty() {
@@ -12754,6 +11575,35 @@ fn svg_escape_attr(s: &str, buf: &mut String) {
     }
 }
 
+/// References in rendered SVG instances, excluding dormant definitions and
+/// display:none branches. Local uses expand their referenced definition.
+fn selected_svg_uses(
+    tree: &DomTree, root: obscura_dom::tree::NodeId,
+    styles: Option<&HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>>,
+) -> Vec<obscura_dom::tree::NodeId> {
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack = vec![(root, true)];
+    while let Some((id, instance)) = stack.pop() {
+        if !visited.insert((id, instance)) { continue; }
+        let Some(node) = tree.borrow_node(id) else { continue; };
+        let Some(element) = node.as_element() else { continue; };
+        if styles.and_then(|styles| styles.get(&id))
+            .is_some_and(|style| style.display == crate::Display::None) { continue; }
+        if !instance && matches!(&*element.local, "defs" | "symbol" | "clipPath" | "mask"
+            | "pattern" | "marker" | "linearGradient" | "radialGradient") { continue; }
+        if &*element.local == "use" {
+            result.push(id);
+            if let Some(fragment) = node.get_attribute("href").or_else(|| node.get_attribute("xlink:href"))
+                .and_then(|href| href.strip_prefix('#')) {
+                if let Some(target) = tree.get_element_by_id(fragment) { stack.push((target, true)); }
+            }
+        }
+        stack.extend(tree.children(id).into_iter().rev().map(|child| (child, false)));
+    }
+    result
+}
+
 /// Resolve `<use>` elements in an inline `<svg>` subtree against either a
 /// document-level symbol sprite (`href="#id"`) or an external sprite file
 /// (`href="url#id"`), splicing the referenced symbol into the standalone SVG
@@ -12779,7 +11629,7 @@ fn inject_external_sprites(
     let root_descendants = tree.descendants(root);
     let mut refs: Vec<(String, String, String)> = Vec::new();
     let mut local_fragments = Vec::new();
-    for nid in tree.descendants(root) {
+    for nid in selected_svg_uses(tree, root, styles) {
         let Some(node) = tree.get_node(nid) else {
             continue;
         };
@@ -13258,7 +12108,7 @@ fn paint_mask(
         return false;
     }
     let window_width = x1 - x0;
-    let Some(mut recolored) = Pixmap::new(window_width, y1 - y0) else {
+    let Some(mut recolored) = crate::pdf::new_pixmap(window_width, y1 - y0) else {
         return false;
     };
     let scale_to_mask = |tile: u32, tile_len: u32, mask_len: u32| {
@@ -13318,7 +12168,7 @@ fn paint_mask(
                 premultiplied(color);
         }
     }
-    let mut clip = extra_clip.cloned();
+    let mut clip = crate::pdf::clone_optional_mask(extra_clip);
     if !border_radius.is_zero() {
         let path = rounded_rect_path_radii(rect.x, rect.y, rect.width, rect.height, border_radius);
         match (clip.as_mut(), path) {
@@ -13336,14 +12186,12 @@ fn paint_mask(
             _ => {}
         }
     }
-    pixmap.draw_pixmap(
-        (origin_x + x0 as i64) as i32,
-        (origin_y + y0 as i64) as i32,
-        recolored.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        Transform::identity(),
-        clip.as_ref(),
-    );
+    pixmap.pdf_draw_pixmap((origin_x + x0 as i64) as i32,
+    (origin_y + y0 as i64) as i32,
+    recolored.as_ref(),
+    &tiny_skia::PixmapPaint::default(),
+    Transform::identity(),
+    clip.as_ref(),);
     true
 }
 
@@ -13660,7 +12508,7 @@ mod tests {
         assert_eq!(cache.profiled_image_intrinsic("https://assets.test/unknown.svg", profile), None);
         assert_eq!(cache.cached_image_metadata("https://assets.test/unknown.svg", None), None);
         let misses = cache.take_sync_misses(usize::MAX);
-        assert_eq!(misses, vec![("https://assets.test/unknown.svg".into(), Some(profile), false)]);
+        assert!(matches!(misses.as_slice(), [(url, _, false)] if url == "https://assets.test/unknown.svg"));
     }
 
     #[test]
@@ -15215,7 +14063,7 @@ mod tests {
                 None => cache.seed_shared(url.to_owned(), bytes),
             }
             let draw = |src, cache: &mut RenderResourceCache| {
-                let mut surface = Pixmap::new(12, 18).unwrap();
+                let mut surface = crate::pdf::new_pixmap(12, 18).unwrap();
                 assert!(paint_image(src, Some(base), &rect, &rect, crate::ObjectFit::Fill,
                     crate::ObjectPosition::default(), &mut surface, cache, profile, None,
                     crate::ResolvedBorderRadii::default(), None));
@@ -15301,7 +14149,7 @@ mod tests {
         let rect = crate::Rect { x: 5.0, y: 5.0, width: 20.0, height: 20.0 };
         let clip = crate::Rect { x: 10.0, y: 10.0, width: 10.0, height: 10.0 };
         let draw = |cache: &mut RenderResourceCache| {
-            let mut surface = Pixmap::new(40, 40).unwrap();
+            let mut surface = crate::pdf::new_pixmap(40, 40).unwrap();
             assert!(paint_image(url, None, &rect, &clip, crate::ObjectFit::Cover,
                 crate::ObjectPosition::default(), &mut surface, cache,
                 Some(ImageRequestProfile::NoCorsInclude), None,
@@ -15357,7 +14205,7 @@ mod tests {
         assert!(!static_raster_cacheable(b"GIF89a"));
         assert!(!static_raster_cacheable(b"<svg/>"));
         assert!(!static_raster_cacheable(b"not an image"));
-        cache.remove(url);
+        cache.seed_missing(url.to_owned());
         assert_eq!(cache.raster_paint_bytes, 0);
     }
 
@@ -16287,7 +15135,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_none_retains_width_but_does_not_change_geometry_or_computed_used_width() {
+    fn outline_none_retains_computed_width_without_paint_or_layout_space() {
         let tree = parse_html(
             r#"<html><body style="margin:0"><div id="box" style="width:40px;height:20px;
                 outline-width:9px;outline-style:none"></div></body></html>"#,
@@ -16298,7 +15146,7 @@ mod tests {
         let rect = prepared.document_rect(id).unwrap();
         assert_eq!((rect.width, rect.height), (40.0, 20.0));
         assert_eq!(prepared.layout.styles[&id].outline.specified_width, 9.0);
-        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "0px");
+        assert_eq!(prepared.computed_style(id).unwrap()["outline-width"], "9px");
     }
 
     #[test]
@@ -19155,11 +18003,11 @@ mod tests {
         let tree = parse_html(r#"<style id=faces>
             @font-face{font-family:First;src:url(first.ttf)}
             @font-face{font-family:Second;src:url(second.ttf);font-weight:700;font-style:italic}
-            </style><link id=preload rel="alternate PrElOaD" as="FoNt" href="second.ttf">
+            </style><p style="font-family:First">First</p><link id=preload rel="alternate PrElOaD" as="FoNt" href="second.ttf">
             <x-card id=host><style>@font-face{font-family:Ignored;src:url(ignored.ttf)}</style>
                 <svg><text>Unslotted</text></svg></x-card>
             <div id=source><style>@font-face{font-family:Shadow;src:url(shadow.ttf)}</style>
-                <svg id=visible><text>Visible</text></svg></div>"#);
+                <svg id=visible style="font-family:Shadow"><text>Visible</text></svg></div>"#);
         let host = tree.get_element_by_id("host").unwrap();
         let source = tree.get_element_by_id("source").unwrap();
         let visible = tree.get_element_by_id("visible").unwrap();
@@ -19175,7 +18023,7 @@ mod tests {
             Some(SERIF_FONT_BYTES.to_vec())
         });
         let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[],
-            (800.0, 600.0), crate::CssMediaType::Screen);
+            (800.0, 600.0), crate::CssMediaType::Screen, &crate::dom::layout_dom(&tree, (800.0, 600.0)).styles);
         assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
             vec!["Second", "First", "Shadow"]);
         assert_eq!(fonts[0].weight, Some((700, 700)));
@@ -19190,14 +18038,16 @@ mod tests {
         tree.with_node_mut(preload, |node| node.set_attribute("href", "first.ttf".into()));
         tree.remove(visible);
         let fonts = collect_web_fonts(&tree, Some("https://example.test/page"), &mut resources, &[],
-            (800.0, 600.0), crate::CssMediaType::Screen);
+            (800.0, 600.0), crate::CssMediaType::Screen, &crate::dom::layout_dom(&tree, (800.0, 600.0)).styles);
         assert_eq!(fonts.iter().map(|f| f.family.as_deref().unwrap()).collect::<Vec<_>>(),
-            vec!["Changed", "Second", "Shadow"]);
+            vec!["Changed"]);
         assert_eq!(fonts[0].weight, Some((600, 600)));
         assert!(!has_inline_svg_text(&tree), "unslotted SVG text must remain excluded");
-        assert_eq!(*loads.lock().unwrap(), vec![
-            "https://example.test/second.ttf", "https://example.test/first.ttf",
-            "https://example.test/shadow.ttf"], "warm resources must not reload or discover unslotted fonts");
+        let mut observed = loads.lock().unwrap().clone();
+        observed.sort();
+        assert_eq!(observed, vec!["https://example.test/first.ttf",
+            "https://example.test/second.ttf", "https://example.test/shadow.ttf"],
+            "warm resources must not reload or discover unslotted fonts");
     }
 
     #[test]
@@ -19258,21 +18108,20 @@ mod tests {
                 unicode-range: U+??, U+2000-206F;
             }
         "#;
-        let faces = font_face_blocks(css);
+        let faces = crate::css::font_face_blocks_for_viewport_and_media(css,
+            (800.0, 600.0), crate::CssMediaType::Screen);
         assert_eq!(faces.len(), 2);
-        let mut points = Vec::new();
-        add_font_codepoints(&mut points, "Example");
-        assert!(!font_face_covers_text(faces[0], &points));
-        assert!(font_face_covers_text(faces[1], &points));
-        let mut cyrillic = Vec::new();
-        add_font_codepoints(&mut cyrillic, "Ж");
-        assert!(font_face_covers_text(faces[0], &cyrillic));
-        assert!(!font_face_covers_text(faces[1], &cyrillic));
-        assert_eq!(font_face_family(faces[1]).as_deref(), Some("Example"));
-        assert_eq!(font_face_weight(faces[1]), Some((350, 650)));
-        assert_eq!(font_face_italic(faces[1]), Some(true));
+        let covers = |face: &str, ch: char| font_face_ranges(face).iter()
+            .any(|&(start, end)| (start..=end).contains(&(ch as u32)));
+        assert!(!covers(&faces[0], 'E'));
+        assert!(covers(&faces[1], 'E'));
+        assert!(covers(&faces[0], 'Ж'));
+        assert!(!covers(&faces[1], 'Ж'));
+        assert_eq!(font_face_family(&faces[1]).as_deref(), Some("Example"));
+        assert_eq!(font_face_weight(&faces[1]), Some((350, 650)));
+        assert_eq!(font_face_italic(&faces[1]), Some(true));
         assert_eq!(
-            font_face_urls(faces[1]),
+            font_face_urls(&faces[1]),
             vec![
                 "data:font/woff2;base64,d09GMg==".to_string(),
                 "./example-latin.woff".to_string(),
@@ -19283,9 +18132,10 @@ mod tests {
     #[test]
     fn font_face_without_unicode_range_is_general_purpose() {
         let css = r#"@font-face{font-family:Example;src:url(example.otf)}"#;
-        let face = font_face_blocks(css)[0];
-        assert!(font_face_covers_text(face, &[]));
-        assert_eq!(font_face_urls(face), vec!["example.otf"]);
+        let faces = crate::css::font_face_blocks_for_viewport_and_media(css,
+            (800.0, 600.0), crate::CssMediaType::Screen);
+        assert_eq!(font_face_ranges(&faces[0]), vec![(0, 0x10ffff)]);
+        assert_eq!(font_face_urls(&faces[0]), vec!["example.otf"]);
     }
 
     #[test]
@@ -19298,7 +18148,7 @@ mod tests {
                          url("fixture.woff2") format("woff2"),
                          url("fixture.ttf") format("truetype");
                 }
-            </style></head><body></body></html>"#,
+            </style></head><body style="font-family:Fixture">Sample</body></html>"#,
         );
         let loads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let loader_loads = Arc::clone(&loads);
@@ -19323,6 +18173,7 @@ mod tests {
             &[],
             (800.0, 600.0),
             crate::CssMediaType::Screen,
+            &crate::dom::layout_dom(&tree, (800.0, 600.0)).styles,
         );
 
         assert_eq!(fonts.len(), 1);
@@ -19347,10 +18198,11 @@ mod tests {
                  url("icons.woff2") format("woff2"),
                  url("icons.ttf") format("truetype");
         }"#;
-        let face = font_face_blocks(css)[0];
+        let faces = crate::css::font_face_blocks_for_viewport_and_media(css,
+            (800.0, 600.0), crate::CssMediaType::Screen);
 
         assert_eq!(
-            font_face_urls(face),
+            font_face_urls(&faces[0]),
             vec![
                 "legacy.eot?#iefix".to_string(),
                 "icons.woff2".to_string(),
@@ -20424,7 +19276,7 @@ mod tests {
 
     #[test]
     fn paint_surface_culling_uses_css_coordinates_and_ink_overflow() {
-        let pixmap = Pixmap::new(200, 160).expect("surface");
+        let pixmap = crate::pdf::new_pixmap(200, 160).expect("surface");
         assert!(rect_intersects_paint_surface(
             &crate::Rect {
                 x: 90.0,
@@ -20539,7 +19391,7 @@ mod tests {
             loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(vec![0; 1024])
         });
-        let mut pixmap = Pixmap::new(100, 100).expect("surface");
+        let mut pixmap = crate::pdf::new_pixmap(100, 100).expect("surface");
         let rect = crate::Rect {
             x: 0.0,
             y: 10_000.0,

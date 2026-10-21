@@ -2,7 +2,7 @@
 
 #![allow(clippy::unusual_byte_groupings)]
 
-use crate::geometry::Size;
+use crate::geometry::{Point, Size};
 use crate::style::AvailableSpace;
 use crate::tree::{CollapsibleMarginSet, LayoutInput, LayoutOutput, RunMode};
 use crate::RequestedAxis;
@@ -140,12 +140,14 @@ pub(crate) struct CacheEntry<T> {
 
 /// The block-layout metadata required by a preliminary size contribution.
 ///
-/// A compact entry avoids retaining full baselines/content-size while keeping
-/// the collapsible margins that an ancestor grid or flex item must consume.
+/// Keep the baselines consumed by ancestor flex/grid alignment as well as
+/// collapsible margins; a cache hit must match freshly measured geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 struct MeasureOutput {
     size: Size<f32>,
+    first_baselines: Point<Option<f32>>,
+    last_baselines: Point<Option<f32>>,
     top_margin: CollapsibleMarginSet,
     bottom_margin: CollapsibleMarginSet,
     margins_can_collapse_through: bool,
@@ -156,6 +158,8 @@ impl MeasureOutput {
     fn new(input: &LayoutInput, output: LayoutOutput) -> Self {
         Self {
             size: output.size,
+            first_baselines: output.first_baselines,
+            last_baselines: output.last_baselines,
             top_margin: output.top_margin,
             bottom_margin: output.bottom_margin,
             margins_can_collapse_through: output.margins_can_collapse_through,
@@ -165,6 +169,8 @@ impl MeasureOutput {
 
     fn into_layout_output(self) -> LayoutOutput {
         let mut output = LayoutOutput::from_outer_size(self.size);
+        output.first_baselines = self.first_baselines;
+        output.last_baselines = self.last_baselines;
         output.top_margin = self.top_margin;
         output.bottom_margin = self.bottom_margin;
         output.margins_can_collapse_through = self.margins_can_collapse_through;

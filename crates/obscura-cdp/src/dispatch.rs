@@ -8,7 +8,6 @@ use obscura_js::runtime::CdpExecutionWorld;
 use serde_json::json;
 
 use crate::domains;
-use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
 #[cfg(feature = "render")]
@@ -66,8 +65,19 @@ pub(crate) struct RegisteredPreloadScript {
     pub identifier: String,
     pub script: obscura_browser::page::PreloadScript,
 }
+#[derive(Clone)]
+pub(crate) struct AutoAttachSubscription {
+    pub client: u64,
+    pub parent: Option<String>,
+    pub target: Option<String>,
+    pub wait_for_debugger: bool,
+}
+
 
 pub struct CdpContext {
+    pub(crate) server_registry: Option<Arc<crate::browser_registry::BrowserRegistry>>,
+    pub(crate) server_owner: u64,
+    pub(crate) server_client: u64,
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     /// Current document loader per page. Navigation events and later
@@ -95,7 +105,9 @@ pub struct CdpContext {
     browser_context_counter: u32,
     target_session_counter: u64,
     pub(crate) target_discovery_sessions: HashSet<Option<String>>,
-    pub(crate) target_auto_attach_sessions: HashSet<Option<String>>,
+    pub(crate) target_auto_attach_sessions: HashMap<(u64, Option<String>), AutoAttachSubscription>,
+    pub(crate) auto_attached_sessions: HashMap<String, (u64, Option<String>)>,
+    debugger_wait_sessions: HashSet<String>,
     pub(crate) target_session_parents: HashMap<String, Option<String>>,
     native_windows: HashMap<String, WindowInfo>,
     native_navigation_generations: HashMap<String, u64>,
@@ -122,8 +134,12 @@ pub struct CdpContext {
     pub(crate) backend_nodes: HashMap<u64, NodeRecord>,
     pub(crate) backend_node_ids: HashMap<NodeRecord, u64>,
     pub(crate) next_backend_node_id: u64,
-    pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub(crate) page_enabled_sessions: HashSet<String>,
+    pub(crate) network_enabled_sessions: HashSet<String>,
+    pub(crate) network_body_views: HashMap<String, HashSet<String>>,
+    pub(crate) session_announced_frames: HashMap<String, Vec<String>>,
+    pub(crate) session_frame_documents: HashMap<String, HashMap<String, u64>>,
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
     // body taken out of the page cache so a large download is streamed
     // chunk-by-chunk via IO.read and freed on IO.close (issue #360). The store
@@ -138,9 +154,84 @@ pub struct CdpContext {
     /// process-wide lock, so connections run in parallel (measured ~2x at
     /// concurrency 2, ~3x at 4) instead of serializing all V8 on one mutex.
     pub v8_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) profile_session: Option<crate::server::ProfileSession>,
+    pub(crate) profile_commit_error: Option<String>,
 }
 
 impl CdpContext {
+    pub(crate) fn commit_profile(&mut self) -> Result<(), String> {
+        match &self.profile_session {
+            Some(session) => session.commit(),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn filter_pending_events(&mut self) {
+        let pending = std::mem::take(&mut self.pending_events);
+        for event in pending {
+            let allowed = match event.session_id.as_ref() {
+                Some(session) if event.method.starts_with("Network.") => self.network_enabled_sessions.contains(session),
+                Some(session) if event.method == "Page.lifecycleEvent" => self.lifecycle_enabled_sessions.contains(session),
+                // Dialog closure was authorized when queued; accepting a
+                // beforeunload dialog can detach its owner before this flush.
+                Some(_) if event.method == "Page.javascriptDialogClosed" => true,
+                Some(session) if event.method.starts_with("Page.") => self.page_enabled_sessions.contains(session),
+                _ => true,
+            };
+            if allowed {
+                if event.method == "Network.responseReceived" {
+                    if let (Some(session), Some(request)) = (event.session_id.as_ref(), event.params["requestId"].as_str()) {
+                        self.network_body_views.entry(session.clone()).or_default().insert(request.into());
+                    }
+                }
+                self.pending_events.push(event);
+            }
+        }
+        let sessions = self.network_body_views.keys().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            let target = self.sessions.get(&session).cloned();
+            if let Some(mut view) = self.network_body_views.remove(&session) {
+                view.retain(|request| target.as_ref().and_then(|target| self.get_page(target))
+                    .is_some_and(|page| page.has_response_body(request)));
+                self.network_body_views.insert(session, view);
+            }
+        }
+    }
+
+    pub(crate) fn disable_network_session(&mut self, session: &str) {
+        self.network_enabled_sessions.remove(session);
+        self.network_body_views.remove(session);
+        if let Some(registry) = &self.server_registry { registry.subscriptions(session, false); }
+        let target = self.sessions.get(session).cloned();
+        if let Some(target) = target {
+            if !self.network_enabled_sessions.iter().any(|other| self.sessions.get(other) == Some(&target)) {
+                if let Some(page) = self.get_page_mut(&target) { page.clear_response_bodies(); }
+            }
+        }
+    }
+    pub(crate) fn publish_server_state(&self) {
+        let Some(registry) = &self.server_registry else { return };
+        registry.publish(self.server_owner, self.pages.iter().filter(|page| !page.window_info().closed)
+            .map(|page| self.page_target_info(page)).collect(), self.browser_contexts.keys().cloned().collect());
+        for (session, target) in &self.sessions {
+            let client = self.target_session_parents.get(session).and_then(|parent| parent.as_ref())
+                .and_then(|parent| registry.session_client(parent)).unwrap_or(self.server_client);
+            registry.register_session(session, target, self.server_owner, client);
+            registry.subscriptions(session, self.network_enabled_sessions.contains(session));
+            registry.page_subscription(session, self.page_enabled_sessions.contains(session));
+        }
+        for page in &self.pages {
+            let loader = self.current_loader_ids.get(&page.id).cloned().unwrap_or_else(|| format!("loader-blank-{}", page.id));
+            registry.page_route(&page.id, &page.frame_id, &loader, &page.url_string());
+            let generation = page.js.as_ref().and_then(|js| js.cdp_document_generation(0).ok()).unwrap_or(0);
+            let owners = page.network_frame_registry().map(|registry| registry.borrow().live_frame_owners())
+                .unwrap_or_default().into_iter().filter_map(|(frame, parent, _)| {
+                    page.js.as_ref()?.cdp_document_generation(frame).ok()
+                        .map(|generation| (frame, parent, generation))
+                }).collect();
+            registry.frame_owners(&page.id, generation, owners);
+        }
+    }
     pub fn new() -> Self {
         Self::new_with_options(None, false)
     }
@@ -166,7 +257,7 @@ impl CdpContext {
         stealth: bool,
         user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         Self::_new_inner(proxy, stealth, user_agent, storage_dir, false, false)
     }
 
@@ -177,6 +268,7 @@ impl CdpContext {
         allow_file_access: bool,
     ) -> Self {
         Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access, false)
+            .expect("memory-only context has no profile I/O")
     }
 
     /// Build a CDP context around an already-constructed default browser
@@ -185,6 +277,9 @@ impl CdpContext {
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
         let valid_context_ids = HashSet::new();
         CdpContext {
+            server_registry: None,
+            server_owner: 0,
+            server_client: 0,
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
@@ -203,7 +298,9 @@ impl CdpContext {
             browser_context_counter: 0,
             target_session_counter: 0,
             target_discovery_sessions: HashSet::new(),
-            target_auto_attach_sessions: HashSet::new(),
+            target_auto_attach_sessions: HashMap::new(),
+            auto_attached_sessions: HashMap::new(),
+            debugger_wait_sessions: HashSet::new(),
             target_session_parents: HashMap::new(),
             native_windows: HashMap::new(),
             native_navigation_generations: HashMap::new(),
@@ -212,8 +309,12 @@ impl CdpContext {
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
             lifecycle_enabled_sessions: HashSet::new(),
+            page_enabled_sessions: HashSet::new(),
+            network_enabled_sessions: HashSet::new(),
+            network_body_views: HashMap::new(),
+            session_announced_frames: HashMap::new(),
+            session_frame_documents: HashMap::new(),
             preload_counter: 0,
-            fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             valid_context_ids,
             next_default_context_id: 1,
@@ -225,6 +326,8 @@ impl CdpContext {
             next_backend_node_id: 1u64 << 32,
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
+            profile_session: None,
+            profile_commit_error: None,
         }
     }
 
@@ -235,7 +338,7 @@ impl CdpContext {
         storage_dir: Option<std::path::PathBuf>,
         allow_file_access: bool,
         allow_private_network: bool,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let mut ctx = BrowserContext::with_storage_and_network(
             "default".to_string(),
             proxy,
@@ -243,9 +346,9 @@ impl CdpContext {
             user_agent,
             storage_dir,
             allow_private_network,
-        );
-        ctx.allow_file_access = allow_file_access;
-        Self::new_with_shared_context(Arc::new(ctx))
+        )?;
+        ctx.set_allow_file_access(allow_file_access);
+        Ok(Self::new_with_shared_context(Arc::new(ctx)))
     }
 
 
@@ -263,16 +366,26 @@ impl CdpContext {
             None => self.default_context.clone(),
         };
         self.page_counter += 1;
-        let page_id = format!("page-{}", self.page_counter);
+        context.regional.as_ref().map_err(Clone::clone)?;
+        let page_id = if self.server_registry.is_some() { format!("page-{}", uuid::Uuid::new_v4()) }
+            else { format!("page-{}", self.page_counter) };
         let mut page = Page::new(page_id.clone(), context);
+        if let Some(registry) = &self.server_registry {
+            page.set_network_event_tx(registry.network_events());
+            let observer = registry.clone();
+            page.set_intercept_observer(Arc::new(move |request| observer.intercept(request)));
+        }
         page.navigate_blank();
         if let Some(tx) = &self.intercept_tx {
             page.set_intercept_tx(tx.clone());
         }
         self.native_windows.insert(page_id.clone(), page.window_info());
         self.pages.push(page);
+        self.refresh_popup_debugger_wait();
+        self.auto_attach_native_target(&page_id, true);
         self.current_loader_ids
             .insert(page_id.clone(), format!("loader-blank-{page_id}"));
+        self.publish_server_state();
         Ok(page_id)
     }
 
@@ -284,12 +397,14 @@ impl CdpContext {
         }
     }
 
-    pub fn create_browser_context(&mut self) -> String {
+    pub fn create_browser_context(&mut self) -> Result<String, String> {
         self.browser_context_counter += 1;
-        let id = format!("context-{}", self.browser_context_counter);
+        let id = if self.server_registry.is_some() { format!("context-{}", uuid::Uuid::new_v4()) }
+            else { format!("context-{}", self.browser_context_counter) };
         let context = Arc::new(self.default_context.isolated_copy(id.clone(), false));
+        context.regional.as_ref().map_err(Clone::clone)?;
         self.browser_contexts.insert(id.clone(), context);
-        id
+        Ok(id)
     }
 
     /// Allocate a distinct CDP session for every explicit target attachment.
@@ -394,31 +509,77 @@ impl CdpContext {
         }
     }
 
-    pub(crate) fn auto_attach_native_target(&mut self, target_id: &str) {
-        let mut parents = self.target_auto_attach_sessions.iter().cloned().collect::<Vec<_>>();
-        parents.sort();
-        for parent in parents {
-            let relevant = parent.as_ref().and_then(|session| self.sessions.get(session))
-                .filter(|target| target.as_str() != "browser");
-            if let Some(opener) = relevant {
-                let Some(page) = self.get_page(target_id) else { continue };
+    pub(crate) fn set_auto_attach(&mut self, subscription: AutoAttachSubscription, enabled: bool) {
+        let key = (subscription.client, subscription.parent.clone());
+        if enabled {
+            self.target_auto_attach_sessions.insert(key, subscription);
+        } else {
+            self.target_auto_attach_sessions.remove(&key);
+            let sessions = self.auto_attached_sessions.iter().filter(|(_, owner)| **owner == key)
+                .map(|(session, _)| session.clone()).collect::<Vec<_>>();
+            for session in sessions {
+                let target = self.sessions.get(&session).cloned();
+                domains::target::detach_session(self, &session);
+                self.pending_events.push(CdpEvent { method: "Target.detachedFromTarget".into(),
+                    params: json!({"sessionId": session, "targetId": target}), session_id: subscription.parent.clone() });
+            }
+        }
+        self.refresh_popup_debugger_wait();
+        if enabled {
+            let targets = self.pages.iter().filter(|page| !page.window_info().closed)
+                .map(|page| page.id.clone()).collect::<Vec<_>>();
+            for target in targets { self.auto_attach_native_target(&target, false); }
+        }
+    }
+
+    pub(crate) fn refresh_popup_debugger_wait(&self) {
+        for page in &self.pages {
+            page.set_popup_debugger_wait(self.target_auto_attach_sessions.values().any(|subscription|
+                subscription.wait_for_debugger && subscription.target.as_ref().is_none_or(|target| target == &page.id)));
+        }
+    }
+
+    pub(crate) fn waiting_for_debugger(&self, target: &str) -> bool {
+        self.debugger_wait_sessions.iter().any(|session| self.sessions.get(session).is_some_and(|page| page == target))
+    }
+
+    pub(crate) fn resume_debugger_session(&mut self, session: &str) {
+        if !self.debugger_wait_sessions.remove(session) { return; }
+        if let Some(target) = self.sessions.get(session) {
+            if let Some(page) = self.get_page(target) { page.set_window_debugger_wait(self.waiting_for_debugger(target)); }
+        }
+    }
+
+    pub(crate) fn auto_attach_native_target(&mut self, target_id: &str, new_target: bool) {
+        let mut subscriptions = self.target_auto_attach_sessions.values().cloned().collect::<Vec<_>>();
+        subscriptions.sort_by(|a, b| (a.client, &a.parent).cmp(&(b.client, &b.parent)));
+        for subscription in subscriptions {
+            let key = (subscription.client, subscription.parent.clone());
+            let Some(page) = self.get_page(target_id) else { continue };
+            if let Some(opener) = &subscription.target {
                 if page.window_info().opener_id.and_then(|id| page.window_target_id(id)).as_ref() != Some(opener) {
                     continue;
                 }
             }
-            if self.target_session_parents.iter().any(|(session, owner)| owner == &parent
-                && self.sessions.get(session).is_some_and(|target| target == target_id)) {
-                continue;
-            }
+            if self.auto_attached_sessions.iter().any(|(session, owner)| owner == &key
+                && self.sessions.get(session).is_some_and(|target| target == target_id)) { continue; }
             let session = self.next_target_session(target_id);
             self.sessions.insert(session.clone(), target_id.to_string());
-            self.target_session_parents.insert(session.clone(), parent.clone());
-            let Some(page) = self.get_page(target_id) else { continue };
-            let info = self.page_target_info(page);
+            self.target_session_parents.insert(session.clone(), subscription.parent.clone());
+            self.auto_attached_sessions.insert(session.clone(), key);
+            let waiting = new_target && subscription.wait_for_debugger;
+            if waiting {
+                self.debugger_wait_sessions.insert(session.clone());
+                self.get_page(target_id).unwrap().set_window_debugger_wait(true);
+            }
+            if let Some(registry) = &self.server_registry {
+                registry.register_session(&session, target_id, self.server_owner, subscription.client);
+            }
+            let info = self.page_target_info(self.get_page(target_id).unwrap());
             self.pending_events.push(CdpEvent {
                 method: "Target.attachedToTarget".to_string(),
-                params: json!({"sessionId": session, "targetInfo": info, "waitingForDebugger": false}),
-                session_id: parent,
+                params: json!({"sessionId": session, "targetInfo": info, "waitingForDebugger": waiting}),
+                session_id: subscription.parent,
             });
         }
     }
@@ -525,7 +686,7 @@ impl CdpContext {
             let info = self.native_window_target_info(&window, &self.pages[owner]);
             self.emit_target_discovery("Target.targetCreated", json!({"targetInfo": info}));
             if self.get_page(&window.target_id).is_some_and(|page| !page.window_info().closed) {
-                self.auto_attach_native_target(&window.target_id);
+                self.auto_attach_native_target(&window.target_id, true);
             }
             self.native_windows.insert(window.target_id.clone(), window);
         }
@@ -550,7 +711,7 @@ impl CdpContext {
             match previous {
                 None => {
                     self.emit_target_discovery("Target.targetCreated", json!({"targetInfo": info}));
-                    self.auto_attach_native_target(&window.target_id);
+                    self.auto_attach_native_target(&window.target_id, true);
                 }
                 Some(previous) if previous.url != window.url || previous.title != window.title
                     || previous.opener_id != window.opener_id || previous.can_access_opener != window.can_access_opener => {
@@ -559,6 +720,7 @@ impl CdpContext {
                 _ => {}
             }
         }
+        self.refresh_popup_debugger_wait();
     }
 
     /// Publish `Page.frameNavigated` for native windows whose document commit
@@ -619,9 +781,16 @@ impl CdpContext {
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
             self.lifecycle_enabled_sessions.remove(session_id);
+            self.page_enabled_sessions.remove(session_id);
+            self.network_enabled_sessions.remove(session_id);
+            self.network_body_views.remove(session_id);
+            self.session_announced_frames.remove(session_id);
+            self.session_frame_documents.remove(session_id);
             self.target_session_parents.remove(session_id);
             self.target_discovery_sessions.remove(&Some(session_id.clone()));
-            self.target_auto_attach_sessions.remove(&Some(session_id.clone()));
+            self.target_auto_attach_sessions.retain(|(_, parent), _| parent.as_ref() != Some(session_id));
+            self.auto_attached_sessions.remove(session_id);
+            self.debugger_wait_sessions.remove(session_id);
         }
         if let Some(context_ids) = self.page_contexts.remove(id) {
             for context_id in context_ids {
@@ -1108,6 +1277,7 @@ pub(crate) async fn finalize_command_after_reply(ctx: &mut CdpContext, method: &
     // committed while the command ran) are asynchronous renderer results, not
     // command side effects. They must follow the reply: a click's input ACK is
     // sent first, and only then does the navigation it started publish.
+    domains::dom::drain_mutations(ctx);
     ctx.publish_native_navigation_events();
 }
 
@@ -1190,7 +1360,7 @@ pub async fn dispatch_command(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResp
 
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
-        "Browser" => domains::browser::handle(method, &req.params).await,
+        "Browser" => domains::browser::handle(method, &req.params, ctx).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
@@ -1252,7 +1422,9 @@ pub async fn dispatch_command(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResp
     drain_script_network_events(ctx, &req.session_id);
     drain_runtime_events(ctx);
     drain_binding_calls(ctx);
+    domains::dom::drain_mutations(ctx);
     drain_frame_events(ctx);
+    ctx.filter_pending_events();
 
     match result {
         Ok(value) => CdpResponse::success(req.id, value, req.session_id.clone()),
@@ -1468,104 +1640,63 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
 // after every dispatch, reports a frame whenever it actually appears instead
 // of only at navigation, and is the same drain point binding calls use.
 pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
-    // Every session on the page, not just one: a client that reaches a page the
-    // ordinary way holds two of them, because Target.createTarget opens a
-    // session and the Target.attachToTarget that follows opens another. A
-    // client drops any event whose sessionId is not the one it attached with,
-    // so announcing to an arbitrary session is the same as not announcing.
-    let mut page_to_sessions: HashMap<String, Vec<String>> = HashMap::new();
-    for (session_id, page_id) in &ctx.sessions {
-        page_to_sessions
-            .entry(page_id.clone())
-            .or_default()
-            .push(session_id.clone());
-    }
-    // ctx.sessions is a HashMap, so fix an order the events can be asserted in.
-    for sessions in page_to_sessions.values_mut() {
-        sessions.sort();
-    }
-
-    let mut events: Vec<CdpEvent> = Vec::new();
-    let mut announced: HashMap<String, Vec<String>> = HashMap::new();
+    let mut events = Vec::new();
     let mut detached = Vec::new();
+    let mut announced = HashMap::new();
     for page in &ctx.pages {
-        let Some(session_ids) = page_to_sessions.get(&page.id) else {
-            continue;
-        };
-        let live = crate::domains::page::child_frame_values(page);
-        let announcement_state = ctx.announced_frames.borrow();
-        let known = announcement_state.get(&page.id);
-        let mut owners = page.network_frame_registry()
-            .map(|registry| registry.borrow().live_frame_owners()).unwrap_or_default();
+        let mut sessions = ctx.page_enabled_sessions.iter().filter(|session|
+            ctx.sessions.get(*session).is_some_and(|target| target == &page.id)).cloned().collect::<Vec<_>>();
+        sessions.sort_unstable();
+        let mut owners = page.network_frame_registry().map(|registry| registry.borrow().live_frame_owners()).unwrap_or_default();
         owners.sort_unstable_by_key(|(id, _, _)| *id);
-        let live_ids = owners.iter().map(|(id, _, _)|
-            domains::page::child_frame_id(&page.frame_id, *id)).collect::<Vec<_>>();
-
-        // Reservations are real browsing contexts with a native owner, even
-        // while their Document request has not constructed a V8 realm yet.
-        for (id, parent, _) in owners {
-            let id = domains::page::child_frame_id(&page.frame_id, id);
-            if known.is_some_and(|ids| ids.contains(&id)) { continue; }
-            let parent_id = if parent == 0 { page.frame_id.clone() }
-                else { domains::page::child_frame_id(&page.frame_id, parent) };
-            for session_id in session_ids {
-                events.push(CdpEvent::with_session("Page.frameAttached", json!({
-                    "frameId": id, "parentFrameId": parent_id,
-                }), session_id.clone()));
-            }
+        let live_ids = owners.iter().map(|(id, _, _)| domains::page::child_frame_id(&page.frame_id, *id)).collect::<Vec<_>>();
+        if let Some(previous) = ctx.announced_frames.borrow().get(&page.id) {
+            for id in previous { if !live_ids.contains(id) { detached.push((page.id.clone(), id.clone())); } }
         }
-        for frame in &live {
-            let id = frame["id"].as_str().unwrap_or_default();
-            if ctx.contexts_for_page(&page.id).any(|context| context.is_default && context.frame_id == id) {
-                continue;
-            }
-            for session_id in session_ids {
-                events.push(CdpEvent::with_session("Page.frameNavigated",
-                    json!({"frame": frame, "type": "Navigation"}), session_id.clone()));
-                events.push(CdpEvent::with_session("Page.frameStoppedLoading",
-                    json!({"frameId": id}), session_id.clone()));
-            }
-        }
-
-        if let Some(known) = known {
-            for id in known {
-                if !live_ids.contains(id) {
-                    detached.push((page.id.clone(), id.clone(), session_ids.clone()));
+        let frames = domains::page::child_frame_values(page);
+        for session in sessions {
+            let known = ctx.session_announced_frames.entry(session.clone()).or_default();
+            for (id, parent, _) in &owners {
+                let id = domains::page::child_frame_id(&page.frame_id, *id);
+                if !known.contains(&id) {
+                    let parent = if *parent == 0 { page.frame_id.clone() } else { domains::page::child_frame_id(&page.frame_id, *parent) };
+                    events.push(CdpEvent::with_session("Page.frameAttached", json!({"frameId":id,"parentFrameId":parent}), session.clone()));
                 }
+            }
+            for id in known.iter().filter(|id| !live_ids.contains(id)) {
+                events.push(CdpEvent::with_session("Page.frameDetached", json!({"frameId":id,"reason":"remove"}), session.clone()));
+            }
+            *known = live_ids.clone();
+            let documents = ctx.session_frame_documents.entry(session.clone()).or_default();
+            documents.retain(|id, _| live_ids.contains(id));
+            for frame in &frames {
+                let id = frame["id"].as_str().unwrap_or_default();
+                let generation = domains::page::native_frame_id(page, id).ok().and_then(|native|
+                    page.js.as_ref().and_then(|js| js.cdp_document_generation(native).ok())).unwrap_or(0);
+                if documents.get(id) == Some(&generation) { continue; }
+                documents.insert(id.into(), generation);
+                events.push(CdpEvent::with_session("Page.frameNavigated", json!({"frame":frame,"type":"Navigation"}), session.clone()));
+                events.push(CdpEvent::with_session("Page.frameStoppedLoading", json!({"frameId":id}), session.clone()));
             }
         }
         announced.insert(page.id.clone(), live_ids);
     }
-    for (page_id, frame_id, page_sessions) in detached {
-        let removed = ctx.remove_frame_contexts(&page_id, &frame_id);
-        let runtime_sessions = ctx.runtime_sessions_for_page(&page_id);
+    for (page, frame) in detached {
+        let removed = ctx.remove_frame_contexts(&page, &frame);
+        let sessions = ctx.runtime_sessions_for_page(&page);
         for context in removed {
-            for session_id in &runtime_sessions {
-                events.push(CdpEvent::with_session(
-                    "Runtime.executionContextDestroyed",
-                    json!({
-                        "executionContextId": context.id,
-                        "executionContextUniqueId": context.unique_id,
-                    }),
-                    session_id.clone(),
-                ));
+            for session in &sessions {
+                ctx.pending_events.push(CdpEvent::with_session("Runtime.executionContextDestroyed", json!({
+                    "executionContextId":context.id,"executionContextUniqueId":context.unique_id}), session.clone()));
             }
-        }
-        for session_id in page_sessions {
-            events.push(CdpEvent {
-                method: "Page.frameDetached".into(),
-                params: json!({ "frameId": frame_id, "reason": "remove" }),
-                session_id: Some(session_id),
-            });
         }
     }
-    for page_id in page_to_sessions.keys() {
-        let created = ctx.ensure_child_default_contexts(page_id);
-        let sessions = ctx.runtime_sessions_for_page(page_id);
+    let pages = ctx.pages.iter().map(|page| page.id.clone()).collect::<Vec<_>>();
+    for page in pages {
+        let created = ctx.ensure_child_default_contexts(&page);
+        let sessions = ctx.runtime_sessions_for_page(&page);
         for context in created {
-            for session in &sessions {
-                events.push(domains::runtime::execution_context_created_event(&context, Some(session.clone())));
-            }
+            for session in &sessions { events.push(domains::runtime::execution_context_created_event(&context, Some(session.clone()))); }
         }
     }
     ctx.announced_frames.borrow_mut().extend(announced);

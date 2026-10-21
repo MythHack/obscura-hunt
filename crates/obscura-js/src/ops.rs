@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -21,7 +21,8 @@ use obscura_net::{
     SameSiteContext, same_site,
 };
 #[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
+use obscura_net::{RequestCredentials, RequestMode};
+use obscura_net::ResourceRequest;
 use tokio::sync::Mutex;
 
 #[cfg(feature = "render")]
@@ -36,48 +37,7 @@ pub type InterceptCallback = Arc<
     >,
 >;
 
-#[derive(Debug)]
-pub enum InterceptResolution {
-    Continue {
-        url: Option<String>,
-        method: Option<String>,
-        headers: Option<HashMap<String, String>>,
-        /// Already-decoded request body. Bytes rather than `String`: a POST the
-        /// client rewrites may be a protobuf, a gzip stream or a multipart part,
-        /// and passing those through `String` replaces every non-UTF-8 sequence
-        /// with U+FFFD before they reach the wire.
-        body: Option<Vec<u8>>,
-    },
-    Fulfill {
-        status: u16,
-        headers: HashMap<String, String>,
-        /// Lossy UTF-8 view of the fulfilled body, for text consumers.
-        body: String,
-        /// The exact fulfilled body as standard base64. CDP delivers the
-        /// fulfillRequest body base64-encoded; carrying it through unchanged
-        /// lets the bootstrap fetch layer reconstruct the exact bytes
-        /// (`_base64ToUint8Array`) instead of a `from_utf8_lossy` corruption
-        /// of any non-UTF-8 payload (image, font, protobuf). See #912.
-        body_base64: String,
-    },
-    Fail {
-        reason: String,
-    },
-}
-
-pub struct InterceptedRequest {
-    pub request_id: String,
-    pub page_id: String,
-    /// Native initiating browsing context. Zero is the main realm.
-    pub frame_id: u32,
-    /// Authoritative embedding realm captured at native initiation, absent for main.
-    pub parent_frame_id: Option<u32>,
-    pub url: String,
-    pub method: String,
-    pub headers: HashMap<String, String>,
-    pub resource_type: String,
-    pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
-}
+pub use obscura_net::{InterceptPattern, InterceptResolution, InterceptedRequest};
 
 #[derive(Debug, Clone)]
 pub struct StoredNetworkResponseBody {
@@ -100,6 +60,10 @@ pub struct JsNetworkEvent {
     pub frame_id: u32,
     /// Exact document generation captured at native request initiation.
     pub frame_generation: u64,
+    /// Actual request headers and body, retained for Network.requestWillBeSent.
+    pub request_headers: HashMap<String, String>,
+    pub request_body: Option<Vec<u8>>,
+    pub request_started: bool,
     /// The interception consumer already received the request start.
     pub intercepted: bool,
     pub url: String,
@@ -187,6 +151,13 @@ pub struct ObscuraState {
     /// JavaScript keeps its owned DOM, but new module jobs must reject as
     /// inactive rather than fetching under the retired document.
     pub(crate) document_active: Rc<Cell<bool>>,
+    pub(crate) websockets: crate::websocket::SocketRegistry,
+    pub(crate) local_resources: crate::local_resource::LocalResources,
+    pub(crate) local_resource_owner: crate::local_resource::LocalResourceOwner,
+    pub(crate) local_resource_principal: Option<crate::local_resource::LocalResourcePrincipal>,
+    pub(crate) content_security_policy: Vec<String>,
+    pub(crate) is_worker: bool,
+    pub(crate) worker_entry_pending: bool,
     /// Identity of an opaque origin. Two documents both serializing as
     /// `"null"` are same-principal only when they share this token (inherited
     /// about:blank/srcdoc); distinct data: or sandboxed documents each get a
@@ -216,6 +187,9 @@ pub struct ObscuraState {
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub indexed_db: Arc<crate::indexed_db::IndexedDbStorage>,
     pub(crate) indexed_db_owner: Option<crate::indexed_db::IndexedDbOwner>,
+    pub(crate) geolocation: Arc<crate::geolocation::Geolocation>,
+    pub(crate) geolocation_policy: String,
+    pub(crate) rtc_connections: crate::rtc::Connections,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -237,10 +211,11 @@ pub struct ObscuraState {
     /// the page can move its cursor instead of appending an entry.
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
+    pub intercept_observer: Option<Arc<dyn Fn(InterceptedRequest) + Send + Sync>>,
+    pub network_event_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, JsNetworkEvent)>>,
     pub intercept_enabled: bool,
-    /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
-    /// sent to the interception channel; empty means every request.
-    pub intercept_url_patterns: Vec<String>,
+    /// `Fetch.enable` selectors; empty means every request.
+    pub intercept_url_patterns: Vec<InterceptPattern>,
     pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
@@ -332,7 +307,6 @@ pub struct ObscuraState {
     pub pending_style_mutations: Vec<obscura_render::RetainedStyleMutation>,
     /// Page-lifetime raw image/font bytes. A new document resets this cache;
     /// relayout of the same document reuses it without refetching.
-    #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
     /// Cancellation handle and waiters sharing an HTMLImageElement request. The key keeps
     /// navigation identity and request credentials separate so neither stale
@@ -363,13 +337,12 @@ pub struct ObscuraState {
     /// renderer's resource loads follow the same interception policy as the
     /// page's own subresource fetches (a matching URL is not fetched here).
     #[cfg(feature = "render")]
-    pub intercept_block_patterns: Vec<String>,
+    pub intercept_block_patterns: Vec<InterceptPattern>,
     /// Background transport tasks of this document, one page-wide
     /// concurrency limit shared by all of them, a wake-up for waiters, and
     /// requests that could not be started outside a Tokio context.
     #[cfg(feature = "render")]
     pub render_resource_tasks: Vec<tokio::task::JoinHandle<()>>,
-    #[cfg(feature = "render")]
     pub render_resource_limiter: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "render")]
     pub render_resource_notify: Arc<tokio::sync::Notify>,
@@ -385,13 +358,11 @@ pub struct ObscuraState {
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
-    #[cfg(feature = "render")]
     pub dynamic_fonts: Vec<obscura_render::DynamicFontFace>,
     /// Live Canvas2D backing stores keyed by stable DOM identity. Pixel damage
     /// updates this resource independently of retained style/layout geometry.
     #[cfg(feature = "render")]
     pub(crate) canvas_surfaces: HashMap<NodeId, CanvasBackingSurface>,
-    #[cfg(feature = "render")]
     pub viewport: (f32, f32),
     /// Root scrolling offset in CSS pixels. With render enabled this is
     /// clamped against the cached document overflow and is the single source
@@ -473,24 +444,30 @@ impl ObscuraState {
         }
         self.cookie_jar = parent.cookie_jar.clone();
         self.indexed_db = parent.indexed_db.clone();
+        self.local_resources = parent.local_resources.clone();
+        self.geolocation = parent.geolocation.clone();
         self.http_client = parent.http_client.clone();
         self.callbacks = parent.callbacks.clone();
+        if matches!(self.url.as_str(), "about:blank" | "about:srcdoc") {
+            self.content_security_policy.clone_from(&parent.content_security_policy);
+        }
+        self.intercept_observer = parent.intercept_observer.clone();
+        self.network_event_tx = parent.network_event_tx.clone();
         self.encoding = parent.encoding.clone();
         self.referrer_policy = document_referrer_policy(parent);
         self.blocked_urls = parent.blocked_urls.clone();
         self.intercept_enabled = parent.intercept_enabled;
         self.intercept_url_patterns = parent.intercept_url_patterns.clone();
         self.page_in_flight = parent.page_in_flight.clone();
+        self.render_resource_limiter = parent.render_resource_limiter.clone();
         #[cfg(feature = "stealth")]
         {
             self.stealth_client = parent.stealth_client.clone();
         }
         #[cfg(feature = "render")]
         {
-            self.render_resource_limiter = parent.render_resource_limiter.clone();
             self.render_resource_notify = parent.render_resource_notify.clone();
         }
-        #[cfg(feature = "render")]
         if has_page_transport(parent) {
             self.render_resources.set_sync_loading_enabled(false);
         }
@@ -523,6 +500,13 @@ impl ObscuraState {
             reflected_url: None,
             timeout_cancels: Rc::new(RefCell::new(HashMap::new())),
             document_active: Rc::new(Cell::new(true)),
+            websockets: crate::websocket::SocketRegistry::default(),
+            local_resources: crate::local_resource::LocalResources::default(),
+            local_resource_owner: crate::local_resource::LocalResourceOwner::default(),
+            local_resource_principal: None,
+            content_security_policy: Vec::new(),
+            is_worker: false,
+            worker_entry_pending: false,
             opaque_origin: None,
             scripting_enabled: true,
             sandbox_opaque_origin: false,
@@ -538,6 +522,9 @@ impl ObscuraState {
             cookie_jar: None,
             indexed_db: Arc::new(crate::indexed_db::IndexedDbStorage::default()),
             indexed_db_owner: None,
+            geolocation: Arc::new(crate::geolocation::Geolocation::default()),
+            geolocation_policy: String::new(),
+            rtc_connections: crate::rtc::Connections::default(),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -546,6 +533,8 @@ impl ObscuraState {
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
             intercept_tx: None,
+            intercept_observer: None,
+            network_event_tx: None,
             intercept_enabled: false,
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
@@ -585,7 +574,6 @@ impl ObscuraState {
             animation_sampled_task_generation: 0,
             #[cfg(feature = "render")]
             pending_style_mutations: Vec::new(),
-            #[cfg(feature = "render")]
             render_resources: obscura_render::RenderResourceCache::default(),
             #[cfg(feature = "render")]
             render_image_in_flight: HashMap::new(),
@@ -601,7 +589,6 @@ impl ObscuraState {
             intercept_block_patterns: Vec::new(),
             #[cfg(feature = "render")]
             render_resource_tasks: Vec::new(),
-            #[cfg(feature = "render")]
             render_resource_limiter: Arc::new(tokio::sync::Semaphore::new(
                 RENDER_RESOURCE_CONCURRENCY,
             )),
@@ -613,11 +600,9 @@ impl ObscuraState {
             stylesheet_cache: obscura_render::StylesheetCache::default(),
             #[cfg(feature = "render")]
             style_query_cache: None,
-            #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
             canvas_surfaces: HashMap::new(),
-            #[cfg(feature = "render")]
             viewport: (1280.0, 720.0),
             #[cfg(feature = "render")]
             scroll_offset: (0.0, 0.0),
@@ -633,14 +618,16 @@ impl ObscuraState {
             document_write_inserted_script: Cell::new(false),
         }
     }
-    #[cfg(feature = "render")]
     pub(crate) fn set_viewport(&mut self, width: f64, height: f64) {
         let viewport = (width as f32, height as f32);
         if self.viewport != viewport {
             self.viewport = viewport;
-            self.prepared_render = None;
-            self.pending_style_mutations.clear();
-            self.resolved_scroll = None;
+            #[cfg(feature = "render")]
+            {
+                self.prepared_render = None;
+                self.pending_style_mutations.clear();
+                self.resolved_scroll = None;
+            }
         }
     }
 }
@@ -775,16 +762,6 @@ fn response_body_byte_limit() -> usize {
         .unwrap_or(2 * 1024 * 1024)
 }
 
-fn record_js_network_completion(
-    state: &RefCell<ObscuraState>,
-    event: JsNetworkEvent,
-    body: &str,
-    base64_encoded: bool,
-) {
-    record_network_completion(&mut state.borrow_mut(), event, |_| StoredNetworkResponseBody {
-        body: body.to_string(), base64_encoded,
-    });
-}
 
 pub(crate) fn record_network_response(
     state: &RefCell<ObscuraState>, event: JsNetworkEvent, body: &[u8],
@@ -799,7 +776,7 @@ pub(crate) fn record_network_response(
     });
 }
 
-fn record_network_completion(
+pub(crate) fn record_network_completion(
     gs: &mut ObscuraState, event: JsNetworkEvent,
     body: impl FnOnce(&HashMap<String, String>) -> StoredNetworkResponseBody,
 ) {
@@ -818,6 +795,9 @@ fn record_network_completion(
 }
 
 pub(crate) fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
+    if let Some(sender) = &gs.network_event_tx {
+        let _ = sender.send((gs.intercept_page_id.clone(), event.clone()));
+    }
     gs.js_network_events.push(event);
     const MAX_JS_NETWORK_EVENTS: usize = 4096;
     if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
@@ -832,7 +812,7 @@ pub(crate) fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent
 /// read; it is far larger than `response_body_byte_limit()` (which only decides
 /// whether a body is *cached*) because real page fetches can be large.
 /// Configurable via `OBSCURA_FETCH_MAX_BODY_BYTES`.
-fn fetch_max_body_bytes() -> usize {
+pub(crate) fn fetch_max_body_bytes() -> usize {
     std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -938,6 +918,9 @@ struct FetchBodyResource {
     body: RefCell<Option<AsyncResult<Vec<u8>>>>,
     cancel: Rc<CancelHandle>,
     world_cancel: Rc<CancelHandle>,
+    worker_cancel: Option<Arc<crate::worker::WorkerCancellation>>,
+    owner: Weak<RefCell<ObscuraState>>,
+    generation: u64,
     opaque: bool,
 }
 
@@ -950,19 +933,52 @@ impl Resource for FetchBodyResource {
 
 #[op2]
 #[buffer]
-async fn op_fetch_body(
-    state: Rc<RefCell<OpState>>,
-    rid: u32,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+fn op_fetch_body(
+    scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>, rid: u32,
+    receiver: v8::Local<v8::Object>,
+) -> impl Future<Output = Result<Vec<u8>, JsErrorBox>> + use<> {
+    let captured = (|| {
+        let owner = if let Some((owner, _, _)) = crate::worker::receiver_state(scope, &state.borrow(), receiver) {
+            owner
+        } else {
+            let context = receiver.get_creation_context(scope).ok_or_else(||
+                deno_error::JsErrorBox::new("DOMExceptionSecurityError", "Blocked access to a foreign or retired document"))?;
+            if !receiver.strict_equals(context.global(scope).into()) {
+                return Err(deno_error::JsErrorBox::type_error("Invalid fetch execution world receiver"));
+            }
+            let context = v8::Global::new(scope, context);
+            crate::window::context_document(&state.borrow(), &context)?.2
+        };
+        let resource = state.borrow().resource_table.get::<FetchBodyResource>(rid)
+            .map_err(|error| JsErrorBox::type_error(error.to_string()))?;
+        let same_owner = resource.owner.upgrade().is_some_and(|actual| Rc::ptr_eq(&actual, &owner));
+        let owner = owner.borrow();
+        if !same_owner || !owner.document_active.get() || owner.document_generation != resource.generation {
+            return Err(JsErrorBox::new("DOMExceptionSecurityError", "Response body belongs to a different or retired document"));
+        }
+        Ok(())
+    })();
+    async move { captured?; fetch_body(state, rid).await }
+}
+
+async fn fetch_body(state: Rc<RefCell<OpState>>, rid: u32) -> Result<Vec<u8>, JsErrorBox> {
     let resource = state.borrow().resource_table.get::<FetchBodyResource>(rid)
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
     let body = resource.body.borrow_mut().take()
         .ok_or_else(|| deno_error::JsErrorBox::type_error("Body is already consumed"))?;
-    let result = async {
-        body.or_cancel(resource.world_cancel.clone()).await
-            .map_err(|_| deno_error::JsErrorBox::type_error("Fetch execution world was disposed"))?
-    }.or_cancel(resource.cancel.clone()).await
-        .map_err(|_| deno_error::JsErrorBox::generic("Response body was cancelled"))?;
+    let read = async {
+        async {
+            body.or_cancel(resource.world_cancel.clone()).await
+                .map_err(|_| JsErrorBox::type_error("Fetch execution world was disposed"))?
+        }.or_cancel(resource.cancel.clone()).await
+            .map_err(|_| JsErrorBox::generic("Response body was cancelled"))?
+    };
+    let result = if let Some(cancel) = resource.worker_cancel.clone() {
+        tokio::select! { biased;
+            _ = cancel.cancelled() => Err(JsErrorBox::generic("Worker was terminated")),
+            result = read => result,
+        }
+    } else { read.await };
     let closed = state.borrow_mut().resource_table.take_any(rid);
     if let Ok(resource) = closed {
         resource.close();
@@ -977,16 +993,19 @@ async fn fetch_body_result(
     internal_load: bool,
     cancel: Option<Rc<CancelHandle>>,
     world_cancel: Rc<CancelHandle>,
+    worker_cancel: Option<Arc<crate::worker::WorkerCancellation>>,
+    owner: Weak<RefCell<ObscuraState>>, generation: u64,
 ) -> Result<String, deno_error::JsErrorBox> {
     if internal_load {
         let bytes = body.or_cancel(world_cancel).await
             .map_err(|_| deno_error::JsErrorBox::type_error("Fetch execution world was disposed"))??;
-        metadata["body"] = serde_json::json!(String::from_utf8_lossy(&bytes));
-        metadata["bodyBase64"] = serde_json::json!(BASE64.encode(&bytes));
+        let mime = metadata.get("headers").and_then(|headers| headers.get("content-type")).and_then(serde_json::Value::as_str);
+        metadata["body"] = serde_json::json!(obscura_net::decode_non_html(&bytes, mime));
     } else {
         let rid = state.borrow_mut().resource_table.add(FetchBodyResource {
             body: RefCell::new(Some(body)), cancel: cancel.unwrap_or_else(CancelHandle::new_rc),
-            world_cancel,
+            world_cancel, worker_cancel,
+            owner, generation,
             opaque: metadata["opaque"].as_bool().unwrap_or(false),
         });
         metadata["bodyRid"] = serde_json::json!(rid);
@@ -1060,10 +1079,16 @@ struct FrameTimers {
     document_load_started: bool,
     document_load_cancel: Option<Rc<CancelHandle>>,
     referrer_policy: Option<String>,
+    content_security_policy: Vec<String>,
+    geolocation_policy: Option<String>,
     cancel: Rc<CancelHandle>,
 }
 
 impl RealmStates {
+    pub(crate) fn frame_content_security_policy(&self, frame_id: u32) -> Vec<String> {
+        self.frame_timers.get(&frame_id).map(|frame| frame.content_security_policy.clone()).unwrap_or_default()
+    }
+
     pub(crate) fn proxy_record(&self, frame_id: u32, world_id: Option<u64>)
         -> Option<(v8::Global<v8::Object>, usize)>
     {
@@ -1259,6 +1284,14 @@ impl RealmStates {
         self.frame_timers.get(&frame_id)?.referrer_policy.clone()
     }
 
+    pub(crate) fn frame_geolocation_policy(&self, frame_id: u32) -> String {
+        self.frame_timers.get(&frame_id).and_then(|frame| frame.geolocation_policy.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn geolocation_is_top_level(&self, frame_id: u32) -> bool {
+        self.frame_timers.get(&frame_id).is_some_and(|frame| frame.owner.is_none() && frame.parent_document.is_none())
+    }
+
     /// Native document ownership, not execution worlds. Popups and retired
     /// owner chains are not subdocuments of this page.
     pub(crate) fn page_document_states<'a>(&'a self, root: &'a SharedState)
@@ -1283,6 +1316,7 @@ impl RealmStates {
         for entry in &self.entries {
             if !self.entry_active(entry) {
                 entry.cancel.cancel();
+                if let Ok(state) = entry.state.try_borrow() { state.rtc_connections.cancel_realm(&entry.cancel); }
                 if let Some(realm) = &entry.modules { realm.retire(scope); }
             }
         }
@@ -1305,6 +1339,9 @@ impl RealmStates {
                         cancel.cancel();
                     }
                     state.document_active.set(false);
+                    state.websockets.cancel_all();
+                    state.local_resource_owner.retire();
+                    state.rtc_connections.cancel_all();
                     state.pending_navigation = None;
                     #[cfg(feature = "render")]
                     state.abandon_render_resources();
@@ -1325,6 +1362,8 @@ impl RealmStates {
         self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
             owner: None, parent_document: None, sandboxed_opaque: false, document_url: None,
             referrer_policy: None,
+            content_security_policy: Vec::new(),
+            geolocation_policy: None,
             document_load_started: false, cancel: CancelHandle::new_rc(),
             document_load_cancel: None,
         });
@@ -1350,6 +1389,9 @@ impl RealmStates {
                         cancel.cancel();
                     }
                     state.document_active.set(false);
+                    state.websockets.cancel_all();
+                    state.local_resource_owner.retire();
+                    state.rtc_connections.cancel_all();
                     state.pending_navigation = None;
                     #[cfg(feature = "render")]
                     state.abandon_render_resources();
@@ -1368,6 +1410,7 @@ impl RealmStates {
             let entry = self.entries.remove(index);
             self.proxies.remove(&(entry.frame_id, entry.world_id));
             entry.cancel.cancel();
+            if let Ok(state) = entry.state.try_borrow() { state.rtc_connections.cancel_realm(&entry.cancel); }
             if let Some(modules) = entry.modules { self.retired_modules.push(modules); }
         }
     }
@@ -1388,6 +1431,8 @@ impl RealmStates {
             sandboxed_opaque, document_url: None, document_load_started: false,
             document_load_cancel: None,
             referrer_policy: None,
+            content_security_policy: Vec::new(),
+            geolocation_policy: None,
             cancel: CancelHandle::new_rc(),
         });
     }
@@ -1997,7 +2042,6 @@ pub(crate) fn queue_retained_style_mutation(
 /// Page-wide limit on concurrent background render-resource requests: the
 /// bound the navigation warmup stream always had, now shared by every load
 /// of the document however many scans or layout misses queue them.
-#[cfg(feature = "render")]
 pub const RENDER_RESOURCE_CONCURRENCY: usize = 16;
 
 /// One finished page-transport load for the renderer cache.
@@ -2035,7 +2079,6 @@ pub struct RenderResourceEvent {
 }
 
 /// Whether this runtime is owned by a page with an asynchronous transport.
-#[cfg(feature = "render")]
 pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
     #[cfg(feature = "stealth")]
     {
@@ -2054,7 +2097,6 @@ pub(crate) fn has_page_transport(state: &ObscuraState) -> bool {
 /// latency of every unknown asset (retries included). Such runtimes start
 /// cache-only and are fed through the page transport; standalone render
 /// runtimes without a transport keep the compatibility loader.
-#[cfg(feature = "render")]
 pub(crate) fn fresh_render_resources(state: &ObscuraState) -> obscura_render::RenderResourceCache {
     let mut cache = obscura_render::RenderResourceCache::default();
     if has_page_transport(state) {
@@ -2414,9 +2456,9 @@ fn op_dom(
     #[string] arg2: String,
     frame_id: u32,
     receiver: v8::Local<v8::Object>,
-) -> String {
-    let Some(context) = receiver.get_creation_context(scope) else { return "null".into() };
-    if !receiver.strict_equals(context.global(scope).into()) { return "null".into(); }
+) -> Result<String, deno_error::JsErrorBox> {
+    let Some(context) = receiver.get_creation_context(scope) else { return Ok("null".into()) };
+    if !receiver.strict_equals(context.global(scope).into()) { return Ok("null".into()); }
     let context_state = context.get_slot::<DocumentStateSlot>().map(|slot| slot.0.clone());
     let context = v8::Global::new(scope, context);
     // A retained (removed) frame keeps its old document reachable through its
@@ -2427,26 +2469,47 @@ fn op_dom(
         Ok((_, root, shared)) => (root, shared),
         Err(_) => {
             let Some(shared) = context_state else {
-                return "null".into();
+                return Ok("null".into());
             };
-            if shared.borrow().document_active.get() { return "null".into(); }
+            if shared.borrow().document_active.get() { return Ok("null".into()); }
             (u32::MAX, shared)
         }
     };
-    if shared.borrow().frame_id != frame_id { return "null".into(); }
+    if shared.borrow().frame_id != frame_id { return Ok("null".into()); }
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
-    // engine (and every CDP client) down. Catch it so one malformed selector or
-    // inconsistent tree node degrades to a null result for that single call.
+    // engine (and every CDP client) down. Catch it so an inconsistent tree node
+    // degrades to a null result; ordinary selector parse errors propagate below.
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        if matches!(cmd.as_str(), "query_selector" | "query_selector_all"
+            | "query_selector_scoped" | "query_selector_all_scoped" | "matches_selector") {
+            let document = shared.borrow();
+            let Some(dom) = &document.dom else { return Ok("null".into()); };
+            let (root, selector) = if matches!(cmd.as_str(), "query_selector" | "query_selector_all") {
+                (dom.document(), arg1.as_str())
+            } else {
+                (NodeId::new(arg1.parse::<u32>().unwrap_or(0)), arg2.as_str())
+            };
+            let result = match cmd.as_str() {
+                "query_selector" | "query_selector_scoped" => dom.query_selector_from(root, selector)
+                    .map(|id| id.map(|id| id.index().to_string()).unwrap_or_else(|| "-1".into())),
+                "query_selector_all" | "query_selector_all_scoped" => dom.query_selector_all_from(root, selector)
+                    .map(|ids| {
+                        let ids: Vec<i32> = ids.iter().map(|id| id.index() as i32).collect();
+                        serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+                    }),
+                _ => dom.matches_selector(root, selector).map(|matched| matched.to_string()),
+            };
+            return result.map_err(|error| deno_error::JsErrorBox::new("DOMExceptionSyntaxError", error));
+        }
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
         if cmd == "frame_ancestor_origins" || cmd == "frame_embedding_allowed" {
             let policy = if cmd == "frame_embedding_allowed" {
                 match crate::embedding_policy::FrameEmbeddingPolicy::from_response(&arg1) {
                     Some(policy) => Some(policy),
-                    None => return "false".into(),
+                    None => return Ok("false".into()),
                 }
             } else {
                 None
@@ -2460,13 +2523,13 @@ fn op_dom(
                     if ancestor.frame_id != 0
                         && (registry.frame_timers_active(ancestor.frame_id) != Some(true)
                             || registry.frame_is_sandboxed_opaque(ancestor.frame_id)) {
-                        return if policy.is_some() { "false" } else { "null" }.into();
+                        return Ok(if policy.is_some() { "false" } else { "null" }.into());
                     }
                     if let Some(policy) = &policy {
                         // Use the same native principal, without serializing and
                         // reparsing an ordinary tuple origin or copying inherited ones.
                         let origin = ancestor.inherited_origin.as_deref().unwrap_or(&ancestor.url);
-                        if !policy.allows_ancestor(origin) { return "false".into(); }
+                        if !policy.allows_ancestor(origin) { return Ok("false".into()); }
                     } else {
                         let origin = ancestor.inherited_origin.clone().unwrap_or_else(||
                             url::Url::parse(&ancestor.url).map(|url| url.origin().ascii_serialization())
@@ -2476,22 +2539,22 @@ fn op_dom(
                     ancestor.frame_id
                 };
                 if id == 0 {
-                    if policy.is_some() { return "true".into(); }
-                    return serde_json::to_string(&origins).unwrap_or_else(|_| "null".into());
+                    if policy.is_some() { return Ok("true".into()); }
+                    return Ok(serde_json::to_string(&origins).unwrap_or_else(|_| "null".into()));
                 }
                 ancestor = match registry.frame_timers.get(&id)
                     .and_then(|frame| frame.owner.as_ref())
                     .and_then(|(parent, _, _)| parent.upgrade())
                 {
                     Some(parent) => parent,
-                    None => return "null".into(),
+                    None => return Ok("null".into()),
                 };
             }
-            return "null".into();
+            return Ok("null".into());
         }
         if cmd == "frame_is_sandboxed_opaque" {
-            return arg1.parse::<u32>().ok().map_or(true, |id|
-                registry.borrow().frame_is_sandboxed_opaque(id)).to_string();
+            return Ok(arg1.parse::<u32>().ok().map_or(true, |id|
+                registry.borrow().frame_is_sandboxed_opaque(id)).to_string());
         }
         if cmd == "frame_owner_matches" || cmd == "frame_same_origin" {
             let registry = registry.borrow();
@@ -2532,7 +2595,7 @@ fn op_dom(
                     (url::Origin::Tuple(..), url::Origin::Tuple(..)))
                     && parent_origin == child_origin)
             })().unwrap_or(false);
-            return valid.to_string();
+            return Ok(valid.to_string());
         }
         if cmd == "retire_frame" {
             if let Ok(id) = arg1.parse::<u32>() {
@@ -2540,11 +2603,11 @@ fn op_dom(
                 let owns = registry.frame_timers.get(&id).and_then(|frame| frame.owner.as_ref())
                     .is_some_and(|(parent, _, generation)| parent.as_ptr() == Rc::as_ptr(&shared)
                         && *generation == shared.borrow().document_generation);
-                if !owns { return "false".into(); }
+                if !owns { return Ok("false".into()); }
                 registry.forget_frame(id);
                 registry.forget_proxies(id);
             }
-            return "true".into();
+            return Ok("true".into());
         }
         let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
         let may_remove_focus = matches!(cmd.as_str(), "remove_child" | "append_child" | "insert_before"
@@ -2556,7 +2619,7 @@ fn op_dom(
                 document.focused_node = None;
             }
         }
-        if result == "true" && !removed.is_empty() {
+        Ok(if result == "true" && !removed.is_empty() {
             let registry = registry.borrow();
             for (id, _) in &removed {
                 if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
@@ -2567,11 +2630,11 @@ fn op_dom(
             serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
         } else {
             result
-        }
+        })
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
-        "null".to_string()
+        Ok("null".to_string())
     })
 }
 
@@ -2811,6 +2874,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             dom.set_popover_open(nid, arg2 == "true").to_string()
         }
+        "get_range_state" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            dom.input_range_state(nid).map(|range| serde_json::json!({
+                "min": range.min, "max": range.max, "step": range.step,
+                "base": range.base, "value": range.value, "text": range.value.to_string(),
+            }).to_string()).unwrap_or_else(|| "null".to_string())
+        }
         "get_form_state" => {
             let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             dom.form_control_state(nid)
@@ -2935,45 +3005,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 }
             }
         }
-        "query_selector" => dom
-            .query_selector(&arg1)
-            .ok()
-            .flatten()
-            .map(|id| id.index().to_string())
-            .unwrap_or("-1".into()),
-        "query_selector_all" => {
-            let ids: Vec<i32> = dom
-                .query_selector_all(&arg1)
-                .ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
-                .unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
-        }
-        "query_selector_scoped" => {
-            let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.query_selector_from(NodeId::new(root_nid), &arg2)
-                .ok()
-                .flatten()
-                .map(|id| id.index().to_string())
-                .unwrap_or("-1".into())
-        }
-        "query_selector_all_scoped" => {
-            let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom
-                .query_selector_all_from(NodeId::new(root_nid), &arg2)
-                .ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect())
-                .unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
-        }
-        "matches_selector" => {
-            let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
-            dom.matches_selector(nid, &arg2)
-                .unwrap_or(false)
-                .to_string()
-        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
+            if dom.is_cdata(NodeId::new(nid)) { return "4".into(); }
             dom.with_node(NodeId::new(nid), |n| match &n.data {
                 NodeData::Document => "9",
                 NodeData::Element { .. } => "1",
@@ -2990,8 +3024,11 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let name: String = dom
                 .with_node(NodeId::new(nid), |n| match &n.data {
                     NodeData::Document => "#document".to_string(),
-                    NodeData::Element { name, .. } => str::to_ascii_uppercase(&name.local),
-                    NodeData::Text { .. } => "#text".to_string(),
+                    NodeData::Element { name, .. } => {
+                        let qualified = name.prefix.as_ref().map_or_else(|| name.local.to_string(), |prefix| format!("{}:{}", prefix, name.local));
+                        if name.ns == html5ever::ns!(html) && !dom.is_xml_node(NodeId::new(nid)) { qualified.to_ascii_uppercase() } else { qualified }
+                    }
+                    NodeData::Text { .. } => if dom.is_cdata(NodeId::new(nid)) { "#cdata-section" } else { "#text" }.to_string(),
                     NodeData::Comment { .. } => "#comment".to_string(),
                     NodeData::Doctype { name, .. } => name.clone(),
                     NodeData::ProcessingInstruction { target, .. } => target.clone(),
@@ -3121,8 +3158,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let name = dom
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
-                        if name.ns == html5ever::ns!(html) {
-                            str::to_ascii_uppercase(&name.local)
+                        if name.ns == html5ever::ns!(html) && !dom.is_xml_node(NodeId::new(nid)) {
+                            name.prefix.as_ref().map_or_else(|| str::to_ascii_uppercase(&name.local), |prefix| format!("{}:{}", prefix, name.local).to_ascii_uppercase())
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -3166,6 +3203,36 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 })
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
+        }
+        "mark_xml_document" => {
+            dom.mark_xml_document(NodeId::new(arg1.parse::<u32>().unwrap_or(0)));
+            "true".into()
+        }
+        "set_node_document" => {
+            let (Ok(node), Ok(document)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else { return "false".into(); };
+            dom.set_node_document(NodeId::new(node), NodeId::new(document));
+            "true".into()
+        }
+        "element_prefix" => {
+            let prefix = dom.with_node(NodeId::new(arg1.parse::<u32>().unwrap_or(0)), |node| {
+                node.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
+        }
+        "create_cdata" => dom.create_cdata(arg1).index().to_string(),
+        "create_xml_element" => dom.new_node(NodeData::Element {
+            name: html5ever::QualName::new(None, html5ever::Namespace::default(), html5ever::LocalName::from(arg1.as_str())),
+            attrs: Vec::new(), template_contents: None, mathml_annotation_xml_integration_point: false,
+        }).index().to_string(),
+        "parse_xml_document" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let error = if root == dom.document() { Some("Cannot replace an active document".to_string()) }
+                else { dom.parse_xml_document(root, &arg2).err() };
+            if error.is_none() { mark_script_subtree_started(&gs, root); }
+            serde_json::to_string(&error).unwrap_or("null".into())
+        }
+        "serialize_xml" => {
+            serde_json::Value::String(dom.serialize_xml(NodeId::new(arg1.parse::<u32>().unwrap_or(0)))).to_string()
         }
         "parse_html_document" => {
             let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
@@ -3218,6 +3285,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 } else {
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                 }
+                if matches!(name, "allow" | "sandbox") { gs.geolocation.permissions.policy_changed(); }
             }
             "true".into()
         }
@@ -3299,6 +3367,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             if arg2 == "id" {
                 dom.update_id_index(node_id, old_id.as_deref(), None);
             }
+            if matches!(arg2.as_str(), "allow" | "sandbox") { gs.geolocation.permissions.policy_changed(); }
             "true".into()
         }
         // Namespace-aware attribute ops. arg2 packs the pieces with a NUL:
@@ -3339,6 +3408,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         n.set_attribute_ns(ns, qualified, value.to_string())
                     });
                 }
+                if ns.is_empty() && matches!(local, "allow" | "sandbox") { gs.geolocation.permissions.policy_changed(); }
             }
             "true".into()
         }
@@ -3355,6 +3425,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             } else {
                 dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
             }
+            if ns.is_empty() && matches!(local, "allow" | "sandbox") { gs.geolocation.permissions.policy_changed(); }
             "true".into()
         }
         "set_inner_html" => {
@@ -3904,39 +3975,7 @@ pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client,
 }
 
 fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
-    // Redirects are followed manually below so each hop can be re-validated
-    // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
-    // With reqwest's default auto-follow, an attacker-controlled origin can
-    // 302 to http://127.0.0.1 and read the internal-service body.
-    // Per-request timeout so a scripted fetch()/XHR, or a CORS preflight OPTIONS
-    // (issue #251), to a server that accepts the connection but never responds
-    // cannot hang forever. Without it op_fetch_url never returns, the fetch
-    // promise never settles, and the JS XHR is stuck at readyState 1 with no
-    // completion event (which stranded Angular HttpClient). On timeout reqwest's
-    // send().await errors, which op_fetch_url propagates and the fetch shim turns
-    // into an XHR `error`/`loadend`. 30s matches the other clients in the
-    // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(fetch_timeout())
-        // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
-        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
-            false,
-        )))
-        // Be explicit about pool size: default is unbounded which is fine,
-        // but pool_idle_timeout default (90s) is short for SPA-heavy
-        // workloads where the same origin is hit dozens of times across
-        // a navigation. Keep connections warm longer.
-        .pool_idle_timeout(std::time::Duration::from_secs(300))
-        .tcp_keepalive(std::time::Duration::from_secs(60));
-    if let Some(proxy) = proxy_url {
-        let p = reqwest::Proxy::all(proxy)
-            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
-        builder = builder.proxy(p);
-    }
-    builder
-        .build()
-        .map_err(|e| format!("failed to build reqwest::Client: {}", e))
+    obscura_net::client::auxiliary_request_client(proxy_url)
 }
 
 fn fetch_timeout() -> std::time::Duration {
@@ -4276,62 +4315,19 @@ fn visible_response_headers(
 /// `*` matches any run, `?` matches one character, and backslash escapes.
 /// Shared with the CDP layer so reported pauses match live interception.
 pub fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let mut pattern = pattern.chars();
-    let mut url = url.chars();
-    let mut star = None;
-    loop {
-        let mut next_pattern = pattern.clone();
-        match next_pattern.next() {
-            Some('*') => {
-                pattern = next_pattern;
-                star = Some((pattern.clone(), url.clone()));
-                continue;
-            }
-            None if url.as_str().is_empty() => return true,
-            Some(token) => {
-                let literal = if token == '\\' { next_pattern.next() } else { Some(token) };
-                let mut next_url = url.clone();
-                if let Some(character) = next_url.next() {
-                    if token == '?' || literal == Some(character) {
-                        pattern = next_pattern;
-                        url = next_url;
-                        continue;
-                    }
-                }
-            }
-            _ => {}
-        }
-        let Some((saved_pattern, saved_url)) = &mut star else {
-            return false;
-        };
-        if saved_url.next().is_none() {
-            return false;
-        }
-        pattern = saved_pattern.clone();
-        url = saved_url.clone();
-    }
+    obscura_net::interception::url_matches_cdp_pattern(pattern, url)
 }
 
-/// Whether a scripted request is paused for the interception consumer. Like
-/// Chrome, only requests matching a `Fetch.enable` URL pattern pause.
-pub(crate) fn should_intercept_url(enabled: bool, patterns: &[String], url: &str) -> bool {
-    enabled && (patterns.is_empty() || patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url)))
+/// Whether the native request matches the consumer's Fetch selectors.
+pub fn should_intercept_request(enabled: bool, patterns: &[InterceptPattern], url: &str, resource_type: &str) -> bool {
+    enabled && (patterns.is_empty() || patterns.iter().any(|pattern| pattern.matches(url, resource_type)))
 }
 
-/// Build the JS-facing result for an intercepted request a CDP client chose to
-/// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
-/// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
-/// the bootstrap fetch layer prefers (`_base64ToUint8Array`) so a binary
-/// fulfilled body is delivered intact rather than `from_utf8_lossy`-corrupted.
-/// See #912.
+/// Serialize one fulfilled response without converting its body through text.
 fn intercept_fulfill_response(
     status: u16,
     headers: HashMap<String, String>,
-    body: &str,
-    body_base64: &str,
+    body: &[u8],
     url: &str,
     page_origin: &str,
     mode: &str,
@@ -4339,6 +4335,12 @@ fn intercept_fulfill_response(
     internal_load: bool,
 ) -> serde_json::Value {
     let cross_origin = request_origin(url).is_some_and(|origin| origin != page_origin);
+    if mode == "cors" && cross_origin && !cors_response_allows(credentials, page_origin,
+        headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("access-control-allow-origin")).map(|(_, value)| value.as_str()).unwrap_or(""),
+        headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("access-control-allow-credentials")).map(|(_, value)| value.as_str()).unwrap_or("")) {
+        return serde_json::json!({"status":0,"bodyBytes":[],"headers":{},"url":url,"corsBlocked":true,
+            "corsError":"CORS blocked fulfilled response"});
+    }
     let opaque = !internal_load && mode == "no-cors" && cross_origin;
     let visible_headers = if opaque {
         HashMap::new()
@@ -4349,30 +4351,71 @@ fn intercept_fulfill_response(
     };
     serde_json::json!({
         "status": if opaque { 0 } else { status },
-        "body": if opaque { "" } else { body },
-        "bodyBase64": if opaque { "" } else { body_base64 },
+        "bodyBytes": if opaque { &[][..] } else { body },
+        "body": internal_load.then(|| {
+            let content_type = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("content-type")).map(|(_, value)| value.as_str());
+            if content_type.is_some_and(|value| value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))) {
+                obscura_net::decode_response(body, content_type)
+            } else { obscura_net::decode_non_html(body, content_type) }
+        }),
         "url": url,
         "headers": visible_headers,
         "opaque": opaque,
     })
 }
 
-// Only the nine JS arguments count; scope and state are injected by op2.
+// Both modes capture their real native realm before any network polling.
 #[op2(required(9))]
 #[string]
 fn op_fetch_url(
-    scope: &mut v8::PinScope,
-    state: Rc<RefCell<OpState>>,
-    #[string] url: String,
-    #[string] method: String,
-    #[string] headers_json: String,
-    #[buffer] body: JsBuffer,
-    #[string] _origin: String,
-    #[string] mode: String,
-    #[string] credentials: String,
-    #[serde] options: FetchOptions,
+    scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>,
+    #[string] url: String, #[string] method: String, #[string] headers_json: String,
+    #[buffer] body: JsBuffer, #[string] origin: String, #[string] mode: String,
+    #[string] credentials: String, #[serde] options: FetchOptions, receiver: v8::Local<v8::Object>,
+) -> impl Future<Output = Result<String, JsErrorBox>> + use<> {
+    fetch_url(scope, state, url, method, headers_json, body, origin, mode, credentials, options, receiver)
+}
+
+#[op2(required(9))]
+#[string]
+fn op_fetch_url_sync(
+    scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>,
+    #[string] url: String, #[string] method: String, #[string] headers_json: String,
+    #[buffer] body: JsBuffer, #[string] origin: String, #[string] mode: String,
+    #[string] credentials: String, #[serde] options: FetchOptions, receiver: v8::Local<v8::Object>,
+) -> Result<String, JsErrorBox> {
+    let future = fetch_url(scope, state.clone(), url, method, headers_json, body, origin, mode, credentials, options, receiver);
+    // This polls only Rust state/receipts. Socket I/O and pause responders run
+    // independently; no browser task, microtask or V8 callback is re-entered.
+    let _io = obscura_net::network_io_handle().enter();
+    deno_core::futures::executor::block_on(async move {
+        tokio::time::timeout(fetch_timeout(), async move {
+            let raw = future.await?;
+            let mut response: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|error| JsErrorBox::generic(error.to_string()))?;
+            if let Some(rid) = response.get("bodyRid").and_then(serde_json::Value::as_u64) {
+                let bytes = fetch_body(state, rid as u32).await?;
+                response.as_object_mut().unwrap().remove("bodyRid");
+                response["bodyBytes"] = serde_json::json!(bytes);
+            }
+            if response.get("statusText").is_none() {
+                let reason = response.get("status").and_then(serde_json::Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok())
+                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                    .and_then(|status| status.canonical_reason()).unwrap_or("");
+                response["statusText"] = serde_json::json!(reason);
+            }
+            Ok(response.to_string())
+        }).await.map_err(|_| JsErrorBox::new("DOMExceptionNetworkError", "Synchronous request timed out"))?
+    })
+}
+
+fn fetch_url(
+    scope: &mut v8::PinScope, state: Rc<RefCell<OpState>>,
+    url: String, method: String, headers_json: String, body: JsBuffer,
+    _origin: String, mode: String, credentials: String, options: FetchOptions,
     receiver: v8::Local<v8::Object>,
-) -> impl Future<Output = Result<String, deno_error::JsErrorBox>> + use<> {
+) -> impl Future<Output = Result<String, JsErrorBox>> + use<> {
     // Capture the binding's native realm before async polling. The shared deno
     // wrapper's incumbent context does not identify the requesting document.
     let captured = (|| {
@@ -4382,15 +4425,18 @@ fn op_fetch_url(
             return Err(deno_error::JsErrorBox::type_error("Invalid fetch execution world receiver"));
         }
         let context = v8::Global::new(scope, context);
-        let (windows, root, owner) = crate::window::context_document(&state.borrow(), &context)?;
-        // Origin arguments are page-controlled. The native document binding,
-        // including inherited and sandbox principals, owns network authority.
-        let origin = crate::window::origin(&owner.borrow());
-        let page = windows.borrow().windows.get(&root)
-            .ok_or_else(|| deno_error::JsErrorBox::generic("Fetch root owner is unavailable"))?.state.clone();
         let registry = state.borrow().borrow::<Rc<RefCell<RealmStates>>>().clone();
-        let world_cancel = registry.borrow().context_cancel(&context)
-            .ok_or_else(|| deno_error::JsErrorBox::type_error("Fetch execution world is retired"))?;
+        let (owner, page, world_cancel) = if let Some(worker) = crate::worker::receiver_state(scope, &state.borrow(), receiver) {
+            worker
+        } else {
+            let (windows, root, owner) = crate::window::context_document(&state.borrow(), &context)?;
+            let page = windows.borrow().windows.get(&root)
+                .ok_or_else(|| JsErrorBox::generic("Fetch root owner is unavailable"))?.state.clone();
+            let cancel = registry.borrow().context_cancel(&context)
+                .ok_or_else(|| JsErrorBox::type_error("Fetch execution world is retired"))?;
+            (owner, page, cancel)
+        };
+        let origin = crate::window::origin(&owner.borrow());
         let (destination, cancel_rid, document_frame, referrer, referrer_policy, redirect) = match options {
             FetchOptions::Destination(destination) => (destination, None, None, None, String::new(), follow_redirect_mode()),
             FetchOptions::Request { cancel_rid, destination, referrer, referrer_policy, redirect } =>
@@ -4440,9 +4486,15 @@ fn op_fetch_url(
             frame.document_load_cancel.clone()
         } else { None };
         let load_cancel = owner.borrow().resource_load_cancel.clone();
-        let initiator = FetchInitiator { frame_id, owner, generation, registry, world_cancel, load_cancel };
+        let worker_cancel = crate::worker::request_cancellation(scope, &state.borrow(), receiver);
+        let local_blob = match url::Url::parse(&url) {
+            Ok(url) if url.scheme() == "blob" => crate::local_resource::load_local_resource(&owner.borrow(), &url)?,
+            _ => None,
+        };
+        let initiator = FetchInitiator { frame_id, owner, generation, registry, world_cancel, load_cancel,
+            document_load_cancel: document_cancel.clone(), worker_cancel, local_blob };
         initiator.ensure_live()?;
-        let parent_frame_id = if frame_id == calling_frame && Rc::ptr_eq(&initiator.owner, &page) { None } else {
+        let parent_frame_id = if initiator.owner.borrow().is_worker || (frame_id == calling_frame && Rc::ptr_eq(&initiator.owner, &page)) { None } else {
             Some(initiator.registry.borrow().live_frame_owner(frame_id)
                 .ok_or_else(|| deno_error::JsErrorBox::generic("Fetch frame owner is unavailable"))?.0)
         };
@@ -4457,17 +4509,26 @@ fn op_fetch_url(
         let request_cancel = cancel.clone();
         let world_cancel = initiator.world_cancel.clone();
         let load_cancel = initiator.load_cancel.clone();
+        let worker_cancel = initiator.worker_cancel.clone();
         let future = async move {
             fetch_url_inner(state, page, initiator, url, method, headers_json, body,
                 origin, mode, credentials, redirect, destination, parent_frame_id, request_cancel, referrer_source, referrer_policy)
                 .or_cancel(world_cancel).await
                 .map_err(|_| deno_error::JsErrorBox::type_error("Fetch execution world was disposed"))?
         }.or_cancel(load_cancel);
-        match cancel {
-            Some(cancel) => future.or_cancel(cancel).await
-                .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
-            None => future.await,
-        }.map_err(|_| deno_error::JsErrorBox::generic("Fetch was stopped"))?
+        let request = async {
+            match cancel {
+                Some(cancel) => future.or_cancel(cancel).await
+                    .map_err(|_| JsErrorBox::generic("Fetch was cancelled"))?,
+                None => future.await,
+            }.map_err(|_| JsErrorBox::generic("Fetch was stopped"))?
+        };
+        if let Some(cancel) = worker_cancel {
+            tokio::select! { biased;
+                _ = cancel.cancelled() => Err(JsErrorBox::generic("Worker was terminated")),
+                result = request => result,
+            }
+        } else { request.await }
     }
 }
 
@@ -4495,10 +4556,44 @@ struct FetchInitiator {
     registry: Rc<RefCell<RealmStates>>,
     world_cancel: Rc<CancelHandle>,
     load_cancel: Rc<CancelHandle>,
+    document_load_cancel: Option<Rc<CancelHandle>>,
+    worker_cancel: Option<Arc<crate::worker::WorkerCancellation>>,
+    local_blob: Option<crate::local_resource::LocalResource>,
 }
 
 impl FetchInitiator {
+    fn record_document_policy(&self, headers: &HashMap<String, String>) -> Result<(), JsErrorBox> {
+        self.ensure_live()?;
+        let Some(cancel) = &self.document_load_cancel else { return Ok(()); };
+        let mut registry = self.registry.borrow_mut();
+        let frame = registry.frame_timers.get_mut(&self.frame_id)
+            .ok_or_else(|| JsErrorBox::type_error("Document response owner was retired"))?;
+        if !frame.document_load_cancel.as_ref().is_some_and(|current| Rc::ptr_eq(current, cancel)) {
+            return Err(JsErrorBox::type_error("Document response reservation was replaced"));
+        }
+        frame.content_security_policy = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"))
+            .map(|(_, policy)| policy.clone()).collect();
+        frame.referrer_policy = Some(headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+            .and_then(|(_, value)| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
+        frame.geolocation_policy = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("permissions-policy"))
+            .map(|(_, value)| value.clone());
+        Ok(())
+    }
+
+    fn record_worker_entry(&self, requested: &str, response_url: &str, policy: Option<&str>) {
+        let mut owner = self.owner.borrow_mut();
+        if !owner.is_worker || !owner.worker_entry_pending || owner.url != requested
+            || !owner.document_active.get() || owner.document_generation != self.generation { return; }
+        if response_url.starts_with("http:") || response_url.starts_with("https:") {
+            owner.content_security_policy = policy.map(str::to_owned).into_iter().collect();
+        }
+        owner.url = response_url.to_owned();
+        owner.worker_entry_pending = false;
+    }
     fn ensure_live(&self) -> Result<(), deno_error::JsErrorBox> {
+        if self.document_load_cancel.as_ref().is_some_and(|cancel| cancel.is_canceled()) {
+            return Err(JsErrorBox::type_error("Document response reservation was cancelled"));
+        }
         if self.load_cancel.is_canceled() {
             return Err(deno_error::JsErrorBox::generic("Fetch was stopped"));
         }
@@ -4508,9 +4603,10 @@ impl FetchInitiator {
         let owner = self.owner.try_borrow().map_err(|_| deno_error::JsErrorBox::generic(
             "Fetch document owner is unavailable"))?;
         let owner_frame = owner.frame_id;
-        if owner.document_generation != self.generation {
+        if !owner.document_active.get() || owner.document_generation != self.generation {
             return Err(deno_error::JsErrorBox::generic("Fetch document owner was replaced"));
         }
+        if owner.is_worker { return Ok(()); }
         drop(owner);
         let registry = self.registry.borrow();
         if owner_frame != 0 && registry.frame_timers_active(owner_frame) != Some(true)
@@ -4550,8 +4646,84 @@ pub(crate) fn document_referrer_policy(state: &ObscuraState) -> String {
     policy
 }
 
+fn script_request_profile(resource_type: ResourceType, origin: &str, mode: &str,
+    frame_id: u32, parent_frame_id: Option<u32>, frame_generation: u64) -> obscura_net::ResourceRequest {
+    let mut request = obscura_net::ResourceRequest::navigation();
+    request.resource_type = resource_type;
+    request.initiator = url::Url::parse(if origin == "null" { "data:," } else { origin }).ok();
+    request.mode = match mode {
+        "same-origin" => obscura_net::RequestMode::SameOrigin,
+        "no-cors" => obscura_net::RequestMode::NoCors,
+        "navigate" => obscura_net::RequestMode::Navigate,
+        _ => obscura_net::RequestMode::Cors,
+    };
+    request.frame_id = frame_id; request.parent_frame_id = parent_frame_id; request.frame_generation = frame_generation;
+    request.max_response_bytes = fetch_max_body_bytes();
+    request
+}
+
+fn script_request_info(request: &obscura_net::ResourceRequest, request_id: &str, page_id: &str,
+    url: url::Url, method: String, headers: HashMap<String, String>, body: &[u8]) -> RequestInfo {
+    RequestInfo { url, method, headers, resource_type: request.resource_type,
+        request_id: request_id.to_string(), page_id: page_id.to_string(),
+        frame_id: request.frame_id, parent_frame_id: request.parent_frame_id,
+        frame_generation: request.frame_generation, body: (!body.is_empty()).then(|| body.to_vec()) }
+}
+
+async fn selected_preflight(client: &reqwest::Client, page: &SharedState, target: &url::Url,
+    headers: HashMap<String, String>) -> Result<(u16, reqwest::header::HeaderMap), deno_error::JsErrorBox> {
+    #[cfg(feature = "stealth")]
+    {
+        let stealth = page.borrow().stealth_client.clone();
+        if let Some(stealth) = stealth {
+            let response = stealth.send_single_headers_with_context("OPTIONS", target, &headers, &[], None, false,
+                fetch_max_body_bytes()).await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+            let mut result = reqwest::header::HeaderMap::new();
+            for (name, value) in response.headers {
+                result.insert(reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?,
+                    value.parse().map_err(|error: reqwest::header::InvalidHeaderValue| deno_error::JsErrorBox::type_error(error.to_string()))?);
+            }
+            return Ok((response.status, result));
+        }
+    }
+    #[cfg(not(feature = "stealth"))]
+    let _ = page;
+    let mut request = client.request(reqwest::Method::OPTIONS, target.as_str()).timeout(fetch_timeout());
+    for (name, value) in headers { request = request.header(name, value); }
+    let response = obscura_net::on_network_io(async move { request.send().await }).await
+        .map_err(deno_error::JsErrorBox::generic)?.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    Ok((response.status().as_u16(), response.headers().clone()))
+}
+
+async fn resolve_script_redirect(page: &SharedState, request_id: &str, url: &mut url::Url,
+    method: &mut String, headers: &mut HashMap<String, String>, body: &mut Option<Vec<u8>>,
+    profile: &obscura_net::ResourceRequest) -> Result<Option<obscura_net::Response>, deno_error::JsErrorBox> {
+    let config = {
+        let state = page.borrow();
+        obscura_net::RequestInterception { page_id: state.intercept_page_id.clone(),
+            enabled: state.intercept_enabled, patterns: state.intercept_url_patterns.clone(),
+            blocked: state.blocked_urls.clone(), sender: state.intercept_tx.clone(), observer: state.intercept_observer.clone() }
+    };
+    config.resolve(request_id, url, method, headers, body, profile).await
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))
+}
+
+fn finish_script_fulfill(page: &SharedState, network_guard: &mut FetchNetworkGuard,
+    response: obscura_net::Response, method: &str, origin: &str, mode: &str,
+    credentials: FetchCredentials, internal_load: bool) -> String {
+    let mut event = network_guard.event.take().unwrap();
+    event.url = response.url.to_string(); event.method = method.to_string(); event.status = response.status;
+    event.intercepted = true; event.response_headers = response.headers.clone(); event.body_size = response.body.len();
+    let request_id = event.request_id.clone();
+    record_network_response(page, event, &response.body);
+    let mut result = intercept_fulfill_response(response.status, response.headers, &response.body,
+        response.url.as_str(), origin, mode, credentials, internal_load);
+    result["requestId"] = serde_json::json!(request_id);
+    result.to_string()
+}
+
 async fn fetch_url_inner(
-    state: Rc<RefCell<OpState>>, page: SharedState, initiator: FetchInitiator,
+    state: Rc<RefCell<OpState>>, page: SharedState, mut initiator: FetchInitiator,
     url: String, method: String, headers_json: String,
     body: JsBuffer, origin: String, mode: String, credentials: String,
     redirect: String, destination: String, parent_frame_id: Option<u32>, cancel: Option<Rc<CancelHandle>>,
@@ -4575,7 +4747,7 @@ async fn fetch_url_inner(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, page_id, request_id, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, intercept_observer, page_id, request_id, proxy_url, callbacks, http_client) = {
         let mut gs = page.borrow_mut();
         for pattern in &gs.blocked_urls {
             if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
@@ -4612,16 +4784,19 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
+        let itx = if should_intercept_request(gs.intercept_enabled, &gs.intercept_url_patterns, &url, resource_type_name) {
             gs.intercept_tx.clone()
         } else {
             None
         };
+        let observer = should_intercept_request(gs.intercept_enabled, &gs.intercept_url_patterns, &url, resource_type_name)
+            .then(|| gs.intercept_observer.clone()).flatten();
         (
             jar,
             in_flight,
             Arc::clone(&gs.page_in_flight),
             itx,
+            observer,
             gs.intercept_page_id.clone(),
             request_id,
             proxy_url,
@@ -4640,8 +4815,51 @@ async fn fetch_url_inner(
     // A network URL is gated before interception or either transport can send.
     let parsed_url = url::Url::parse(&url)
         .map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid fetch URL: {error}")))?;
-    if parsed_url.scheme() == "data" {
-        return fetch_data_url(&state, parsed_url, internal_load, cancel, initiator.world_cancel).await;
+    let local = if parsed_url.scheme() == "blob" { initiator.local_blob.take() }
+        else { crate::local_resource::load_local_resource(&initiator.owner.borrow(), &parsed_url)? };
+    if let Some(resource) = local {
+        if resource_type == ResourceType::Script && !crate::local_resource::is_javascript_mime(&resource.mime) {
+            return Err(JsErrorBox::type_error("Script resource is not a JavaScript MIME type"));
+        }
+        if resource_type == ResourceType::Script { initiator.record_worker_entry(&url, parsed_url.as_str(), None); }
+        let mut response_url = parsed_url.clone(); response_url.set_fragment(None);
+        let metadata = serde_json::json!({
+            "status":200, "statusText":"OK", "url":response_url.as_str(), "redirected":false,
+            "opaque":false, "headers":{"content-type":resource.mime},
+        });
+        let bytes = resource.bytes;
+        return fetch_body_result(&state, metadata, Box::pin(async move { Ok(bytes.to_vec()) }),
+            internal_load, cancel, initiator.world_cancel, initiator.worker_cancel,
+            Rc::downgrade(&initiator.owner), initiator.generation).await;
+    }
+    if parsed_url.scheme() == "file" {
+        let source = url::Url::parse(&initiator.owner.borrow().url)
+            .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+        let native_client = http_client.as_ref().ok_or_else(|| deno_error::JsErrorBox::type_error("File access is not allowed"))?;
+        if !native_client.allow_file_access {
+            return Err(deno_error::JsErrorBox::type_error("File access is not allowed"));
+        }
+        if source.scheme() != "file" { return Err(deno_error::JsErrorBox::type_error("Network documents cannot access file URLs")); }
+        let mut profile = script_request_profile(resource_type, &origin, &mode, frame_id, parent_frame_id, frame_generation);
+        profile.initiator = Some(source); profile.referrer = referrer_source;
+        profile.referrer_policy = referrer_policy;
+        #[cfg(feature = "stealth")]
+        let response = {
+            let stealth = page.borrow().stealth_client.clone();
+            if let Some(stealth) = stealth { stealth.fetch_with_method(&method, &parsed_url,
+                (!body.is_empty()).then_some(body), callbacks.as_deref(), profile).await }
+            else { native_client.fetch_with_method_and_profile(method.parse().map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid method: {error}")))?,
+                &parsed_url, (!body.is_empty()).then_some(body), callbacks.as_deref(), profile).await }
+        };
+        #[cfg(not(feature = "stealth"))]
+        let response = native_client.fetch_with_method_and_profile(method.parse().map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid method: {error}")))?,
+            &parsed_url, (!body.is_empty()).then_some(body), callbacks.as_deref(), profile).await;
+        let response = response.map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+        initiator.ensure_live()?;
+        let metadata = serde_json::json!({"status":response.status,"url":response.url.as_str(),"headers":response.headers,"redirected":false});
+        return fetch_body_result(&state, metadata, Box::pin(async move { Ok(response.body) }),
+            internal_load, cancel, initiator.world_cancel, initiator.worker_cancel,
+            Rc::downgrade(&initiator.owner), initiator.generation).await;
     }
     validate_fetch_request_url(&parsed_url, allow_private_network, &mode, &origin)
         .map_err(deno_error::JsErrorBox::type_error)?;
@@ -4651,6 +4869,8 @@ async fn fetch_url_inner(
         state: Rc::downgrade(&page),
         event: Some(JsNetworkEvent {
             request_id: request_id.clone(), frame_id, frame_generation, intercepted: false,
+            request_headers: serde_json::from_str(&headers_json).unwrap_or_default(),
+            request_body: (!body.is_empty()).then(|| body.clone()), request_started: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
             response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
@@ -4667,25 +4887,55 @@ async fn fetch_url_inner(
     let mut override_body: Option<Vec<u8>> = None;
 
     let mut was_intercepted = false;
-    if let Some(tx) = intercept_tx {
-        let custom_headers: HashMap<String, String> =
-            serde_json::from_str(&headers_json).unwrap_or_default();
+    if intercept_tx.is_some() || intercept_observer.is_some() {
+        let mut custom_headers = HashMap::new();
+        let profile = script_request_profile(resource_type, &origin, &mode, frame_id, parent_frame_id, frame_generation);
+        let platform = if let Some(client) = &http_client { client.platform.read().await.clone() } else { String::new() };
+        if let Some(client) = &http_client {
+            custom_headers.insert("user-agent".into(), client.user_agent.read().await.clone());
+            custom_headers.insert("accept-language".into(), client.accept_language.read().await.clone());
+            for (name, value) in client.extra_headers.read().await.iter() { custom_headers.insert(name.to_ascii_lowercase(), value.clone()); }
+        }
+        let supplied: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+        for (name, value) in supplied { custom_headers.insert(name.to_ascii_lowercase(), value); }
+        custom_headers.entry("accept".into()).or_insert(profile.accept().into());
+        let ua = custom_headers.get("user-agent").cloned().unwrap_or_default();
+        obscura_net::client::apply_request_metadata(&mut custom_headers, &profile, &parsed_url, &[], &ua, &platform);
+        custom_headers.remove("referer"); custom_headers.remove("origin");
+        if let Some(referer) = obscura_net::client::referrer_for_policy(referrer_source.as_ref(), &parsed_url, &referrer_policy) { custom_headers.insert("referer".into(), referer); }
+        if sends_origin_header(&method, parsed_url.origin().ascii_serialization() != origin) { custom_headers.insert("origin".into(), origin.clone()); }
+        if credentials.allows(&origin, &url) {
+            if let Some(jar) = &cookie_jar {
+                let context = profile.initiator.as_ref().filter(|source| same_site(source, &parsed_url))
+                    .map_or(SameSiteContext::CrossSite, |_| SameSiteContext::SameSite);
+                let cookie = jar.get_cookie_header_in_context(&parsed_url, context);
+                if !cookie.is_empty() { custom_headers.insert("cookie".into(), cookie); }
+            }
+        }
+        if let Some(event) = network_guard.event.as_mut() {
+            event.request_headers = custom_headers.clone();
+        }
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
-            page_id,
+            page_id: page_id.clone(),
             frame_id,
             parent_frame_id,
+            frame_generation, body: (!body.is_empty()).then(|| body.clone()),
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
             resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
         };
-        if tx.send(intercepted).is_ok() {
+        if let Some(observer) = intercept_observer { observer(intercepted); }
+        else { intercept_tx.unwrap().send(intercepted)
+            .map_err(|_| deno_error::JsErrorBox::generic("Interception consumer disconnected"))?; }
+        {
             was_intercepted = true;
             network_guard.event.as_mut().unwrap().intercepted = true;
-            match resolve_rx.await {
+            match tokio::time::timeout(fetch_timeout(), resolve_rx).await
+                .map_err(|_| deno_error::JsErrorBox::generic("Interception decision timed out"))? {
                 resolution if initiator.ensure_live().is_err() => {
                     drop(resolution);
                     return Err(deno_error::JsErrorBox::generic("Intercepted fetch owner is detached or was replaced"));
@@ -4694,33 +4944,29 @@ async fn fetch_url_inner(
                     status,
                     headers: h,
                     body: b,
-                    body_base64: bb,
                 }) => {
                     network_guard.event = None;
-                    if resource_type == ResourceType::Document {
-                        initiator.registry.borrow_mut().frame_timers.get_mut(&frame_id).map(|frame| {
-                            frame.referrer_policy = Some(h.iter().find(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
-                                .and_then(|(_, value)| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
-                        });
+                    if resource_type == ResourceType::Script {
+                        initiator.record_worker_entry(&url, &url, h.iter().find(|(name,_)| name.eq_ignore_ascii_case("content-security-policy")).map(|(_,value)| value.as_str()));
                     }
+                    initiator.record_document_policy(&h)?;
                     // Keep fulfilled responses visible to CDP just like transport
                     // responses, including exact binary bodies and bounded retention.
-                    let encoded = !bb.is_empty();
-                    let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
-                    record_js_network_completion(&page, JsNetworkEvent {
+                    let body_size = b.len();
+                    record_network_response(&page, JsNetworkEvent {
                         request_id: request_id.clone(), frame_id, frame_generation, intercepted: true,
+                        request_headers: custom_headers.clone(), request_body: (!body.is_empty()).then(|| body.clone()), request_started: false,
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
-                    }, if encoded { &bb } else { &b }, encoded);
+                    }, &b);
                     let mut response = intercept_fulfill_response(
                         status,
                         h,
                         &b,
-                        &bb,
                         &url,
                         &origin,
                         &mode,
@@ -4762,7 +5008,7 @@ async fn fetch_url_inner(
                         override_body.is_some()
                     );
                 }
-                Err(_) => {}
+                Err(_) => return Err(deno_error::JsErrorBox::generic("Interception consumer disconnected")),
             }
         }
     }
@@ -4805,40 +5051,25 @@ async fn fetch_url_inner(
     let method = override_method.unwrap_or(method);
     let body = override_body.unwrap_or(body);
 
-    let client = match &http_client {
-        Some(client) => client.request_client().await,
-        None => {
-            cached_request_client(proxy_url.as_deref()).map_err(deno_error::JsErrorBox::generic)?
+    let native_client = http_client.clone();
+    let client = obscura_net::on_network_io(async move {
+        match native_client {
+            Some(client) => Ok(client.request_client().await),
+            None => cached_request_client(proxy_url.as_deref()),
         }
-    };
+    }).await.map_err(JsErrorBox::generic)?.map_err(JsErrorBox::generic)?;
     initiator.ensure_live()?;
 
     let initial_request_origin = request_origin(&url).unwrap_or_default();
     let page_origin = origin;
     let is_cross_origin = initial_request_origin != page_origin;
 
-    let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
+    let req_method: reqwest::Method = method.parse().map_err(|error|
+        deno_error::JsErrorBox::type_error(format!("Invalid request method: {error}")))?;
 
     let custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
 
-    // Passive request observation (non-blocking). Fires for every request that
-    // reaches the network (Fulfill/Fail from the interception channel short-
-    // circuit earlier). on_request/on_response previously fired only for
-    // navigation; this wires them for JS fetch()/XHR too.
-    if let Some(ref cbs) = callbacks {
-        if cbs.has_request_callbacks().await {
-            if let Ok(parsed) = url::Url::parse(&url) {
-                let info = RequestInfo {
-                    url: parsed,
-                    method: method.clone(),
-                    headers: custom_headers.clone(),
-                    resource_type,
-                };
-                cbs.fire_request(&info).await;
-            }
-        }
-    }
 
     let unsafe_header_names = if is_cross_origin && mode == "cors" {
         cors_unsafe_request_header_names(&custom_headers)
@@ -4850,38 +5081,46 @@ async fn fetch_url_inner(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let mut preflight_request = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str());
-        if !unsafe_header_names.is_empty() {
-            preflight_request = preflight_request.header(
-                "Access-Control-Request-Headers",
-                unsafe_header_names.join(","),
-            );
+        let mut preflight_headers = HashMap::from([
+            ("origin".to_string(), page_origin.clone()),
+            ("access-control-request-method".to_string(), method.clone()),
+        ]);
+        if !unsafe_header_names.is_empty() { preflight_headers.insert("access-control-request-headers".into(), unsafe_header_names.join(",")); }
+        if let Some(client) = &http_client {
+            preflight_headers.insert("user-agent".into(), client.user_agent.read().await.clone());
+            preflight_headers.insert("accept-language".into(), client.accept_language.read().await.clone());
+            client.validate_destination(&parsed_url).await.map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
         }
-        let preflight = preflight_request.send().await.map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+        let profile = script_request_profile(ResourceType::Fetch, &page_origin, "cors", frame_id, parent_frame_id, frame_generation);
+        let ua = preflight_headers.get("user-agent").cloned().unwrap_or_default();
+        let platform = if let Some(client) = &http_client { client.platform.read().await.clone() } else { String::new() };
+        obscura_net::client::apply_request_metadata(&mut preflight_headers, &profile, &parsed_url, &[], &ua, &platform);
+        let preflight_info = script_request_info(&profile, &format!("{request_id}-preflight"), &page_id,
+            parsed_url.clone(), "OPTIONS".into(), preflight_headers.clone(), &[]);
+        if let Some(callbacks) = &callbacks { callbacks.fire_request(&preflight_info).await; }
+        let (preflight_status, preflight_headers) = selected_preflight(&client, &page, &parsed_url, preflight_headers).await?;
+        if let Some(callbacks) = &callbacks {
+            let response = obscura_net::Response { url: parsed_url.clone(), status: preflight_status,
+                headers: preflight_headers.iter().map(|(name, value)| (name.to_string(), obscura_net::client::decode_response_header_value(value.as_bytes()))).collect(),
+                body: Vec::new(), redirected_from: Vec::new() };
+            callbacks.fire_response(&preflight_info, &response).await;
+        }
 
         // Fetch spec: the preflight response's status must be an ok status
         // before its CORS headers are consulted (#973).
-        if !preflight.status().is_success() {
+        if !(200..300).contains(&preflight_status) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight returned HTTP {}",
-                preflight.status()
+                preflight_status
             )));
         }
 
-        let allowed_origin = preflight
-            .headers()
+        let allowed_origin = preflight_headers
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let allow_credentials = preflight
-            .headers()
+        let allow_credentials = preflight_headers
             .get("access-control-allow-credentials")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -4893,14 +5132,14 @@ async fn fetch_url_inner(
         }
 
         let allowed_methods =
-            parse_cors_header_list(preflight.headers(), "access-control-allow-methods")
+            parse_cors_header_list(&preflight_headers, "access-control-allow-methods")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Methods value",
             )
         })?;
         let allowed_headers =
-            parse_cors_header_list(preflight.headers(), "access-control-allow-headers")
+            parse_cors_header_list(&preflight_headers, "access-control-allow-headers")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Headers value",
@@ -4949,6 +5188,11 @@ async fn fetch_url_inner(
     for (name, value) in custom_headers { request_headers.insert(name.to_ascii_lowercase(), value); }
     request_headers.remove("referer");
     request_headers.remove("origin");
+    request_headers.entry("accept".into()).or_insert_with(|| match resource_type {
+        ResourceType::Stylesheet => "text/css,*/*;q=0.1".into(),
+        ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
+        _ => "*/*".into(),
+    });
 
     // Stealth mode: route scripted requests through wreq after the CORS
     // preflight. stealth_fetch_all applies the credentials decision to each
@@ -4997,18 +5241,41 @@ async fn fetch_url_inner(
     let mut redirected_from = Vec::new();
     let mut crossed_origin = is_cross_origin;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
+    let profile = script_request_profile(resource_type, &page_origin, &mode, frame_id, parent_frame_id, frame_generation);
+    let platform = if let Some(client) = &http_client { client.platform.read().await.clone() } else { String::new() };
+    let mut actual_request_info: RequestInfo;
+    let mut current_request_origin: String;
     let response = loop {
         initiator.ensure_live()?;
+        if redirects_followed > 0 {
+            let mut target = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+            let mut method = current_method.to_string();
+            let mut body = Some(std::mem::take(&mut current_body));
+            let fulfilled = resolve_script_redirect(&page, &request_id, &mut target, &mut method,
+                &mut current_headers, &mut body, &profile).await?;
+            initiator.ensure_live()?;
+            validate_fetch_request_url(&target, allow_private_network, &mode, &page_origin).map_err(deno_error::JsErrorBox::type_error)?;
+            if let Some(response) = fulfilled { return Ok(finish_script_fulfill(&page, &mut network_guard, response,
+                &method, &page_origin, &mode, credentials, internal_load)); }
+            if request_origin(&current_url) != Some(target.origin().ascii_serialization()) {
+                sanitize_redirect_headers(&mut current_headers, true, false);
+            }
+            current_url = target.to_string();
+            current_method = method.parse().map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid request method: {error}")))?;
+            current_body = body.unwrap_or_default();
+        }
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
 
+        let target = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+        current_request_origin = obscura_net::client::request_origin_with_redirects(&profile, &target, &redirected_from);
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
         crossed_origin |= current_is_cross_origin;
         if sends_origin_header(current_method.as_str(), current_is_cross_origin) {
-            req = req.header("Origin", &page_origin);
+            req = req.header("Origin", &current_request_origin);
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -5031,10 +5298,13 @@ async fn fetch_url_inner(
             }
         }
 
-        let target = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
         let referer = obscura_net::client::referrer_for_policy(referrer_source.as_ref(), &target, &referrer_policy);
         referrer_source = referer.as_deref().and_then(|value| url::Url::parse(value).ok());
         if let Some(referer) = referer { req = req.header("Referer", referer); }
+        if let Some(native_client) = &http_client { native_client.validate_destination(&target).await
+            .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?; }
+        let ua = current_headers.get("user-agent").cloned().unwrap_or_default();
+        obscura_net::client::apply_request_metadata(&mut current_headers, &profile, &target, &redirected_from, &ua, &platform);
 
         for (k, v) in &current_headers {
             if !credentials_allowed && k == "cookie" { continue; }
@@ -5044,13 +5314,26 @@ async fn fetch_url_inner(
         if !current_body.is_empty() {
             req = req.body(current_body.clone());
         }
+        let wire_request = req.build().map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+        let wire_headers = wire_request.headers().iter().map(|(name, value)|
+            (name.to_string(), obscura_net::client::decode_response_header_value(value.as_bytes()))).collect();
+        actual_request_info = script_request_info(&profile, &request_id, &page_id, target,
+            current_method.to_string(), wire_headers, &current_body);
+        if let Some(callbacks) = &callbacks { callbacks.fire_request(&actual_request_info).await; }
+        if let Some(event) = network_guard.event.as_mut() {
+            event.url = actual_request_info.url.to_string(); event.method = actual_request_info.method.clone();
+            event.request_headers = actual_request_info.headers.clone(); event.request_body = actual_request_info.body.clone();
+        }
 
         let resp = {
             let _in_flight = in_flight.as_ref().map(|counter| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 PageInFlightGuard(counter.clone())
             });
-            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+            let wire_client = client.clone();
+            obscura_net::on_network_io(async move { wire_client.execute(wire_request).await }).await
+                .map_err(deno_error::JsErrorBox::generic)?
+                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
         };
 
         if credentials_allowed {
@@ -5068,6 +5351,12 @@ async fn fetch_url_inner(
         if !resp.status().is_redirection() {
             break resp;
         }
+        if let Some(callbacks) = &callbacks {
+            let response = obscura_net::Response { url: actual_request_info.url.clone(), status: resp.status().as_u16(),
+                headers: resp.headers().iter().map(|(name, value)| (name.to_string(), obscura_net::client::decode_response_header_value(value.as_bytes()))).collect(),
+                body: Vec::new(), redirected_from: redirected_from.clone() };
+            callbacks.fire_response(&actual_request_info, &response).await;
+        }
 
         // Fetch spec: the CORS check applies to every response in cors mode,
         // not only the final one. A cross-origin redirect response must be
@@ -5083,7 +5372,7 @@ async fn fetch_url_inner(
                 .get("access-control-allow-credentials")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+            if !cors_response_allows(credentials, &current_request_origin, allowed, allow_credentials) {
                 return Ok(serde_json::json!({
                     "status": 0, "body": "", "url": current_url, "headers": {},
                     "corsBlocked": true,
@@ -5198,12 +5487,7 @@ async fn fetch_url_inner(
             resp_headers.insert(name.to_string(), value);
         }
     }
-    if resource_type == ResourceType::Document {
-        initiator.registry.borrow_mut().frame_timers.get_mut(&frame_id).map(|frame| {
-            frame.referrer_policy = Some(resp_headers.get("referrer-policy")
-                .and_then(|value| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
-        });
-    }
+    initiator.record_document_policy(&resp_headers)?;
 
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
@@ -5218,7 +5502,7 @@ async fn fetch_url_inner(
             .get("access-control-allow-credentials")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+        if !cors_response_allows(credentials, &current_request_origin, allowed, allow_credentials) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -5248,6 +5532,7 @@ async fn fetch_url_inner(
     };
 
     initiator.ensure_live()?;
+    if resource_type == ResourceType::Script { initiator.record_worker_entry(&url, current_url.as_str(), resp_headers.get("content-security-policy").map(String::as_str)); }
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
         "requestId": request_id,
@@ -5260,11 +5545,15 @@ async fn fetch_url_inner(
     let body_state = Rc::downgrade(&page);
     let world_cancel = initiator.world_cancel.clone();
     let load_cancel = initiator.load_cancel.clone();
+    let worker_cancel = initiator.worker_cancel.clone();
+    let body_owner = Rc::downgrade(&initiator.owner);
+    let body_generation = initiator.generation;
     let body = Box::pin(async move {
         async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes = obscura_net::on_network_io(read_body_capped(response, fetch_max_body_bytes())).await
+            .map_err(JsErrorBox::generic)??;
         initiator.ensure_live()?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
@@ -5272,16 +5561,14 @@ async fn fetch_url_inner(
                     current_url.as_str(), status, resp_headers.clone(),
                     resp_bytes.to_vec(), redirected_from,
                 );
-                let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method.as_str().to_string(),
-                    headers: resp_headers.clone(), resource_type,
-                };
-                cbs.fire_response(&info, &resp).await;
+                let info = &actual_request_info;
+                cbs.fire_response(info, &resp).await;
             }
         }
         if let Some(state) = body_state.upgrade() {
             record_network_response(&state, JsNetworkEvent {
                 request_id, frame_id, frame_generation, intercepted: was_intercepted,
+                request_headers: actual_request_info.headers.clone(), request_body: actual_request_info.body.clone(), request_started: false,
                 error_text: None,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 resource_type: resource_type_name.to_string(),
@@ -5296,7 +5583,7 @@ async fn fetch_url_inner(
         }.or_cancel(load_cancel).await
             .map_err(|_| deno_error::JsErrorBox::generic("Fetch was stopped"))?
     });
-    fetch_body_result(&state, metadata, body, internal_load, cancel, world_cancel).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel, world_cancel, worker_cancel, body_owner, body_generation).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -5342,10 +5629,19 @@ async fn stealth_fetch_all(
     allow_private_network: bool,
     internal_load: bool,
     cancel: Option<Rc<CancelHandle>>,
-    network_guard: FetchNetworkGuard,
+    mut network_guard: FetchNetworkGuard,
     resource_type: ResourceType,
     mut referrer_source: Option<url::Url>, mut referrer_policy: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let frame_id = initiator.frame_id;
+    let frame_generation = initiator.generation;
+    let parent_frame_id = initiator.registry.borrow().frame_parent(frame_id);
+    let profile = script_request_profile(resource_type, &page_origin, &mode, frame_id, parent_frame_id, frame_generation);
+    let request_id = network_guard.event.as_ref().unwrap().request_id.clone();
+    let page_id = page.borrow().intercept_page_id.clone();
+    let platform = stealth.platform.read().await.clone();
+    let mut actual_request_info: RequestInfo;
+    let mut current_request_origin: String;
     let mut current_url = url.clone();
     let mut current_method = method;
     let mut current_body = body;
@@ -5360,6 +5656,20 @@ async fn stealth_fetch_all(
     let cookie_initiator = url::Url::parse(&page_origin).ok();
 
     let response = loop {
+        if redirects_followed > 0 {
+            let mut target = url::Url::parse(&current_url).map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+            let mut body = Some(std::mem::take(&mut current_body));
+            let fulfilled = resolve_script_redirect(&page, &request_id, &mut target, &mut current_method,
+                &mut current_headers, &mut body, &profile).await?;
+            initiator.ensure_live()?;
+            validate_fetch_request_url(&target, allow_private_network, &mode, &page_origin).map_err(deno_error::JsErrorBox::type_error)?;
+            if let Some(response) = fulfilled { return Ok(finish_script_fulfill(&page, &mut network_guard, response,
+                &current_method, &page_origin, &mode, credentials, internal_load)); }
+            if request_origin(&current_url) != Some(target.origin().ascii_serialization()) {
+                sanitize_redirect_headers(&mut current_headers, true, false);
+            }
+            current_url = target.to_string(); current_body = body.unwrap_or_default();
+        }
         let parsed_current = match url::Url::parse(&current_url) {
             Ok(u) => u,
             Err(_) => {
@@ -5373,9 +5683,10 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
+        current_request_origin = obscura_net::client::request_origin_with_redirects(&profile, &parsed_current, &redirected_from);
         crossed_origin |= current_is_cross_origin;
         if sends_origin_header(&current_method, current_is_cross_origin) {
-            req_headers.insert("origin".to_string(), page_origin.clone());
+            req_headers.insert("origin".to_string(), current_request_origin.clone());
         }
         for (k, v) in &current_headers {
             if !credentials.allows(&page_origin, &current_url) && k == "cookie" { continue; }
@@ -5396,13 +5707,26 @@ async fn stealth_fetch_all(
                 SameSiteContext::CrossSite
             }
         });
+        if let Some(context) = cookie_context {
+            let cookie = stealth.cookie_jar.get_cookie_header_in_context(&parsed_current, context);
+            if !cookie.is_empty() { req_headers.insert("cookie".into(), cookie); }
+        }
+        let ua = req_headers.get("user-agent").cloned().unwrap_or_else(|| String::new());
+        obscura_net::client::apply_request_metadata(&mut req_headers, &profile, &parsed_current, &redirected_from, &ua, &platform);
+        actual_request_info = script_request_info(&profile, &request_id, &page_id, parsed_current.clone(),
+            current_method.clone(), req_headers.clone(), &current_body);
+        if let Some(callbacks) = &callbacks { callbacks.fire_request(&actual_request_info).await; }
+        if let Some(event) = network_guard.event.as_mut() {
+            event.url = actual_request_info.url.to_string(); event.method = actual_request_info.method.clone();
+            event.request_headers = actual_request_info.headers.clone(); event.request_body = actual_request_info.body.clone();
+        }
         let r = stealth
             .send_single_headers_with_context(
                 &current_method,
                 &parsed_current,
                 &req_headers,
                 &current_body,
-                cookie_context,
+                None,
                 credentials_allowed,
                 fetch_max_body_bytes().min(64 * 1024 * 1024),
             )
@@ -5411,6 +5735,11 @@ async fn stealth_fetch_all(
 
         if !(300..400).contains(&r.status) {
             break r;
+        }
+        if let Some(callbacks) = &callbacks {
+            let response = obscura_net::Response { url: actual_request_info.url.clone(), status: r.status,
+                headers: r.headers.clone(), body: Vec::new(), redirected_from: redirected_from.clone() };
+            callbacks.fire_response(&actual_request_info, &response).await;
         }
         // Cross-origin redirect responses must pass the CORS check too, before
         // the redirect is followed (#973).
@@ -5425,7 +5754,7 @@ async fn stealth_fetch_all(
                 .get("access-control-allow-credentials")
                 .map(String::as_str)
                 .unwrap_or("");
-            if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+            if !cors_response_allows(credentials, &current_request_origin, allowed, allow_credentials) {
                 return Ok(serde_json::json!({
                     "status": 0, "body": "", "url": current_url, "headers": {},
                     "corsBlocked": true,
@@ -5495,12 +5824,7 @@ async fn stealth_fetch_all(
 
     let status = response.status;
     let resp_headers = response.headers;
-    if resource_type == ResourceType::Document {
-        initiator.registry.borrow_mut().frame_timers.get_mut(&initiator.frame_id).map(|frame| {
-            frame.referrer_policy = Some(resp_headers.get("referrer-policy")
-                .and_then(|value| obscura_net::client::parse_referrer_policy(value)).unwrap_or("").to_string());
-        });
-    }
+    initiator.record_document_policy(&resp_headers)?;
     let final_is_cross_origin = request_origin(&current_url)
         .map(|request_origin| request_origin != page_origin)
         .unwrap_or(false);
@@ -5513,7 +5837,7 @@ async fn stealth_fetch_all(
             .get("access-control-allow-credentials")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
+        if !cors_response_allows(credentials, &current_request_origin, allowed, allow_credentials) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": url, "headers": {},
                 "corsBlocked": true,
@@ -5543,6 +5867,7 @@ async fn stealth_fetch_all(
     };
 
     initiator.ensure_live()?;
+    if resource_type == ResourceType::Script { initiator.record_worker_entry(&url, current_url.as_str(), resp_headers.get("content-security-policy").map(String::as_str)); }
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
         "requestId": network_guard.event.as_ref().unwrap().request_id,
@@ -5553,6 +5878,9 @@ async fn stealth_fetch_all(
     });
     let body_state = Rc::downgrade(&page);
     let world_cancel = initiator.world_cancel.clone();
+    let worker_cancel = initiator.worker_cancel.clone();
+    let body_owner = Rc::downgrade(&initiator.owner);
+    let body_generation = initiator.generation;
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
         let mut network_guard = network_guard;
@@ -5565,11 +5893,8 @@ async fn stealth_fetch_all(
                     current_url.as_str(), status, resp_headers.clone(),
                     resp_bytes.clone(), redirected_from,
                 );
-                let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method.clone(),
-                    headers: resp_headers.clone(), resource_type,
-                };
-                cbs.fire_response(&info, &resp).await;
+                let info = &actual_request_info;
+                cbs.fire_response(info, &resp).await;
             }
         }
         if let Some(state) = body_state.upgrade() {
@@ -5585,7 +5910,7 @@ async fn stealth_fetch_all(
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
-    fetch_body_result(&state, metadata, body, internal_load, cancel, world_cancel).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel, world_cancel, worker_cancel, body_owner, body_generation).await
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -5629,16 +5954,19 @@ mod tests {
     #[test]
     fn scripted_requests_pause_only_for_matching_fetch_patterns() {
         let url = "https://example.test/value/1";
-        assert!(!super::should_intercept_url(false, &[], url));
-        assert!(super::should_intercept_url(true, &[], url));
-        assert!(super::should_intercept_url(true, &["*".to_string()], url));
-        assert!(super::should_intercept_url(true, &["*/value/*".to_string()], url));
-        assert!(!super::should_intercept_url(true, &["*never-matches*".to_string()], url));
-        assert!(super::should_intercept_url(
-            true,
-            &["*never-matches*".to_string(), "https://example.test/*".to_string()],
-            url
-        ));
+        let patterns = |urls: &[&str]| urls.iter().map(|url| super::InterceptPattern {
+            url_pattern: (*url).into(), resource_type: None,
+        }).collect::<Vec<_>>();
+        assert!(!super::should_intercept_request(false, &[], url, "Fetch"));
+        assert!(super::should_intercept_request(true, &[], url, "Fetch"));
+        assert!(super::should_intercept_request(true, &patterns(&["*"]), url, "Fetch"));
+        assert!(super::should_intercept_request(true, &patterns(&["*/value/*"]), url, "Fetch"));
+        assert!(!super::should_intercept_request(true, &patterns(&["*never-matches*"]), url, "Fetch"));
+        assert!(super::should_intercept_request(true, &patterns(&["*never-matches*", "https://example.test/*"]), url, "Fetch"));
+        let document = [super::InterceptPattern { url_pattern: "*".into(), resource_type: Some("Document".into()) }];
+        assert!(super::should_intercept_request(true, &document, url, "Document"));
+        assert!(!super::should_intercept_request(true, &document, url, "Fetch"));
+        assert!(!super::should_intercept_request(true, &document, url, "XHR"));
     }
 
     #[test]
@@ -5737,7 +6065,6 @@ mod tests {
     use super::url_set_inner;
     use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
     use super::{intercept_fulfill_response, visible_response_headers};
-    use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
 
     // #1008: URL property setters must follow WHATWG — search/hash keep a bare
     // delimiter as an empty component, and port parses the leading digits.
@@ -5874,33 +6201,23 @@ mod tests {
         assert!(parse_cors_header_list(&headers, "access-control-allow-methods").is_none());
     }
 
-    // #912 — a fulfilled binary body (non-UTF-8) must survive as exact bytes via
-    // `bodyBase64`, not be silently corrupted by the lossy `body` text view.
+    // A fulfilled binary response must survive the public bytes boundary.
     #[test]
-    fn intercept_fulfill_carries_binary_body_as_base64() {
+    fn intercept_fulfill_carries_exact_binary_body() {
         let raw = [
             0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00,
         ];
-        let b64 = FULFILL_BASE64.encode(raw);
-        let lossy = String::from_utf8_lossy(&raw).to_string();
         let result = intercept_fulfill_response(
             200,
             std::collections::HashMap::new(),
-            &lossy,
-            &b64,
+            &raw,
             "https://example.test/",
             "https://example.test",
             "cors",
             FetchCredentials::SameOrigin,
             false,
         );
-        let out_b64 = result["bodyBase64"]
-            .as_str()
-            .expect("fulfill result must carry bodyBase64");
-        let decoded = FULFILL_BASE64
-            .decode(out_b64)
-            .expect("bodyBase64 must be valid base64");
-        assert_eq!(decoded, raw, "the exact bytes must survive via bodyBase64");
+        assert_eq!(result["bodyBytes"], serde_json::json!(raw));
     }
 
     #[test]
@@ -5908,8 +6225,7 @@ mod tests {
         let public = intercept_fulfill_response(
             200,
             std::collections::HashMap::new(),
-            "script body",
-            "",
+            b"script body",
             "https://cdn.example/script.js",
             "https://page.example",
             "no-cors",
@@ -5917,14 +6233,13 @@ mod tests {
             false,
         );
         assert_eq!(public["status"], 0);
-        assert_eq!(public["body"], "");
+        assert_eq!(public["bodyBytes"], serde_json::json!([]));
         assert_eq!(public["opaque"], true);
 
         let internal = intercept_fulfill_response(
             200,
             std::collections::HashMap::new(),
-            "script body",
-            "",
+            b"script body",
             "https://cdn.example/script.js",
             "https://page.example",
             "no-cors",
@@ -5932,7 +6247,7 @@ mod tests {
             true,
         );
         assert_eq!(internal["status"], 200);
-        assert_eq!(internal["body"], "script body");
+        assert_eq!(internal["bodyBytes"], serde_json::json!(b"script body"));
         assert_eq!(internal["opaque"], false);
     }
 
@@ -6354,7 +6669,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn shared_posted_task_queue_preserves_priority_fifo_and_microtasks() {
+    async fn posted_task_sources_preserve_priority_fifo_and_microtasks() {
         let mut runtime = ObscuraJsRuntime::new();
         runtime.set_dom(parse_html("<html><body></body></html>"));
         runtime.set_url("http://example.com/posted-task-order");
@@ -6391,20 +6706,22 @@ mod tests {
 
         runtime.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
-            runtime.evaluate("__sharedPostedOrder").unwrap(),
-            serde_json::json!([
-                "sync",
-                "initial-microtask",
-                "blocking",
-                "blocking-microtask",
-                "message-1",
-                "message-1-microtask",
-                "visible",
-                "visible-microtask",
-                "message-2",
-                "message-2-microtask",
-                "background",
-            ]),
+            runtime.evaluate(r#"(() => {
+                const order = __sharedPostedOrder;
+                return {
+                    initial: order.slice(0, 2),
+                    scheduler: order.filter(value => /^(blocking|visible|background)/.test(value)),
+                    messages: order.filter(value => value.startsWith('message-')),
+                    checkpoints: ['blocking', 'visible', 'message-1', 'message-2'].every(value =>
+                        order.indexOf(value + '-microtask') === order.indexOf(value) + 1),
+                };
+            })()"#).unwrap(),
+            serde_json::json!({
+                "initial": ["sync", "initial-microtask"],
+                "scheduler": ["blocking", "blocking-microtask", "visible", "visible-microtask", "background"],
+                "messages": ["message-1", "message-1-microtask", "message-2", "message-2-microtask"],
+                "checkpoints": true,
+            }),
         );
     }
 
@@ -6811,82 +7128,12 @@ fn validate_fetch_request_url(
     Ok(())
 }
 
-async fn fetch_data_url(
-    state: &RefCell<OpState>, mut url: url::Url, internal_load: bool, cancel: Option<Rc<CancelHandle>>,
-    world_cancel: Rc<CancelHandle>,
-) -> Result<String, deno_error::JsErrorBox> {
-    // Fetch response URLs exclude fragments, and fragments are never body data.
-    url.set_fragment(None);
-    let data = data_url::DataUrl::process(url.as_str())
-        .map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid data URL: {error}")))?;
-    let limit = fetch_max_body_bytes();
-    let mut bytes = Vec::with_capacity(url.as_str().len().min(limit));
-    data.decode(|chunk| {
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
-            return Err("Data URL exceeds fetch response body byte limit");
-        }
-        bytes.extend_from_slice(chunk);
-        Ok(())
-    }).map_err(|error| deno_error::JsErrorBox::type_error(format!("Invalid data URL: {error}")))?;
-    let metadata = serde_json::json!({
-        "status": 200, "statusText": "OK", "url": url.as_str(), "redirected": false,
-        "opaque": false, "headers": { "content-type": data.mime_type().to_string() },
-    });
-    fetch_body_result(state, metadata, Box::pin(async move { Ok(bytes) }), internal_load, cancel, world_cancel).await
-}
 
 fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
-    let scheme = url.scheme();
-    // file:// is denied by default here, matching Page.navigate /
-    // Target.createTarget (which gate it behind --allow-file-access). The
-    // transports cannot fetch file:// anyway, so a page never reaches the
-    // filesystem through fetch()/XHR.
-    if scheme != "http" && scheme != "https" {
-        return Err(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
-            scheme
-        ));
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("Forbidden URL scheme '{}' - only http and https are allowed", url.scheme()));
     }
-
-    if allow_private_network || obscura_net::env_allows_private_network() {
-        return Ok(());
-    }
-
-    if let Some(host) = url.host() {
-        match host {
-            url::Host::Ipv4(ip) => {
-                if obscura_net::is_forbidden_ip(std::net::IpAddr::V4(ip)) {
-                    return Err(format!(
-                        "Access to private/internal IP address {} is not allowed",
-                        ip
-                    ));
-                }
-            }
-            url::Host::Ipv6(ip) => {
-                if obscura_net::is_forbidden_ip(std::net::IpAddr::V6(ip)) {
-                    return Err(format!(
-                        "Access to private/internal IPv6 address {} is not allowed",
-                        ip
-                    ));
-                }
-            }
-            url::Host::Domain(domain) => {
-                let lower_domain = domain.to_lowercase();
-                if lower_domain == "localhost"
-                    || lower_domain.ends_with(".localhost")
-                    || lower_domain == "127.0.0.1"
-                    || lower_domain == "::1"
-                {
-                    return Err(format!(
-                        "Access to localhost domain '{}' is not allowed",
-                        domain
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    obscura_net::client::validate_url(url, allow_private_network).map_err(|error| error.to_string())
 }
 
 #[op2]
@@ -7072,13 +7319,43 @@ fn op_navigate(
 /// clears it back to the committed document URL. The write is bound to the
 /// receiver's native realm, not the op wrapper's realm, so a child document's
 /// location setter updates its own reflected URL.
+pub(crate) fn decode_fragment(fragment: &str) -> String {
+    let bytes = fragment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = ((bytes[index + 1] as char).to_digit(16), (bytes[index + 2] as char).to_digit(16)) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 #[op2(fast)]
 fn op_set_reflected_url(scope: &mut v8::PinScope, state: &OpState,
     receiver: v8::Local<v8::Object>, #[string] url: &str) -> bool {
     let Some(context) = receiver.get_creation_context(scope) else { return false };
     if !receiver.strict_equals(context.global(scope).into()) { return false; }
     let Some(slot) = context.get_slot::<DocumentStateSlot>() else { return false };
-    slot.0.borrow_mut().reflected_url = (!url.is_empty()).then(|| url.to_string());
+    let mut document = slot.0.borrow_mut();
+    document.reflected_url = (!url.is_empty()).then(|| url.to_string());
+    let current = document.reflected_url.as_deref().unwrap_or(&document.url);
+    let fragment = url::Url::parse(current).ok().and_then(|url| url.fragment().map(str::to_owned)).unwrap_or_default();
+    if document.dom.as_ref().is_some_and(|dom| dom.set_target_fragment(&decode_fragment(&fragment))) {
+        document.activity_generation = document.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            document.prepared_render = None;
+            document.pending_style_mutations.clear();
+            document.resolved_scroll = None;
+        }
+    }
     state.waker.wake();
     true
 }
@@ -7451,6 +7728,51 @@ fn allocate_frame_id() -> Option<u32> {
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
 const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
+/// Execute a javascript navigation in its target's live native realm. No
+/// caller-provided frame id, source principal or DOM wrapper grants authority.
+#[op2(reentrant)]
+#[string]
+fn op_frame_javascript_navigation(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    owner_node: u32,
+    frame_id: u32,
+    #[string] url: &str,
+    receiver: v8::Local<v8::Object>,
+) -> Result<Option<String>, JsErrorBox> {
+    let (_, _, parent) = crate::window::storage_window(scope, state, receiver)?;
+    let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
+    let (context, child) = {
+        let registry = registry.borrow();
+        if !registry.frame_owner_matches(frame_id, &parent, NodeId::new(owner_node)) {
+            return Err(JsErrorBox::type_error("Invalid JavaScript navigation owner"));
+        }
+        (registry.context(frame_id).ok_or_else(|| JsErrorBox::type_error("Target frame is unavailable"))?,
+         registry.by_frame_id(frame_id).ok_or_else(|| JsErrorBox::type_error("Target document is unavailable"))?)
+    };
+    {
+        let parent = parent.borrow();
+        let child = child.borrow();
+        if !parent.document_active.get() || !child.document_active.get() || !child.scripting_enabled
+            || !parent.scripting_enabled || child.sandbox_opaque_origin
+            || crate::window::origin(&parent) != crate::window::origin(&child)
+            || (crate::window::origin(&child) == "null"
+                && !matches!((&parent.opaque_origin, &child.opaque_origin), (Some(a), Some(b)) if Rc::ptr_eq(a,b))) {
+            return Err(JsErrorBox::new("DOMExceptionSecurityError", "JavaScript navigation is not permitted"));
+        }
+    }
+    let source = url.get(..11).filter(|prefix| prefix.eq_ignore_ascii_case("javascript:"))
+        .and_then(|_| url.get(11..)).ok_or_else(|| JsErrorBox::type_error("Invalid JavaScript URL"))?;
+    let source = percent_encoding::percent_decode_str(source).decode_utf8_lossy();
+    let context = v8::Local::new(scope, &context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(let scope, scope);
+    let source = v8::String::new(scope, &source).ok_or_else(|| JsErrorBox::range_error("JavaScript URL is too large"))?;
+    let result = v8::Script::compile(scope, source, None).and_then(|script| script.run(scope))
+        .ok_or_else(|| JsErrorBox::generic("JavaScript navigation failed"))?;
+    Ok(result.is_string().then(|| result.to_rust_string_lossy(scope)))
+}
+
 /// Reserve a document load without replacing its browsing-context identity.
 #[op2(nofast)]
 fn op_frame_document_begin(
@@ -7487,7 +7809,9 @@ fn op_frame_document_begin(
         if let Some(cancel) = frame.document_load_cancel.take() { cancel.cancel(); }
         frame.document_load_cancel = Some(CancelHandle::new_rc());
         frame.document_url = Some(url.to_string());
+        frame.geolocation_policy = None;
         frame.document_load_started = matches!(url, "about:blank" | "about:srcdoc");
+        frame.content_security_policy.clear();
         drop(registry);
         // Supersede a document queued before its host turn, including an
         // initial blank document materialized synchronously by contentWindow.
@@ -7556,7 +7880,7 @@ pub(crate) const FRAME_OBJECTS_SLOT: i32 = DOCUMENT_OWNER_SLOT + 1;
 pub(crate) const FRAME_MESSAGE_SLOT: i32 = FRAME_OBJECTS_SLOT + 1;
 // The realm's private `postMessage` dispatch, invoked by the native window
 // entry after it fixes the source principal natively.
-const POST_MESSAGE_DISPATCH_SLOT: i32 = crate::window::WINDOW_MESSAGE_SLOT + 1;
+const POST_MESSAGE_DISPATCH_SLOT: i32 = crate::window::WORLD_DOCUMENT_SLOT + 1;
 
 pub(crate) fn initialize_document_realm_slots(
     context: v8::Local<v8::Context>,
@@ -7935,14 +8259,9 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
-// WebCrypto (crypto.subtle) secret-key primitives.
-//
-// These ops are stateless. The JS shim in bootstrap.js owns the CryptoKey
-// objects and their raw key bytes; it hands the bytes plus normalized algorithm
-// parameters to these ops for each operation. Only secret-key algorithms live
-// here (HMAC, AES-GCM/CBC/CTR/KW, PBKDF2, HKDF); public-key algorithms are rejected
-// in the shim. A fallible op returns a JsErrorBox that the shim turns into the
-// appropriate DOMException (OperationError for a bad tag or padding, etc.).
+// WebCrypto secret-key primitives. Public-key operations and immutable native
+// handles live in webcrypto.rs; the existing symmetric byte-oriented consumers
+// remain here. Fallible ops are translated to DOMExceptions by the JS boundary.
 // ---------------------------------------------------------------------------
 
 fn crypto_err(msg: impl std::fmt::Display) -> deno_error::JsErrorBox {
@@ -8609,22 +8928,6 @@ fn op_encoding_for_label(#[string] label: &str) -> String {
     obscura_net::label_name(label).unwrap_or_default()
 }
 
-/// Decode bytes with a legacy/explicit encoding via encoding_rs. Returns
-/// {"ok":true,"v":<string>} or {"ok":false} (unknown label, or a fatal decode
-/// error). The UTF-8 non-fatal common case is handled in JS without this op.
-#[op2]
-#[string]
-fn op_text_decode(
-    #[string] label: &str,
-    #[buffer] bytes: &[u8],
-    fatal: bool,
-    ignore_bom: bool,
-) -> String {
-    match obscura_net::decode_with_label(label, bytes, fatal, ignore_bom) {
-        Some(s) => serde_json::json!({ "ok": true, "v": s }).to_string(),
-        None => "{\"ok\":false}".to_string(),
-    }
-}
 
 /// Re-encode a URL query component using a non-UTF-8 document encoding override
 /// (the WHATWG "encoding override"). `query` is the already-UTF-8-decoded query
@@ -8638,7 +8941,24 @@ fn op_url_encode_query(#[string] query: &str, #[string] label: &str, special: bo
     obscura_net::url_encode_query(query, label, special).unwrap_or_else(|| query.to_string())
 }
 
-#[cfg(feature = "render")]
+/// Resolve CSS design metrics without layout, paint, or a separate font scan.
+/// FontFace loading owns resource I/O; this synchronous geometry consumer sees
+/// only native faces already admitted to the document font cache.
+pub(crate) fn document_font_metrics(owner: &ObscuraState, family: Option<&str>, weight: u16, italic: bool)
+    -> obscura_render::fonts::FontMetrics {
+    #[cfg(feature = "render")]
+    if owner.pending_style_mutations.is_empty() {
+        if let Some(prepared) = &owner.prepared_render {
+            return prepared.layout().text_engine.selected_font_metrics_for(family, weight, italic);
+        }
+    }
+    let base = document_base_url(owner);
+    let fonts = owner.dom.as_ref().map(|tree| obscura_render::loaded_web_fonts(
+        tree, base.as_deref(), &owner.render_resources, &owner.dynamic_fonts, owner.viewport,
+        obscura_render::CssMediaType::Screen)).unwrap_or_default();
+    obscura_render::fonts::selected_font_metrics(family, weight, italic, &fonts)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DynamicFontFaceInput {
@@ -8652,7 +8972,6 @@ struct DynamicFontFaceInput {
 /// Replace the native snapshot of `document.fonts`. The JS implementation
 /// remains the source of truth for set semantics; this narrow bridge only
 /// supplies resource descriptors to the render preparation path.
-#[cfg(feature = "render")]
 #[op2(fast)]
 fn op_set_dynamic_fonts(
     scope: &mut v8::PinScope,
@@ -8697,12 +9016,12 @@ fn op_set_dynamic_fonts(
     let mut state = shared.borrow_mut();
     if state.dynamic_fonts != fonts {
         state.dynamic_fonts = fonts;
+        #[cfg(feature = "render")]
         invalidate_render_resource_geometry(&mut state);
     }
     Ok(true)
 }
 
-#[cfg(feature = "render")]
 fn font_document(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -8729,19 +9048,20 @@ fn font_document(
     let load_cancel = owner.borrow().resource_load_cancel.clone();
     let initiator = FetchInitiator {
         frame_id, generation, owner, registry, world_cancel, load_cancel,
+        document_load_cancel: None,
+        worker_cancel: None,
+        local_blob: None,
     };
     initiator.ensure_live()?;
     Ok((page, initiator))
 }
 
-#[cfg(feature = "render")]
 fn font_error(name: &str, message: impl AsRef<str>) -> String {
     serde_json::json!({ "ok": false, "name": name, "message": message.as_ref() }).to_string()
 }
 
 /// BufferSource constructors perform real decoding synchronously, retaining
 /// bytes natively rather than making a base64 copy in the JavaScript realm.
-#[cfg(feature = "render")]
 #[op2]
 #[string]
 fn op_decode_font_face(
@@ -8771,7 +9091,6 @@ fn op_decode_font_face(
 /// FontFace.load owns the creating document, including unattached faces.
 /// Authenticate the lexical global and capture its registered per-world
 /// cancellation handle before building the future; no V8 handle crosses await.
-#[cfg(feature = "render")]
 #[op2(required(2))]
 #[string]
 fn op_load_font_face(
@@ -8795,6 +9114,9 @@ fn op_load_font_face(
         let root = page.clone();
         let page = page.borrow();
         let mut request = ResourceRequest::subresource(ResourceType::Font, &document_url);
+        request.frame_id = initiator.frame_id;
+        request.parent_frame_id = initiator.registry.borrow().frame_parent(initiator.frame_id);
+        request.frame_generation = initiator.generation;
         request.max_response_bytes = 8 * 1024 * 1024;
         #[cfg(feature = "stealth")]
         let clients = (page.http_client.clone(), page.stealth_client.clone());
@@ -8838,6 +9160,10 @@ fn op_load_font_face(
             } else if url.starts_with("data:") {
                 obscura_render::font_data_url_bytes(&url).map(Arc::<[u8]>::from)
             } else {
+                // FontFace owns this document's load. Keep layout discovery
+                // from starting it again; successful seeding clears the stop,
+                // while this face's failure remains terminal for the renderer.
+                initiator.owner.borrow_mut().render_resources.stop_resource(&url, None);
                 in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _in_flight = PageInFlightGuard(in_flight.clone());
                 let permit = limiter.clone().acquire_owned();
@@ -8904,6 +9230,7 @@ fn op_load_font_face(
             let mut owner = initiator.owner.borrow_mut();
             if !retained {
                 owner.render_resources.seed_shared(url.clone(), bytes);
+        #[cfg(feature = "render")]
                 invalidate_render_resource_geometry(&mut owner);
             }
             owner.render_resources.cache_decoded_font(&url, decoded);
@@ -8913,18 +9240,33 @@ fn op_load_font_face(
     }
 }
 
+#[cfg(feature = "render")]
+fn canvas_document(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>) -> Result<SharedState, deno_error::JsErrorBox> {
+    let context=receiver.get_creation_context(scope).ok_or_else(||
+        deno_error::JsErrorBox::new("DOMExceptionSecurityError","Canvas document is retired"))?;
+    if !receiver.strict_equals(context.global(scope).into()) {
+        return Err(deno_error::JsErrorBox::new("DOMExceptionSecurityError","Invalid Canvas document binding"));
+    }
+    let context=v8::Global::new(scope,context);
+    let (_,_,owner)=crate::window::context_document(state,&context)?;
+    Ok(owner)
+}
+
 /// Retain the JavaScript-owned Canvas2D pixel buffer without copying it. A
 /// canvas resize supplies a new fixed backing store and atomically replaces
 /// the previous surface for the same DOM node.
 #[cfg(feature = "render")]
 #[op2]
 fn op_canvas_register_surface(
+    scope: &mut v8::PinScope,
     state: &OpState,
+    receiver: v8::Local<v8::Object>,
     nid: u32,
     width: u32,
     height: u32,
     #[buffer] pixels: JsBuffer,
-) -> bool {
+) -> Result<bool, deno_error::JsErrorBox> {
     const MAX_CANVAS_DIMENSION: u32 = 32_767;
     const MAX_CANVAS_PIXELS: usize = 67_108_864;
     const MAX_CANVAS_SURFACE_BYTES: usize = 256 * 1024 * 1024;
@@ -8932,29 +9274,27 @@ fn op_canvas_register_surface(
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
     else {
-        return false;
+        return Ok(false);
     };
     if width > MAX_CANVAS_DIMENSION
         || height > MAX_CANVAS_DIMENSION
         || expected / 4 > MAX_CANVAS_PIXELS
         || pixels.len() != expected
     {
-        return false;
+        return Ok(false);
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = canvas_document(scope,state,receiver)?;
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     let is_canvas = state
         .dom
         .as_ref()
-        .and_then(|dom| dom.get_node(node))
-        .is_some_and(|node| {
-            node.as_element()
-                .is_some_and(|name| &*name.local == "canvas")
-        });
+        .is_some_and(|dom| dom.with_node(node, |node| node.as_element()
+            .is_some_and(|name| &*name.local == "canvas" && &*name.ns == "http://www.w3.org/1999/xhtml"))
+            .unwrap_or(false));
     if !is_canvas {
-        return false;
+        return Ok(false);
     }
     let replacing = state
         .canvas_surfaces
@@ -8969,7 +9309,7 @@ fn op_canvas_register_surface(
         .and_then(|total| total.checked_sub(replacing.unwrap_or(0)))
         .and_then(|total| total.checked_add(expected));
     if retained_bytes.is_none_or(|bytes| bytes > MAX_CANVAS_SURFACE_BYTES) {
-        return false;
+        return Ok(false);
     }
     state.canvas_surfaces.insert(
         node,
@@ -8979,7 +9319,7 @@ fn op_canvas_register_surface(
             pixels,
         },
     );
-    true
+    Ok(true)
 }
 
 /// Report one coalesced Canvas2D paint at the JavaScript task boundary. Pixel
@@ -8987,12 +9327,13 @@ fn op_canvas_register_surface(
 /// screencast/readiness without throwing away otherwise-valid layout.
 #[cfg(feature = "render")]
 #[op2(fast)]
-fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_canvas_paint_damage(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, nid: u32) -> Result<bool, deno_error::JsErrorBox> {
+    let shared = canvas_document(scope,state,receiver)?;
     let mut state = shared.borrow_mut();
     let node = NodeId::new(nid);
     if !state.canvas_surfaces.contains_key(&node) {
-        return false;
+        return Ok(false);
     }
     let connected = state
         .dom
@@ -9001,7 +9342,7 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     if connected {
         state.activity_generation = state.activity_generation.wrapping_add(1);
     }
-    connected
+    Ok(connected)
 }
 
 pub fn build_extension() -> Extension {
@@ -9022,6 +9363,7 @@ pub fn build_extension() -> Extension {
         op_console_msg(),
         op_report_browser_exception(),
         op_fetch_url(),
+        op_fetch_url_sync(),
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),
@@ -9035,6 +9377,7 @@ pub fn build_extension() -> Extension {
         op_session_history(),
         op_history_traverse(),
         op_frame_document_begin(),
+        op_frame_javascript_navigation(),
         op_frame_document_ready(),
         op_initial_frame(),
         op_document_realm_member(),
@@ -9066,21 +9409,28 @@ pub fn build_extension() -> Extension {
         op_document_domain_candidate(),
         op_add_import_map(),
         op_encoding_for_label(),
-        op_text_decode(),
         op_url_encode_query(),
+        op_set_dynamic_fonts(),
+        op_decode_font_face(),
+        op_load_font_face(),
         op_begin_render_task(),
         op_set_hovered(),
     ];
+    ops.extend(crate::geolocation::ops());
+    ops.extend(crate::rtc::ops());
     ops.extend(crate::window::ops());
     ops.extend(crate::storage::ops());
+    ops.extend(crate::webcrypto::ops());
+    ops.extend(crate::websocket::ops());
+    ops.extend(crate::svg_geometry::ops());
+    ops.extend(crate::text_decoder::ops());
+    ops.extend(crate::worker::ops());
+    ops.extend(crate::local_resource::ops());
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]
     let ops = {
         let mut ops = ops;
-        ops.push(op_set_dynamic_fonts());
-        ops.push(op_decode_font_face());
-        ops.push(op_load_font_face());
         ops.push(op_canvas_register_surface());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
@@ -9095,6 +9445,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
         ops.push(op_css_supports());
+        ops.push(op_css_register_property());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
         ops.push(op_element_scroll_to());
@@ -9807,9 +10158,12 @@ fn finish_async_image_metadata(
 #[op2]
 #[string]
 async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
-    let shared = {
+    let (shared, parent_frame_id) = {
         let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        let shared = state.borrow::<SharedState>().clone();
+        let frame_id = shared.borrow().frame_id;
+        let parent_frame_id = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().frame_parent(frame_id);
+        (shared, parent_frame_id)
     };
     let node_id = NodeId::new(nid);
     let (
@@ -9845,6 +10199,9 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             .or_else(|_| url::Url::parse(&selected_url))
             .unwrap_or_else(|_| url::Url::parse("about:blank").unwrap());
         let mut request = ResourceRequest::subresource(ResourceType::Image, &initiator);
+        request.frame_id = gs.frame_id;
+        request.parent_frame_id = parent_frame_id;
+        request.frame_generation = gs.document_generation;
         match profile {
             ImageRequestProfile::CorsInclude => {
                 request.mode = RequestMode::Cors;
@@ -10465,6 +10822,24 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
 #[op2(fast)]
 fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
     obscura_render::style::supports_declaration(name, value)
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_css_register_property(
+    scope: &mut v8::PinScope, state: &OpState,
+    #[string] name: &str, #[string] syntax: &str, inherits: bool, #[string] initial: &str, has_initial: bool,
+) -> Result<(), deno_error::JsErrorBox> {
+    let shared = realm_state(scope, state);
+    let mut state = shared.borrow_mut();
+    let dom = state.dom.as_ref().ok_or_else(|| deno_error::JsErrorBox::generic("No document"))?;
+    obscura_render::css::register_custom_property(dom, name, syntax, inherits, has_initial.then_some(initial))
+        .map_err(|name| deno_error::JsErrorBox::new(name, "Invalid custom property registration"))?;
+    state.prepared_render = None;
+    state.pending_style_mutations.clear();
+    state.resolved_scroll = None;
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    Ok(())
 }
 
 /// Root scrolling overflow in CSS pixels. The JS CSSOM probes this op only in

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,6 @@ use std::net::{IpAddr, SocketAddr};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
-use reqwest::tls::Certificate;
 use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
@@ -16,7 +15,7 @@ use url::Url;
 use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
-fn configured_root_paths() -> Vec<std::path::PathBuf> {
+pub(crate) fn configured_root_paths() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
         paths.push(path.into());
@@ -35,31 +34,6 @@ fn configured_root_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-fn configured_root_certificates() -> &'static [Certificate] {
-    static ROOTS: LazyLock<Vec<Certificate>> = LazyLock::new(|| {
-        let mut certificates = Vec::new();
-        for path in configured_root_paths() {
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "failed to read CA certificate file");
-                    continue;
-                }
-            };
-            match Certificate::from_pem_bundle(&bytes) {
-                Ok(mut bundle) if !bundle.is_empty() => certificates.append(&mut bundle),
-                _ => match Certificate::from_der(&bytes) {
-                    Ok(certificate) => certificates.push(certificate),
-                    Err(error) => {
-                        tracing::warn!(%error, path = %path.display(), "failed to parse CA certificate file");
-                    }
-                },
-            }
-        }
-        certificates
-    });
-    ROOTS.as_slice()
-}
 
 /// Whether SSL_CERT_FILE / SSL_CERT_DIR request a custom TLS trust store. A
 /// variable that is set but empty (e.g. `SSL_CERT_FILE=""`, a common shell
@@ -151,6 +125,21 @@ pub struct RequestInfo {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub resource_type: ResourceType,
+    pub request_id: String,
+    pub page_id: String,
+    pub frame_id: u32,
+    pub parent_frame_id: Option<u32>,
+    pub frame_generation: u64,
+    pub body: Option<Vec<u8>>,
+}
+
+impl RequestInfo {
+    pub fn new(url: Url, method: String, headers: HashMap<String, String>, resource_type: ResourceType) -> Self {
+        static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self { url, method, headers, resource_type,
+            request_id: format!("native-{}", NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)),
+            page_id: String::new(), frame_id: 0, parent_frame_id: None, frame_generation: 0, body: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -212,6 +201,9 @@ pub struct ResourceRequest {
     /// Hard limit for the decoded response body retained by this request.
     /// Callers can lower it for especially constrained resource consumers.
     pub max_response_bytes: usize,
+    pub frame_id: u32,
+    pub parent_frame_id: Option<u32>,
+    pub frame_generation: u64,
 }
 
 impl ResourceRequest {
@@ -224,6 +216,7 @@ impl ResourceRequest {
             mode: RequestMode::Navigate,
             credentials: RequestCredentials::Include,
             max_response_bytes: 64 * 1024 * 1024,
+            frame_id: 0, parent_frame_id: None, frame_generation: 0,
         }
     }
 
@@ -261,6 +254,7 @@ impl ResourceRequest {
                 | ResourceType::Xhr
                 | ResourceType::Fetch => 64 * 1024 * 1024,
             },
+            frame_id: 0, parent_frame_id: None, frame_generation: 0,
         }
     }
 
@@ -283,6 +277,7 @@ impl ResourceRequest {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32 * 1024 * 1024),
+            frame_id: 0, parent_frame_id: None, frame_generation: 0,
         }
     }
 
@@ -302,7 +297,7 @@ impl ResourceRequest {
         }
     }
 
-    pub(crate) fn accept(&self) -> &'static str {
+    pub fn accept(&self) -> &'static str {
         match self.resource_type {
             ResourceType::Document => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             ResourceType::Stylesheet => "text/css,*/*;q=0.1",
@@ -390,6 +385,18 @@ pub(crate) fn redirect_taints_origin(
             .is_none_or(|initiator| initiator.origin() != current.origin())
 }
 
+pub fn request_origin_with_redirects(request: &ResourceRequest, target: &Url, redirects: &[Url]) -> String {
+    let mut tainted = false;
+    if let Some(first) = redirects.first() {
+        let mut current = first;
+        for next in redirects.iter().skip(1).chain(std::iter::once(target)) {
+            tainted |= redirect_taints_origin(request, current, next);
+            current = next;
+        }
+    }
+    serialized_request_origin(request, tainted)
+}
+
 pub(crate) fn validate_request_mode(
     request: &ResourceRequest,
     target: &Url,
@@ -447,18 +454,40 @@ pub(crate) fn response_too_large(url: &Url, limit: usize) -> ObscuraNetError {
     }
 }
 
-pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
+pub fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'static str {
     let Some(initiator) = request.initiator.as_ref() else {
         return "none";
     };
     if initiator.origin() == target.origin() {
         "same-origin"
     } else {
-        // A public-suffix-aware `same-site` classification will be added with
-        // the page resource scheduler. Until then, cross-site is the safe
-        // conservative value; it never overstates ambient trust.
-        "cross-site"
+        if same_site(initiator, target) { "same-site" } else { "cross-site" }
     }
+}
+
+pub fn request_fetch_site_with_redirects(request: &ResourceRequest, target: &Url, redirects: &[Url]) -> &'static str {
+    let mut site = request_fetch_site(request, target);
+    for redirect in redirects {
+        match request_fetch_site(request, redirect) {
+            "cross-site" => return "cross-site",
+            "same-site" if site != "cross-site" => site = "same-site",
+            _ => {}
+        }
+    }
+    site
+}
+
+pub fn apply_request_metadata(headers: &mut HashMap<String, String>, request: &ResourceRequest,
+    target: &Url, redirects: &[Url], user_agent: &str, platform: &str) {
+    headers.retain(|name, _| !name.to_ascii_lowercase().starts_with("sec-fetch-")
+        && !matches!(name.to_ascii_lowercase().as_str(), "sec-ch-ua" | "sec-ch-ua-platform" | "sec-ch-ua-mobile"));
+    let (brands, derived_platform) = chrome_client_hints(user_agent);
+    headers.insert("sec-ch-ua".into(), brands);
+    headers.insert("sec-ch-ua-mobile".into(), if user_agent.contains("Mobile") { "?1" } else { "?0" }.into());
+    headers.insert("sec-ch-ua-platform".into(), if platform.is_empty() { derived_platform } else { format!("{:?}", platform) });
+    headers.insert("sec-fetch-site".into(), request_fetch_site_with_redirects(request, target, redirects).into());
+    headers.insert("sec-fetch-mode".into(), request.mode.header_value().into());
+    headers.insert("sec-fetch-dest".into(), request.destination().into());
 }
 
 pub(crate) fn same_site_context(
@@ -628,7 +657,7 @@ impl Default for CallbackRegistry {
     }
 }
 
-pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
+pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip, NetworkRange};
 
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
@@ -643,17 +672,23 @@ pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 /// guard away for a better TLS fingerprint.
 pub struct SsrfGuardResolver {
     pub(crate) allow_private: bool,
+    pub(crate) allow_network: Vec<NetworkRange>,
 }
 
 impl SsrfGuardResolver {
     pub fn new(allow_private: bool) -> Self {
-        Self { allow_private }
+        Self { allow_private, allow_network: obscura_ssrf::env_allowed_networks().expect("Invalid OBSCURA_ALLOW_NETWORK") }
+    }
+
+    pub fn with_networks(allow_private: bool, allow_network: Vec<NetworkRange>) -> Self {
+        Self { allow_private, allow_network }
     }
 }
 
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let allow = self.allow_private || env_allows_private_network();
+        let networks = self.allow_network.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
@@ -661,7 +696,7 @@ impl Resolve for SsrfGuardResolver {
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
                 .collect();
             if !allow {
-                if let Some(bad) = addrs.iter().find(|sa| is_forbidden_ip(sa.ip())) {
+                if let Some(bad) = addrs.iter().find(|sa| !obscura_ssrf::address_allowed(sa.ip(), allow, &networks)) {
                     return Err(format!(
                         "SSRF blocked: '{}' resolves to forbidden address {}",
                         host,
@@ -676,7 +711,24 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+pub(crate) async fn validate_proxy_destination(url: &Url, allow_private: bool, networks: &[NetworkRange]) -> Result<(), ObscuraNetError> {
+    if allow_private || env_allows_private_network() || url.scheme() == "file" { return Ok(()); }
+    let host = url.host_str().ok_or_else(|| ObscuraNetError::Network("URL has no host".into()))?;
+    let addresses = tokio::net::lookup_host((host.trim_matches(['[', ']']), url.port_or_known_default().unwrap_or(443)))
+        .await.map_err(|error| ObscuraNetError::Network(format!("Destination DNS lookup failed: {error}")))?;
+    for address in addresses {
+        if !obscura_ssrf::address_allowed(address.ip(), allow_private, networks) {
+            return Err(ObscuraNetError::Blocked(format!("SSRF blocked proxied destination {address}")));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+    validate_url_with_networks(url, allow_private_network, &obscura_ssrf::env_allowed_networks().map_err(ObscuraNetError::Network)?)
+}
+
+pub(crate) fn validate_url_with_networks(url: &Url, allow_private_network: bool, networks: &[NetworkRange]) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -693,7 +745,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if is_forbidden_ip(IpAddr::V4(ip)) {
+                if !obscura_ssrf::address_allowed(IpAddr::V4(ip), allow_private_network, networks) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -701,7 +753,7 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                 }
             }
             url::Host::Ipv6(ip) => {
-                if is_forbidden_ip(IpAddr::V6(ip)) {
+                if !obscura_ssrf::address_allowed(IpAddr::V6(ip), allow_private_network, networks) {
                     return Err(ObscuraNetError::Network(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip
@@ -713,29 +765,34 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
             // and https schemes the url crate normalizes them to Host::Ipv4,
             // which is checked above. This arm is a belt-and-braces check on
             // names, and the resolver re-checks whatever the name resolves to.
-            url::Host::Domain(domain) => {
-                let lower_domain = domain.to_lowercase();
-                if lower_domain == "localhost"
-                    || lower_domain.ends_with(".localhost")
-                    || lower_domain == "127.0.0.1"
-                    || lower_domain == "::1"
-                {
-                    return Err(ObscuraNetError::Network(format!(
-                        "Access to localhost domain '{}' is not allowed",
-                        domain
-                    )));
-                }
-            }
+            // Domain names, including localhost, are checked against their actual
+            // resolved addresses by the resolver, not granted by their spelling.
+            url::Host::Domain(_) => {}
         }
     }
 
     Ok(())
 }
 
+pub(crate) fn validate_file_request(url: &Url, request: &ResourceRequest, allow_file_access: bool) -> Result<(), ObscuraNetError> {
+    if url.scheme() != "file" { return Ok(()); }
+    if !allow_file_access {
+        return Err(ObscuraNetError::Network("File access is not allowed".into()));
+    }
+    if request.mode != RequestMode::Navigate && request.initiator.as_ref().is_some_and(|source| source.scheme() != "file") {
+        return Err(ObscuraNetError::Network("Network documents cannot access file URLs".into()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn fetch_file_url(
     url: &Url,
     max_response_bytes: usize,
+    allow_file_access: bool,
 ) -> Result<Response, ObscuraNetError> {
+    if !allow_file_access {
+        return Err(ObscuraNetError::Network("File access is not allowed".to_string()));
+    }
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
@@ -876,6 +933,7 @@ pub struct ObscuraHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
     pub accept_language: RwLock<String>,
+    pub platform: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: Arc<RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>>,
     pub timeout: Duration,
@@ -886,6 +944,9 @@ pub struct ObscuraHttpClient {
     /// through in addition to the `OBSCURA_ALLOW_PRIVATE_NETWORK` env var.
     /// Set via `--allow-private-network` on the CLI (issue #33).
     pub allow_private_network: bool,
+    pub allow_network: Vec<NetworkRange>,
+    pub allow_file_access: bool,
+    pub request_interception: std::sync::RwLock<crate::RequestInterception>,
 }
 
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
@@ -1031,7 +1092,7 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
+pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua
         .split("Chrome/")
         .nth(1)
@@ -1067,6 +1128,24 @@ fn chrome_client_hints(ua: &str) -> (String, String) {
     (sec_ch_ua, platform.to_string())
 }
 
+/// Build the bounded auxiliary client used only when no page client exists,
+/// with the same explicit route, address policy and TLS verifier as normal traffic.
+pub fn auxiliary_request_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    let allow_private_network = env_allows_private_network();
+    let allow_network = obscura_ssrf::env_allowed_networks()?;
+    let mut builder = Client::builder().no_proxy()
+        .redirect(Policy::none()).timeout(Duration::from_secs(30))
+        .tls_danger_accept_invalid_certs(false)
+        .dns_resolver(Arc::new(SsrfGuardResolver::with_networks(allow_private_network, allow_network.clone())));
+    if let Some(proxy) = proxy_url {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?);
+    }
+    let builder = crate::aia::configure_reqwest(builder, crate::aia::AiaPolicy {
+        proxy_url: proxy_url.map(str::to_owned), allow_private_network, allow_network,
+    })?;
+    builder.build().map_err(|error| error.to_string())
+}
+
 impl ObscuraHttpClient {
     pub fn new() -> Self {
         Self::with_cookie_jar(Arc::new(CookieJar::new()))
@@ -1100,6 +1179,10 @@ impl ObscuraHttpClient {
             block_trackers: false,
             resource_loader: Arc::new(std::sync::Mutex::new(ResourceLoaderState::default())),
             allow_private_network,
+            allow_network: obscura_ssrf::env_allowed_networks().expect("Invalid OBSCURA_ALLOW_NETWORK"),
+            allow_file_access: false,
+            platform: RwLock::new(String::new()),
+            request_interception: std::sync::RwLock::new(crate::RequestInterception::default()),
         }
     }
 
@@ -1112,41 +1195,47 @@ impl ObscuraHttpClient {
             cookie_jar: self.cookie_jar.clone(),
             user_agent: RwLock::new(self.user_agent.try_read().expect("identity is being updated").clone()),
             accept_language: RwLock::new(self.accept_language.try_read().expect("identity is being updated").clone()),
+            platform: RwLock::new(self.platform.try_read().expect("identity is being updated").clone()),
             extra_headers: RwLock::new(self.extra_headers.try_read().expect("headers are being updated").clone()),
             interceptor: self.interceptor.clone(), timeout: self.timeout,
             in_flight: self.in_flight.clone(), block_trackers: self.block_trackers,
             resource_loader: self.resource_loader.clone(), allow_private_network: self.allow_private_network,
+            allow_network: self.allow_network.clone(), allow_file_access: self.allow_file_access,
+            request_interception: std::sync::RwLock::new(self.request_interception.read().unwrap().clone()),
         }
     }
 
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
+            let proxy_url = self.proxy_url.clone();
+            let allow_private = self.allow_private_network;
+            let allow_network = self.allow_network.clone();
+            let timeout = self.timeout;
+            crate::on_network_io(async move {
             let mut builder = Client::builder()
-                .tls_backend_rustls()
+                .no_proxy()
                 .redirect(Policy::none())
-                .timeout(self.timeout)
+                .timeout(timeout)
                 .tls_danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.
                 .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
-                .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
+                .dns_resolver(Arc::new(SsrfGuardResolver::with_networks(allow_private, allow_network.clone())))
 ;
 
-            if std::env::var_os("SSL_CERT_FILE").is_some()
-                || std::env::var_os("SSL_CERT_DIR").is_some()
-            {
-                // Keep configured CAs additive to the platform's trusted roots.
-                builder = builder.tls_certs_merge(configured_root_certificates().iter().cloned());
-            }
 
-            if let Some(ref proxy) = self.proxy_url {
+            if let Some(proxy) = &proxy_url {
                 if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
                     builder = builder.proxy(p);
                 }
             }
+            builder = crate::aia::configure_reqwest(builder, crate::aia::AiaPolicy {
+                proxy_url, allow_private_network: allow_private, allow_network,
+            }).expect("failed to configure certificate verifier");
 
             builder.build().expect("failed to build HTTP client")
+            }).await.expect("network IO runtime stopped")
         }).await
     }
 
@@ -1167,6 +1256,47 @@ impl ObscuraHttpClient {
         self.proxy_url.as_deref()
     }
 
+    /// Upgrade through this context's real proxy, DNS guard and verified TLS.
+    pub async fn websocket(&self, request: &crate::websocket::WebSocketRequest)
+        -> Result<crate::websocket::WebSocketConnection, ObscuraNetError>
+    {
+        let url = request.http_url()?;
+        self.validate_destination(&url).await?;
+        if self.block_trackers && url.host_str().is_some_and(crate::blocklist::is_blocked) {
+            return Err(crate::websocket::network_error("WebSocket target is blocked"));
+        }
+        let extra = self.extra_headers.read().await;
+        let (key, headers) = request.headers(&extra, &url);
+        let mut outgoing = self.get_client().await.get(url.clone()).version(reqwest::Version::HTTP_11);
+        if !extra.keys().any(|name| name.eq_ignore_ascii_case("user-agent")) {
+            outgoing = outgoing.header("user-agent", self.user_agent.read().await.as_str());
+        }
+        if !extra.keys().any(|name| name.eq_ignore_ascii_case("accept-language")) {
+            outgoing = outgoing.header("accept-language", self.accept_language.read().await.as_str());
+        }
+        drop(extra);
+        for (name, value) in headers { outgoing = outgoing.header(name, value); }
+        let cookies = self.cookie_jar.get_cookie_header_in_context(&url, request.cookie_context(&url));
+        if !cookies.is_empty() { outgoing = outgoing.header("cookie", cookies); }
+        let response = outgoing.send().await.map_err(|error| crate::websocket::network_error(error_chain(&error)))?;
+        let protocol = request.validate_response(response.status().as_u16(), &key,
+            response.headers().iter().map(|(name, value)| (name.as_str(), value.as_bytes())))?;
+        for value in response.headers().get_all("set-cookie") {
+            if let Ok(value) = value.to_str() { self.cookie_jar.set_cookie(value, &url); }
+        }
+        let upgraded = response.upgrade().await.map_err(|error| crate::websocket::network_error(error_chain(&error)))?;
+        Ok(crate::websocket::WebSocketConnection::upgraded(upgraded, protocol).await)
+    }
+
+    pub fn validate_url(&self, url: &Url) -> Result<(), ObscuraNetError> {
+        validate_url_with_networks(url, self.allow_private_network, &self.allow_network)
+    }
+
+    pub async fn validate_destination(&self, url: &Url) -> Result<(), ObscuraNetError> {
+        self.validate_url(url)?;
+        if self.proxy_url.is_some() { validate_proxy_destination(url, self.allow_private_network, &self.allow_network).await?; }
+        Ok(())
+    }
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_method(Method::GET, url, None, None).await
     }
@@ -1214,6 +1344,11 @@ impl ObscuraHttpClient {
         .await
     }
 
+
+    pub async fn fetch_with_method_and_profile(&self, method: Method, url: &Url, body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>, request: ResourceRequest) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(method, url, body, callbacks, request).await
+    }
     /// Fetch a non-navigation resource through the same validated client,
     /// cookie jar, proxy, connection pool, interception and callback path as
     /// the owning page. The renderer can seed its byte cache from this result
@@ -1240,6 +1375,8 @@ impl ObscuraHttpClient {
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
             || self.interceptor.read().await.is_some()
+            || self.request_interception.read().unwrap().enabled
+            || !self.request_interception.read().unwrap().blocked.is_empty()
         {
             return None;
         }
@@ -1417,12 +1554,19 @@ impl ObscuraHttpClient {
         let Some(callbacks) = callbacks else {
             return;
         };
-        let request_info = RequestInfo {
-            url: url.clone(),
-            method: Method::GET.to_string(),
-            headers: self.extra_headers.read().await.clone(),
-            resource_type: request.resource_type,
-        };
+        let mut request_info = RequestInfo::new(url.clone(), Method::GET.to_string(),
+            self.extra_headers.read().await.clone(), request.resource_type);
+        let config = self.request_interception.read().unwrap().clone();
+        request_info.page_id = config.page_id;
+        request_info.frame_id = request.frame_id; request_info.parent_frame_id = request.parent_frame_id;
+        request_info.frame_generation = request.frame_generation;
+        let user_agent = self.user_agent.read().await.clone();
+        let platform = self.platform.read().await.clone();
+        request_info.headers.insert("user-agent".into(), user_agent.clone());
+        request_info.headers.insert("accept-language".into(), self.accept_language.read().await.clone());
+        request_info.headers.insert("accept".into(), request.accept().into());
+        apply_request_metadata(&mut request_info.headers, request, url, &[], &user_agent, &platform);
+        if let Some(referer) = request_referrer(request, url) { request_info.headers.insert("referer".into(), referer); }
         callbacks.fire_request(&request_info).await;
         callbacks.fire_response(&request_info, response).await;
     }
@@ -1435,12 +1579,10 @@ impl ObscuraHttpClient {
         callbacks: Option<&CallbackRegistry>,
         mut request: ResourceRequest,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, self.allow_private_network)?;
+        self.validate_url(url)?;
         validate_request_mode(&request, url)?;
 
-        if url.scheme() == "file" {
-            return fetch_file_url(url, request.max_response_bytes).await;
-        }
+        validate_file_request(url, &request, self.allow_file_access)?;
 
         let mut method = initial_method;
         let mut body = initial_body;
@@ -1468,17 +1610,13 @@ impl ObscuraHttpClient {
         // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
-        let mut request_callback_fired = false;
         let mut strip_credential_headers = false;
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
-            let request_info = RequestInfo {
-                url: current_url.clone(),
-                method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
-                resource_type: request.resource_type.clone(),
-            };
+            let mut request_info = RequestInfo::new(current_url.clone(), method.to_string(),
+                self.extra_headers.read().await.clone(),
+                request.resource_type);
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
                 match interceptor.intercept(&request_info).await {
@@ -1496,15 +1634,11 @@ impl ObscuraHttpClient {
                 }
             }
 
-            if !request_callback_fired {
-                if let Some(cbs) = callbacks {
-                    cbs.fire_request(&request_info).await;
-                }
-                request_callback_fired = true;
-            }
 
             let ua = self.user_agent.read().await.clone();
-            let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
+            let (sec_ch_ua, derived_platform) = chrome_client_hints(&ua);
+            let platform = self.platform.read().await.clone();
+            let sec_ch_ua_platform = if platform.is_empty() { derived_platform } else { format!("{:?}", platform) };
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
             // accept-encoding/host after these, so accept-encoding lands after
@@ -1532,7 +1666,7 @@ impl ObscuraHttpClient {
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-site"),
-                HeaderValue::from_static(request_fetch_site(&request, &current_url)),
+                HeaderValue::from_static(request_fetch_site_with_redirects(&request, &current_url, &redirects)),
             );
             headers.insert(
                 HeaderName::from_static("sec-fetch-mode"),
@@ -1600,7 +1734,8 @@ impl ObscuraHttpClient {
                 }
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            let extra_headers = self.extra_headers.read().await;
+            for (k, v) in extra_headers.iter() {
                 if k.eq_ignore_ascii_case("referer") || ((strip_credential_headers || !request.sends_credentials_to(&current_url))
                     && is_credential_header(k)) { continue; }
                 if let (Ok(name), Ok(val)) = (
@@ -1610,9 +1745,10 @@ impl ObscuraHttpClient {
                     headers.insert(name, val);
                 }
             }
+            drop(extra_headers);
             // Origin is a forbidden browser request header. Keep it derived
             // from the initiator even when callers supplied extra headers.
-            if cors_required(&request, &current_url) {
+            if cors_required(&request, &current_url) || (request.mode == RequestMode::Navigate && !matches!(method, Method::GET | Method::HEAD)) {
                 if let Ok(value) = HeaderValue::from_str(&request_origin) {
                     headers.insert(reqwest::header::ORIGIN, value);
                 }
@@ -1620,23 +1756,63 @@ impl ObscuraHttpClient {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
-            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
-                .headers(headers);
-
-            if let Some(ref b) = body {
-                if method == Method::POST {
-                    req_builder = req_builder.header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    );
-                }
-                req_builder = req_builder.body(b.clone());
+            if method == Method::POST && body.is_some() && !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+                headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
             }
-
+            let interception = self.request_interception.read().unwrap().clone();
+            let original_url = current_url.clone();
+            let mut selected_method = method.to_string();
+            let mut selected_headers: HashMap<String, String> = headers.iter()
+                .map(|(name, value)| (name.to_string(), decode_response_header_value(value.as_bytes()))).collect();
+            request_info.headers = selected_headers.clone(); request_info.body = body.clone();
+            request_info.page_id = interception.page_id.clone(); request_info.frame_id = request.frame_id;
+            request_info.parent_frame_id = request.parent_frame_id; request_info.frame_generation = request.frame_generation;
+            if let Some(response) = interception.resolve(&request_info.request_id, &mut current_url,
+                &mut selected_method, &mut selected_headers, &mut body, &request).await? {
+                validate_cors_response(&request, &current_url, &request_origin,
+                    response.header("access-control-allow-origin"), response.header("access-control-allow-credentials"))?;
+                if let Some(callbacks) = callbacks { callbacks.fire_response(&request_info, &response).await; }
+                return Ok(response);
+            }
+            self.validate_destination(&current_url).await?;
+            validate_request_mode(&request, &current_url)?;
+            if original_url.scheme() != "file" && current_url.scheme() == "file" {
+                return Err(ObscuraNetError::Network("Network interception cannot access file URLs".into()));
+            }
+            if original_url.origin() != current_url.origin() {
+                selected_headers.retain(|name, _| !is_credential_header(name));
+            }
+            if original_url != current_url {
+                apply_request_metadata(&mut selected_headers, &request, &current_url, &redirects, &ua, &platform);
+                selected_headers.remove("referer");
+                if let Some(referer) = request_referrer(&request, &current_url) { selected_headers.insert("referer".into(), referer); }
+            }
+            method = selected_method.parse().map_err(|error| ObscuraNetError::Network(format!("Invalid intercepted method: {error}")))?;
+            if current_url.scheme() == "file" {
+                validate_file_request(&current_url, &request, self.allow_file_access)?;
+                if let Some(callbacks) = callbacks { callbacks.fire_request(&request_info).await; }
+                let response = fetch_file_url(&current_url, request.max_response_bytes, self.allow_file_access).await?;
+                if let Some(callbacks) = callbacks { callbacks.fire_response(&request_info, &response).await; }
+                return Ok(response);
+            }
+            let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str());
+            for (name, value) in &selected_headers { req_builder = req_builder.header(name, value); }
+            if let Some(bytes) = &body { req_builder = req_builder.body(bytes.clone()); }
+            let wire_request = req_builder.build().map_err(|error| ObscuraNetError::Network(error_chain(&error)))?;
+            request_info.url = current_url.clone();
+            request_info.method = method.to_string();
+            request_info.headers = wire_request.headers().iter()
+                .map(|(name, value)| (name.to_string(), decode_response_header_value(value.as_bytes()))).collect();
+            request_info.body = body.clone();
+            request_info.page_id = interception.page_id;
+            request_info.frame_id = request.frame_id;
+            request_info.parent_frame_id = request.parent_frame_id;
+            request_info.frame_generation = request.frame_generation;
+            if let Some(callbacks) = callbacks { callbacks.fire_request(&request_info).await; }
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = req_builder.send().await.map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
-            })?;
+            let client = self.get_client().await.clone();
+            let resp = crate::on_network_io(async move { client.execute(wire_request).await }).await
+                .map_err(ObscuraNetError::Network)?.map_err(|error| ObscuraNetError::Network(error_chain(&error)))?;
 
             let status = resp.status();
             validate_reqwest_cors_response(
@@ -1664,6 +1840,11 @@ impl ObscuraHttpClient {
             }
 
             if status.is_redirection() {
+                if let Some(callbacks) = callbacks {
+                    let hop = Response { url: current_url.clone(), status: status.as_u16(),
+                        headers: response_headers.clone(), body: Vec::new(), redirected_from: redirects.clone() };
+                    callbacks.fire_response(&request_info, &hop).await;
+                }
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
                     let location_str = location.to_str().map_err(|_| {
                         ObscuraNetError::Network("Invalid redirect Location header".into())
@@ -1671,7 +1852,10 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, self.allow_private_network)?;
+                    self.validate_url(&next_url)?;
+                    if current_url.scheme() != "file" && next_url.scheme() == "file" {
+                        return Err(ObscuraNetError::Network("Network redirects cannot access file URLs".into()));
+                    }
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -1681,10 +1865,9 @@ impl ObscuraHttpClient {
                     }
                     redirects.push(current_url.clone());
                     current_url = next_url;
-                    if status == reqwest::StatusCode::MOVED_PERMANENTLY
-                        || status == reqwest::StatusCode::FOUND
-                        || status == reqwest::StatusCode::SEE_OTHER
-                    {
+                    if ((status == reqwest::StatusCode::MOVED_PERMANENTLY || status == reqwest::StatusCode::FOUND)
+                        && method == Method::POST)
+                        || (status == reqwest::StatusCode::SEE_OTHER && method != Method::HEAD) {
                         method = Method::GET;
                         body = None;
                     }
@@ -1692,12 +1875,10 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
-                resp,
-                &current_url,
-                request.max_response_bytes,
-            )
-            .await?;
+            let body_url = current_url.clone();
+            let limit = request.max_response_bytes;
+            let body_bytes = crate::on_network_io(async move { read_reqwest_body_limited(resp, &body_url, limit).await })
+                .await.map_err(ObscuraNetError::Network)??;
             drop(in_flight);
 
             let response = Response {
@@ -2638,7 +2819,7 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
-    async fn callbacks_fire_once_across_redirects() {
+    async fn callbacks_report_each_redirect_hop() {
         let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (target, _) = http_fixture(vec![redirect.to_string(), ok_response("", "done")]).await;
         let client = ObscuraHttpClient::with_full_options(
@@ -2647,23 +2828,26 @@ mod ssrf_tests {
             true,
         );
         let callbacks = CallbackRegistry::new();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(AtomicUsize::new(0));
-        let request_count = requests.clone();
-        callbacks.add_request(Arc::new(move |_| {
-            request_count.fetch_add(1, Ordering::SeqCst);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_requests = requests.clone();
+        callbacks.add_request(Arc::new(move |request| {
+            observed_requests.lock().unwrap().push(request.url.clone());
         }));
-        let response_count = responses.clone();
-        callbacks.add_response(Arc::new(move |_, _| {
-            response_count.fetch_add(1, Ordering::SeqCst);
+        let observed_responses = responses.clone();
+        callbacks.add_response(Arc::new(move |request, response| {
+            assert_eq!(request.url, response.url);
+            observed_responses.lock().unwrap().push((response.url.clone(), response.status));
         }));
 
-        client
+        let response = client
             .fetch_with_callbacks(&target, Some(&callbacks))
             .await
             .unwrap();
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert_eq!(responses.load(Ordering::SeqCst), 1);
+        let final_url = target.join("/final").unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec![target.clone(), final_url.clone()]);
+        assert_eq!(*responses.lock().unwrap(), vec![(target, 302), (final_url, 200)]);
+        assert_eq!(response.body, b"done");
     }
 
     async fn cacheable_resource_fixture(

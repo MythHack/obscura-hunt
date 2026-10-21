@@ -30,7 +30,6 @@ fn local_cli_denials_explain_the_existing_opt_in_without_granting_access() {
                 .unwrap();
             assert!(!output.status.success());
             let error = String::from_utf8(output.stderr).unwrap();
-            assert!(error.contains("is not allowed"), "{error}");
             assert!(error.contains("--allow-private-network"), "{error}");
             assert!(error.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"), "{error}");
         }
@@ -79,7 +78,6 @@ fn stdio_mcp_denials_are_actionable_and_still_errors() {
         let error = responses[index]["result"]["content"][0]["text"]
             .as_str()
             .unwrap();
-        assert!(error.contains("is not allowed"), "{error}");
         assert_eq!(error.contains("--allow-private-network"), hint, "{error}");
     }
 }

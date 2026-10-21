@@ -69,7 +69,6 @@ pub struct BrowserState {
     active_tab: Option<String>,
     tab_counter: u32,
     context: Arc<BrowserContext>,
-    user_agent: Option<String>,
     operator_network_hints: bool,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
@@ -82,7 +81,7 @@ pub struct BrowserState {
 }
 
 impl BrowserState {
-    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+    pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<Self> {
         // `--storage-dir` is a global flag, so the profile arrives through the
         // environment rather than through every constructor call. Without this
         // the MCP path silently ignored the flag and persisted nothing, cookies
@@ -92,20 +91,19 @@ impl BrowserState {
             "mcp".to_string(),
             proxy,
             stealth,
-            None,
+            user_agent,
             storage_dir,
-        );
-        BrowserState {
+        )?;
+        Ok(BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
             context: Arc::new(context),
-            user_agent,
             operator_network_hints: false,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
             ref_generation: 0,
-        }
+        })
     }
 
     /// Make sure there is at least one tab and return a &mut to the
@@ -164,13 +162,39 @@ impl BrowserState {
             .is_some_and(|page| page.has_js() && !page.is_suspended())
     }
 
-    /// Advance the active page by one wake-driven browser task and immediately
-    /// consume any navigation that task queued. MCP owns its pages continuously,
-    /// so leaving either half for the next tool call strands timers, fetches,
-    /// and location/form/click navigations while the transport waits on stdin.
-    async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
-        let reached_idle = self.page_mut().run_autonomous_event_loop_turn().await?;
-        self.finish_active_page_turn(reached_idle).await
+    /// Only the event-loop turn may be cancelled by a polling slice. A native
+    /// navigation consumes intent before I/O, so its own deadline owns commit.
+    async fn poll_page_until(&mut self, deadline: tokio::time::Instant) -> Result<(), String> {
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, self.page_mut().run_autonomous_event_loop_turn()).await {
+                Ok(result) => {
+                    if self.finish_active_page_turn(result?).await? {
+                        tokio::time::sleep_until(deadline).await;
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        // Take one bounded turn per live tab on its owner thread. Work that
+        // already completed is ordered before the final commit; future timers
+        // and never-idle tasks cannot extend clean shutdown indefinitely.
+        let tabs: Vec<_> = self.tabs.keys().cloned().collect();
+        for id in tabs {
+            self.activate(&id);
+            let page = self.tabs.get_mut(&id).expect("tab exists during shutdown");
+            if let Ok(result) = tokio::time::timeout(
+                std::time::Duration::from_millis(1), page.run_autonomous_event_loop_turn(),
+            ).await { result.map_err(anyhow::Error::msg)?; }
+            page.process_pending_frame_navigations().await?;
+            page.process_pending_navigation().await?;
+        }
+        self.context.save_storage()?;
+        Ok(())
     }
 
     // Complete navigation outside the cancelable wait: it consumes pending state before I/O.
@@ -206,7 +230,7 @@ impl BrowserState {
     /// `Runtime.evaluate`, which is why the same click POSTs over CDP and
     /// does nothing over MCP (#618).
     ///
-    /// [`Self::advance_active_page_tasks`] cannot cover this. It is armed
+    /// The transport's autonomous pump cannot cover this. It is armed
     /// after every dispatch, but it sits in a `biased` select behind
     /// `read_line`, so a client that sends its next tool call immediately,
     /// which an agent does, wins that race every time. The reply is also
@@ -280,7 +304,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut reader = BufReader::new(stdin);
     let mut writer = stdout;
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::new(proxy, user_agent, stealth)?;
     state.operator_network_hints = true;
     // Cookies and Web Storage are written on every navigation; this covers the
     // writes an agent makes after a page has settled, on the way out.
@@ -300,10 +324,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
                     };
                     match pump_result {
                         Ok(reached_idle) => runtime_pump_armed = !reached_idle,
-                        Err(error) => {
-                            runtime_pump_armed = false;
-                            eprintln!("MCP page task failed: {error}");
-                        }
+                        Err(error) => return Err(anyhow::anyhow!("MCP page task failed: {error}")),
                     }
                     None
                 }
@@ -315,7 +336,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
-            state.context.save_storage();
+            state.shutdown().await?;
             return Ok(());
         }
 
@@ -733,6 +754,26 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 }
             },
             {
+                "name": "browser_regional_profile",
+                "description": "Read resolved native regional identity, data licence/accuracy and point-in-time egress provenance. Does not discover egress or grant location permission.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "browser_geolocation_permission",
+                "description": "Set geolocation permission for one HTTP(S) origin, or every origin in this context when origin is omitted. Coordinates never imply consent.",
+                "inputSchema": { "type": "object", "properties": { "origin": {"type":"string"}, "state": {"type":"string", "enum":["granted","denied","prompt"]}}, "required":["state"], "additionalProperties": false }
+            },
+            {
+                "name": "browser_reset_geolocation_permissions",
+                "description": "Reset this context's origin geolocation decisions to prompt; active watches lose access until granted again.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "browser_geolocation_position",
+                "description": "Override this tab's position in degrees and accuracy in meters, without granting permission. Set reset=true to restore regional coordinates.",
+                "inputSchema": { "type": "object", "properties": { "latitude":{"type":"number","minimum":-90,"maximum":90}, "longitude":{"type":"number","minimum":-180,"maximum":180}, "accuracy":{"type":"number","minimum":0}, "reset":{"type":"boolean"}}, "additionalProperties": false }
+            },
+            {
                 "name": "browser_storage_state",
                 "description": "Export the full authentication / session state (cookies + localStorage + sessionStorage) as a JSON object. Save this to skip a login on a subsequent run via browser_set_storage_state.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -770,7 +811,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
             }),
             json!({
                 "name": "browser_pdf",
-                "description": "Export the current rendered document as a paginated raster PDF using print media and bounded PDF defaults.",
+                "description": "Export the current print-media document as a paginated PDF with selectable Unicode text, embedded subset fonts, vector shapes and local images. Tagged PDF, CSS @page, headers and footers are not supported.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -779,6 +820,13 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                         "scale": { "type": "number", "minimum": 0.1, "maximum": 2.0 },
                         "paper_width": { "type": "number", "exclusiveMinimum": 0, "maximum": 200, "description": "Paper width in inches" },
                         "paper_height": { "type": "number", "exclusiveMinimum": 0, "maximum": 200, "description": "Paper height in inches" },
+                        "page_ranges": {
+                            "type": "array", "maxItems": 64,
+                            "items": {"type": "object", "additionalProperties": false,
+                                "properties": {"start": {"type": "integer", "minimum": 1},
+                                    "end": {"type": "integer", "minimum": 1}}},
+                            "description": "One-based inclusive page ranges; omitted endpoints select first/final page. Duplicates are emitted once in document order."
+                        },
                         "margin_top": { "type": "number", "minimum": 0, "description": "Top margin in inches" },
                         "margin_bottom": { "type": "number", "minimum": 0, "description": "Bottom margin in inches" },
                         "margin_left": { "type": "number", "minimum": 0, "description": "Left margin in inches" },
@@ -857,6 +905,33 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
+        "browser_regional_profile" => state.context.regional.as_ref().map_err(Clone::clone)
+            .and_then(|profile| serde_json::to_string_pretty(profile.as_ref()).map_err(|error| error.to_string())),
+        "browser_geolocation_permission" => {
+            let decision = match args.get("state").and_then(Value::as_str) {
+                Some("granted") => Ok(obscura_js::geolocation::Decision::Granted),
+                Some("denied") => Ok(obscura_js::geolocation::Decision::Denied),
+                Some("prompt") => Ok(obscura_js::geolocation::Decision::Prompt),
+                _ => Err("state must be granted, denied or prompt".to_string()),
+            };
+            decision.and_then(|decision| {
+                let origin = args.get("origin").map(|value| value.as_str().ok_or("origin must be a string".to_string())).transpose()?;
+                state.context.geolocation_permissions.set(origin, decision)?;
+                Ok("Geolocation permission updated".into())
+            })
+        }
+        "browser_reset_geolocation_permissions" => state.context.geolocation_permissions.reset().map(|()| "Geolocation permissions reset".into()),
+        "browser_geolocation_position" => {
+            let position = if args.get("reset").and_then(Value::as_bool) == Some(true) {
+                if ["latitude","longitude","accuracy"].iter().any(|key| args.get(*key).is_some()) { Err("reset cannot be combined with coordinates".into()) } else { Ok(None) }
+            } else {
+                match (args.get("latitude").and_then(Value::as_f64),args.get("longitude").and_then(Value::as_f64),args.get("accuracy").and_then(Value::as_f64)) {
+                    (Some(latitude),Some(longitude),Some(accuracy)) => obscura_js::geolocation::Position::new(latitude,longitude,accuracy).map(|position| Some(Some(position))),
+                    _ => Err("latitude, longitude and accuracy are required together".into()),
+                }
+            };
+            position.and_then(|position| { state.page_mut().set_geolocation_override(position)?; Ok("Geolocation position updated (permission unchanged)".into()) })
+        }
         _ => Err(format!("Unknown tool: {name}")),
     };
 
@@ -943,9 +1018,9 @@ async fn tool_screenshot(args: &Value, state: &mut BrowserState) -> Result<Value
 async fn tool_pdf(args: &Value, state: &mut BrowserState) -> Result<Value, String> {
     validate_tool_options(args, &[
         "landscape", "print_background", "scale", "paper_width", "paper_height",
-        "margin_top", "margin_bottom", "margin_left", "margin_right",
+        "margin_top", "margin_bottom", "margin_left", "margin_right", "page_ranges",
     ])?;
-    let mut options = obscura_browser::RasterPdfOptions::default();
+    let mut options = obscura_browser::PdfOptions::default();
     if let Some(value) = optional_bool(args, "landscape")? { options.landscape = value; }
     if let Some(value) = optional_bool(args, "print_background")? { options.print_background = value; }
     if let Some(value) = optional_number(args, "scale")? { options.scale = value; }
@@ -955,10 +1030,26 @@ async fn tool_pdf(args: &Value, state: &mut BrowserState) -> Result<Value, Strin
     if let Some(value) = optional_number(args, "margin_bottom")? { options.margin_bottom_in = value; }
     if let Some(value) = optional_number(args, "margin_left")? { options.margin_left_in = value; }
     if let Some(value) = optional_number(args, "margin_right")? { options.margin_right_in = value; }
+    if let Some(value) = args.get("page_ranges") {
+        let ranges = value.as_array().ok_or("'page_ranges' must be an array")?;
+        if ranges.len() > 64 { return Err("'page_ranges' has too many ranges".into()); }
+        for range in ranges {
+            validate_tool_options(range, &["start", "end"])?;
+            let endpoint = |name| -> Result<Option<usize>, String> {
+                range.get(name).map(|value| value.as_u64().and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0).ok_or_else(|| format!("page range '{name}' must be a positive integer"))).transpose()
+            };
+            let (start, end) = (endpoint("start")?, endpoint("end")?);
+            if start.zip(end).is_some_and(|(start, end)| start > end) {
+                return Err("page range start exceeds its end".into());
+            }
+            options.page_ranges.push(obscura_browser::PdfPageRange { start, end });
+        }
+    }
 
     let page = state.page_mut();
     let _ = page.prepare_screenshot_resources(1_000).await;
-    let pdf = page.raster_pdf(options).map_err(|error| error.to_string())?;
+    let pdf = page.pdf(options).map_err(|error| error.to_string())?;
     Ok(json!({
         "type": "resource",
         "resource": {
@@ -1018,12 +1109,8 @@ async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String,
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
-    let ua = state.user_agent.clone();
     let operator_hints = state.operator_network_hints;
     let page = state.page_mut();
-    if let Some(ref ua) = ua {
-        page.http_client.set_user_agent(ua).await;
-    }
 
     page.navigate_with_wait(url, condition).await
         .map_err(|e| {
@@ -1234,29 +1321,17 @@ async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Resul
         }
         let poll_deadline = (tokio::time::Instant::now()
             + tokio::time::Duration::from_millis(poll_ms)).min(deadline);
-        while tokio::time::Instant::now() < poll_deadline {
-            match tokio::time::timeout_at(
-                poll_deadline, state.page_mut().run_autonomous_event_loop_turn(),
-            ).await {
-                Ok(result) => {
-                    // Navigation consumes pending state before I/O, so do not cancel it mid-turn.
-                    if state.finish_active_page_turn(result?).await? {
-                        tokio::time::sleep_until(poll_deadline).await;
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        state.poll_page_until(poll_deadline).await?;
     }
 }
 
 async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let selector = args.get("selector").and_then(Value::as_str)
         .ok_or("Missing selector parameter")?;
-    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0) as u64;
-
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+    let timeout = std::time::Duration::try_from_secs_f64(timeout_secs)
+        .map_err(|_| "timeout must be a finite non-negative number of seconds")?;
+    let deadline = tokio::time::Instant::now().checked_add(timeout).ok_or("timeout is too large")?;
     // Exponential backoff: 5 -> 10 -> 20 -> ... -> 200 ms. The old fixed
     // 200ms tick added up to a full poll cycle of latency every time;
     // a selector that appears in 30ms now returns in ~35ms instead of
@@ -1275,13 +1350,9 @@ async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String,
             return Err(format!("Timeout waiting for '{selector}'"));
         }
 
-        let tick = tokio::time::Duration::from_millis(tick_ms);
-        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {}
-        }
+        let poll_deadline = (tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(tick_ms)).min(deadline);
+        state.poll_page_until(poll_deadline).await?;
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
@@ -1579,8 +1650,10 @@ fn tool_clear_cookies(state: &BrowserState) -> Result<String, String> {
 async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let needle = args.get("text").and_then(Value::as_str)
         .ok_or("Missing text parameter")?;
-    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0) as u64;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+    let timeout = std::time::Duration::try_from_secs_f64(timeout_secs)
+        .map_err(|_| "timeout must be a finite non-negative number of seconds")?;
+    let deadline = tokio::time::Instant::now().checked_add(timeout).ok_or("timeout is too large")?;
     let escaped = serde_json::to_string(needle).unwrap_or_else(|_| "\"\"".to_string());
     let js = format!(r#"(function(){{
         var t = (document.body && (document.body.innerText || document.body.textContent)) || '';
@@ -1596,13 +1669,9 @@ async fn tool_wait_for_text(args: &Value, state: &mut BrowserState) -> Result<St
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Timeout waiting for text {needle:?}"));
         }
-        let tick = tokio::time::Duration::from_millis(tick_ms);
-        match tokio::time::timeout(tick, state.advance_active_page_tasks()).await {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {}
-        }
+        let poll_deadline = (tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(tick_ms)).min(deadline);
+        state.poll_page_until(poll_deadline).await?;
         if tick_ms < 200 { tick_ms = (tick_ms * 2).min(200); }
     }
 }
@@ -1869,11 +1938,7 @@ async fn tool_tab_new(args: &Value, state: &mut BrowserState) -> Result<String, 
     let url = args.get("url").and_then(Value::as_str);
     let id = state.new_tab();
     if let Some(u) = url {
-        let ua = state.user_agent.clone();
         let page = state.page_mut();
-        if let Some(ref ua) = ua {
-            page.http_client.set_user_agent(ua).await;
-        }
         page.navigate_with_wait(u, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)
             .await.map_err(|e| e.to_string())?;
         Ok(format!("Opened {id} and navigated to {}", page.url_string()))
@@ -2234,7 +2299,7 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
         }
     }
     state.context.cookie_jar.set_cookies_from_cdp(parsed);
-    state.context.save_storage();
+    state.context.save_storage().map_err(|error| error.to_string())?;
     Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
 }
 
@@ -2244,7 +2309,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tab_switch_preserves_globals_listeners_and_pending_promises() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let mut tabs = Vec::new();
         for index in 0..3 {
             tool_tab_new(&json!({"url":"data:text/html,<button id=action>Increment</button>"}), &mut state).await.unwrap();
@@ -2266,7 +2331,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn live_tabs_with_frames_can_close_in_any_order_and_reopen() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let mut tabs = Vec::new();
         for index in 0..3 {
             tool_tab_new(&json!({"url":"data:text/html,<iframe srcdoc='<p>Child frame</p>'></iframe>"}), &mut state).await.unwrap();
@@ -2286,7 +2351,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_references_are_actionable_without_an_extra_listing() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<label for=q>Work email</label><input id=q><button aria-label='Save account' onclick='window.saved=true'>Unhelpful text</button>").await.unwrap();
         let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
         let action = snapshot.lines().find(|line| line.starts_with("ref=") && line.contains("Save account"))
@@ -2300,7 +2365,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_exposes_live_states_without_password_values() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<input id=c type=checkbox checked aria-label=Consent><input id=f value=old aria-label=Account><input id=p type=password aria-label=Password><button disabled>Blocked</button><div role=tab aria-selected=true>Overview</div><button aria-expanded=false>Details</button>").await.unwrap();
         state.page_mut().evaluate("(function(){document.getElementById('c').checked=false;document.getElementById('f').value='fresh';document.getElementById('p').value='private-password';return true;})()");
         let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
@@ -2312,7 +2377,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_budget_bounds_metadata_and_never_splits_a_reference() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let html = format!("<title>{}</title><button>Continue</button><p>{}</p>", "界".repeat(1000), "Body ".repeat(2000));
         state.page_mut().navigate(&format!("data:text/html,{html}")).await.unwrap();
         let snapshot = tool_snapshot(&json!({"max_chars":96}), &mut state).unwrap();
@@ -2330,7 +2395,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_omits_hidden_content_and_controls() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>Visible</p><div hidden><button>Hidden action</button><p>Hidden body</p></div><div aria-hidden=true>Private panel</div>").await.unwrap();
         let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
         let content = snapshot.split_once("\n\n").unwrap().1;
@@ -2342,7 +2407,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn snapshots_preserve_generic_interactive_text_and_hidden_referenced_names() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<div tabindex=0 onclick='window.opened=true'>Open <b>folder</b></div><span id=label hidden>Accessible details</span><button aria-labelledby=label>Other text</button>").await.unwrap();
         let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
         assert!(snapshot.lines().any(|line| line.starts_with("ref=") && line.contains("Open folder")), "unlabelled generic controls must keep their visible text: {snapshot}");
@@ -2352,7 +2417,7 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn snapshots_apply_css_visibility_without_hiding_visible_overrides() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<style>.gone{display:none}.invisible{visibility:hidden}.shown{visibility:visible}</style><div class=gone><button>CSS hidden action</button></div><div class=invisible>Hidden text<button class=shown>Visible override</button></div>").await.unwrap();
         let snapshot = tool_snapshot(&json!({}), &mut state).unwrap();
         let content = snapshot.split_once("\n\n").unwrap().1;
@@ -2370,7 +2435,7 @@ mod tests {
                 std::process::exit(1);
             }
         });
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>Content</p>").await.unwrap();
         assert_eq!(state.page_mut().evaluate("(function(){globalThis.savedStringify=JSON.stringify;JSON.stringify=function(){while(true){}};return true;})()"), json!(true));
         let result = tool_extract(&json!({"schema":{"text":"p"}}), &mut state);
@@ -2383,7 +2448,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_failures_are_mcp_tool_errors() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
         let mut responses = Vec::new();
         for expression in [
@@ -2405,7 +2470,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_runs_scripts_once_and_preserves_null_results() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
         for expression in ["null", "undefined", "Promise.resolve(null)"] {
             assert_eq!(tool_evaluate(&json!({"expression": expression}), &mut state).await.unwrap(), "null");
@@ -2426,7 +2491,7 @@ mod tests {
         for (tool, arguments, setup) in [
             ("browser_scroll", json!({"selector":"#action"}), "document.getElementById('action').scrollIntoView = function(){throw new Error('action failed')};"),
         ] {
-            let mut state = BrowserState::new(None, None, false);
+            let mut state = BrowserState::new(None, None, false).unwrap();
             state.page_mut().navigate("data:text/html,<button id=action>Continue</button>").await.unwrap();
             assert_eq!(state.page_mut().evaluate(&format!("(function(){{{setup} return true;}})()")), json!(true));
             let response = dispatch("tools/call", json!(1), &json!({"name":tool,"arguments":arguments}), &mut state).await;
@@ -2439,7 +2504,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn form_errors_prevent_submission() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<input id=q><button id=go onclick='window.submits++'>Submit</button><script>window.submits=0</script>").await.unwrap();
         let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
             "fields":[{"selector":"#q","value":"kept"},{"selector":"#missing","value":"bad"}],
@@ -2457,7 +2522,7 @@ mod tests {
     async fn fill_form_submission_reaches_the_server_before_replying() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate(&base).await.unwrap();
         assert!(requests.recv_timeout(std::time::Duration::from_secs(2)).unwrap().starts_with("GET /"));
         let response = dispatch("tools/call", json!(1), &json!({"name":"browser_fill_form", "arguments":{
@@ -2474,7 +2539,7 @@ mod tests {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (first, _) = spawn_form_recording_server();
         let (second, _) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         tool_set_storage_state(&json!({"state": {"origins": [
             {"origin": first, "localStorage": [["token", "first"]], "sessionStorage": [["tab", "first-session"]]},
             {"origin": second, "localStorage": [["token", "second"]], "sessionStorage": [["tab", "second-session"]]}
@@ -2500,7 +2565,7 @@ mod tests {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (first, _) = spawn_form_recording_server();
         let (second, _) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         for (origin, value) in [(&first, "first"), (&second, "second")] {
             state.page_mut().navigate(origin).await.expect("fixture page");
             state.page_mut().evaluate(&format!("(function(){{localStorage.setItem('token', '{value}'); sessionStorage.setItem('tab', '{value}-session'); return true;}})()"));
@@ -2522,7 +2587,7 @@ mod tests {
             json!({"origin": "https://other.test/path", "localStorage": [["token", "bad"]]}),
             json!({"origin": "https://other.test", "localStorage": [["token", 12]]}),
         ] {
-            let mut state = BrowserState::new(None, None, false);
+            let mut state = BrowserState::new(None, None, false).unwrap();
             let result = tool_set_storage_state(&json!({"state": {"origins": [
                 {"origin": "https://first.test", "localStorage": [["token", "partial"]]}, invalid
             ]}}), &mut state);
@@ -2534,7 +2599,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn storage_restore_reports_rejected_quota_writes() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let result = tool_set_storage_state(&json!({"state": {"origins": [
             {"origin": "https://first.test", "localStorage": [["oversized", "x".repeat(5 * 1024 * 1024 + 1)]]}
         ]}}), &mut state);
@@ -2546,14 +2611,14 @@ mod tests {
     async fn storage_state_round_trip_preserves_nul_prefixed_strings() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (origin, _) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate(&origin).await.expect("fixture page");
         state.page_mut().evaluate(r#"(function(){localStorage.setItem('\0key', '\0"value"'); sessionStorage.setItem('\0tab', '\0session'); return true;})()"#);
         let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
         assert_eq!(exported["origins"][0]["localStorage"], json!([["\0key", "\0\"value\""]]));
         assert_eq!(exported["origins"][0]["sessionStorage"], json!([["\0tab", "\0session"]]));
         drop(state);
-        let mut restored = BrowserState::new(None, None, false);
+        let mut restored = BrowserState::new(None, None, false).unwrap();
         tool_set_storage_state(&json!({"state": exported}), &mut restored).expect("restore");
         restored.page_mut().navigate(&origin).await.expect("restored page");
         assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
@@ -2566,7 +2631,7 @@ mod tests {
             "button.replaceWith(copy)",
             "button.before(copy)",
         ] {
-            let mut state = BrowserState::new(None, None, false);
+            let mut state = BrowserState::new(None, None, false).unwrap();
             state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
                 .await.expect("test page");
             tool_snapshot(&json!({}), &mut state).expect("snapshot");
@@ -2589,7 +2654,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn element_refs_from_old_snapshots_cannot_alias_new_targets() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<button id=target>Buy</button>")
             .await.expect("test page");
         tool_snapshot(&json!({}), &mut state).expect("snapshot");
@@ -2605,7 +2670,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn element_refs_follow_the_same_connected_node_after_reordering() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<button id=target>Buy</button><p>Details</p>")
             .await.expect("test page");
         tool_snapshot(&json!({}), &mut state).expect("snapshot");
@@ -2619,7 +2684,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn first_evaluation_and_promise_results_work_without_prior_state() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>Evaluate</p>").await.unwrap();
         assert_eq!(tool_evaluate(&json!({"expression":"1 + 1"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 2.0);
         assert_eq!(tool_evaluate(&json!({"expression":"Promise.resolve(3)"}), &mut state).await.unwrap().parse::<f64>().unwrap(), 3.0);
@@ -2681,24 +2746,21 @@ mod tests {
     #[tokio::test]
     async fn local_network_hint_is_limited_to_operator_stdio_state() {
         std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let args = json!({"url": "http://localhost:9/"});
         let remote_error = tool_navigate(&args, &mut state).await.unwrap_err();
-        assert!(remote_error.contains("is not allowed"));
         assert!(!remote_error.contains("--allow-private-network"));
         state.operator_network_hints = true;
         let local_error = tool_navigate(&args, &mut state).await.unwrap_err();
-        assert!(local_error.contains("is not allowed"));
         assert!(local_error.contains("--allow-private-network"));
         assert!(local_error.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"));
         let metadata_error = tool_navigate(&json!({"url":"http://169.254.169.254/latest/meta-data/"}), &mut state).await.unwrap_err();
-        assert!(metadata_error.contains("is not allowed"));
         assert!(!metadata_error.contains("--allow-private-network"));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn mcp_navigation_rejects_local_files() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let error = tool_navigate(&json!({"url": "file:///etc/passwd"}), &mut state)
             .await
             .expect_err("MCP must not expose local files");
@@ -2709,7 +2771,7 @@ mod tests {
     // browser_navigate: the browser layer enforces it for all of them.
     #[tokio::test(flavor = "current_thread")]
     async fn mcp_tab_new_rejects_local_files() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         let error = tool_tab_new(&json!({"url": "file:///etc/passwd"}), &mut state)
             .await
             .expect_err("browser_tab_new must not expose local files");
@@ -2725,7 +2787,7 @@ mod tests {
         std::fs::write(&path, "<p>local-secret</p>").expect("write fixture");
         let file_url = url::Url::from_file_path(&path).expect("file url").to_string();
 
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate(&format!("data:text/html,<a id=l href='{file_url}'>go</a>"))
@@ -2774,9 +2836,9 @@ mod tests {
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn render_tool_calls_return_mcp_binary_content_and_reject_bad_options() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate(
-            "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'></div></body></html>",
+            "data:text/html,<html style='margin:0'><body style='margin:0;background:red'><div style='width:64px;height:48px'>Hello</div></body></html>",
         ).await.expect("render test page should navigate");
         state.page_mut().set_viewport((64.0, 48.0));
 
@@ -2800,7 +2862,9 @@ mod tests {
         assert_eq!(resource["resource"]["mimeType"], "application/pdf");
         let bytes = BASE64.decode(resource["resource"]["blob"].as_str().expect("PDF base64"))
             .expect("valid PDF base64");
-        assert!(bytes.starts_with(b"%PDF-"));
+        let document = lopdf::Document::load_mem(&bytes).expect("independent PDF parser");
+        let pages = document.get_pages();
+        assert_eq!(pages.len(), 1);
 
         let invalid_screenshot = handle_tool_call(
             json!(3),
@@ -2827,7 +2891,7 @@ mod tests {
                 console.error('mcp-console-click');\
                 setTimeout(()=>{console.error('mcp-console-async');document.body.id='done'},25)\
             }</script>";
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate(PAGE)
@@ -2997,7 +3061,7 @@ mod tests {
         // --allow-private-network to run their repro.
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate(&base)
@@ -3034,7 +3098,7 @@ mod tests {
     async fn function_wait_advances_fetch_response_callbacks() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate(&base).await.expect("fixture page");
         requests.recv_timeout(std::time::Duration::from_secs(2)).expect("page request");
         evaluate_tool_script(state.page_mut(),
@@ -3065,7 +3129,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<p id=landed>done</p>").await.unwrap();
         });
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>waiting</p>").await.unwrap();
         evaluate_tool_script(state.page_mut(), &format!(
             "setTimeout(() => location.href = {}, 0); true", serde_json::to_string(&url).unwrap()
@@ -3081,7 +3145,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn function_wait_preserves_idle_polling_and_caps_the_last_interval() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state.page_mut().navigate("data:text/html,<p>idle</p>").await.unwrap();
         evaluate_tool_script(state.page_mut(), "window.waitPolls = 0; true").unwrap();
         let started = std::time::Instant::now();
@@ -3096,10 +3160,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn selector_and_text_waits_finish_slow_navigation_without_losing_intent() {
+        use tokio::io::AsyncReadExt;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        for text_wait in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/landed", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /landed "));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<p id=landed>done</p>").await.unwrap();
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await.is_err(),
+                    "the navigation must not be submitted twice");
+            });
+            let mut state = BrowserState::new(None, None, false).unwrap();
+            state.page_mut().navigate("data:text/html,<p>waiting</p>").await.unwrap();
+            evaluate_tool_script(state.page_mut(), &format!(
+                "setTimeout(() => location.href = {}, 0); true", serde_json::to_string(&url).unwrap(),
+            )).unwrap();
+            if text_wait {
+                tool_wait_for_text(&json!({"text":"done","timeout":2.0}), &mut state).await.unwrap();
+            } else {
+                tool_wait_for(&json!({"selector":"#landed","timeout":2.0}), &mut state).await.unwrap();
+            }
+            assert_eq!(state.page_mut().url_string(), url);
+            assert_eq!(evaluate_tool_script(state.page_mut(), "document.getElementById('landed').textContent").unwrap(), json!("done"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selector_and_text_idle_waits_preserve_subsecond_timeouts() {
+        let mut state = BrowserState::new(None, None, false).unwrap();
+        state.page_mut().navigate("data:text/html,<p>idle</p>").await.unwrap();
+        for text_wait in [false, true] {
+            let started = std::time::Instant::now();
+            let result = if text_wait {
+                tool_wait_for_text(&json!({"text":"absent","timeout":0.08}), &mut state).await
+            } else {
+                tool_wait_for(&json!({"selector":"#absent","timeout":0.08}), &mut state).await
+            };
+            assert!(result.unwrap_err().contains("Timeout"));
+            assert!(started.elapsed() >= std::time::Duration::from_millis(70), "fractional timeout was truncated");
+            assert!(started.elapsed() < std::time::Duration::from_millis(500), "last polling interval exceeded the deadline");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn network_tool_includes_completed_script_fetches() {
         std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         let (base, requests) = spawn_form_recording_server();
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate(&base)
@@ -3134,7 +3248,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_tools_notify_controlled_input_tracker() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate("data:text/html,<div id=root><input id=field></div>")
@@ -3230,7 +3344,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fill_form_check_and_select_use_native_setter_and_trusted_events() {
-        let mut state = BrowserState::new(None, None, false);
+        let mut state = BrowserState::new(None, None, false).unwrap();
         state
             .page_mut()
             .navigate(

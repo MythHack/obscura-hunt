@@ -40,6 +40,14 @@ With stealth and proxy:
 obscura mcp --stealth --proxy http://proxy.example.com:8080
 ```
 
+Use `obscura --storage-dir ./profile mcp` (or add `--http`) to restore and
+automatically persist cookies and origin localStorage. Explicit configuration
+wins over `OBSCURA_STORAGE_DIR`. Both transports commit navigation state before
+success; stdio EOF and handled HTTP Ctrl-C/SIGTERM commit later evaluation and
+completed background-task changes. Failures are reported as tool/startup/exit
+errors, not only tracing warnings. No profile means in-memory storage only.
+See [profile durability and private permissions](Persist-cookies-and-storage.md).
+
 ## Security
 
 The HTTP transport exposes a privileged browser session. Its guards are:
@@ -61,6 +69,12 @@ The server keeps a live browser session, so tools operate on the current page ra
 The active page continues running timers and network callbacks between tool
 calls over both stdio and HTTP. Task driving is wake-driven and parks when
 the page is idle; a future timer does not block incoming MCP requests.
+
+Selector, text and function waits advance real page tasks between polls. A
+polling slice may stop waiting for a task, but cannot cancel a navigation after
+its intent was consumed. Native navigation has its own bounded deadline.
+Selector/text timeouts accept fractional seconds; idle waits sleep only until
+the remaining deadline instead of busy polling or rounding down to zero.
 
 Navigation and lifecycle:
 
@@ -117,6 +131,18 @@ Diagnostics:
 
 - `browser_network_requests`, `browser_console_messages`
 
+Regional identity and geolocation consent:
+
+- Configure `OBSCURA_REGIONAL_CONFIG` (or CLI `--regional-config`) before starting the server. Native locale/timezone cannot change incompatibly after the first isolate.
+- `browser_regional_profile`: inspect resolved identity and licence/build/accuracy/egress provenance without a new discovery request.
+- `browser_geolocation_permission`: set `state` to `granted`, `denied` or `prompt`, with optional HTTP(S) `origin` (omission applies to this context).
+- `browser_reset_geolocation_permissions`: restore this context's origin decisions to prompt, revoking active watches.
+- `browser_geolocation_position`: supply `latitude`, `longitude`, `accuracy` in meters together, or `reset: true` to restore regional coordinates. This changes the active tab's source, not consent.
+
+Frames remain subject to secure-origin, sandbox and Permissions-Policy checks.
+See [regional profiles and real RTC routing](Configure-stealth-and-proxies.md#regional-identity-location-permission-and-rtc-routing).
+
+
 Visual output (render-enabled builds):
 
 - `browser_screenshot`: current viewport as an MCP `image/png` content block.
@@ -126,6 +152,10 @@ Visual output (render-enabled builds):
 CSS pixels and enforces a bounded capture size. `browser_pdf` accepts
 `landscape`, `print_background`, `scale`, paper width/height, and top, bottom,
 left, and right margins. Paper dimensions and margins are measured in inches.
+
+PDF export uses the retained print-media layout, shaped text with embedded
+subset fonts, vector paint and images. It is not a full-page raster image.
+Tagged PDF, headers/footers, outlines and full CSS paged media are not implemented.
 
 Cookies and storage:
 

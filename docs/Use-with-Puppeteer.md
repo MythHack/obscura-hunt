@@ -11,11 +11,28 @@ npm install puppeteer-core
 const puppeteer = require('puppeteer-core');
 
 const browser = await puppeteer.connect({
-  browserWSEndpoint: 'ws://127.0.0.1:9222',
+  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser',
 });
 ```
 
 Use `puppeteer-core`, not `puppeteer`. The `puppeteer` package bundles a Chrome download.
+
+`GET /json/version` and `GET /json/version/` return the browser WebSocket URL.
+The trailing-slash endpoint supports Playwright's HTTP `connect_over_cdp`
+discovery. Routes remain exact: extra suffixes and query strings are refused.
+Discovery retains the same Host validation, browser-Origin rejection, and
+configured bearer authentication as WebSocket connections.
+
+`GET /json/protocol` reports the protocol version and implemented domain names.
+It does not publish command/type schemas or advertise Chromium domains that
+Obscura only accepts as compatibility no-ops.
+
+`GET /json/list` lists the browser's real targets, including its initial
+`about:blank` page. Each advertised `/devtools/page/<targetId>` socket is bound
+to that page; commands on a page socket do not need a `sessionId`. Browser
+sockets attach with `Target.attachToTarget` and use its returned session ID.
+Targets and browser contexts are shared across browser connections. Closing a
+client connection detaches only its sessions; it does not close its pages.
 
 ## Navigate
 
@@ -71,24 +88,25 @@ For session persistence across runs see [Persist cookies and storage](Persist-co
 
 ## Intercept requests
 
-```js
-await page.setRequestInterception(true);
-
-page.on('request', req => {
-  if (req.resourceType() === 'image') {
-    req.abort();
-  } else {
-    req.continue();
-  }
-});
-```
-
-See [Intercept and modify requests](Intercept-and-modify-requests.md).
+Use a public CDP session and request-stage `Fetch.enable` for blocking,
+rewriting or fulfilling requests. Authentication-challenge interception is
+unsupported; Puppeteer versions that enable it automatically through
+`page.setRequestInterception()` are rejected rather than silently accepting an
+unimplemented mode. See [Intercept and modify requests](Intercept-and-modify-requests.md)
+for the supported session setup and byte-preserving examples.
 
 Scripted fetch/XHR requests in stealth mode report Network events and retained
 response bodies using the same request IDs as the normal transport. The existing
 `OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
 settings still control retention; disabling retention does not disable events.
+
+Raw CDP sessions subscribe independently with `Page.enable`, `Runtime.enable`,
+`Network.enable`, and `Page.setLifecycleEventsEnabled`. `Network.disable` or a
+session detach releases only that session's response-body view. Other enabled
+sessions keep their events and bounded retained bodies. Request events include
+the method, body, and headers of the actual native send and arrive before a
+slow response finishes. Request interception pauses before I/O, not by
+reconstructing a pause from a completed response.
 
 ## Expose a Node callback
 
@@ -114,7 +132,10 @@ await Promise.all([
 ]);
 ```
 
-Pages share one V8 isolate. Concurrent JS execution serializes through a lock. CPU-bound JS on one page blocks the others.
+Pages stay on their native owner threads; a server-wide directory routes
+commands to those owners without sharing live V8 objects or a global V8 lock.
+CPU-bound JavaScript can delay other pages on the same owner thread, but does
+not block another owner's JavaScript or the HTTP discovery endpoints.
 
 ## Screenshots, scrolling, and PDF
 
@@ -130,7 +151,8 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
 A normal screenshot captures the live viewport and scroll position;
-`fullPage: true` captures document space. PDF output is raster-backed.
+`fullPage: true` captures document space. PDF export uses print-media layout,
+shaped text with embedded subset fonts, vector paint and images.
 
 ## Screencasting
 
@@ -193,7 +215,7 @@ are not implemented by this change.
 - Some device emulation, service-worker, native media, long-tail CSS, and
   compositor behavior remains incomplete relative to Chromium.
 - Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- Tagged PDF, headers/footers, outlines and full CSS paged media are not implemented.
 
 Network events are shared by sessions attached to the same target. An additional
 CDP session can observe navigation and later fetch/XHR traffic without issuing a

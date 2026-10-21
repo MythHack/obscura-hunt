@@ -1,0 +1,408 @@
+{
+  "scope": "Prior local CLI/CDP/MCP observations, retained without rerunning; not implementation acceptance for this proposal.",
+  "source_baseline": "main 2086082 after upstream a754dce integration; executable was compiled before merge commit.",
+  "binary_path_used": "E:/rust/target/release/obscura.exe",
+  "binary_sha256_at_execution": null,
+  "provenance_limit": "Historical probes did not record the executable sha256 at execution time. Do not use these receipts to check implementation tasks. Future acceptance must bind SHA, features, platform, fixture and exit status.",
+  "third_party_target_requests": false,
+  "results": {
+    "window-document": {
+      "exit": 0,
+      "stdout": "{\"getter\":\"undefined\",\"setter\":\"undefined\",\"writable\":true,\"configurable\":true,\"enumerable\":true,\"sloppyKeepsDocument\":false,\"strictResult\":\"no throw\",\"liveDocument\":false,\"body\":\"undefined\",\"cookie\":\"undefined\"}",
+      "stderr": ""
+    },
+    "summary-activation": {
+      "exit": 0,
+      "stdout": "{\"before\":false,\"first\":false,\"second\":false,\"openAttribute\":false}",
+      "stderr": ""
+    },
+    "hidden-table-row": {
+      "exit": 0,
+      "stdout": "[{\"id\":\"d\",\"width\":0,\"height\":0,\"display\":\"none\",\"visible\":false,\"offsetParent\":null},{\"id\":\"r\",\"width\":8,\"height\":20,\"display\":\"none\",\"visible\":false,\"offsetParent\":\"TABLE\"},{\"id\":\"s\",\"width\":0,\"height\":0,\"display\":\"none\",\"visible\":false,\"offsetParent\":null}]",
+      "stderr": ""
+    },
+    "selectors-decoder": {
+      "exit": 0,
+      "stdout": "{\"focusWithin\":0,\"target\":{\"count\":0,\"color\":\"rgb(0, 0, 0)\"},\"registerProperty\":\"TypeError: CSS.registerProperty is not a function\",\"streamingDecode\":\"₀|̀\"}",
+      "stderr": ""
+    },
+    "picture-and-code": {
+      "exit": 0,
+      "stdout": "[{\"id\":\"p\",\"display\":\"block\",\"fontFamily\":\"Times\"},{\"id\":\"c\",\"display\":\"inline\",\"fontFamily\":\"Times\"},{\"id\":\"pre\",\"display\":\"block\",\"fontFamily\":\"Times\"},{\"id\":\"k\",\"display\":\"inline\",\"fontFamily\":\"Times\"}]",
+      "stderr": ""
+    },
+    "domparser-xml": {
+      "exit": 0,
+      "stdout": "{\"root\":\"HTML\",\"ns\":\"http://www.w3.org/1999/xhtml\",\"child\":\"HEAD\",\"mixed\":null}",
+      "stderr": ""
+    },
+    "network-top": {
+      "exit": 0,
+      "stdout": "loopback",
+      "stderr": "",
+      "requests": [
+        {
+          "path": "/page",
+          "method": "GET",
+          "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+          "sec_fetch": {
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document"
+          }
+        },
+        {
+          "path": "/api-fetch",
+          "method": "POST",
+          "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+          "sec_fetch": {}
+        },
+        {
+          "path": "/api-xhr",
+          "method": "GET",
+          "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+          "sec_fetch": {}
+        }
+      ]
+    },
+    "network-subcommand": {
+      "exit": 0,
+      "stdout": "loopback",
+      "stderr": "",
+      "requests": [
+        {
+          "path": "/page",
+          "method": "GET",
+          "ua": "UpstreamTriage/1",
+          "sec_fetch": {
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document"
+          }
+        },
+        {
+          "path": "/api-fetch",
+          "method": "POST",
+          "ua": "UpstreamTriage/1",
+          "sec_fetch": {}
+        },
+        {
+          "path": "/api-xhr",
+          "method": "GET",
+          "ua": "UpstreamTriage/1",
+          "sec_fetch": {}
+        }
+      ]
+    },
+    "network-cdp": [
+      {
+        "type": "Fetch",
+        "request": {
+          "url": "http://127.0.0.1:39611/api-fetch",
+          "method": "POST",
+          "headers": {}
+        }
+      },
+      {
+        "type": "XHR",
+        "request": {
+          "url": "http://127.0.0.1:39611/api-xhr",
+          "method": "GET",
+          "headers": {}
+        }
+      },
+      {
+        "type": "Fetch",
+        "request": {
+          "url": "http://127.0.0.1:39611/api-fetch",
+          "method": "POST",
+          "headers": {}
+        }
+      },
+      {
+        "type": "XHR",
+        "request": {
+          "url": "http://127.0.0.1:39611/api-xhr",
+          "method": "GET",
+          "headers": {}
+        }
+      }
+    ],
+    "public-key-crypto": {
+      "result": {
+        "type": "string",
+        "description": "[{\"name\":\"ECDSA\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ECDSA\"},{\"name\":\"ECDH\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ECDH\"},{\"name\":\"Ed25519\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ED25519\"},{\"name\":\"RSA-PSS\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support RSA-PSS\"}]",
+        "value": "[{\"name\":\"ECDSA\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ECDSA\"},{\"name\":\"ECDH\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ECDH\"},{\"name\":\"Ed25519\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support ED25519\"},{\"name\":\"RSA-PSS\",\"result\":\"NotSupportedError\",\"message\":\"generateKey does not support RSA-PSS\"}]"
+      }
+    },
+    "worker-port-transfer": {
+      "result": {
+        "type": "string",
+        "description": "{\"kind\":\"missing-port\",\"ports\":null,\"globalArray\":\"undefined\",\"globalMap\":\"undefined\"}",
+        "value": "{\"kind\":\"missing-port\",\"ports\":null,\"globalArray\":\"undefined\",\"globalMap\":\"undefined\"}"
+      }
+    },
+    "javascript-iframe": {
+      "exit": 0,
+      "stdout": "{\"url\":\"about:blank\",\"body\":\"\",\"element\":false}",
+      "stderr": ""
+    },
+    "preload-event": {
+      "result": {
+        "type": "string",
+        "description": "no-event",
+        "value": "no-event"
+      }
+    },
+    "websocket-echo": {
+      "cdp": {
+        "result": {
+          "type": "string",
+          "description": "{\"opened\":true,\"reply\":null,\"error\":false}",
+          "value": "{\"opened\":true,\"reply\":null,\"error\":false}"
+        }
+      },
+      "server_connections": 0
+    },
+    "network-session-body": {
+      "before": {
+        "body": "{}",
+        "base64Encoded": false
+      },
+      "after_other_session_disabled": {
+        "code": -32601,
+        "message": "No response body found for requestId loader-449959db-c081-4809-b5d5-c03f8784848f"
+      }
+    },
+    "mcp-navigation-waits": {
+      "browser_wait_for": {
+        "navigation": {
+          "jsonrpc": "2.0",
+          "id": 3,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Navigated to http://127.0.0.1:30142/start — \"\""
+              }
+            ]
+          }
+        },
+        "armed": {
+          "jsonrpc": "2.0",
+          "id": 4,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "true"
+              }
+            ]
+          }
+        },
+        "wait": {
+          "jsonrpc": "2.0",
+          "id": 5,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Error: Timeout waiting for '#landed'"
+              }
+            ],
+            "isError": true
+          }
+        },
+        "final": {
+          "jsonrpc": "2.0",
+          "id": 6,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"url\":\"http://127.0.0.1:30142/slow\",\"text\":\"OLD_DOCUMENT\",\"landed\":false}"
+              }
+            ]
+          }
+        },
+        "requests": [
+          "/start",
+          "/slow"
+        ]
+      },
+      "browser_wait_for_text": {
+        "navigation": {
+          "jsonrpc": "2.0",
+          "id": 8,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Navigated to http://127.0.0.1:30142/start — \"\""
+              }
+            ]
+          }
+        },
+        "armed": {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "true"
+              }
+            ]
+          }
+        },
+        "wait": {
+          "jsonrpc": "2.0",
+          "id": 10,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Error: Timeout waiting for text \"LANDED_MARKER\""
+              }
+            ],
+            "isError": true
+          }
+        },
+        "final": {
+          "jsonrpc": "2.0",
+          "id": 11,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"url\":\"http://127.0.0.1:30142/slow\",\"text\":\"OLD_DOCUMENT\",\"landed\":false}"
+              }
+            ]
+          }
+        },
+        "requests": [
+          "/start",
+          "/slow"
+        ]
+      },
+      "browser_wait_for_function": {
+        "navigation": {
+          "jsonrpc": "2.0",
+          "id": 13,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Navigated to http://127.0.0.1:30142/start — \"\""
+              }
+            ]
+          }
+        },
+        "armed": {
+          "jsonrpc": "2.0",
+          "id": 14,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "true"
+              }
+            ]
+          }
+        },
+        "wait": {
+          "jsonrpc": "2.0",
+          "id": 15,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "condition met after 8 poll(s)"
+              }
+            ]
+          }
+        },
+        "final": {
+          "jsonrpc": "2.0",
+          "id": 16,
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"url\":\"http://127.0.0.1:30142/slow\",\"text\":\"LANDED_MARKER\",\"landed\":true}"
+              }
+            ]
+          }
+        },
+        "requests": [
+          "/start",
+          "/slow"
+        ]
+      }
+    },
+    "page-websocket": {
+      "advertised_url": "ws://127.0.0.1:15777/devtools/page/page-1",
+      "bare_evaluate": {
+        "code": -32601,
+        "message": "No page"
+      }
+    },
+    "unsupported-touch": {
+      "dispatch": {},
+      "observed": {
+        "result": {
+          "type": "number",
+          "description": "0.0",
+          "value": 0.0
+        }
+      }
+    },
+    "geo-profile-current": {
+      "exit": 0,
+      "stdout": "{\"timezone\":\"Europe/Berlin\",\"locale\":\"en-US\",\"language\":\"en-US\",\"languages\":[\"en-US\",\"en\"],\"rtc\":\"function\",\"geolocation\":{\"latitude\":50.06394640105531,\"longitude\":8.634261614713763}}",
+      "stderr": ""
+    },
+    "geolocation-permission": {
+      "result": {
+        "type": "string",
+        "description": "[\"prompt\",{\"success\":true,\"lat\":50.121951727892146,\"lon\":8.669653501161177}]",
+        "value": "[\"prompt\",{\"success\":true,\"lat\":50.121951727892146,\"lon\":8.669653501161177}]"
+      }
+    },
+    "worker-importscripts": {
+      "result": {
+        "type": "string",
+        "description": "{\"type\":\"undefined\",\"error\":\"ReferenceError\",\"message\":\"importScripts is not defined\"}",
+        "value": "{\"type\":\"undefined\",\"error\":\"ReferenceError\",\"message\":\"importScripts is not defined\"}"
+      }
+    },
+    "target-discovery": {
+      "before_create": {
+        "targetInfos": []
+      },
+      "creator_connection": {
+        "targetInfos": [
+          {
+            "targetId": "page-1",
+            "type": "page",
+            "title": "",
+            "url": "about:blank",
+            "attached": true,
+            "canAccessOpener": false,
+            "browserContextId": "default"
+          }
+        ]
+      },
+      "second_browser_connection": {
+        "targetInfos": []
+      }
+    },
+    "additional-canvas-controls-svg": {
+      "exit": 0,
+      "stdout": "{\"rangeValue\":\"\",\"rangeValueAsNumber\":50,\"canvasHslPixel\":[0,0,0,255],\"pathError\":\"TypeError: document.getElementById(...).getTotalLength is not a function\"}",
+      "stderr": ""
+    }
+  }
+}

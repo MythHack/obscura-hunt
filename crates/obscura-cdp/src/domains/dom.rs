@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
@@ -12,6 +12,9 @@ pub(crate) struct DomDocument {
     pub page_id: String,
     document_generation: u64,
     children_sent: HashMap<u64, bool>,
+    published_children: HashMap<u64, Vec<u64>>,
+    retired_nodes: HashSet<u64>,
+    topology_generation: u64,
 }
 
 impl DomDocument {
@@ -19,13 +22,88 @@ impl DomDocument {
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             if let Some(id) = node["nodeId"].as_u64() {
+                self.retired_nodes.remove(&id);
                 self.children_sent.insert(id,
                     node["children"].is_array() || node["childNodeCount"] == 0);
+                if let Some(children) = node["children"].as_array() {
+                    self.published_children.insert(id, children.iter().filter_map(|child| child["nodeId"].as_u64()).collect());
+                } else if node["childNodeCount"] == 0 {
+                    self.published_children.insert(id, Vec::new());
+                }
             }
             if let Some(children) = node["children"].as_array() {
                 pending.extend(children);
             }
         }
+    }
+}
+
+/// Compare only the client-published light tree after a native topology change.
+/// No page-visible object map participates in node identity or mutation routing.
+pub(crate) fn drain_mutations(ctx: &mut CdpContext) {
+    let sessions = ctx.dom_documents.keys().cloned().collect::<Vec<_>>();
+    for session in sessions {
+        let Some(mut state) = ctx.dom_documents.remove(&session) else { continue };
+        let current = ctx.get_session_page(&session).and_then(|page| page.js.as_ref())
+            .and_then(|js| Some((js.cdp_document_generation(0).ok()?,
+                js.with_dom_in_frame(0, DomTree::topology_generation).ok()?)));
+        let Some((generation, topology)) = current else { continue };
+        if generation != state.document_generation { continue; }
+        if topology != state.topology_generation {
+            let mut parents = state.published_children.keys().copied().collect::<Vec<_>>();
+            parents.sort_unstable();
+            for parent in parents {
+                if !state.published_children.contains_key(&parent) { continue; }
+                let Some(record) = ctx.backend_nodes.get(&parent).cloned() else { continue };
+                let children = ctx.get_session_page(&session).and_then(|page| page.js.as_ref())
+                    .and_then(|js| js.with_dom_in_frame(0, |dom| dom.children(NodeId::new(record.node_id))).ok())
+                    .unwrap_or_default();
+                let mut actual = Vec::with_capacity(children.len());
+                for child in children {
+                    if let Ok(id) = backend_node_id(ctx, &session, 0, child.index() as u32) { actual.push(id); }
+                }
+                let old = state.published_children.get(&parent).cloned().unwrap_or_default();
+                if old == actual { continue; }
+                let positions = old.iter().enumerate().map(|(index, id)| (*id, index)).collect::<HashMap<_, _>>();
+                let mut kept = std::collections::HashSet::new();
+                let mut next = 0;
+                for id in &actual {
+                    if let Some(&index) = positions.get(id) {
+                        if index >= next { kept.insert(*id); next = index + 1; }
+                    }
+                }
+                for id in old.iter().filter(|id| !kept.contains(id)) {
+                    ctx.pending_events.push(CdpEvent { method: "DOM.childNodeRemoved".into(),
+                        params: json!({"parentNodeId": parent, "nodeId": id}), session_id: session.clone() });
+                    let mut removed = vec![*id];
+                    while let Some(id) = removed.pop() {
+                        state.retired_nodes.insert(id);
+                        state.children_sent.remove(&id);
+                        if let Some(children) = state.published_children.remove(&id) { removed.extend(children); }
+                    }
+                }
+                let mut previous = 0;
+                for id in &actual {
+                    if !kept.contains(id) {
+                        let Some(record) = ctx.backend_nodes.get(id).cloned() else { continue };
+                        let node = ctx.get_session_page(&session).and_then(|page| page.js.as_ref())
+                            .and_then(|js| js.with_dom_in_frame(0, |dom| serialize_node(dom, NodeId::new(record.node_id), 0, 0)).ok());
+                        if let Some(mut node) = node {
+                            if scope_node_tree(ctx, &session, 0, &mut node).is_ok() {
+                                state.remember(&node);
+                                ctx.pending_events.push(CdpEvent { method: "DOM.childNodeInserted".into(),
+                                    params: json!({"parentNodeId": parent, "previousNodeId": previous, "node": node}),
+                                    session_id: session.clone() });
+                            }
+                        }
+                    }
+                    previous = *id;
+                }
+                state.published_children.insert(parent, actual);
+            }
+            state.topology_generation = topology;
+        }
+        ctx.dom_documents.insert(session, state);
     }
 }
 
@@ -50,6 +128,7 @@ fn push_children(ctx: &mut CdpContext, state: &mut DomDocument, node: u64, depth
                 state.remember(node);
             }
             state.children_sent.insert(parent, true);
+            state.published_children.insert(parent, nodes.iter().filter_map(|node| node["nodeId"].as_u64()).collect());
             events.push(CdpEvent {
                 method: "DOM.setChildNodes".into(),
                 params: json!({"parentId":parent, "nodes":nodes}),
@@ -72,6 +151,7 @@ fn push_children(ctx: &mut CdpContext, state: &mut DomDocument, node: u64, depth
 
 fn push_node(ctx: &mut CdpContext, session_id: &Option<String>, world: CdpExecutionWorld,
     node: NodeId) -> Result<u64, String> {
+    drain_mutations(ctx);
     if world.frame_id != 0 {
         return Err("Node is outside the requested light-DOM document".into());
     }
@@ -101,8 +181,7 @@ fn push_node(ctx: &mut CdpContext, session_id: &Option<String>, world: CdpExecut
                 push_children(ctx, &mut state, parent_id, 1, session_id, &mut events)?;
             }
             if !state.children_sent.contains_key(&id) {
-                // Refresh inserted children until live DOM mutation events publish them.
-                return Err("Node requires DOM mutation events; request the document again".into());
+                return Err("Node is outside the published light-DOM document".into());
             }
         }
         Ok(id)
@@ -130,6 +209,12 @@ fn node_for_location(page: &mut Page, x: i64, y: i64) -> Result<NodeId, String> 
 fn resolve_node_id(ctx: &mut CdpContext, session: &Option<String>, params: &Value)
     -> Result<(CdpExecutionWorld, u32), String>
 {
+    drain_mutations(ctx);
+    if let Some(id) = params.get("nodeId").and_then(Value::as_u64) {
+        if ctx.dom_documents.get(session).is_some_and(|document| document.retired_nodes.contains(&id)) {
+            return Err("Cannot find node in the current document".to_string());
+        }
+    }
     if let Some(id) = params.get("nodeId").or_else(|| params.get("backendNodeId")).and_then(Value::as_u64) {
         let record = ctx.backend_nodes.get(&id).cloned().ok_or("Cannot find node in the current document")?;
         let page = ctx.get_session_page_mut(session).ok_or("No page")?;
@@ -254,12 +339,18 @@ pub async fn handle(
             Ok(json!({}))
         }
         "getDocument" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            // Fresh about:blank targets retain a native DOM until first use.
+            // Activate that document through the normal Page lifecycle before
+            // requesting its generation and native node identities.
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(2);
             let mut root = page.with_dom(|dom| serialize_node(dom, dom.document(), depth as u32, 0))
                 .ok_or("No DOM loaded")?;
             let mut state = DomDocument {
                 page_id: page.id.clone(), children_sent: HashMap::new(),
+                published_children: HashMap::new(),
+                retired_nodes: HashSet::new(),
+                topology_generation: page.with_dom(DomTree::topology_generation).ok_or("No DOM loaded")?,
                 document_generation: page.js.as_ref().ok_or("No JavaScript runtime")?.cdp_document_generation(0)?,
             };
             scope_node_tree(ctx, session_id, 0, &mut root)?;

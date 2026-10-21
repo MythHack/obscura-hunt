@@ -67,14 +67,15 @@ async fn fixture(redirect: Option<String>) -> Fixture {
     Fixture { base, requests, task }
 }
 
-fn context(stealth: bool) -> (CdpContext, String) {
+async fn context(stealth: bool) -> (CdpContext, String) {
     let mut ctx = CdpContext::new();
     ctx.default_context = Arc::new(obscura_browser::BrowserContext::with_storage_and_network(
         "network-ports".into(), None, stealth, None, None, true,
-    ));
+    ).expect("network fixture context"));
     let page = ctx.create_page();
     let session = "network-ports-session".to_string();
     ctx.sessions.insert(session.clone(), page);
+    cdp(&mut ctx, &session, "Network.enable", json!({})).await;
     (ctx, session)
 }
 
@@ -107,7 +108,7 @@ fn response(ctx: &CdpContext, suffix: &str) -> Value {
 
 async fn module_receipts(stealth: bool) {
     let server = fixture(None).await;
-    let (mut ctx, session) = context(stealth);
+    let (mut ctx, session) = context(stealth).await;
     cdp(&mut ctx, &session, "Page.navigate", json!({"url": format!("{}module.html", server.base)})).await;
     assert_eq!(evaluate(&mut ctx, &session, "moduleValue").await.as_f64(), Some(42.0));
     assert_eq!(evaluate(&mut ctx, &session, "import('/lazy.js').then(m => m.default)").await.as_f64(), Some(73.0));
@@ -160,7 +161,7 @@ async fn stealth_module_receipts_cover_static_dynamic_failed_and_frame_graphs() 
 
 async fn body_policy(stealth: bool) {
     let server = fixture(None).await;
-    let (mut ctx, session) = context(stealth);
+    let (mut ctx, session) = context(stealth).await;
     cdp(&mut ctx, &session, "Page.navigate", json!({"url": server.base})).await;
     for (path, bytes, expected) in [
         ("gbk", vec![0xd6, 0xd0, 0xce, 0xc4], json!({"body": "中文", "base64Encoded": false})),
@@ -188,7 +189,7 @@ async fn stealth_response_body_charset_and_bytes_are_lossless() { body_policy(tr
 async fn headers_and_referrer(stealth: bool) {
     let destination = fixture(None).await;
     let server = fixture(Some(destination.base.clone())).await;
-    let (mut ctx, session) = context(stealth);
+    let (mut ctx, session) = context(stealth).await;
     cdp(&mut ctx, &session, "Network.setExtraHTTPHeaders", json!({"headers": {
         "X-Page": "private", "Authorization": "secret", "Cookie": "manual=secret", "Proxy-Authorization": "proxy-secret"
     }})).await;
@@ -222,6 +223,7 @@ async fn headers_and_referrer(stealth: bool) {
     let popup = targets["targetInfos"].as_array().unwrap().iter().find(|info| info["openerId"] == opener).unwrap()["targetId"].clone();
     let attached = cdp(&mut ctx, "browser", "Target.attachToTarget", json!({"targetId": popup, "flatten": true})).await;
     let popup_session = attached["sessionId"].as_str().unwrap();
+    cdp(&mut ctx, popup_session, "Network.enable", json!({})).await;
     evaluate(&mut ctx, popup_session, "fetch('/echo').then(r => r.text())").await;
     assert_eq!(header(server.requests.lock().await.last().unwrap(), "x-page").as_deref(), Some("private"));
     cdp(&mut ctx, popup_session, "Network.setExtraHTTPHeaders", json!({"headers": {"X-Page": "popup"}})).await;
@@ -278,7 +280,7 @@ async fn stealth_page_headers_and_referrer_obey_ownership_and_redirect_policy() 
 
 async fn identity_override(stealth: bool) {
     let server = fixture(None).await;
-    let (mut ctx, session) = context(stealth);
+    let (mut ctx, session) = context(stealth).await;
     for method in ["Network.setUserAgentOverride", "Emulation.setUserAgentOverride"] {
         cdp(&mut ctx, &session, "Page.navigate", json!({"url": server.base})).await;
         let root = ctx.get_session_page(&Some(session.clone())).unwrap().frame_id.clone();

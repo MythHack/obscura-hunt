@@ -165,6 +165,8 @@ struct AlgoConstants {
     is_wrap: bool,
     /// Is the wrap direction inverted
     is_wrap_reverse: bool,
+    /// This flex row stands in for a CSS inline formatting line.
+    inline_line: bool,
 
     /// The item's min_size style
     min_size: Size<Option<f32>>,
@@ -522,6 +524,7 @@ fn compute_constants(
         is_column,
         is_wrap,
         is_wrap_reverse,
+        inline_line: style.inline_line(),
         min_size: style
             .min_size()
             .maybe_resolve(parent_size, |val, basis| tree.calc(val, basis))
@@ -1821,7 +1824,22 @@ fn distribute_remaining_free_space(flex_lines: &mut [FlexLine], constants: &Algo
 fn resolve_cross_axis_auto_margins(flex_lines: &mut [FlexLine], constants: &AlgoConstants) {
     for line in flex_lines {
         let line_cross_size = line.cross_size;
-        let max_baseline: f32 = line.items.iter_mut().map(|child| child.baseline).fold(0.0, |acc, x| acc.max(x));
+        let mut max_baseline: f32 = line.items.iter().map(|child| child.baseline).fold(0.0, f32::max);
+        if constants.inline_line && constants.is_row {
+            let mut baseline_extent = 0.0_f32;
+            let mut bottom_extent = 0.0_f32;
+            for child in line.items.iter() {
+                if child.align_self == AlignSelf::BASELINE {
+                    baseline_extent = baseline_extent.max(max_baseline - child.baseline + child.outer_target_size.height);
+                } else if child.align_self == AlignSelf::FLEX_END {
+                    bottom_extent = bottom_extent.max(child.outer_target_size.height);
+                }
+            }
+            // A bottom-aligned atomic inline can enlarge the line below the
+            // baseline group. Move that group with the line's bottom edge;
+            // real flex rows retain ordinary cross-axis baseline alignment.
+            max_baseline += (bottom_extent - baseline_extent).max(0.0);
+        }
 
         for child in line.items.iter_mut() {
             let free_space = line_cross_size - child.outer_target_size.cross(constants.dir);

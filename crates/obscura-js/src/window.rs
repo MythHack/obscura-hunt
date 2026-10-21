@@ -230,6 +230,8 @@ impl WindowRegistry {
         window.closed = true;
         let mut state = window.state.borrow_mut();
         state.document_generation = state.document_generation.wrapping_add(1);
+        state.websockets.cancel_all();
+        state.rtc_connections.cancel_all();
         state.pending_navigation = None;
         drop(state);
         self.callbacks.remove(&window.realm_id);
@@ -470,12 +472,14 @@ const WORLD_EVENT_CREATE_SLOT: i32 = WORLD_WRAP_NODE_SLOT + 1;
 const WORLD_EVENT_PHASE_SLOT: i32 = WORLD_EVENT_CREATE_SLOT + 1;
 const WORLD_EVENT_FINISH_SLOT: i32 = WORLD_EVENT_PHASE_SLOT + 1;
 const WORLD_NATIVE_INPUT_SLOT: i32 = WORLD_EVENT_FINISH_SLOT + 1;
-pub(crate) const WINDOW_MESSAGE_SLOT: i32 = WORLD_NATIVE_INPUT_SLOT + 1;
+const WORLD_FRAGMENT_NAVIGATION_SLOT: i32 = WORLD_NATIVE_INPUT_SLOT + 1;
+pub(crate) const WINDOW_MESSAGE_SLOT: i32 = WORLD_FRAGMENT_NAVIGATION_SLOT + 1;
+pub(crate) const WORLD_DOCUMENT_SLOT: i32 = WINDOW_MESSAGE_SLOT + 1;
 const WINDOW_EVENT_NODE: u32 = u32::MAX;
 
 pub(crate) fn initialize_world_callback_slots(context: v8::Local<v8::Context>,
     undefined: v8::Local<v8::Value>) {
-    for slot in WORLD_NODE_ID_SLOT..=WINDOW_MESSAGE_SLOT {
+    for slot in WORLD_NODE_ID_SLOT..=WORLD_DOCUMENT_SLOT {
         context.set_embedder_data(slot, undefined);
     }
 }
@@ -489,15 +493,37 @@ fn world_receiver(scope: &mut v8::PinScope, state: &OpState,
     Ok((v8::Global::new(scope, context), document))
 }
 
+// Retirement cancels browsing-context authority, not the document an author
+// already holds. Only read-only DOM bindings use this path; storage, network,
+// focus and event dispatch continue to require world_receiver's live owner.
+fn readable_world_receiver(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>) -> Result<(v8::Global<v8::Context>, SharedState), JsErrorBox> {
+    let context = receiver.get_creation_context(scope).ok_or_else(security_error)?;
+    if !receiver.strict_equals(context.global(scope).into()) { return Err(security_error()); }
+    let document = context.get_slot::<crate::ops::DocumentStateSlot>()
+        .map(|slot| slot.0.clone()).ok_or_else(security_error)?;
+    if document.borrow().document_active.get() {
+        return world_receiver(scope, state, receiver);
+    }
+    let context = v8::Global::new(scope, context);
+    let caller = caller_context(scope)?;
+    if caller != context {
+        let source = state.borrow::<Rc<RefCell<RealmStates>>>().borrow().by_context(&caller)
+            .ok_or_else(security_error)?;
+        if !same_principal(&source.borrow(), &document.borrow()) { return Err(security_error()); }
+    }
+    Ok((context, document))
+}
+
 #[op2(nofast)]
 fn op_world_register(scope: &mut v8::PinScope, state: &OpState,
     receiver: v8::Local<v8::Object>, node_id: v8::Local<v8::Function>,
     wrap_node: v8::Local<v8::Function>, event_create: v8::Local<v8::Function>,
     event_phase: v8::Local<v8::Function>, event_finish: v8::Local<v8::Function>,
-    native_input: v8::Local<v8::Function>) -> Result<(), JsErrorBox> {
+    native_input: v8::Local<v8::Function>, navigate_fragment: v8::Local<v8::Function>) -> Result<(), JsErrorBox> {
     let (handle, _) = world_receiver(scope, state, receiver)?;
     let context = v8::Local::new(scope, handle);
-    let functions = [node_id, wrap_node, event_create, event_phase, event_finish, native_input];
+    let functions = [node_id, wrap_node, event_create, event_phase, event_finish, native_input, navigate_fragment];
     if functions.iter().any(|function| function.get_creation_context(scope) != Some(context)) {
         return Err(security_error());
     }
@@ -511,10 +537,31 @@ fn op_world_register(scope: &mut v8::PinScope, state: &OpState,
 }
 
 
+#[op2]
+fn op_world_document<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
+    receiver: v8::Local<'s, v8::Object>) -> Result<v8::Local<'s, v8::Value>, JsErrorBox> {
+    let (context, _) = readable_world_receiver(scope, state, receiver)?;
+    Ok(v8::Local::new(scope, context).get_embedder_data(scope, WORLD_DOCUMENT_SLOT)
+        .filter(|value| value.is_object()).unwrap_or_else(|| v8::null(scope).into()))
+}
+
+#[op2(nofast, reentrant)]
+fn op_world_document_bind(scope: &mut v8::PinScope, state: &OpState,
+    receiver: v8::Local<v8::Object>, document: v8::Local<v8::Object>) -> Result<(), JsErrorBox> {
+    let (context, owner) = world_receiver(scope, state, receiver)?;
+    let native = world_node_id(scope, &context, document.into()).ok_or_else(security_error)?;
+    let owner = owner.borrow();
+    if !owner.document_active.get() || document.get_creation_context(scope) != Some(v8::Local::new(scope, &context)) { return Err(security_error()); }
+    let dom = owner.dom.as_ref().ok_or_else(security_error)?;
+    if native != dom.document().raw() { return Err(security_error()); }
+    v8::Local::new(scope, context).set_embedder_data(WORLD_DOCUMENT_SLOT, document.into());
+    Ok(())
+}
+
 #[op2(nofast)]
 fn op_world_dom_generation(scope: &mut v8::PinScope, state: &OpState,
     receiver: v8::Local<v8::Object>, tree: bool) -> Result<f64, JsErrorBox> {
-    let (_, document) = world_receiver(scope, state, receiver)?;
+    let (_, document) = readable_world_receiver(scope, state, receiver)?;
     let owner = document.borrow();
     let dom = owner.dom.as_ref().ok_or_else(security_error)?;
     let generation = dom.topology_generation();
@@ -560,6 +607,16 @@ pub(crate) fn world_native_input<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>,
     callback.call(scope, receiver.into(), &[payload])
 }
 
+pub(crate) fn world_navigate_fragment(scope: &mut v8::PinScope,
+    context: &v8::Global<v8::Context>, url: &str) -> Option<()> {
+    let callback = world_function(scope, context, WORLD_FRAGMENT_NAVIGATION_SLOT)?;
+    let receiver = v8::undefined(scope);
+    let url = v8::String::new(scope, url)?;
+    let replace = v8::Boolean::new(scope, false);
+    callback.call(scope, receiver.into(), &[url.into(), replace.into()])?;
+    Some(())
+}
+
 #[op2(reentrant)]
 fn op_world_node_id<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>, state: &OpState,
     receiver: v8::Local<'s, v8::Object>, value: v8::Local<'s, v8::Value>) -> v8::Local<'s, v8::Value> {
@@ -593,6 +650,15 @@ fn op_world_focus(scope: &mut v8::PinScope, state: &OpState,
     }
     if owner.focused_node.is_some_and(|node| owner.dom.as_ref().is_none_or(|dom| !dom.is_connected(node))) {
         owner.focused_node = None;
+    }
+    if owner.dom.as_ref().is_some_and(|dom| dom.set_focused(owner.focused_node)) {
+        owner.activity_generation = owner.activity_generation.wrapping_add(1);
+        #[cfg(feature = "render")]
+        {
+            owner.prepared_render = None;
+            owner.pending_style_mutations.clear();
+            owner.resolved_scroll = None;
+        }
     }
     Ok(owner.focused_node.map(|node| node.index() as u32).unwrap_or(WINDOW_EVENT_NODE))
 }
@@ -893,7 +959,6 @@ fn op_window_open(scope: &mut v8::PinScope, state: &OpState,
             child.inherited_origin = Some(if noopener { "null".to_string() } else { origin(&parent) });
             child.opaque_origin = if noopener { Some(Rc::new(())) } else { parent_opaque.clone() };
             child.referrer = if noreferrer { String::new() } else { parent.url.clone() };
-            #[cfg(feature = "render")]
             child.set_viewport(parent.viewport.0 as f64, parent.viewport.1 as f64);
         }
         let child = Rc::new(RefCell::new(child));
@@ -1384,5 +1449,6 @@ pub(crate) fn ops() -> Vec<OpDecl> {
         op_window_same_origin(), op_window_closed(), op_window_relation(), op_window_source(),
         op_window_navigate(), op_window_close(), op_window_command(), op_window_post_message(),
         op_window_realm_proxy(), op_window_realm_same_origin(), op_install_window_bundle(), op_window_realm_member(), op_world_register(),
+        op_world_document(), op_world_document_bind(),
         op_world_dom_generation(), op_world_node_id(), op_world_focus(), op_world_event_dispatch()]
 }

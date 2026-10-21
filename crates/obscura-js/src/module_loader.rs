@@ -218,6 +218,29 @@ impl ModuleLoader for ObscuraModuleLoader {
                 )));
             }
         }
+        if matches!(module_specifier.scheme(), "data" | "blob") {
+            let resource = match self.page_state.as_ref().and_then(Weak::upgrade) {
+                Some(state) => crate::local_resource::load_local_resource(&state.borrow(), module_specifier),
+                None if self.page_state.is_some() => Err(JsErrorBox::type_error("Module document was dropped")),
+                None => crate::local_resource::load_local_resource(&ObscuraState::new(), module_specifier),
+            };
+            return ModuleLoadResponse::Sync(resource.and_then(|resource| {
+                let resource = resource.ok_or_else(|| JsErrorBox::type_error("Local module is unavailable"))?;
+                if !crate::local_resource::is_javascript_mime(&resource.mime) {
+                    return Err(JsErrorBox::type_error("Module resource is not a JavaScript MIME type"));
+                }
+                if let Some(owner) = self.page_state.as_ref().and_then(Weak::upgrade) {
+                    let mut owner = owner.borrow_mut();
+                    if owner.is_worker && owner.worker_entry_pending && owner.url == module_specifier.as_str() {
+                        owner.worker_entry_pending = false;
+                    }
+                }
+                self.loaded_specifiers.borrow_mut().push(url);
+                Ok(ModuleSource::new(deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(obscura_net::decode_non_html(&resource.bytes, None).into()),
+                    module_specifier, None))
+            }));
+        }
         // Module-graph CORS and same-origin credentials are relative to the
         // owning document, not to the importing module. The importer remains
         // the HTTP referrer for a dependency; keeping these URLs distinct
@@ -302,6 +325,8 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let mut request = obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    request.frame_id = frame_id;
+                    request.frame_generation = generation;
                     request.referrer_policy = referrer_policy;
                     // URL resolution and the native document principal are distinct:
                     // an opaque sandbox must not gain its URL origin's credentials.
@@ -312,6 +337,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         state: state.clone(), cancel: None,
                         event: Some(JsNetworkEvent {
                             request_id: request_id.clone(), frame_id, frame_generation: generation,
+                            request_headers: Default::default(), request_body: None, request_started: false,
                             intercepted: false, url: url.clone(), method: "GET".to_string(),
                             resource_type: "Script".to_string(), status: 0,
                             response_headers: Default::default(), body_size: 0,
@@ -355,7 +381,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     if let Some(owner) = page_state.as_ref().and_then(Weak::upgrade) {
                         let owner = owner.try_borrow().map_err(|_| io_err(
                             "Module document owner is already borrowed".to_string()))?;
-                        if owner.frame_id != frame_id || owner.document_generation != generation {
+                        if !owner.document_active.get() || owner.frame_id != frame_id || owner.document_generation != generation {
                             return Err(io_err("Module document owner was replaced".to_string()));
                         }
                     } else if page_state.is_some() {
@@ -372,6 +398,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
                             push_js_network_event(&mut state.borrow_mut(), JsNetworkEvent {
                                 request_id: request_id.clone(), frame_id, frame_generation: generation, intercepted: false,
+                                request_headers: Default::default(), request_body: None, request_started: false,
                                 url: url.clone(), method: "GET".to_string(), resource_type: "Script".to_string(),
                                 status: 0, response_headers: Default::default(), body_size: 0,
                                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -386,6 +413,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                         if let Some(state) = network_state.as_ref().and_then(Weak::upgrade) {
                             record_network_response(&state, JsNetworkEvent {
                                 request_id, frame_id, frame_generation: generation, intercepted: false,
+                                request_headers: Default::default(), request_body: None, request_started: false,
                                 url: resp.url.to_string(), method: "GET".to_string(),
                                 resource_type: "Script".to_string(), status: resp.status,
                                 response_headers: resp.headers.clone(), body_size: resp.body.len(),
@@ -401,6 +429,17 @@ impl ModuleLoader for ObscuraModuleLoader {
                             url, resp.status
                         )));
                     }
+                    if !resp.content_type().is_some_and(crate::local_resource::is_javascript_mime) {
+                        return Err(JsErrorBox::type_error(format!("Module {url} is not a JavaScript MIME type")));
+                    }
+                    if let Some(owner) = page_state.as_ref().and_then(Weak::upgrade) {
+                        let mut owner = owner.try_borrow_mut().map_err(|_| io_err("Module owner is unavailable".to_string()))?;
+                        if owner.is_worker && owner.worker_entry_pending && owner.url == requested.as_str() {
+                            owner.content_security_policy = resp.headers.get("content-security-policy").cloned().into_iter().collect();
+                            owner.url = resp.url.to_string();
+                            owner.worker_entry_pending = false;
+                        }
+                    }
                     let found = ModuleSpecifier::parse(resp.url.as_str()).map_err(|e| {
                         io_err(format!("Invalid final module URL {}: {}", resp.url, e))
                     })?;
@@ -409,7 +448,9 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .borrow_mut()
                             .push(found.to_string());
                     }
-                    let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                    // Module source text is always UTF-8; MIME charset parameters
+                    // do not select a legacy classic-script decoder.
+                    let code = obscura_net::decode_non_html(&resp.body, None);
                     Ok(ModuleSource::new_with_redirect(
                         deno_core::ModuleType::JavaScript,
                         ModuleSourceCode::String(code.into()),

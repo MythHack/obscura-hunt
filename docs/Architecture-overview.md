@@ -42,6 +42,14 @@ obscura-browser/page.rs         navigate_with_wait
 
 The dispatcher emits CDP events (`Network.requestWillBeSent`, `Page.frameNavigated`, `Page.lifecycleEvent`) back to the client through the same WebSocket.
 
+Parser-discovered classic scripts use one bounded native fetch queue, admitted
+alongside stylesheet loading. Completed sources remain in that queue's retained
+results until blocking CSS and its imports have been installed. Execution still
+uses the parser, async, defer and module scheduling rules; module graph/evaluation
+budgets do not include time waiting for stylesheets. The queue shares the page's
+selected transport, resource cache, callbacks and interception, and dropping the
+navigation drops its pending fetches rather than leaving detached work running.
+
 ## Rendering flow
 
 `obscura-render` consumes the shared DOM and computed style state. Taffy
@@ -49,12 +57,20 @@ provides the flex/grid foundation; Obscura adds browser formatting behavior,
 text shaping, intrinsic replaced-element sizing, retained geometry, scrolling,
 and CPU-backed paint. `obscura-js` exposes renderer-owned geometry to DOM APIs,
 `obscura-browser` prepares resources and owns capture, and `obscura-cdp` maps
-screenshots, screencast frames, and raster PDF output onto CDP.
+screenshots, screencast frames, and text/vector PDF output onto CDP.
 
 Layout is retained between captures and invalidated by relevant DOM, style,
 viewport, scroll, animation, font, and resource changes. The same geometry
 therefore drives browser APIs and paint instead of maintaining separate
 measurement and screenshot models.
+
+The render-enabled `obscura_browser` API exports `PdfOptions`, `PdfPageRange`
+and `PdfError`. `Page::pdf(PdfOptions)` returns `Result<Vec<u8>, PdfError>`;
+`pdf_at_animation_time` and `pdf_with_animation_sample` select the animation
+sample explicitly. Export uses retained print-media layout, shaped text with
+embedded subset fonts, vector paint and images, rather than a full-page JPEG.
+There is no separate raster-PDF entry point or compatibility alias. Tagged PDF,
+headers/footers, outlines and full CSS paged media are not implemented.
 
 Whitespace collapse belongs to the inline formatting context, not an individual
 text node. Mixed text/SVG fallback layout shares that state through ordinary
@@ -62,9 +78,15 @@ inline wrappers, including margin-bearing links, and trims the same stream's
 leading and trailing spaces. Atomic descendants have separate state, while
 preserved-whitespace modes retain their authored spacing.
 
-Page-owned layout and paint never fetch resources synchronously. Missing
-resources load through the page transport, with URL blocking checked both
-for navigation/screenshot warmup and for later renderer misses. The DOM-only
+Page-owned layout and paint never fetch resources synchronously. Navigation
+and screenshot preparation select resources from the retained effective
+cascade, not every URL in stylesheet text: used backgrounds, generated
+pseudo-elements, instantiated SVG references, and the family/weight/style and
+glyph subsets required by text. Class, stylesheet, viewport and media changes
+invalidate that selection through the same layout state. Selected misses load
+through the page transport and bounded retained cache, preserving URL blocking,
+proxy, credentials, interception and response limits for warmup and later paint.
+The DOM-only
 `Page::screenshot` fallback (for example after `Page::suspend_js`) also performs
 no network requests: external images and fonts absent from its cache remain
 unavailable. Resume the page and prepare its resources before capture when
@@ -73,7 +95,7 @@ existing synchronous-loader behavior.
 
 The relevant paths are `Page::screenshot_with_animation_sample` and
 `Page::render_resource_candidates` in `crates/obscura-browser/src/page.rs`,
-`ObscuraJsRuntime::take_render_resource_requests` in
+`ObscuraJsRuntime::selected_render_resource_urls` and `take_render_resource_requests` in
 `crates/obscura-js/src/runtime.rs`, and `RenderResourceCache` in
 `crates/obscura-render/src/paint.rs`.
 
@@ -91,6 +113,16 @@ page.evaluate(script)
 The dispatcher routes long-running operations (navigation, eval) through `process_with_interception` in `server.rs`, which spawns the work onto the tokio `LocalSet` and releases the dispatcher to keep handling other CDP messages.
 
 This is why `Target.createTarget` from many concurrent clients works: each `newPage` returns immediately while the actual navigation runs in a spawned task.
+
+Dedicated Workers are different: each owns a native thread, V8 isolate and
+event loop. They initialize their own built-ins and Worker globals, never a
+page-global proxy or a `with`/`eval` scope. Worker script loads, synchronous
+ordered `importScripts`, module graphs and fetches reuse the creator's selected
+native clients and resource principal. No page DOM, V8 handle or `Rc` crosses
+the thread boundary. Native channels carry structured-clone bytes, transferred
+ArrayBuffer backing stores, MessagePort ownership and opaque CryptoKey handles.
+Termination signals both the Worker isolate and its pending network work;
+creator-document retirement also discards stale responses and tasks.
 
 ## Child frames
 

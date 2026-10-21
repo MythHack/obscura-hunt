@@ -1,0 +1,1796 @@
+{
+  "as_of": "2026-10-20",
+  "base_commit": "208608215a42f2c392b13ccce62f433a4441155a",
+  "inventory": {
+    "source": "https://api.github.com/search/issues?q=repo%3Ah4ckf0r0day%2Fobscura%20is%3Aissue%20is%3Aopen&per_page=100",
+    "pages": [
+      {
+        "page": 1,
+        "count": 100
+      },
+      {
+        "page": 2,
+        "count": 2
+      }
+    ],
+    "total_count": 102,
+    "unique_ids": 102,
+    "incomplete_results": false
+  },
+  "coverage": {
+    "all_open_issue_bodies_read": true,
+    "comments": "Selected relevant discussions; not every historical comment",
+    "historical_closed_issues_fully_reviewed": false,
+    "current_source": "Focused comparison for applicability, not exhaustive whole-source audit",
+    "runtime": "Selected real local CLI/CDP/MCP probes only; not all102 issues reproduced"
+  },
+  "correction": "Previous16-issue claim was incomplete. The website issues adapter returned a first-page subset. Open PR inventory was separately fetched completely (92).",
+  "scope": {
+    "approved": "All priority and compatibility items in prior sections1/2 retained. Full public-key WebCrypto issue1289 added explicitly by user.",
+    "recommended_addition": "Issue1284 full GeoIP feature, including weighted languages and honest WebRTC boundaries, plus permission issue1207. Additional candidates are classified, not silently all approved or implemented."
+  },
+  "status_definitions": {
+    "covered": "Current-source/history coverage of reported narrow requirement; not newly verified/full standards conformance",
+    "partial": "Some requirements covered; explicit remainder still open",
+    "proposed": "Relevant repair/feature candidate, including already-approved work; see evidence for runtime/static status",
+    "diagnostic": "Needs current minimized repro or measurements before a root-cause fix is selected",
+    "optional": "Product/packaging/integration/performance extension rather than obligatory browser bug",
+    "not-recommended": "Requested behavior should not be adopted; reason given"
+  },
+  "counts": {
+    "proposed": 34,
+    "partial": 27,
+    "diagnostic": 14,
+    "optional": 6,
+    "covered": 20,
+    "not-recommended": 1
+  },
+  "items": [
+    {
+      "number": 1302,
+      "title": "window.document is writable, unlike Chrome's non-configurable getter-only attribute",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1302",
+      "requirements": "Window.document getter-only/non-configurable descriptor and strict/sloppy assignment invariants",
+      "status": "proposed",
+      "reason": "Approved first-group repair. Actual local binary permits replacement; not implemented.",
+      "evidence": "Local CLI window-document.json; upstream issue1302.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1295,
+      "title": "Missing CSS selectors and APIs: :nth-child(An+B of S), :focus-within, :target, CSS.registerProperty, streaming TextDecoder",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1295",
+      "requirements": "All five: nth-child(of selector), focus-within, target query/style matching, typed CSS.registerProperty, streaming UTF-8 TextDecoder",
+      "status": "proposed",
+      "reason": "Approved first/second-group scope. Five independent acceptance items; current local probes fail.",
+      "evidence": "Local selectors-decoder.json; upstream issue1295.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1294,
+      "title": "Clicking <summary> does not toggle its <details>",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1294",
+      "requirements": "First-summary activation via script/CDP, cancellation, details.open, toggle event",
+      "status": "proposed",
+      "reason": "Approved compatibility repair; actual click leaves details closed. Open PR1299 is not completion.",
+      "evidence": "Local summary-activation.json; upstream issue1294 and PR1299.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1293,
+      "title": "A display:none table row still has a box: non-zero getBoundingClientRect, checkVisibility() true",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1293",
+      "requirements": "display:none tr zero rect, false visibility, null offsetParent and correct automation visibility",
+      "status": "partial",
+      "reason": "Local checkVisibility alreadyfalse but rect8x20 and offsetParentTABLE remain. Approved geometry fix.",
+      "evidence": "Local hidden-table-row.json; upstream issue1293.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1292,
+      "title": "fetch() and XMLHttpRequest send no Sec-Fetch-* headers",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1292",
+      "requirements": "Correct Fetch Metadata on fetch and XHR, including mode/site/destination and redirects",
+      "status": "proposed",
+      "reason": "Approved network repair. Local requests lack metadata. PR1301 needs standards corrections rather than unchanged adoption.",
+      "evidence": "Local network-top.json/network-subcommand.json; https://w3c.github.io/webappsec-fetch-metadata/",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1291,
+      "title": "CDP DOM domain: requestNode, getNodeForLocation, requestChildNodes and getAttributes are unimplemented (breaks go-rod, ferrum, chromedp)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1291",
+      "requirements": "Four DOM methods plus live childNodeInserted notifications after document retrieval",
+      "status": "partial",
+      "reason": "Four methods integrated and actual-tested at2086082; live mutation notifications remain. Shadow/frame publication limitations must not be called full issue completion.",
+      "evidence": "Merge2086082 and docs/Testing-and-debugging.md upstream-sync-a754dce; issue1291 body.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1289,
+      "title": "WebCrypto public-key algorithms (RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, ECDH, Ed25519): which backend?",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1289",
+      "requirements": "RSA-OAEP, RSASSA-PKCS1-v1_5, RSA-PSS, ECDSA, ECDH, Ed25519, X25519, applicable generation/import/export/encrypt/decrypt/sign/verify/derive/wrap semantics",
+      "status": "proposed",
+      "reason": "Explicitly added by user. Full public-key operations and key usage/extractability/format/errors, not signatures-only subset.",
+      "evidence": "Issue1289; Cargo.lock aws-lc-rs1.18.2; local public-key-crypto.json.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1284,
+      "title": "add geoIP=true feature",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1284",
+      "requirements": "Automatic egress-IP or explicit-IP GeoIP; coordinates/timezone/country/locale; weighted regional language; coherent RTC address behavior",
+      "status": "proposed",
+      "reason": "Previously omitted. Recommend adding independent full feature with permissions/native Intl/context scope and honest RTC boundaries. Manual timezone/geolocation is not completion.",
+      "evidence": "Issue1284; source comparison agentGeoIPScope; CloakBrowser and Camoufox references.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1283,
+      "title": "0.2.5: \"ReferenceError: cdApi is not defined\" logged 14x during login submit — uppopi SDK still never inserted",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1283",
+      "requirements": "Post-submit missing later SDK insertion and repeated cdApi errors; login/transactions still succeed",
+      "status": "diagnostic",
+      "reason": "Needs authorized reduced loader/worker repro. No site-specific globals, exception suppression or claim of loginfailure.",
+      "evidence": "Issue1283 body/comments.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1278,
+      "title": "Top-level --user-agent is accepted but ignored (and scrape has no way to set a UA)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1278",
+      "requirements": "Top-level UA reaches HTTP and navigator consistently; include scrape and preserve override precedence",
+      "status": "proposed",
+      "reason": "Approved CLI repair; top-level flag ignored on local requests, subcommand flagworks.",
+      "evidence": "Local network-top.json/network-subcommand.json; issue1278/PR1279.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1247,
+      "title": "Worker global scope doesn't expose built-ins on self",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1247",
+      "requirements": "Worker built-ins reachable via self.Object/self.Uint8Array and membership checks, within correct worker realm",
+      "status": "proposed",
+      "reason": "Approved compatibility repair. Actual Worker self.Array/self.Map undefined.",
+      "evidence": "Local worker-port-transfer.json; issue1247/PR1249.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1246,
+      "title": "Network.requestWillBeSent has no request headers or post data",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1246",
+      "requirements": "Network.requestWillBeSent headers/postData, actual requestWillBeSentExtraInfo headers, prompt non-stealth emission, both transports",
+      "status": "proposed",
+      "reason": "Approved request-evidence repair; actual local CDP drops sent headers/body. ExtraInfo/timing must remain separate acceptance clauses.",
+      "evidence": "Local network-cdp.json; issue1246/PR1250.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1245,
+      "title": "<iframe src=\"javascript:...\"> is never run, the frame stays empty",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1245",
+      "requirements": "javascript iframe navigation executes in child Window, callsparent as allowed, string completion installs child document, does not become networkfetch",
+      "status": "proposed",
+      "reason": "Approved navigation repair; local iframe remains about:blank with empty document.",
+      "evidence": "Local javascript-iframe.json; issue1245/PR1251.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1244,
+      "title": "<link rel=\"preload\"> never fires load or error",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1244",
+      "requirements": "Dynamic preload-as-style emits load/error and preserves stylesheet lifecycle, unblocking dependent application loading",
+      "status": "proposed",
+      "reason": "Approved preload repair; local preload emitted neither callback during awaited1s loopbackprobe.",
+      "evidence": "Local preload-event.json; issue1244/PR1248.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1242,
+      "title": "CDP replies stall for up to 1.7 s after page load on script-heavy pages",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1242",
+      "requirements": "Eliminate measured postload CDP stalls/idle latency across awaitPromise modes without removing watchdogs",
+      "status": "diagnostic",
+      "reason": "Source/performance issue read; prior fixes and parent MCP repro do not prove this latency report resolved. Needs matched local benchmark.",
+      "evidence": "Issue1242 body; no new latency measurements.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1240,
+      "title": "Add an opt-in Parallel Search MCP example for web discovery and browsing",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1240",
+      "requirements": "Opt-in runnable third-party search-to-browser MCP client example, declared deps/validation, no engine search integration",
+      "status": "optional",
+      "reason": "Documentation/integration example, not core browser defect; no runtime integration assumed approved.",
+      "evidence": "Issue1240 body/comments.",
+      "review_group": "Recent"
+    },
+    {
+      "number": 1222,
+      "title": "Module scripts log 0 bytes and intermittently fail to execute, stranding SPAs on their boot splash",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1222",
+      "requirements": [
+        "Accurate decoded module body sizes and CDP body lookup",
+        "Reliable initial and dynamic module execution with native transport and private-network policy preserved"
+      ],
+      "status": "partial",
+      "reason": "Existing module compatibility scope: current loader records exact response bytes, size, status and failures and tracks pending dynamic graphs; source tests cover static and dynamic execution. This establishes accounting coverage, not resolution of the Android intermittent startup/socket report. Do not adopt blanket retries from PR1226 as proof of the root cause or of execution reliability. No runtime reproduction performed.",
+      "evidence": [
+        "crates/obscura-js/src/module_loader.rs:289-425",
+        "crates/obscura-cdp/tests/module_network_events.rs:110-178",
+        "https://github.com/h4ckf0r0day/obscura/pull/1226"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 1220,
+      "title": "failed to perform detect tests",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1220",
+      "requirements": [
+        "Windows render+stealth diagnostic pages finish their asynchronous checks; reported canvas/WebGL/font checks and screenshots become explainable."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. Site-specific completion/green verdicts are not an engine acceptance criterion and are not established by an API existing. Current source deliberately returns null for WebGL; Canvas2D/fonts are different capabilities. Relates to generic canvas, font, script/event-loop and frame compatibility already being considered, but no identified reduced cause links all these sites. Needs retained console/network results and an authorized reduced local fixture; no target requests or bypass work performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1220",
+        "crates/obscura-js/js/bootstrap.js:17159-17165",
+        "docs/Configure-stealth-and-proxies.md:82"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 1216,
+      "title": "TLS: servers that omit an intermediate certificate fail to load",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1216",
+      "requirements": [
+        "Recover missing intermediates without making them trust anchors or disabling normal certificate validation",
+        "Bound AIA URL/DNS/redirect requests, size, timeout and cache; honor explicit proxy and private-network policy in both clients"
+      ],
+      "status": "proposed",
+      "reason": "Additional TLS compatibility scope, not currently covered: source has configured CA loading but no AIA module or unknown-issuer recovery in the inspected native clients. PR1217 is an implementation candidate, not merged/fixed evidence. Its stealth verification-off HEAD chain-probing design requires independent confidentiality/security review; do not equate the PR's reported tests with local evidence or relax validation.",
+      "evidence": [
+        "crates/obscura-net/src/client.rs:19-78",
+        "crates/obscura-net/src/client.rs:1119-1150",
+        "crates/obscura-net/src/wreq_client.rs:215-280",
+        "https://github.com/h4ckf0r0day/obscura/pull/1217"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 1207,
+      "title": "geolocation: getCurrentPosition() resolves with coordinates while the permission is still \"prompt\" (spoofing tell)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1207",
+      "requirements": [
+        "Coordinates must not be returned while the effective geolocation permission remains undecided/prompt or denied.",
+        "Keep getCurrentPosition/watchPosition, permissions.query and CDP grant/reset behavior consistent; configured coordinates are not themselves a permission grant.",
+        "Preserve configurable coordinate values separately from permission policy."
+      ],
+      "status": "proposed",
+      "reason": "Complete body read; comments endpoint is empty. Confirmed current defect, not merely historical: current query returns prompt while both geolocation methods invoke success with coordinates; Browser.grantPermissions/resetPermissions are no-op acknowledgments. Parent's actual local-loopback CDP probe independently recorded prompt plus successful coordinates without a grant. This is an additional concrete compatibility repair to include alongside the parent's other approved fixes/#1284. Open PR #1228 is a candidate but equates configured coordinates with granted permission, removes default coordinates, and leaves CDP grant no-op; do not conflate configuration with user/browser-context permission or accept that policy unchanged. No probe rerun by scout.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1207",
+        "https://github.com/h4ckf0r0day/obscura/pull/1228",
+        "crates/obscura-js/js/bootstrap.js:8602-8642",
+        "crates/obscura-cdp/src/domains/browser.rs:34-39",
+        "C:/Users/forxu/AppData/Local/Temp/obscura-upstream-triage-t9mxvoyg/geolocation-permission.json"
+      ],
+      "review_group": "Features",
+      "parent_runtime_observation": "Parent local-loopback CDP: permission remains prompt while geolocation succeeds without grant; geolocation-permission.json."
+    },
+    {
+      "number": 1157,
+      "title": "RFC: Persistent storage architecture (localStorage disk sync, ACID IndexedDB via redb, CacheStorage)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1157",
+      "requirements": [
+        "Origin-scoped localStorage disk persistence under --storage-dir with navigation/shutdown flushing.",
+        "Durable transactional IndexedDB including key ranges and cursor operations; RFC proposes pure-Rust redb.",
+        "Real persistent CacheStorage request/response headers and bodies."
+      ],
+      "status": "partial",
+      "reason": "Complete body read. Native localStorage disk load/save is already implemented, unlike the issue's old bootstrap-only premise. IndexedDB is explicitly memory-only and CacheStorage is deliberately unadvertised; neither is covered by current transaction support. Durable IndexedDB and real CacheStorage are additional feature scope, not automatically part of repairing current in-memory semantics. Open PR #1158 is a candidate only, not current implementation or proven full conformance; any evaluation must preserve existing typed-key/structured-clone/transaction contracts rather than blindly replacing them. No storage runtime checks run in this scout.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1157",
+        "https://github.com/h4ckf0r0day/obscura/pull/1158",
+        "crates/obscura-browser/src/context.rs:77-109",
+        "crates/obscura-browser/src/context.rs:297-350",
+        "crates/obscura-browser/src/page.rs:4563-4565",
+        "docs/Persist-cookies-and-storage.md:84-110",
+        "crates/obscura-js/js/bootstrap.js:17373-17374"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 1155,
+      "title": "DOM mutations from JS are slow (3 to 9 us per call, mostly bridge and bootstrap overhead)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1155",
+      "requirements": [
+        "Reduce JS DOM mutation and scalar-read bridge overhead without changing mutation, observer, script, stylesheet or named-property semantics",
+        "Avoid eager style allocation and unnecessary insertion scans"
+      ],
+      "status": "partial",
+      "reason": "New performance scope, not proof of a currently reproduced bug. Current Element construction still eagerly creates CSSStyleDeclaration plus Proxy and _domParse still JSON-parses string results. However the reported always-attached IntersectionObserver MutationObserver is obsolete: current observer scheduling is rendering-opportunity/checkpoint based and gates on active targets. Insertion paths also changed substantially. PR1156 is a relevant unmerged optimization proposal, not evidence all of it exists locally or that its timings transfer. Rebase/minimize and benchmark the actual current tree before adopting composite bridge fast paths.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:805",
+        "crates/obscura-js/js/bootstrap.js:4159",
+        "crates/obscura-js/js/bootstrap.js:2799-2852",
+        "crates/obscura-js/js/bootstrap.js:11634-11722",
+        "https://github.com/h4ckf0r0day/obscura/pull/1156"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1153,
+      "title": "text layout of large pages allocates far more than it keeps",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1153",
+      "requirements": "Additional optional performance scope: avoid cloning full LayoutStyle per word, trim shaped buffer spare capacity, release finalized shape glyphs while supporting reshape on demand; shaping-plan caching alone is insufficient.",
+      "status": "optional",
+      "reason": "The per-token full-style clone still exists and finalize retains its buffer. PR #1154 supplies a bounded candidate and explicitly reports first-layout latency within noise; this is memory optimization, not evidence that all large pages are currently slow. No local benchmark was run.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:11050-11056",
+        "crates/obscura-render/src/inline.rs:2760-2854",
+        "https://github.com/h4ckf0r0day/obscura/pull/1154"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 1151,
+      "title": "page loads on real sites are network-bound by serial subresource fetching",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1151",
+      "requirements": [
+        "Enable HTTP/2 for regular reqwest transport",
+        "Overlap stylesheet and script download phases",
+        "Run ready scripts without waiting for the slowest unrelated script"
+      ],
+      "status": "partial",
+      "reason": "New latency scope partly already covered. Current reqwest enables http2, and current classic-script scheduler uses buffer_unordered(16), readiness polling and receive_classic rather than an all-downloads barrier. But navigate_single still awaits fetch_stylesheets, installs CSS and performs bounded resource warmup before execute_scripts constructs its download stream; stylesheet/script wave overlap remains absent in this path. PR1152 supplies a candidate but cannot be blindly applied over current parser/module readiness work. No live-site or local latency benchmark was run; claimed speedups remain upstream measurements, not this fork's results.",
+      "evidence": [
+        "Cargo.toml:49",
+        "crates/obscura-browser/src/page.rs:3205-3235",
+        "crates/obscura-browser/src/page.rs:3410-3438",
+        "crates/obscura-browser/src/page.rs:4483-4562",
+        "https://github.com/h4ckf0r0day/obscura/pull/1152"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1141,
+      "title": "DOM mutation, MutationObserver, Range and node documents differ from the DOM spec",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1141",
+      "requirements": [
+        "Validate Node arguments, document child constraints and pre-insertion exception order",
+        "Complete MutationRecord siblings/namespace, fragment batching, move removals, removeAttribute records and observer option validation",
+        "Implement Range delete/extract/clone/surround over actual DOM",
+        "Return real detached Documents and correct ownerDocument",
+        "Expose CSSMediaRule nested mutation and invalidate computed style",
+        "Return empty computed style for detached elements",
+        "Correct IO callback this, entry interface, thresholds and inline-block child geometry"
+      ],
+      "status": "covered",
+      "reason": "Already covered at the named-clause/current-source level, not a fresh claim that all DOM/WPT behavior conforms. Shared mutation algorithms validate arguments/order and generate records; real document roots and Range mutations exist; CSS grouping/cache and IO interface/delivery fixes exist; inline-block block-flow has a dedicated regression. Original 22-file WPT corpus was not run here, and no current 165/169 or full conformance result is claimed. PR1142 is primary design/history evidence only; its reported validation is not this checkout's exercised evidence.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:2533-2678 argument and document validity",
+        "crates/obscura-js/js/bootstrap.js:2780-2896 removal/move/fragment records",
+        "crates/obscura-js/js/bootstrap.js:3000-3029 removeChild/insertBefore validation",
+        "crates/obscura-js/js/bootstrap.js:2509-2520 detached native Document construction; 7022-7045 document factories",
+        "crates/obscura-js/js/bootstrap.js:11220-11244 MutationRecord fields; 11303-11348 observer validation",
+        "crates/obscura-js/tests/platform_behavior.rs:629-718 ownership, mutation records and validity assertions; 783-805 actual Range mutation assertions (read, not executed)",
+        "crates/obscura-js/js/bootstrap.js:15635-15678 Range clone/extract/delete; 15702-15723 surround",
+        "crates/obscura-js/js/bootstrap.js:10685-10765 CSSGroupingRule/CSSMediaRule; 10888-10924 rule-change cache invalidation",
+        "crates/obscura-js/js/bootstrap.js:10450-10500 detached computed style",
+        "crates/obscura-js/js/bootstrap.js:11657-11664 IO callback receiver; 11796-11811 entry interface; 11919-11940 threshold-aware entry",
+        "crates/obscura-render/tests/layout_test.rs:2622-2643 inline-block stacking and whitespace fixture assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1142"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 1124,
+      "title": "Native form POST navigations: missing response after redirect and events sent to an observer session",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1124",
+      "requirements": [
+        "Report loaded final Document URL and actual final HTTP method including redirect semantics",
+        "Route page-initiated navigation events deterministically to the owning client rather than an arbitrary observer"
+      ],
+      "status": "partial",
+      "reason": "Existing CDP/navigation compatibility scope: current Document record already uses response.url, covering the final-URL component statically. It still hardcodes GET, and take_live_pending_navigation still picks the first matching HashMap session. PR1118 is relevant but its blanket redirected=>GET method heuristic must not misreport 307/308 POST retention. No runtime checks run.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:4420-4451",
+        "crates/obscura-cdp/src/server.rs:1820-1845",
+        "crates/obscura-cdp/src/domains/page.rs:919-976",
+        "https://github.com/h4ckf0r0day/obscura/pull/1118"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 1103,
+      "title": "Track Playwright engine compatibility and performance verification",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1103",
+      "requirements": [
+        "Correct external IntersectionObserver obstacle fixture without changing engine semantics to satisfy it",
+        "Run paired deterministic Chromium render verification",
+        "Run matched successful Playwright workloads and report wall time, median/p95, peak process-tree memory, concurrency and success rate"
+      ],
+      "status": "diagnostic",
+      "reason": "Verification tracker, not a request to reimplement all listed shipped features. Body explicitly identifies shipped commit542df146932eb9fd6bec5bdf7b724075c17410eb and distinguishes Rust regression results from Chromium-relative speed evidence. The remaining checkboxes concern external benchmark/render evidence. Current source contains the locale handler, native document-navigation routing, bounded cooperative tasks and native capture pipeline, but this read-only audit does not certify every historical gate or supply the missing paired performance/render run. Keep as verification work, not a new concrete engine feature or a claimed speedup.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1103",
+        "crates/obscura-cdp/src/domains/emulation.rs:160-169",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-js/src/runtime.rs:4735-4790",
+        "crates/obscura-cdp/src/domains/page.rs:1883-1950"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1102,
+      "title": "getBoundingClientRect() returns a fixed placeholder box for every element except <html>/<body>",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1102",
+      "requirements": [
+        "Expose actual element layout geometry rather than fixed synthetic100x20 dimensions",
+        "Distinguish missing CSS boxes from a build without a renderer"
+      ],
+      "status": "partial",
+      "reason": "Render-build behavior is statically covered: getBoundingClientRect calls frame-aware op_layout_geometry and returns real native geometry, or a zero rect for an element without an associated box. The exact100x20 synthetic geometry remains intentionally in no-render builds because that op is feature-gated. Body gives no build flags or reduced page, so do not label all current geometry broken or claim the original report reproduced. Existing render compatibility scope covers real geometry; confirm binary feature provenance first. Removing/rejecting no-render synthetic geometry would be a separate product contract, not a necessary duplicate layout implementation.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:5743-5765",
+        "crates/obscura-js/js/bootstrap.js:5933-5976",
+        "crates/obscura-js/src/ops.rs:9077-9090",
+        "crates/obscura-js/src/frame.rs:829-844"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1101,
+      "title": "CDP Emulation.setTouchEmulationEnabled is a no-op; Emulation.setEmulatedMedia not implemented",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1101",
+      "requirements": [
+        "Apply or explicitly reject touch capability emulation instead of false success",
+        "Apply supported media-feature overrides to JS/CSS and retain them across navigation",
+        "Avoid swallowing unsupported media overrides"
+      ],
+      "status": "partial",
+      "reason": "High-value new compatibility gap alongside existing touch-dispatch scope. setTouchEmulationEnabled is still literal success/no-op (also eligible for server fast-path success). setEmulatedMedia now handles reduced-motion and color-scheme via page.set_media_preferences, including regression tests for clearing/navigation, so the old claim it is wholly absent is obsolete. Other feature names are silently ignored and the media type parameter is not read by this handler. Do not duplicate the two existing preference overrides; focus touch pointer/hover/maxTouchPoints policy and honest unsupported handling for unimplemented media overrides. Full gesture implementation is not implied by this issue.",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/emulation.rs:68-99",
+        "crates/obscura-cdp/src/domains/emulation.rs:171-174",
+        "crates/obscura-cdp/src/domains/emulation.rs:180-217",
+        "crates/obscura-cdp/src/server.rs:2575-2576",
+        "https://github.com/h4ckf0r0day/obscura/issues/1101#issuecomment-6000166858"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1100,
+      "title": "SVGGeometryElement.getTotalLength() not implemented (prototype chain exists, method throws)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1100",
+      "requirements": [
+        "Real SVGGeometryElement.getTotalLength for paths and basic shapes",
+        "Compute geometric lengths with mutations, curves/arcs and units rather than fake prototype-only methods"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional compatibility scope. Current SVGGeometryElement and concrete geometry subclasses are empty, so correct instanceof does not supply geometric behavior. Parent independently exercised a local 3-4-5 path and observed TypeError rather than5; do not rerun. PR1204 supplies a native implementation candidate but is not present in current source. It documents stylesheet-cascaded/animated geometry limitations that must remain explicit during adaptation.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:14935-14951 empty geometry classes",
+        "crates/obscura-js/src/runtime.rs:9821-9864 prototype-chain regression does not assert lengths",
+        "Parent supplemental receipt additional-canvas-controls-svg.json: path M0 0 L3 4 getTotalLength TypeError (parent-reported exercised evidence)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1204",
+        "https://github.com/h4ckf0r0day/obscura/issues/1100#issuecomment-5998711803"
+      ],
+      "review_group": "Runtime",
+      "parent_runtime_observation": "Parent SVG path M0 0 L3 4: getTotalLength is not a function, expected length5; additional-canvas-controls-svg.json."
+    },
+    {
+      "number": 1096,
+      "title": "Native horizontal range controls do not paint or respond to CDP input",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1096",
+      "requirements": "Additional native-control scope: default midpoint value, shared min/max/step sanitization, horizontal track/thumb paint, pointer click/drag and keyboard defaults with trusted input/change events, cancellation/disabled/RTL/appearance:none behavior. Vertical controls, authored slider pseudo-elements and touch are outside the bounded upstream candidate.",
+      "status": "proposed",
+      "reason": "Existing 129x16 intrinsic geometry and valueAsNumber range clamping are not a working slider. The value getter still falls through to empty string, native activation only special-cases checkboxes/radios, and no native range painter was found after targeted and broader searches. PR #1097 describes the missing implementation but is not current-source evidence. Current runtime reproduction was not performed.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:7093-7100",
+        "crates/obscura-js/js/bootstrap.js:4881-4914",
+        "crates/obscura-js/js/bootstrap.js:4960-4968",
+        "crates/obscura-js/js/bootstrap.js:19985-20025",
+        "crates/obscura-js/js/bootstrap.js:20125-20180",
+        "https://github.com/h4ckf0r0day/obscura/pull/1097"
+      ],
+      "review_group": "Rendering",
+      "parent_runtime_observation": "Parent default range value is empty string while valueAsNumber is50; additional-canvas-controls-svg.json."
+    },
+    {
+      "number": 1087,
+      "title": "Auto-sized native buttons measure labels differently from their paint font",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1087",
+      "requirements": "Existing font/control work overlaps: auto-sized buttons must measure labels using the selected paint shaper, preserving generated icons, edges, spacing, font weight/style and transforms; establish exact Save and sign in fixture parity rather than assuming a font-policy change fixes every button.",
+      "status": "partial",
+      "reason": "Current button sizing now calls the page TextEngine through text_width, which shapes with selected family/fallbacks, so the original static-font-only measurement mechanism is improved. However text_width collapses weights to 400/700 and hardcodes italic=false, and no exact issue fixture/full font matrix evidence was located. Do not blindly reapply PR #1092 or call the entire issue fixed.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:31-52",
+        "crates/obscura-render/src/dom.rs:6898-6978",
+        "crates/obscura-render/src/inline.rs:1738-1805",
+        "docs/Testing-and-debugging.md:452-456",
+        "https://github.com/h4ckf0r0day/obscura/pull/1092"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 1086,
+      "title": "Input.dispatchTouchEvent reports success without dispatching events",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1086",
+      "requirements": [
+        "Return an explicit unsupported protocol error until real touch lifecycle/contact semantics exist",
+        "Do not fabricate touch/pointer/click events or silently return success"
+      ],
+      "status": "proposed",
+      "reason": "Existing approved compatibility scope, statically still unfixed: Input.dispatchTouchEvent returns an empty successful result without native dispatch. Draft PR1091 directly proposes explicit rejection and focused protocol regressions; its existence does not mean applied. This issue does not require full touch gestures; honest unsupported behavior is the narrow requested repair. No runtime commands were executed.",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:93",
+        "https://github.com/h4ckf0r0day/obscura/pull/1091"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 1085,
+      "title": "Canvas2D HSL colors are not parsed",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1085",
+      "requirements": "Additional Canvas2D color scope: comma and space HSL/HSLA, valid CSS decimal/exponent/percentage alpha, rejecting JavaScript hexadecimal/binary/octal alpha syntax; verify pixels through the Canvas2D path.",
+      "status": "proposed",
+      "reason": "Canvas2D _parseColor handles hex, comma RGB(A) and a few names, then falls back to black; it has no HSL branch. The separate Rust stylesheet HSL parser and CSS.supports HSL recognition do not fix this path. PR #1090 is a candidate only; no local pixel test was run.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:16783-16802",
+        "crates/obscura-js/js/bootstrap.js:16818-16830",
+        "crates/obscura-render/src/style.rs:5242-5274",
+        "https://github.com/h4ckf0r0day/obscura/pull/1090"
+      ],
+      "review_group": "Rendering",
+      "parent_runtime_observation": "Parent Canvas2D hsl(120,100%,50%) fill pixel is [0,0,0,255], not green; additional-canvas-controls-svg.json."
+    },
+    {
+      "number": 1084,
+      "title": "Fallback screenshot reconstruction loses live Canvas2D surfaces",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1084",
+      "requirements": "Existing live-canvas work is incomplete at the fallback boundary: carry retained live Canvas2D surfaces through ad-hoc viewport/base and print-media reconstruction, not just normal prepared captures; require fallback pixel regression.",
+      "status": "partial",
+      "reason": "Prepared viewport and region captures pass RuntimeCanvasSurfaceSource correctly. screenshot_unprepared_with_retained_resources destructures DOM/resources/media/fonts but not canvas_surfaces, and calls surface-unaware APIs for both screen and non-screen fallback paths. Thus source distinguishes the fixed primary path from the still-unconnected fallback. No runtime capture was run.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:5100-5129",
+        "crates/obscura-js/src/runtime.rs:2705-2743",
+        "crates/obscura-js/src/runtime.rs:2747-2781",
+        "https://github.com/h4ckf0r0day/obscura/pull/1089"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 1077,
+      "title": "WebCrypto ECDSA P-256 support: missing generateKey blocks Mercari DPoP API requests",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1077",
+      "requirements": [
+        "Standards-compatible ECDSA P-256 generateKey",
+        "Public-key JWK export and ECDSA signing for DPoP",
+        "Real key/signature behavior, not API-presence or fake output"
+      ],
+      "status": "proposed",
+      "reason": "Existing approved scope: subsumed by full WebCrypto issue1289; do not count as an additional independent crypto project or claim implemented. Current generateKey handles only HMAC/AES then throws, and JWK export emits symmetric oct keys. The issue's Mercari trace is historical reporter evidence; no third-party run was performed and ECDSA alone does not establish end-to-end site success.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:18092-18124 symmetric export and generateKey unsupported branch",
+        "crates/obscura-js/js/bootstrap.js:18127-18133 signing only handles HMAC at entry",
+        "https://github.com/h4ckf0r0day/obscura/issues/1289",
+        "https://github.com/h4ckf0r0day/obscura/issues/1077"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 1067,
+      "title": "checkVisibility() returns true inside a display:none ancestor and ignores visibilityProperty",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1067",
+      "requirements": "Already covered for the reported render-enabled behavior: display:none ancestors return false; requested inherited visibility checks return false; honor opacity aliases and display:contents without using positive area as visibility.",
+      "status": "covered",
+      "reason": "Current implementation walks flattened/shadow ancestor boundaries, checks display and requested CSS flags, and uses native box existence. Existing source tests explicitly cover hidden ancestor, inherited visibility, visible override, aliases, disconnected and zero-area cases plus mutations. This is static implementation/regression evidence, not a test executed in this assignment; residual inline-box bugs are not declared solved by this classification.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:5994-6021",
+        "crates/obscura-js/tests/platform_behavior.rs:67-98",
+        "https://github.com/h4ckf0r0day/obscura/pull/1071"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 1056,
+      "title": "op_fetch_url: SSRF gate skipped when a Continue interception URL override fails to parse",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1056",
+      "requirements": [
+        "Fail closed for malformed Continue URL rewrites before either transport sends",
+        "Revalidate parsed rewrites using the same fetch/private-network/origin policy as the original request"
+      ],
+      "status": "covered",
+      "reason": "Already covered by current source: URL::parse failure returns a blocked response; successful parses are checked by validate_fetch_request_url before the override is used. This is static coverage only; no regression test execution or exploitable-bypass claim.",
+      "evidence": [
+        "crates/obscura-js/src/ops.rs:4770-4805",
+        "AGENTS.md:94-100"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 1051,
+      "title": "Packaging: Official Fedora & CentOS Stream Copr repositories available",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1051",
+      "requirements": [
+        "Document/install Fedora and CentOS RPM packages through the submitter's renich/obscura Copr repository, reportedly built with render,stealth and tracking releases."
+      ],
+      "status": "optional",
+      "reason": "Complete body read. Distribution/documentation proposal, not a browser defect. Repository-wide literal search and packaging-name glob found no current Copr integration. The body establishes a third-party repository announcement, not endorsement, ownership, current package contents or verified release provenance. Optional new distribution scope after maintainer/provenance review; no package installation, remote build validation or target browsing performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1051",
+        "https://copr.fedorainfracloud.org/coprs/renich/obscura/"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 1050,
+      "title": "Layout: Flexbox auto-sizing collapses unconstrained nested containers and <dialog> to 0px height / 3px width",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1050",
+      "requirements": "Diagnostic rendering scope: derive an authorized self-contained nested-flex/dialog intrinsic-sizing repro preserving the reported zero-height/3px-width collapse before attributing a root cause.",
+      "status": "diagnostic",
+      "reason": "The body provides a real LinkedIn page and broad description, not a reduced HTML/CSS fixture. Current source has several flex/cross-size and dialog-state fixes, but neither their existence nor generic positive-height coverage proves this page is fixed. No third-party target was visited and no current reproduction is claimed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1050",
+        "crates/obscura-render/tests/layout_test.rs:1089-1105",
+        "crates/obscura-render/src/dom.rs:2992-2995"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 1040,
+      "title": "Dependency audit fails after the V8 upgrade removes active renderer exceptions",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1040",
+      "requirements": [
+        "Restore only rustybuzz RUSTSEC-2026-0206 and ttf-parser RUSTSEC-2026-0192 maintenance-notice exceptions while required by rendering; do not restore bincode or weaken vulnerability/license/source/bans checks."
+      ],
+      "status": "covered",
+      "reason": "Complete body read. Current deny.toml contains precisely both requested informational/unmaintained exceptions and no bincode exception. This is current-source coverage of the requested narrow policy repair, not a claim that today's full cargo-deny run passes or that all dependencies are vulnerability-free. Open PR #1042 describes the same repair but its existence alone is not the basis for covered.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1040",
+        "https://github.com/h4ckf0r0day/obscura/pull/1042",
+        "deny.toml:4-13",
+        "deny.toml:15-50"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 1039,
+      "title": "innerHTML/textContent/subtree removal leaks native external_stylesheets entries for removed <link>s",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1039",
+      "requirements": [
+        "Release native linked stylesheet entries for all links in removed subtrees",
+        "Cover innerHTML, textContent, removeChild ancestor, replaceChild and replaceChildren paths"
+      ],
+      "status": "covered",
+      "reason": "Already covered by real native cleanup, not JS-wrapper detachment alone. _releaseLinkedStylesheetsIn visits descendants and invokes the remove op; innerHTML calls it before replacement, and shared remove/replace-all paths call cleanup. A dedicated regression inspects native external_stylesheets counts after innerHTML and ancestor removal. Read-only source evidence; regression not run here.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:11025-11046 _releaseLinkedStylesheet and subtree cleanup",
+        "crates/obscura-js/js/bootstrap.js:2780-2796 remove path; 2887-2896 replace-all path",
+        "crates/obscura-js/js/bootstrap.js:4232-4237 innerHTML pre-removal cleanup",
+        "crates/obscura-js/src/ops.rs:2306-2328 native remove_external_stylesheet and render invalidation",
+        "crates/obscura-js/src/runtime.rs:20846-20894 replacing_a_subtree_releases_its_linked_stylesheets native-count regression (not executed)"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 1038,
+      "title": "page WebSocket opens without a connection; send silently discards",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1038",
+      "requirements": [
+        "Real in-page ws/wss client handshake, send/receive and ready-state lifecycle",
+        "Protocol negotiation, binaryType and close/error behavior tied to actual socket",
+        "Preserve proxy/origin/network authority and cancellation; no fake open or discarded frames"
+      ],
+      "status": "proposed",
+      "reason": "Parent already actually confirmed missing. Current constructor manufactures OPEN/open from a microtask and send explicitly drops data. This is high-value real protocol implementation scope, not an API-presence or fake-success compatibility patch. CDP server WebSocket transport is unrelated and must not be mistaken for in-page client support. No duplicate test run here.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:18753-18793 in-page WebSocket fake-open/drop implementation",
+        "Parent assignment explicitly states actual local confirmation of1038 missing; raw receipt path not provided to this scout",
+        "https://github.com/h4ckf0r0day/obscura/issues/1038"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 1021,
+      "title": "Two DOM/Canvas correctness bugs in bootstrap.js: stroke() is a no-op and innerText is aliased to textContent",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1021",
+      "requirements": [
+        "Rasterize Canvas stroke paths honoring lineWidth/strokeStyle",
+        "Retain and interpolate linear-gradient stops and rasterize polygon fill",
+        "Return rendered innerText excluding hidden/script/style content and adding block breaks"
+      ],
+      "status": "covered",
+      "reason": "Named defects already have substantive implementations: Bresenham path stroke, polygon scanline fill, stored/interpolated gradient stops, and computed-style-driven rendered text traversal. Render-mode innerText regression explicitly includes script/style, display:none, hidden, visibility and block boundaries. This is not full Canvas conformance: adjacent unsupported transforms/curves and separate color issue1085 remain outside this issue's narrow closure. No pixel/performance claims were re-exercised.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:16939-16986 polygon/arc fill; 16993-17037 actual stroke",
+        "crates/obscura-js/js/bootstrap.js:17047-17080 retained gradient stops and interpolation",
+        "crates/obscura-js/js/bootstrap.js:4090-4135 rendered text walk; 4262-4266 innerText getter",
+        "crates/obscura-browser/src/page.rs:11227-11265 inner_text_matches_rendered_text_semantics (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/issues/1021"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 1011,
+      "title": "is it possible to support realtime rendering feature?",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1011",
+      "requirements": [
+        "Realtime visual output, suggested SIXEL terminal/framebuffer display, with a human-input path."
+      ],
+      "status": "partial",
+      "reason": "Complete body read. Render builds already implement CDP Page.startScreencast with activity-driven frames, captureScreenshot, and mouse/keyboard input handlers; tools/live-view.mjs also provides a polling browser viewer. These are generic existing capture/input building blocks, not a SIXEL/framebuffer UI or proof of the reported verification-site workflow. A new terminal/framebuffer interactive frontend is optional new UI scope. No challenge-solving or bypass capability recommended and no realtime runtime validation performed here.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/1011",
+        "crates/obscura-cdp/src/domains/page.rs:1820-1852",
+        "crates/obscura-cdp/src/server.rs:1266-1270",
+        "crates/obscura-cdp/src/domains/input.rs:34-66",
+        "tools/live-view.mjs:1-21"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 1001,
+      "title": "HTML element interfaces are aliases of Element, so every brand check matches: style-loader cannot install any stylesheet",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/1001",
+      "requirements": [
+        "Tag/namespace-correct HTML interface brands",
+        "Do not misroute head/div through iframe handling",
+        "Keep interface-specific prototype patches and behavioral native setters"
+      ],
+      "status": "covered",
+      "reason": "Already covered more robustly than the issue's alias-prototype proposal: distinct interfaces/prototypes plus native tag/namespace-based brands. Behavioral subclasses are preserved and style-loader target routing is explicitly asserted. Current-source coverage only, not a live production Angular validation.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:14858-14910 distinct interfaces and Symbol.hasInstance tag/namespace checks",
+        "crates/obscura-js/tests/platform_behavior.rs:744-775 style-loader target, prototype separation, native setter and subclass assertions (not executed)",
+        "crates/obscura-js/src/runtime.rs:10827-10850 iframe brand regression",
+        "https://github.com/h4ckf0r0day/obscura/pull/1002"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 993,
+      "title": "CL search pages: browser UA gets JS shell that never hydrates under V8",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/993",
+      "requirements": [
+        "Browser navigation/hydration completes; reported network-idle timeout and CDP No page for session are separately diagnosable.",
+        "Issue alternatively requests plain raw HTTP and user-agent selection."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. Generic hydration depends on script loading, fetch/XHR, DOM/event-loop behavior and correct CDP session routing; the body labels its Blink API hypothesis as speculative. Current CLI already has --dump original as a browser/JS-bypassing raw response mode, but that does not fix hydration or establish site success. Do not recommend changing identity to obtain alternative site content. Needs an authorized reduced shell+request fixture and separate CDP session trace; no target requests made and no site fix claimed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/993",
+        "crates/obscura-cli/src/main.rs:255-269",
+        "crates/obscura-cli/src/main.rs:618-628"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 992,
+      "title": "error: unexpected argument '--font-dir' found",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/992",
+      "requirements": [
+        "Accept --font-dir on serve and actually load operator-supplied fonts; provide correct feature/build behavior rather than an unknown argument."
+      ],
+      "status": "covered",
+      "reason": "Complete body read. Current CLI declares repeatable global --font-dir, applies policy before dispatch, validates directories and configures render font loading. No-render builds explicitly reject it instead of pretending to load fonts. This covers the reported CLI argument gap statically; this scout did not run flag parsing or validate the reporter's binary/fonts. Open PR #880 is related but current source is broader and not assumed identical to that candidate.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/992",
+        "crates/obscura-cli/src/main.rs:54-60",
+        "crates/obscura-cli/src/main.rs:479-480",
+        "crates/obscura-cli/src/fonts.rs:25-56",
+        "crates/obscura-render/src/inline.rs:583-587",
+        "crates/obscura-cli/tests/mcp_client.rs:12-46",
+        "https://github.com/h4ckf0r0day/obscura/pull/880"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 977,
+      "title": "Stealth mode uses other HTTP clients for classic scripts, form POSTs and CORS preflights",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/977",
+      "requirements": [
+        "Select the installed native stealth transport for classic scripts, form POSTs and OPTIONS when compiled and enabled",
+        "Preserve CORS status/permissions, intermediate redirect checks, cookie/credential stripping, 303/307 semantics and non-replay of POST",
+        "Preserve ordinary mode and explicit proxy/private-network boundaries"
+      ],
+      "status": "proposed",
+      "reason": "Existing native-transport correctness scope, still statically present: parser scripts call the ordinary client, form POST calls ordinary post_form_with_callbacks, and OPTIONS uses reqwest before the stealth branch. Native navigation/modules already select stealth; do not replace working native paths or loosen CORS. PR981 provides a candidate and openly reports unresolved performance-gate failures, so it is not a clean validated adoption.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:3168-3220",
+        "crates/obscura-browser/src/page.rs:4420-4426",
+        "crates/obscura-js/src/ops.rs:4852-4875",
+        "crates/obscura-js/src/ops.rs:4952-4980",
+        "https://github.com/h4ckf0r0day/obscura/pull/981"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 952,
+      "title": "Support Escape dismissal of native modal dialogs",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/952",
+      "requirements": [
+        "Native automation Escape requests closure of the active modal",
+        "Honor canceled keydown/cancel and closedBy none",
+        "Share native browser input behavior across MCP/CDP without granting author synthetic events native defaults"
+      ],
+      "status": "covered",
+      "reason": "Already covered in shared native input, including the originally reported MCP route: tool_press_key dispatches native keyDown/keyUp; native modal keyDefault calls trusted cancelable requestClose; modal stack and focus restoration are handled centrally. CDP regression asserts prevented cancel, closure, nested focus and closedBy none. Not inferred from dialog.requestClose existence alone; no runtime check run here.",
+      "evidence": [
+        "crates/obscura-mcp/src/lib.rs:1147-1160 native key route",
+        "crates/obscura-cdp/src/domains/input.rs:73-95 dispatchKeyEvent native route",
+        "crates/obscura-js/js/bootstrap.js:19913-19939 requestClose and Escape default",
+        "crates/obscura-js/js/bootstrap.js:4848-4871 showModal/close shared state",
+        "crates/obscura-cdp/tests/input_modal.rs:112-132 Escape/cancel/closedBy/focus assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1026"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 936,
+      "title": "UA stylesheet has no rules for small/big/sub/sup, code/kbd/samp/pre, blockquote, mark, u/ins, s/del/strike or q (and font-size: smaller|larger is unimplemented)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/936",
+      "requirements": "Additional broad UA-default scope, not only code fonts: small/big/sub/sup relative sizes and sub/super position; code/kbd/samp/pre monospace; blockquote margins; mark highlight; u/ins underline; s/del/strike line-through; q generated quotes; implement authored smaller/larger. Coordinate with #933 and decoration paint rather than adding UA declarations alone.",
+      "status": "proposed",
+      "reason": "Complete ua_style inspection shows pre white-space but not the requested text-element rules; inline display recognition is not those defaults. font_size_keyword still only handles the absolute scale, so smaller/larger remain absent. Installed-font discovery does not create missing UA rules. Even a code/pre font fix would not cover this whole issue; no runtime matrix was executed.",
+      "evidence": [
+        "crates/obscura-render/src/style.rs:27-348",
+        "crates/obscura-render/src/style.rs:7198-7211",
+        "crates/obscura-render/src/style.rs:1710-1717",
+        "https://github.com/h4ckf0r0day/obscura/issues/936"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 933,
+      "title": "vertical-align: only top and bottom work — baseline (the initial value) behaves as top, and sub/super/text-top/lengths/percentages are ignored",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/933",
+      "requirements": "Extend existing inline baseline work to actual shared baseline placement of unequal atomic inlines, correct line descent/growth, sub/super/text-top/text-bottom and length/percentage shifts, independently of CSSOM reporting and #936 UA rules.",
+      "status": "partial",
+      "reason": "Fork source adds a parent-font descent strut for default baseline replaced inlines and an SVG line-height regression. But parser still maps explicit baseline/text-top to Top and ignores sub/super/lengths; the enum remains a table-cell approximation. One SVG descent test cannot prove unequal-image baseline placement or raised-text geometry. No issue geometry matrix was run.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:10836-10889",
+        "crates/obscura-render/tests/layout_test.rs:747-775",
+        "crates/obscura-render/src/style.rs:1710-1717",
+        "crates/obscura-render/src/lib.rs:2303-2314",
+        "https://github.com/h4ckf0r0day/obscura/issues/933"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 925,
+      "title": "DDoS-Guard challenge still doesn't complete after #285 fix (stealth render)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/925",
+      "requirements": [
+        "Explain stalled loading/redirect after earlier DOM insertion fix; determine whether generic JS/timer/navigation behavior is defective."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read, including its unconfirmed longer-wait/missing-API/visual-challenge alternatives. Prior insertAdjacentText/Element repair is expressly insufficient evidence that this site completes. No reduced local fixture or established cause is supplied. Only generic authorized compatibility diagnosis is in scope; the suggested OCR/vision answer submission is not recommended or included. No target requests, challenge investigation or bypass steps performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/925"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 921,
+      "title": "cdp: Input.dispatch* commands are not read while a page-triggered navigation (Enter submit, link click) loads; the next command times out",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/921",
+      "requirements": [
+        "Answer input commands promptly during document-initiated navigation",
+        "Keep queued navigation/event processing live without a follow-up Runtime.evaluate",
+        "Preserve event-dispatch semantics rather than claiming concurrency from message receipt alone"
+      ],
+      "status": "partial",
+      "reason": "High-value ongoing latency gap. Current input handlers no longer await the whole root document load, and the processor drains pending navigation through a spawned task. However process_with_interception still defers non-Fetch commands, including matching keyUp/input, until navigation settles; stopLoading/close receive special cancellation handling, not generic input responsiveness. Thus the connection can read messages yet still withhold their responses for the load duration. PR922 targets the delay but explicitly acknowledges-and-drops input on the navigating page; that tradeoff is not full Chromium input semantics and should not be silently treated as the final repair. Static evidence only; no delayed-server fixture run in this audit.",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:55-66",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-cdp/src/server.rs:2151-2178",
+        "crates/obscura-cdp/src/server.rs:2224-2272",
+        "https://github.com/h4ckf0r0day/obscura/pull/922",
+        "https://github.com/h4ckf0r0day/obscura/issues/921#issuecomment-5702454061"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 908,
+      "title": "Synchronous XMLHttpRequest never issues the request: open(..., false) is ignored and status stays 0",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/908",
+      "requirements": [
+        "Respect XMLHttpRequest.open async=false",
+        "Complete request and populate status/body/headers/readyState before send returns",
+        "Preserve browser transport, origin and network security semantics"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional compatibility scope. Current open accepts async_ but never stores/reads it; send unconditionally uses Promise-based _fetch. The immediate status0 symptom is statically supported, but the request may still issue asynchronously, so do not repeat the title as a literal claim of zero network traffic. PR909 is a candidate, not applied source; its older dedicated-thread sync design needs adaptation to current transport/authority policy, not blind copying or silent status substitution.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:9161-9175 open ignores async_",
+        "crates/obscura-js/js/bootstrap.js:9197-9217 send always calls _fetch(...).then",
+        "crates/obscura-js/js/bootstrap.js:9259-9280 asynchronous DONE/error state",
+        "https://github.com/h4ckf0r0day/obscura/pull/909"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 907,
+      "title": "data: and blob: URLs are rejected for dynamic import(), module/classic scripts, and fetch()",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/907",
+      "requirements": [
+        "Dynamic import of literal/base64/percent-encoded data and blob modules",
+        "Classic blob script and module data/blob script execution",
+        "Local data/blob fetch with real bytes, revocation and MIME behavior",
+        "Retain file/private-network authority guards"
+      ],
+      "status": "partial",
+      "reason": "Partly already covered: classic data scripts decode locally and fetch(data:) has a native local processor before the HTTP-only gate. New remaining scope: blob fetch/classic scripts and data/blob module loading. Blob store currently retains decoded source text for Worker rather than native bytes/MIME; Rust module loader unconditionally enters HTTP transport. Need real typed byte registry and local scheme handling, not widening socket/file permissions. Full current runtime matrix was not exercised. Open PR909 and external-fork issue comments do not establish this checkout fixed.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:355-410 classic data URL decode/fetch branch",
+        "crates/obscura-js/src/ops.rs:4640-4647 fetch data early local branch; 6814-6836 fetch_data_url byte processor",
+        "crates/obscura-js/src/ops.rs:6838-6848 HTTP/HTTPS gate still rejects blob",
+        "crates/obscura-js/src/module_loader.rs:199-423 load has only network context/transport response path; 302-351 transport call",
+        "crates/obscura-net/src/client.rs:679-686 transport scheme gate",
+        "crates/obscura-js/js/bootstrap.js:17560-17602 object URL store contains decoded text and revoke deletes entry",
+        "https://github.com/h4ckf0r0day/obscura/pull/909",
+        "https://github.com/h4ckf0r0day/obscura/issues/907#issuecomment-5600653644"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 888,
+      "title": "Obscura v0.2.2 : standalone test to parse url is failing with error \"Script error\"",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/888",
+      "requirements": [
+        "CLI title evaluation completes without process segmentation fault.",
+        "Reduce jQuery-triggered Element.replaceWith parentNode errors, later chartbeat type errors, watchdog overrun and response-decoding error separately."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. Important additional crash report, not merely a noisy console warning: body ends in macOS x86_64 Segmentation fault: 11. Current replaceWith code differs and is present, but that is not proof the old jQuery invocation pattern or native crash is fixed. Needs an authorized reduced jQuery/ChildNode case plus retained native stack/core for the segfault; keep crash and JS symptoms separate. Relates to generic DOM mutation/lifecycle work, but no source-only root cause or site fix asserted; no target requests performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/888",
+        "crates/obscura-js/js/bootstrap.js:9627-9636"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 886,
+      "title": "Native <form> submission produces no CDP navigation/network events at all",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/886",
+      "requirements": [
+        "Route native form document navigation through CDP network/frame/lifecycle emission",
+        "Preserve POST method/body and distinguish same-document changes from document replacement"
+      ],
+      "status": "covered",
+      "reason": "Reported old missing-event mechanism is statically covered by current native navigation pipeline. Input leaves document navigation queued; connection processor takes it with method/body/origin-frame and calls process_with_interception. Navigation completion synchronizes network records and emits the shared Page/Network event tail. Runtime-evaluated submission also hands server-managed document navigation back to this processor, while non-server contexts emit the shared tail directly. This does not certify the original Docker0.2.1/Java client runtime, nor solve921's response latency; retain a local POST/navigation regression as acceptance rather than a new duplicate event implementation.",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/input.rs:55-66",
+        "crates/obscura-cdp/src/server.rs:1820-1844",
+        "crates/obscura-cdp/src/server.rs:1480-1500",
+        "crates/obscura-cdp/src/server.rs:2301-2373",
+        "crates/obscura-cdp/src/domains/runtime.rs:88-139",
+        "https://github.com/h4ckf0r0day/obscura/pull/889"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 883,
+      "title": "DOMParser ignores XML mime types: valid XML parses as HTML with an <html> root",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/883",
+      "requirements": [
+        "Parse valid XML MIME types into true XML Documents",
+        "Preserve root identity, source case, namespaces and XML node semantics",
+        "Keep text/html parsing and malformed-XML parsererror behavior"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional compatibility scope, separate from malformed-XML diagnostics and detached-document ownership. Current valid-XML branch explicitly remains HTML-parsed, makes an HTML root and returns it as documentElement, so OData/UI5 root checks are still unsupported. PR1206 offers a real native XML implementation candidate with explicit DTD/mutation/namespace-synthesis limits. No site retest or parser execution here.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:12923-12942 MIME branch and explicit no-XML-parser comment",
+        "crates/obscura-js/js/bootstrap.js:12969-12974 valid input sent to HTML innerHTML",
+        "crates/obscura-js/js/bootstrap.js:12991-13002 docNode returns wrapper HTML documentElement",
+        "https://github.com/h4ckf0r0day/obscura/pull/1206"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 878,
+      "title": "Download binaries (guarded by cloudflare turnstile) through obscura crash with shadowroot error",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/878",
+      "requirements": [
+        "Diagnose reported ShadowRoot.appendChild HierarchyRequestError and later null addEventListener; distinguish console errors from a native process crash and from binary-download delivery."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. Logs show DOM exceptions but no native crash backtrace; the title's crash and successful binary delivery are not established by that excerpt. Generic host-including ancestor checks and shadow insertion semantics are relevant; current guards exist but do not prove this report fixed, and should not be removed to suppress legitimate hierarchy errors. Needs an authorized reduced shadow-tree mutation fixture and independent harmless binary response fixture if download behavior is investigated. No expired signed URL requests, target requests or challenge/bypass work performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/878",
+        "crates/obscura-js/js/bootstrap.js:2595-2621",
+        "crates/obscura-cli/src/main.rs:263-269"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 875,
+      "title": "fetch() omits the default Referer on same-origin requests",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/875",
+      "requirements": [
+        "Default same-origin fetch Referer to the document URL",
+        "Honor explicit referrer and policy, strip fragment/credentials and suppress downgrade leakage in both transports"
+      ],
+      "status": "covered",
+      "reason": "Already covered statically: JS defaults to about:client, the op resolves that to the owning document, and ordinary and stealth request loops generate Referer through the shared referrer policy helper. This is not a claim that open PR932 is merged or that the reporter's older binary was wrong. No wire fixture executed.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:8949-8963",
+        "crates/obscura-js/js/bootstrap.js:8999-9022",
+        "crates/obscura-js/src/ops.rs:4401-4420",
+        "crates/obscura-js/src/ops.rs:5034-5037",
+        "crates/obscura-js/src/ops.rs:5385-5387",
+        "crates/obscura-net/src/client.rs:493-523",
+        "https://github.com/h4ckf0r0day/obscura/pull/932"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 870,
+      "title": "Page.printToPDF emits a rasterized JPEG page instead of vector text — no embedded fonts, no text layer, capped at 800px (~97 DPI)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/870",
+      "requirements": "Additional document-output capability: vector text/drawing operations, embedded subset fonts and selectable/searchable/extractable text. Separately assess raster quality/scale; a larger raster or pagination fix cannot satisfy the text-layer requirement, and full tagged-PDF accessibility is an additional requirement beyond merely selectable text.",
+      "status": "proposed",
+      "reason": "Current PDF is explicitly raster-backed: each page is captured at region scale 1.0, decoded and written as a JPEG XObject invoked with /Im0 Do. It has no font/text emission path. Current content-width capture is no longer evidence of the historical fixed 800px cap, so that exact cap is not asserted; deviceScaleFactor/vector text remain separate concerns. No PDF was generated or inspected in this assignment.",
+      "evidence": [
+        "crates/obscura-browser/src/pdf.rs:1-22",
+        "crates/obscura-browser/src/pdf.rs:320-435",
+        "crates/obscura-browser/src/pdf.rs:478-481",
+        "crates/obscura-cdp/src/domains/pdf.rs:217-249",
+        "https://github.com/h4ckf0r0day/obscura/issues/870"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 866,
+      "title": "Google Maps SPA repeatedly self-navigates and hangs CDP evaluate calls under render+stealth",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/866",
+      "requirements": [
+        "Same-document SPA routing preserves execution context after initial settle.",
+        "Scrolling/lazy-loading errors do not leave every Runtime.callFunctionOn stalled at 30000 ms until connection reset."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. High-value generic liveness/context-recovery report, related to navigation/history, event-loop cancellation and CDP task budgets already in compatibility scope. Current source has same-document navigation paths and explicit callFunctionOn deadlines, but their existence proves neither that this old routing loop is repaired nor that the connection recovers after it. Needs an authorized local history+scroll+pending-promise fixture or retained trace isolating the API/loop; no Maps requests or runtime checks performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/866",
+        "crates/obscura-cdp/src/server.rs:1777-1796",
+        "crates/obscura-cdp/src/domains/runtime.rs:318-320",
+        "crates/obscura-browser/src/page.rs:4170-4174"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 863,
+      "title": "Feature: Chrome extension support (adblock/tracker-blocking first) for agent workflows",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/863",
+      "requirements": [
+        "MV2/MV3 extension host with background/service-worker functionality, declarativeNetRequest and eventually content scripts/messaging.",
+        "Ad/tracker blocking, session manager and privacy/enterprise integration use cases."
+      ],
+      "status": "optional",
+      "reason": "Complete body read. Full Chrome extension hosting is substantial new platform scope, not implied by CDP compatibility or existing storage repairs. Literal and alternate-pattern source searches found no extension manifest/runtime/DNR host. Current native hostname tracker blocklist and persistent cookies/localStorage address subsets only; they are not Chrome extension compatibility or full adblock/filter-list support. Optional product architecture decision; challenge-helper functionality is not recommended as remediation for site reports.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/863",
+        "crates/obscura-net/src/blocklist.rs:5-38",
+        "crates/obscura-browser/src/context.rs:182-184",
+        "docs/Persist-cookies-and-storage.md:1-16"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 857,
+      "title": "`fetch_file_url` has no `--allow-file-access` gate of its own; the check lives only in its callers",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/857",
+      "requirements": [
+        "Gate file reads in the loader before filesystem metadata/read",
+        "Propagate explicit file permission through both transports and context copies",
+        "Keep operator CLI local-file opt-in distinct from remote CDP authority; retain existing caller gates"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional defence-in-depth scope. Confirmed structural gap: fetch_file_url takes only URL and byte cap and both clients dispatch file URLs to it without a local permission argument. Existing CDP caller gate remains; neither this review nor the issue establishes a currently exploitable shipped path. PR1280 is a focused candidate, not current implementation. Root confinement and Chrome-style file-to-file restrictions are explicitly separate scope.",
+      "evidence": [
+        "crates/obscura-net/src/client.rs:735-778",
+        "crates/obscura-net/src/client.rs:1441-1442",
+        "crates/obscura-net/src/wreq_client.rs:334-338",
+        "crates/obscura-cdp/src/server.rs:2102-2107",
+        "https://github.com/h4ckf0r0day/obscura/pull/1280"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 856,
+      "title": "`--allow-private-network` is all-or-nothing; a scoped `--allow-network <CIDR>` would keep the metadata endpoints closed",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/856",
+      "requirements": [
+        "Repeatable/comma-separated CIDR opt-in and environment equivalent with startup errors for invalid prefixes",
+        "Exempt only named denied addresses while retaining the single shared deny-set and existing blanket opt-in semantics",
+        "Apply literal/DNS/redirect checks consistently across native transports including IPv4-mapped IPv6, localhost resolution and /0 warning"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional operator-boundary feature, not an existing blanket-gate bug fix. Inspected policy exposes only boolean allow_private and environment opt-in; scoped allowance is absent in searched source and client constructors. Implement as bounded relaxation, not a new firewall or global deny-set weakening. Avoid adding an alternate non-native transport or opening metadata by default. No runtime evidence.",
+      "evidence": [
+        "crates/obscura-ssrf/src/lib.rs:11-35",
+        "crates/obscura-net/src/client.rs:644-686",
+        "crates/obscura-net/src/wreq_client.rs:35-57",
+        "crates/obscura-browser/src/context.rs:132-145",
+        "https://github.com/h4ckf0r0day/obscura/issues/856"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 855,
+      "title": "Cookie store permissions are incidental and persistence failures are silent; control-plane routing matches substrings of the whole request head; `build.log` is committed",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/855",
+      "requirements": [
+        "Explicit private cookie-store directory/file permissions and observable persistence errors",
+        "Route discovery endpoints by exact request-line target, not header-value substring or near-miss path",
+        "Remove committed build transcript and ignore logs"
+      ],
+      "status": "proposed",
+      "reason": "High-value additional hardening/hygiene scope with three independently located gaps: save_cookies ignores directory error and only warns; tempfile persistence has no explicit permission enforcement; accept_dispatch still uses head.contains. build.log exists and .gitignore has no log rule. No exploitability asserted. Unix modes require platform-appropriate treatment on Windows, and error! alone is insufficient if fetch has no subscriber: ensure actual operator visibility rather than merely changing severity.",
+      "evidence": [
+        "crates/obscura-browser/src/context.rs:343-353",
+        "crates/obscura-net/src/cookies.rs:590-601",
+        "crates/obscura-cdp/src/server.rs:1131-1142",
+        "build.log",
+        ".gitignore:1-6",
+        "https://github.com/h4ckf0r0day/obscura/issues/855"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 852,
+      "title": "SSRF guard hard-blocks 198.18.0.0/15, breaks on Clash fake-ip / WSL2 NAT",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/852",
+      "requirements": [
+        "Explicit private-network opt-in must bypass the benchmarking-range deny-set at URL and DNS checks in both transports",
+        "Keep 198.18.0.0/15 denied by default"
+      ],
+      "status": "covered",
+      "reason": "Current source contradicts the older release's unconditional-block mechanism: both DNS resolvers skip the entire deny-set when allow_private is true, and validate_url returns early on that permission. 198.18/15 remains in the shared default deny-set, as it should. This is source-level coverage of the reported gate defect, not a live Clash/WSL2 networking success claim. A current failure would need retained configuration/resolved-address evidence rather than removal of the range.",
+      "evidence": [
+        "crates/obscura-net/src/client.rs:654-686",
+        "crates/obscura-net/src/wreq_client.rs:35-57",
+        "crates/obscura-ssrf/src/lib.rs:47-55"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 844,
+      "title": "WebGL returns null + Turnstile challenge iframe never created (breaks CF challenge flows)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/844",
+      "requirements": [
+        "Distinguish true WebGL rendering support from Canvas2D and constructor names.",
+        "Diagnose script-created iframe and cross-origin classic-script request behavior independently of a third-party challenge outcome."
+      ],
+      "status": "diagnostic",
+      "reason": "Complete body read. Current WebGL getContext deliberately returns null pending a real backend; WebGL constructors do not establish rendering support. A true WebGL backend would be new scope, not a small iframe repair. Connected script/iframe preparation exists and relates to generic frame/script scheduling work, but neither proves widget creation or target success. Needs an authorized two-origin local script-created-frame fixture with request receipts; no third-party requests or challenge-token/bypass work performed.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/844",
+        "crates/obscura-js/js/bootstrap.js:17159-17165",
+        "crates/obscura-js/js/bootstrap.js:2429-2455",
+        "crates/obscura-browser/src/page.rs:6019-6023"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 843,
+      "title": "fix(js): interpolate console/release objectIds via js_string_literal (defense-in-depth)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/843",
+      "requirements": [
+        "JSON-escape console object-ID retrieval and release-object generated scripts",
+        "Use existing js_string_literal helper consistently"
+      ],
+      "status": "covered",
+      "reason": "Already covered at both reported interpolation sites. Runtime retrieval and deletion embed JSON literals via js_string_literal; hostile-ID regression exists. The issue itself states defense-in-depth, not an exploitable vulnerability; no severity inflation and no check executed here.",
+      "evidence": [
+        "crates/obscura-js/src/runtime.rs:425-427 serde_json helper",
+        "crates/obscura-js/src/runtime.rs:2308-2326 pending runtime object retrieval escaping",
+        "crates/obscura-js/src/runtime.rs:4039-4047 release object escaping",
+        "crates/obscura-js/src/runtime.rs:20831-20843 hostile-ID source-injection regression (not executed)"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 828,
+      "title": "body inner_text includes raw <script> source text (CDP parity: ~100x vs Chromium)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/828",
+      "requirements": [
+        "Connected rendered body innerText excludes script/style and hidden content",
+        "Do not conflate text-extraction defect with Worker app boot failures"
+      ],
+      "status": "covered",
+      "reason": "Already covered by the same rendered-innerText implementation as1021, with a fixture explicitly containing script/style/hidden subtrees. This does not assert the historical Yahoo/AASTOCKS pages now load or report any fresh size ratio. No new independent repair needed for the issue's named defect.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:4090-4135 computed-style text collection",
+        "crates/obscura-js/js/bootstrap.js:4262-4266 rendered innerText getter with browser-like detached/display-none fallback",
+        "crates/obscura-browser/src/page.rs:11227-11265 rendered text regression (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/1023"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 827,
+      "title": "Web Workers: importScripts() not implemented -> Yahoo Finance app dies and redirects to /lookup",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/827",
+      "requirements": [
+        "Real synchronous classic Worker importScripts fetching and ordered execution in worker global scope",
+        "Resolve imported globals and relative URLs using worker script context",
+        "Preserve script loading failures, origin/CSP/network authority and worker termination semantics"
+      ],
+      "status": "proposed",
+      "reason": "Confirmed additional Worker requirement beyond the already planned self-global and transferable-port fixes. Current _makeScope has no importScripts and execution is with(scope)+eval. Parent independently exercised a Blob Worker and observed typeof importScripts undefined and ReferenceError when importing own data JS. Do not retest the real Yahoo target or infer site success; implementation must actually import/execute dependencies, not install a compatibility no-op/global.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:17414-17491 Worker loading and scope properties without importScripts",
+        "crates/obscura-js/js/bootstrap.js:17494-17515 with(scope) eval Worker execution",
+        "Parent receipt worker-importscripts.json under parent triage temp root: undefined plus ReferenceError importing data JS (parent-reported exercised evidence)",
+        "https://github.com/h4ckf0r0day/obscura/issues/827"
+      ],
+      "review_group": "Runtime",
+      "parent_runtime_observation": "Parent Blob Worker: typeof importScripts is undefined and invocation throws ReferenceError; worker-importscripts.json."
+    },
+    {
+      "number": 807,
+      "title": "fill/click/selectOption via Playwright CDP hang despite element reporting visible/enabled/editable",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/807",
+      "requirements": [
+        "Implement Playwright fill's Input.insertText path",
+        "Remove fake success geometry on failed native node resolution",
+        "Use reporter's corrected protocol trace rather than the initial box-model hypothesis"
+      ],
+      "status": "covered",
+      "reason": "The reporter explicitly corrected the suspected root cause: actual trace was Unknown Input method: insertText; the quad-only change did not repair fill. Current insertText calls dispatch_native_input, getBoxModel requires native model and errors when absent, and getContentQuads resolves identifiers then returns actual content quads or an empty list when no box exists. Thus the concrete old missing-input/fake-quad mechanisms are statically covered. No claim that every real SPA interaction now succeeds: original site and current Playwright matrix were not exercised. Other commenters' downstream zero-height/rejection hypotheses are not the reporter's confirmed root cause.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/807#issuecomment-5504613210",
+        "crates/obscura-cdp/src/domains/input.rs:68-73",
+        "crates/obscura-cdp/src/domains/dom.rs:469-487",
+        "crates/obscura-cdp/tests/textarea_enter_selection.rs:210-215",
+        "https://github.com/h4ckf0r0day/obscura/pull/808"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 783,
+      "title": "v0.2.1 serve: RSS leaks to ~2.3 GB with sustained 50-100% CPU on long-running CDP server",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/783",
+      "requirements": [
+        "Maintain bounded retained resources across long-lived CDP/page lifecycle workloads",
+        "Avoid idle runtime CPU spin",
+        "Diagnose abrupt RSS jump with workload, memory and task evidence"
+      ],
+      "status": "diagnostic",
+      "reason": "New diagnostic priority, not an established current leak or a reason for arbitrary cleanup. Current remove_page drops page/isolate and removes extensive session/context/node state; autonomous runtime pumping parks on real wakes, yields busy turns, and has per-turn watchdogs. Response caches have entry bounds and per-body size admission, but this is not proof of globally bounded RSS or a total2MiB cache cap. Upstream comment's3000-cycle plateau is explicitly another downstream tree and cannot verify this fork. Need authorized local long-running lifecycle/network/reply-backpressure workload plus heap/CPU samples around the jump; none was run. Unbounded protocol channels remain visible but causality is not established.",
+      "evidence": [
+        "crates/obscura-cdp/src/dispatch.rs:589-635",
+        "crates/obscura-cdp/src/server.rs:1269-1280",
+        "crates/obscura-cdp/src/server.rs:2623",
+        "crates/obscura-browser/src/page.rs:5640-5658",
+        "crates/obscura-browser/src/page.rs:12863-12875",
+        "crates/obscura-js/src/runtime.rs:4752-4871",
+        "https://github.com/h4ckf0r0day/obscura/issues/783#issuecomment-5553768809"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 777,
+      "title": "Emulation.setUserAgentOverride is a silent no-op, and Network.setUserAgentOverride drops acceptLanguage",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/777",
+      "requirements": [
+        "Honor userAgent and acceptLanguage through both command spellings",
+        "Keep regular/native transport and live navigator identity coherent",
+        "Account separately for dropped platform and Intl locale lifecycle"
+      ],
+      "status": "partial",
+      "reason": "Core old UA/language bug is statically covered: Emulation delegates to shared apply_user_agent_override, which writes regular and native-stealth clients plus live JS identity. Network uses the same helper. Remaining platform field is still unread; do not imply all three fields are implemented. The issue itself deliberately scoped platform to481 and isolate-level Intl changes separately; carry that residual under identity scope, not a duplicate UA/language fix. No wire or navigator evaluation was executed here.",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/emulation.rs:156-169",
+        "crates/obscura-cdp/src/domains/network.rs:27-53",
+        "crates/obscura-cdp/src/domains/network.rs:86-89",
+        "crates/obscura-cdp/tests/network_pr_ports.rs:281-285",
+        "https://github.com/h4ckf0r0day/obscura/pull/778"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 771,
+      "title": "getComputedStyle: 41 properties return '' and a few return wrong values",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/771",
+      "requirements": "Complete existing CSSOM work: all 41 listed properties must have meaningful defaults or real modeled values, running animation names must survive, and table display/flex stand-ins, min-height, transition-property and outline-width differences must be reconciled explicitly rather than claiming blanket PR coverage.",
+      "status": "partial",
+      "reason": "Current snapshot now emits many real background/text/flex/grid/animation values and retains table display provenance. However bootstrap defaults omit transition-property, caption-side, user-select and other listed unmodeled values, so lookup can still return ''. outline-width intentionally returns used_width, with an existing test requiring 0px for style:none, unlike the issue's Chromium target. PR #773 is not fully equivalent to current source; outline spec-versus-Blink policy must stay explicit. No 90-property runtime comparison was run.",
+      "evidence": [
+        "crates/obscura-render/src/paint.rs:2095-2180",
+        "crates/obscura-render/src/style.rs:45-59",
+        "crates/obscura-js/js/bootstrap.js:10400-10455",
+        "crates/obscura-render/src/paint.rs:1989-1991",
+        "crates/obscura-render/src/paint.rs:16290-16301",
+        "https://github.com/h4ckf0r0day/obscura/pull/773"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 769,
+      "title": "Default (non-stealth) client can't reach servers that only offer legacy TLS 1.2 CBC cipher suites — rustls-tls has no CBC support",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/769",
+      "requirements": [
+        "Decide explicit support policy for legacy CBC-only TLS endpoints without disabling certificate validation",
+        "If supported, preserve selected native client, proxy and SSRF boundaries rather than silently retrying through another backend"
+      ],
+      "status": "optional",
+      "reason": "Separate TLS compatibility/product-policy expansion, not proof of a new current regression. Ordinary client explicitly uses rustls; native stealth uses BoringSSL emulation. The issue supplies strong historical cipher diagnosis, but no local current CBC-only fixture was exercised and no third-party target was contacted. Do not make stealth or insecure certificate mode an automatic fallback; an authorized local legacy-TLS fixture is needed before changing the backend policy.",
+      "evidence": [
+        "crates/obscura-net/src/client.rs:1119-1128",
+        "crates/obscura-net/src/wreq_client.rs:217-238",
+        "https://github.com/h4ckf0r0day/obscura/issues/769"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 767,
+      "title": "width:calc(100% - 32px) resolves to 0 inside a flex subtree",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/767",
+      "requirements": "Complete existing cyclic-flex sizing work: cyclic non-replaced preferred widths need intrinsic auto behavior, then resolve calc against final containing-block width; preserve replaced-element handling and native-control intrinsic contribution. Compare the reduced input fixture rather than only unrelated flex examples.",
+      "status": "partial",
+      "reason": "Current final resolver improves ordering by pinning flex items and relaying out before functional resolution, but the intrinsic neutralization still evaluates calc at zero and assigns slot-0 width to Px(max(0,intrinsic)). PR #774 addresses precisely that remaining mechanism; its own numeric-control comparison is not full absolute parity. Current-source presence of deferred reflow therefore cannot close this issue. No reduced fixture was run.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:13122-13247",
+        "crates/obscura-render/src/dom.rs:13268-13313",
+        "https://github.com/h4ckf0r0day/obscura/pull/774",
+        "https://github.com/h4ckf0r0day/obscura/issues/767"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 764,
+      "title": "A display:none float still contributes its width when the line contains an atomic inline",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/764",
+      "requirements": "Additional narrow layout repair: hidden floats must not select the legacy float-zone path; preserve the issue's atomic-inline plus hidden-float matrix, not just hidden-only or inline-block-only cases.",
+      "status": "proposed",
+      "reason": "Current has_float_child still tests float.is_some() without excluding Display::None, the exact branch-selection defect described by PR #775. Later native-band iteration skipping hidden boxes does not undo that upstream path choice. Static evidence supports a concrete repair candidate, not a claim of current measured 82px output.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:14185-14191",
+        "crates/obscura-render/src/dom.rs:14223-14226",
+        "crates/obscura-render/src/dom.rs:15518-15522",
+        "https://github.com/h4ckf0r0day/obscura/pull/775"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 757,
+      "title": "A floated element with a percentage width ignores it once it also has a margin (breaks the Bootstrap 3 grid)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/757",
+      "requirements": "Complete existing percentage-margin work for floated percentage widths with both percentage and px margins, clearfix parent height and following-flow hit targets; do not infer all four original cases from ordinary block/flex/grid margin coverage.",
+      "status": "partial",
+      "reason": "Fork carries typed percentages and final containing-block margin resolution with broad tests, but has_deferred_or_auto_margin still includes margin_percent and can_use_native_float_band still rejects such floats. This retains the path exclusion targeted by PR #758. Its narrow percentage-margin fix does not itself prove the body's separate px-margin case; both need the original matrix. No layout check was run.",
+      "evidence": [
+        "docs/Testing-and-debugging.md:446-450",
+        "crates/obscura-render/tests/layout_test.rs:853-1080",
+        "crates/obscura-render/src/dom.rs:15417-15423",
+        "crates/obscura-render/src/dom.rs:15521-15533",
+        "https://github.com/h4ckf0r0day/obscura/pull/758"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 738,
+      "title": "elementFromPoint ignores z-index among positioned siblings",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/738",
+      "requirements": "Already covered in render-enabled native hit testing: higher-z close button must beat later lower-z overlay, with DOM hit APIs and CDP pointer targeting using the same stacking decision.",
+      "status": "covered",
+      "reason": "PreparedRender hit selection compares stacking paths before DOM-order tie breakers. Existing runtime regression reproduces the issue's dialog/close/overlay z=1000/1002/1001 shape, asserts elementsFromPoint close first and native_hit_test returns close. CDP input routes through native page hit targeting. This is exact static regression/source evidence, not a test executed now.",
+      "evidence": [
+        "crates/obscura-render/src/paint.rs:1584-1640",
+        "crates/obscura-js/src/runtime.rs:6755-6777",
+        "crates/obscura-cdp/src/domains/input.rs:39-57",
+        "crates/obscura-browser/src/page.rs:2220-2228"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 737,
+      "title": "Article text collapses to one character per line on en.wikipedia.org at >=1150px viewport",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/737",
+      "requirements": "Additional reduced layout candidate from PR #750: cap auto inline-block max-content lines at available space, and measure table min-content with wrap enabled; validate inline-block list/pseudo list inside a width-constrained table. Live Wikipedia output requires separately matched captured page state.",
+      "status": "proposed",
+      "reason": "The issue itself is unreduced, but related PR #750 supplies a concrete cslist fixture and explains the 641px infobox floor. Current source still assigns NoWrap to auto inline-blocks without in-flow block children; neither the named overflow repair nor its reduced regression was found under targeted and broader searches. Existing inline-block inner-flow fixes do not prove this bounded-overflow case. No Wikipedia visit/current reproduction was performed.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:13633-13674",
+        "crates/obscura-render/tests/layout_test.rs:2580-2640",
+        "https://github.com/h4ckf0r0day/obscura/pull/750",
+        "https://github.com/h4ckf0r0day/obscura/issues/737"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 726,
+      "title": "HTMLElement.click() does not honor the click in progress flag",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/726",
+      "requirements": [
+        "Per-element click-in-progress guard preventing self/mutual recursive activation",
+        "Release guard in finally so sequential clicks and throwing listeners remain usable",
+        "Retain disabled-control and other-element activation behavior"
+      ],
+      "status": "covered",
+      "reason": "Already covered by closure-private WeakSet checked before activation and removed in finally. A focused regression recursively clicks an input and verifies sequential activations/canceled controls. Read-only static evidence, not a new reproduction of the historical stack overflow.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:3603-3604 private click state",
+        "crates/obscura-js/js/bootstrap.js:4638-4645 disabled and reentrancy guard; 4724-4725 finally cleanup",
+        "crates/obscura-js/tests/platform_behavior.rs:722-742 click reentrancy and cancellation assertions (not executed)",
+        "https://github.com/h4ckf0r0day/obscura/pull/729"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 722,
+      "title": "getBoundingClientRect returns 0x0 for inline elements in a run that cannot fold (replaced, inline-block, block, float or out-of-flow sibling)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/722",
+      "requirements": "Complete existing inline-geometry work across original atomic-sibling fallback and second pre-flattened/block-segment path; preserve margins/padding and paint positions, per-line client rects, nested ownership, exclusion of floats/out-of-flow descendants, empty/replaced-only inline struts and CDP hit targets.",
+      "status": "partial",
+      "reason": "Fork preserves foldable wrappers before mixed-block segmentation and tests real/nested owner geometry after a block, covering part of the later comment's second path. But build_any still directly flattens wrappers on word/atomic fallback, the flattenability predicate excludes horizontal margins but not padding, and no descendant-union fallback covering the full issue matrix was located. PR #727 itself lists residuals and the issue follow-up explicitly says it is not a full fix. No 94-case/current runtime matrix was run.",
+      "evidence": [
+        "crates/obscura-render/src/dom.rs:10551-10580",
+        "crates/obscura-render/src/dom.rs:10789-10821",
+        "crates/obscura-render/src/dom.rs:15066-15099",
+        "crates/obscura-render/tests/layout_test.rs:179-214",
+        "https://github.com/h4ckf0r0day/obscura/issues/722#issuecomment-5601628752",
+        "https://github.com/h4ckf0r0day/obscura/pull/727"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 716,
+      "title": "Binary fetch and interception bodies are corrupted by UTF-8 conversion",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/716",
+      "requirements": [
+        "Byte-preserving fetch/XHR body serialization for Blob, buffers, sliced views, multipart files and inherited Request body",
+        "Byte-native public Continue/Fulfill API and exact CDP base64 decoding with invalid-input pause retention"
+      ],
+      "status": "partial",
+      "reason": "Existing binary compatibility scope is substantially covered: JS serializes bytes with view offsets and inherits Request bodies; op accepts JsBuffer; Continue is Option<Vec<u8>>; CDP validates binary data before consuming pauses; Fulfill retains exact base64 alongside a lossy text view. The public Fulfill API still requires String plus body_base64, not the requested clean byte-native Vec<u8> API. PR718 is the remaining breaking cutover candidate; do not call all of #716 missing or fully fixed. Source tests are present, not executed here.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:8920-8947",
+        "crates/obscura-js/js/bootstrap.js:8987-8994",
+        "crates/obscura-js/src/ops.rs:40-61",
+        "crates/obscura-js/src/ops.rs:4553-4574",
+        "crates/obscura-cdp/src/server.rs:1965-1988",
+        "crates/obscura-js/src/runtime.rs:23396-23472",
+        "crates/obscura-browser/tests/binary_fetch_body.rs:78-143",
+        "https://github.com/h4ckf0r0day/obscura/pull/718"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 694,
+      "title": "Feature: persistent profile / user-data-dir for fetch & scrape (storage is lost between CLI invocations)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/694",
+      "requirements": [
+        "Reuse cookies/localStorage and requested IndexedDB between CLI invocations for fetch/scrape through a persistent profile or equivalent workflow.",
+        "Provide recommended persistent CDP workflow; distinguish within-run sessionStorage lifetime from restart persistence."
+      ],
+      "status": "partial",
+      "reason": "Complete body read. Fetch already routes --storage-dir and explicitly saves cookies/localStorage before return; profile/CDP workflow is documented. IndexedDB remains memory-only, and Scrape has no storage-dir field or profile argument in its worker dispatch, so the combined fetch-and-scrape request is not fully covered. sessionStorage intentionally is not persisted across process restart, as documented, rather than silently promising every listed store survives. Durable IndexedDB and scrape profile semantics are remaining additional scope; no restart tests executed here.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/694",
+        "crates/obscura-cli/src/main.rs:649-668",
+        "crates/obscura-cli/src/main.rs:1624-1625",
+        "crates/obscura-cli/src/main.rs:220-253",
+        "crates/obscura-cli/src/main.rs:672-692",
+        "docs/Persist-cookies-and-storage.md:1-34",
+        "docs/Persist-cookies-and-storage.md:63-68",
+        "docs/Persist-cookies-and-storage.md:84-110"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 684,
+      "title": "Support `scoop` as a way to install in Windows",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/684",
+      "requirements": [
+        "Install, update and manage Windows Obscura through Scoop."
+      ],
+      "status": "optional",
+      "reason": "Complete body read. Packaging feature, not engine defect. No Scoop manifest/instructions found by repository-wide literal search and filename glob. Open PR #923 proposes a v0.2.2 x86_64 default render archive manifest with both executable shims, but candidate existence is not integration or current release provenance; its original fixed version/features require review against current releases. Optional additional distribution scope; no package installation/checks run.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/684",
+        "https://github.com/h4ckf0r0day/obscura/pull/923"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 683,
+      "title": "`browser_navigate` never returns on ad-heavy pages — renderer spins at ~100% CPU indefinitely (v0.2.0)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/683",
+      "requirements": [
+        "Bound MCP navigation with success or error",
+        "Ensure continuously ready async page work cannot monopolize navigation/event-loop polling",
+        "Keep misbehaving background JS bounded without treating distant idle timers as overruns"
+      ],
+      "status": "diagnostic",
+      "reason": "The current architecture has concrete defenses absent from the old report: MCP tool_navigate calls the Page navigation wrapper with an end-to-end configurable default30s timeout; script execution has a shared soft deadline and hard V8 watchdog; cooperative event-loop ticks yield; autonomous microtask/tick entry has watchdogs disarmed while parked. This is substantial static mitigation, not proof the original ad-stack hang is fixed or that all native host work is preemptible. Need a reduced authorized local async scheduler/host-call reproduction and operation-bound assertions. Do not visit the reported third-party ad page or add a blanket no-watchdog mode. No runtime reproduction performed.",
+      "evidence": [
+        "crates/obscura-mcp/src/lib.rs:1009-1040",
+        "crates/obscura-browser/src/page.rs:2980-2997",
+        "crates/obscura-browser/src/page.rs:3947-3983",
+        "crates/obscura-js/src/runtime.rs:4735-4871",
+        "crates/obscura-js/src/cdp_watchdog.rs:1-14",
+        "https://github.com/h4ckf0r0day/obscura/issues/683"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 680,
+      "title": "Runtime.evaluate returns 'No page' on freshly created tab via CDP",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/680",
+      "requirements": [
+        "Bind advertised /devtools/page/{id} WebSocket commands lacking sessionId to the correct page",
+        "Keep browser-scoped and explicit-session routing intact"
+      ],
+      "status": "proposed",
+      "reason": "Existing approved endpoint/session repair scope and statically still present. /json advertises page-1; WebSocket accept does not capture/bind the request target; normal NewConnection only sends __init; get_session_page and mutable variant require sessionId lookup. Bare page-endpoint Runtime.evaluate therefore has no route in this code. PR686 supplies a candidate but is open, not applied. Its per-connection fresh-page approach must also be reconciled with543/570's global visibility/initial-page identity rather than declaring those solved. No live CDP probe executed.",
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1191-1196",
+        "crates/obscura-cdp/src/server.rs:1427-1432",
+        "crates/obscura-cdp/src/server.rs:2608-2627",
+        "crates/obscura-cdp/src/dispatch.rs:888-923",
+        "https://github.com/h4ckf0r0day/obscura/pull/686"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 662,
+      "title": "prepare_screenshot_resources fetches CSS resources from the stylesheet text instead of the render tree",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/662",
+      "requirements": "High-value additional correctness scope: replace raw stylesheet URL warmup with a no-network cascade-selected request set, including used backgrounds, matched pseudo backgrounds, external SVG use and fonts actually needed. Keep normal page transport/policy and prove unused protected URLs are never requested in a local OAuth-state fixture; disabling all CSS backgrounds is not a repair.",
+      "status": "proposed",
+      "reason": "Current render_resource_candidates still collects all style/inline/external stylesheet source text and enumerates css_resource_urls. prepare_screenshot_resources calls spawn_pending_render_resources, which starts those candidates through page transport. Later retained-render misses are selective but do not remove eager unused requests. This is a concrete remaining side-effect risk, not a spec-violation assertion or live SAP reproduction. PR #814 provides a candidate and local regression ideas.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:4772-4863",
+        "crates/obscura-browser/src/page.rs:4951-4988",
+        "crates/obscura-browser/src/page.rs:5002-5010",
+        "https://github.com/h4ckf0r0day/obscura/pull/814",
+        "https://github.com/h4ckf0r0day/obscura/issues/662"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 643,
+      "title": "Fetch interception blocks every matched subresource outright instead of pausing and asking the client",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/643",
+      "requirements": [
+        "Keep Network.setBlockedURLs distinct from Fetch pause patterns",
+        "Actually pause static scripts/styles/imports before I/O and apply Continue/Fail/Fulfill",
+        "Bound abandoned interception without treating unapproved private URLs as authorized"
+      ],
+      "status": "partial",
+      "reason": "Existing interception compatibility scope: should_block_url now consults only blocked_url_patterns, so the original block-list conflation is covered. Static parser script fetch still directly calls the HTTP client, and CDP synthesizes un-intercepted resource requestPaused events from completed network records. Those are not decision-bearing pre-I/O pauses. PR644 is relevant but must integrate with newer native loading/cancellation boundaries. Its fail-open timeout proposal requires explicit policy review; it is not automatically accepted by this triage.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:1701-1705",
+        "crates/obscura-browser/src/page.rs:3168-3220",
+        "crates/obscura-browser/src/page.rs:7848-7860",
+        "crates/obscura-cdp/src/domains/page.rs:1015-1045",
+        "https://github.com/h4ckf0r0day/obscura/pull/644"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 635,
+      "title": "getComputedStyle() methods throw this._owner.getAttribute is not a function on every element",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/635",
+      "requirements": [
+        "Computed getPropertyValue/item/cssText/length must not invoke declaration methods with corrupt proxy this",
+        "Serve computed method lookups before generic target passthrough"
+      ],
+      "status": "covered",
+      "reason": "Named method crash is already covered structurally: all reported methods/fields are handled directly before prop-in-target passthrough and compute from detachedLookup/native snapshot, avoiding _pull through an outer proxy. This does not claim every inherited CSSStyleDeclaration method is fully conformant or that the external WooCommerce page has been retested. No checks executed here.",
+      "evidence": [
+        "crates/obscura-js/js/bootstrap.js:10450-10471 direct computed method/field branches before target passthrough at10483",
+        "crates/obscura-js/js/bootstrap.js:1774-1794 owner-backed declaration explains original failure path",
+        "https://github.com/h4ckf0r0day/obscura/pull/636"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 629,
+      "title": "Request: support --storage-dir in `obscura mcp` for persistent cookies/session",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/629",
+      "requirements": [
+        "Pass a persistent profile into both stdio and HTTP MCP contexts.",
+        "Load/save cookies and origin localStorage after navigation and clean exit, including volume-mounted container use."
+      ],
+      "status": "partial",
+      "reason": "Complete body and all four current comments read. CLI top-level --storage-dir is handed through OBSCURA_STORAGE_DIR; both transports construct the same storage-aware BrowserState, so the old completely-ignored-profile premise is already repaired. localStorage flushes after page scripts and stdio EOF saves both stores. However static callsite tracing finds ordinary MCP navigation does not save cookies, HTTP has no profile-save/shutdown branch, and post-navigation localStorage mutations are not guaranteed durable on HTTP exit. [INFERENCE] These leave the requested automatic cookie/HTTP lifecycle contract incomplete despite docs saying otherwise; needs offline restart/shutdown acceptance by parent, not a reproduced claim. Existing manual storage-state import saves both stores but is the workaround, not the requested automatic guarantee. Open PR #926 is candidate context only. Separate profiles remain required for independent processes; no cross-process database guarantee.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/629",
+        "https://github.com/h4ckf0r0day/obscura/issues/629#issuecomment-5250392532",
+        "https://github.com/h4ckf0r0day/obscura/pull/926",
+        "crates/obscura-cli/src/main.rs:695-716",
+        "crates/obscura-mcp/src/lib.rs:85-108",
+        "crates/obscura-mcp/src/lib.rs:317-319",
+        "crates/obscura-mcp/src/lib.rs:1009-1043",
+        "crates/obscura-mcp/src/lib.rs:2236-2238",
+        "crates/obscura-mcp/src/http.rs:275-310",
+        "crates/obscura-browser/src/page.rs:4563-4565",
+        "crates/obscura-browser/src/context.rs:335-350",
+        "docs/Persist-cookies-and-storage.md:28-34",
+        "docs/Persist-cookies-and-storage.md:59-64"
+      ],
+      "review_group": "Features"
+    },
+    {
+      "number": 606,
+      "title": "In the screenshot, Chinese text cannot be displayed properly",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/606",
+      "requirements": "Already covered for fork font discovery/configuration and shared text/control/SVG fallback when CJK fonts are available; preserve readable painted glyphs, not just nonzero advance. Do not imply a fontless container has bundled CJK fonts or that all Baidu layout is browser-identical.",
+      "status": "covered",
+      "reason": "Issue comments identify deliberately embedded-only fonts and separately bypassed native-control paint. Current source discovers system fonts by default, supports configured directories, and shares the font policy. Existing delivery documentation records fresh Windows original CJK counterexamples and 91/92-case CLI/CDP/MCP/scrape/control/SVG font-policy acceptance. This is source plus recorded prior verification, not a newly exercised screenshot. Fontless hosts still require installed/configured glyph coverage.",
+      "evidence": [
+        "crates/obscura-render/src/inline.rs:301-338",
+        "crates/obscura-render/src/inline.rs:585-605",
+        "docs/Testing-and-debugging.md:452-456",
+        "docs/Testing-and-debugging.md:481-500",
+        "https://github.com/h4ckf0r0day/obscura/issues/606#issuecomment-6098699509"
+      ],
+      "review_group": "Rendering"
+    },
+    {
+      "number": 571,
+      "title": "`setExtraHTTPHeaders` not working with stealth",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/571",
+      "requirements": [
+        "CDP extra page headers reach native stealth document requests",
+        "Keep page header ownership and credential stripping intact"
+      ],
+      "status": "covered",
+      "reason": "Already covered by explicit current-source plumbing: Network handler calls Page::set_extra_headers, which updates both clients; stealth GET request construction applies extra_headers, with deliberate filtering for origin/referrer and credential boundaries. No postman-echo request or local wire test performed; this does not claim every unrelated subresource uses stealth (see #977).",
+      "evidence": [
+        "crates/obscura-cdp/src/domains/network.rs:73-84",
+        "crates/obscura-browser/src/page.rs:1315-1319",
+        "crates/obscura-net/src/wreq_client.rs:365-410"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 570,
+      "title": "serve mode: Target.getTargets empty on fresh browser connection — puppeteer.connect sees no pages",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/570",
+      "requirements": [
+        "Expose an initial real about:blank page consistently through HTTP discovery and browser Target.getTargets",
+        "Emit existing targetCreated notifications when discovery starts"
+      ],
+      "status": "proposed",
+      "reason": "High-value new compatibility scope related to existing680 endpoint repair, not already fixed by current target discovery implementation. New per-connection CdpContext starts pages empty, normal NewConnection creates no page, Target.getTargets enumerates that empty list, while /json always advertises page-1. setDiscoverTargets now emits existing local pages (and browser) correctly, but cannot invent the absent initial page. Fix truthful bootstrap target identity/discovery together; source-only finding, no Puppeteer run.",
+      "evidence": [
+        "crates/obscura-cdp/src/dispatch.rs:181-190",
+        "crates/obscura-cdp/src/server.rs:1191-1196",
+        "crates/obscura-cdp/src/server.rs:1427-1432",
+        "crates/obscura-cdp/src/domains/target.rs:14-39",
+        "https://github.com/h4ckf0r0day/obscura/issues/570"
+      ],
+      "review_group": "Protocol",
+      "parent_runtime_observation": "Parent fresh browser Target.getTargets returns empty and creator page remains invisible to another connection; target-discovery.json. This does not establish every default-page policy requirement."
+    },
+    {
+      "number": 569,
+      "title": "`request.continue()` overrides are silently dropped for all intercepted requests",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/569",
+      "requirements": [
+        "Apply URL/method/header/body overrides before network I/O for top-level navigation and every intercepted resource",
+        "Decode CDP postData as bytes and revalidate rewritten URL at existing private-network/origin gate"
+      ],
+      "status": "partial",
+      "reason": "Existing interception compatibility scope: live fetch/XHR Continue now forwards all four fields, and op_fetch_url applies them with rewrite validation. The claim 'all overrides dropped' is no longer globally true. Top-level and static-resource paths still fetch directly and emit some requestPaused events after completed records, so all-resource/top-level acceptance remains incomplete. Existing navigation-interception unit tests inject an InterceptedRequest and prove servicing, not real top-level request rewriting. No end-to-end wire reproduction run.",
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1959-1971",
+        "crates/obscura-js/src/ops.rs:4747-4759",
+        "crates/obscura-js/src/ops.rs:4770-4825",
+        "crates/obscura-browser/src/page.rs:2483-2496",
+        "crates/obscura-browser/src/page.rs:4420-4426",
+        "crates/obscura-cdp/src/domains/page.rs:958-982",
+        "crates/obscura-cdp/src/server.rs:3750-3887"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 543,
+      "title": "Target.getTargets returns empty for new connections — pages not globally visible (CDP spec violation)",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/543",
+      "requirements": [
+        "Expose shared browser target identity/visibility across connections without sharing cookies or other context state",
+        "Route operations to owning page/context and preserve V8 thread affinity"
+      ],
+      "status": "proposed",
+      "reason": "New architecture-level compatibility scope overlapping570/680 but broader than their initial-page/endpoint fixes. Current processor owns per-connection CdpContext and page Vec; getTargets and attachToTarget inspect only those pages. A new connection cannot enumerate/attach another connection's targets. Body's proposed existing global v8_lock is outdated: current lock is deliberately per-connection and each processor is on its own thread. A shared metadata registry plus owner-thread command routing (not moving V8 Page across threads or merely publishing inaccessible target IDs) is needed for real global semantics. No architecture change or cross-connection runtime check performed.",
+      "evidence": [
+        "crates/obscura-cdp/src/server.rs:1234-1248",
+        "crates/obscura-cdp/src/dispatch.rs:71-73",
+        "crates/obscura-cdp/src/dispatch.rs:134-143",
+        "crates/obscura-cdp/src/domains/target.rs:36-39",
+        "crates/obscura-cdp/src/domains/target.rs:128-137",
+        "https://github.com/h4ckf0r0day/obscura/issues/543"
+      ],
+      "review_group": "Protocol",
+      "parent_runtime_observation": "Parent created page is visible on creator browser WebSocket but absent from second connection Target.getTargets; target-discovery.json."
+    },
+    {
+      "number": 531,
+      "title": "[Feature] Configurable module evaluation timeout, DOM.scrollIntoViewIfNeeded CDP support, and V8 watchdog tuning for complex SPA hydration",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/531",
+      "requirements": [
+        "Configurable module evaluation budget for Vite/SPA boot",
+        "Tune synchronous watchdog without disabling runaway-JS safety",
+        "Implement DOM.scrollIntoViewIfNeeded",
+        "Provide screenshots when render-enabled"
+      ],
+      "status": "partial",
+      "reason": "Most old feature requests are statically covered: OBSCURA_MODULE_BUDGET_MS exists with shell-aware budget policy, OBSCURA_SCRIPT_DEADLINE_MS configures the script phase, DOM.scrollIntoViewIfNeeded resolves the native node and runs real nested-scrollport handling, and captureScreenshot has a native render pipeline. Remaining watchdog configurability is real: execute_script_guarded still applies a fixed5s timeout to scripts>=10000bytes, and autonomous tasks retain fixed5000ms+500ms safety constants. Increasing only module/phase settings does not raise that classic-script limit. No current Astro/Vue/Vite repro is supplied or exercised; targeted configurable bounded per-task policy is optional new tuning scope until justified, while no-watchdog and no-op scrolling suggestions are not recommended.",
+      "evidence": [
+        "crates/obscura-browser/src/page.rs:2980-2997",
+        "crates/obscura-browser/src/page.rs:3260-3303",
+        "crates/obscura-cdp/src/domains/dom.rs:411-429",
+        "crates/obscura-cdp/src/domains/page.rs:1883-1950",
+        "crates/obscura-js/src/runtime.rs:524-525",
+        "crates/obscura-js/src/runtime.rs:4474-4480",
+        "https://github.com/h4ckf0r0day/obscura/issues/531"
+      ],
+      "review_group": "Protocol"
+    },
+    {
+      "number": 527,
+      "title": "canvas / WebGL / AudioContext fingerprint support",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/527",
+      "requirements": [
+        "Issue body requests JavaScript rendering of gongkaoleida template variables, not a concrete Canvas/WebGL/Audio requirement",
+        "Obtain authorized reduced offline reproduction and failing script/network boundary before choosing a repair"
+      ],
+      "status": "diagnostic",
+      "reason": "Body/title mismatch must not be silently converted into fingerprint-spoofing scope. Complete body only reports unresolved articleInfo placeholders at an external URL, with no log or Chrome comparison. Comment explicitly confirms the mismatch and discusses a separate fork's rendering/HTTP heuristic; it is not evidence current fork is fixed. Missing prerequisite is a local/authorized reduced fixture or retained script/network trace identifying the failing template step. No third-party target contacted.",
+      "evidence": [
+        "https://github.com/h4ckf0r0day/obscura/issues/527 complete body in shared corpus",
+        "https://github.com/h4ckf0r0day/obscura/issues/527#issuecomment-5461736003 explicitly distinguishes title and body"
+      ],
+      "review_group": "Runtime"
+    },
+    {
+      "number": 491,
+      "title": "Obscura doesn't automatically fallback to direct access when server on `HTTP_PROXY`/`HTTPS_PROXY` is down",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/491",
+      "requirements": [
+        "Assess requested automatic direct fallback against explicit proxy confidentiality",
+        "Keep proxy failure closed; improve diagnostics separately only if requested"
+      ],
+      "status": "not-recommended",
+      "reason": "Do not adopt the requested automatic fallback: a configured proxy is an operator routing/confidentiality boundary and direct retry can reveal the originating address and bypass policy. The issue itself says Chrome also fails. Current clients install the configured proxy without an automatic direct retry in the inspected constructors; preserve that behavior and the native transport/private-network gates. This is a rejected behavioral proposal, not an uninvestigated networking bug or a request to contact the cited site.",
+      "evidence": [
+        "crates/obscura-net/src/client.rs:1142-1149",
+        "crates/obscura-net/src/wreq_client.rs:273-280",
+        "https://github.com/h4ckf0r0day/obscura/issues/491"
+      ],
+      "review_group": "Network"
+    },
+    {
+      "number": 481,
+      "title": "navigator.userAgent contradicts the User-Agent request header on every platform",
+      "url": "https://github.com/h4ckf0r0day/obscura/issues/481",
+      "requirements": [
+        "Keep HTTP UA, client hints, navigator UA/platform coherent across ordinary and native transports and overrides",
+        "Separate coherence from a product decision to default persona to actual host OS"
+      ],
+      "status": "partial",
+      "reason": "Existing identity scope: default ordinary context seeds the HTTP UA from one profile and seeds runtime UA/platform from that context; default stealth uses matching Chrome145 Windows constants and runtime platform. Thus historical 'every default platform contradicts' is not established today; issue comments also report Windows coverage. Remaining scope is custom UA/profile/override coherence: context platform is selected independently of explicit UA; stealth Page construction does not seed its UA from context; CDP override updates UA in both clients/live runtime but not platform here. Default-to-host behavior is a separate optional policy choice, not necessary for coherent privacy persona. No live anti-bot testing.",
+      "evidence": [
+        "crates/obscura-browser/src/context.rs:185-211",
+        "crates/obscura-browser/src/profiles.rs:1-24",
+        "crates/obscura-browser/src/page.rs:1176-1192",
+        "crates/obscura-browser/src/page.rs:2535-2564",
+        "crates/obscura-cdp/src/domains/network.rs:27-52",
+        "https://github.com/h4ckf0r0day/obscura/issues/481#issuecomment-5356914234",
+        "https://github.com/h4ckf0r0day/obscura/issues/481#issuecomment-5454459842"
+      ],
+      "review_group": "Network"
+    }
+  ]
+}

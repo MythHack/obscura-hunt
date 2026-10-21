@@ -86,8 +86,11 @@ async fn dom_request_node_pushes_ancestors_once_to_the_requesting_session() {
     ok(&mut ctx, &session, "getDocument", json!({"depth":-1})).await;
     let inserted = object(&mut ctx, &session,
         "document.querySelector('main').appendChild(document.createElement('button'))");
-    assert!(call(&mut ctx, &session, "requestNode", json!({"objectId":inserted})).await.error.is_some(),
-        "without mutation events, do not return a frontend ID that was never published");
+    let inserted_id = ok(&mut ctx, &session, "requestNode", json!({"objectId":inserted})).await["nodeId"].clone();
+    let event = ctx.pending_events.iter().find(|event| event.method == "DOM.childNodeInserted"
+        && event.params["node"]["nodeId"] == inserted_id).expect("insertions in a published parent must be published live");
+    assert_eq!(event.params["node"]["nodeName"], "BUTTON");
+    assert_eq!(ok(&mut ctx, &session, "getAttributes", json!({"nodeId":inserted_id})).await["attributes"], json!([]));
 }
 
 #[tokio::test(flavor = "current_thread")]

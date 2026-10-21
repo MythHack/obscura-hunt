@@ -11,19 +11,17 @@
 //!
 //! Fonts load installed operating-system faces by default, with embedded
 //! metric-compatible faces as deterministic fallbacks. Call
-//! [`configure_fonts`] with `system_fonts = false` before the first render to
+//! [`crate::configure_fonts`] with `system_fonts = false` before the first font
 //! keep layout independent of the host's installed fonts.
 
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, VecDeque},
-    hash::{Hash, Hasher},
-    path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    collections::HashMap,
+    sync::Arc,
 };
 
 use cosmic_text::{
     Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
-    CssWordBreak, Cursor, Family, FamilyOwned, FeatureTag, FontFeatures, FontSystem,
+    CssWordBreak, Cursor, Family, FeatureTag, FontFeatures, FontSystem,
     FontVariations, Metrics, Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
@@ -33,34 +31,20 @@ use obscura_dom::tree::{DomTree, NodeId};
 
 use crate::{Dimension, Display, LayoutStyle, Rect, TextTransform};
 use crate::dom::normalize_text;
-
-// Bundled faces. These keep text layout deterministic when system fonts are
-// disabled and provide metric-compatible faces for the ubiquitous
-// Arial/Helvetica (`sans-serif`), Times (`serif`), and Courier (`monospace`)
-// stacks. Installed families with the authored name always win over these
-// aliases; `system-ui` is resolved against the host platform and locale.
-static SANS_R: &[u8] = include_bytes!("../assets/liberation-sans.ttf");
-static SANS_B: &[u8] = include_bytes!("../assets/liberation-sans-bold.ttf");
-static SANS_O: &[u8] = include_bytes!("../assets/liberation-sans-oblique.ttf");
-static SANS_BO: &[u8] = include_bytes!("../assets/liberation-sans-boldoblique.ttf");
-static SERIF_R: &[u8] = include_bytes!("../assets/liberation-serif.ttf");
-static SERIF_B: &[u8] = include_bytes!("../assets/liberation-serif-bold.ttf");
-static SERIF_O: &[u8] = include_bytes!("../assets/liberation-serif-oblique.ttf");
-static SERIF_BO: &[u8] = include_bytes!("../assets/liberation-serif-boldoblique.ttf");
-static MONO_R: &[u8] = include_bytes!("../assets/liberation-mono.ttf");
-static MONO_B: &[u8] = include_bytes!("../assets/liberation-mono-bold.ttf");
-static MONO_O: &[u8] = include_bytes!("../assets/liberation-mono-oblique.ttf");
-static MONO_BO: &[u8] = include_bytes!("../assets/liberation-mono-boldoblique.ttf");
-static SYSTEM_R: &[u8] = include_bytes!("../assets/dejavu-sans.ttf");
-static SYSTEM_B: &[u8] = include_bytes!("../assets/dejavu-sans-bold.ttf");
-static EMOJI_R: &[u8] = include_bytes!("../assets/noto-color-emoji.ttf");
+use crate::fonts::{
+    base_font_database, font_database, resolve_loaded_font, select_loaded_face,
+    selected_metrics_from_database, FaceMetrics, FallbackSet, FontMetrics, LoadedFamily,
+    ResolvedFont, FAMILY,
+};
+use crate::WebFont;
 #[cfg(test)]
-static FALLBACK: &[u8] = SYSTEM_R;
-
-const FAMILY: &str = "Liberation Sans";
-const SERIF_FAMILY: &str = "Liberation Serif";
-const MONO_FAMILY: &str = "Liberation Mono";
-const SYSTEM_FAMILY: &str = "DejaVu Sans";
+use crate::fonts::{
+    build_font_database, bundled_face_metrics, bundled_test_database, font_metrics,
+    match_font_weight, FontConfiguration, FontDatabase, LoadedFace,
+    FALLBACK, MONO_FAMILY, SANS_R, SERIF_FAMILY, SYSTEM_B, SYSTEM_FAMILY,
+};
+#[cfg(test)]
+use std::sync::OnceLock;
 
 /// Whether text contains a code point that can request emoji presentation.
 /// Keep the color face out of ordinary render passes: its bitmap table is
@@ -101,880 +85,7 @@ pub(crate) fn text_may_need_emoji_font(text: &str) -> bool {
     })
 }
 
-/// Static bundled fallback used only when the loaded-family map has no entry
-/// for any authored token. `system-ui`/`ui-sans-serif` are resolved against the
-/// host platform before this point.
-fn resolve_font_family(fam: Option<&str>) -> &'static str {
-    let Some(f) = fam else { return FAMILY };
-    for tok in f.split(',') {
-        if let Some(family) = bundled_family_for_css_token(tok) {
-            return family;
-        }
-        // Unrecognized named webfont: keep scanning for a generic fallback.
-    }
-    FAMILY
-}
 
-/// Map the non-platform generic and legacy family keywords to a bundled face.
-/// `system-ui`/`ui-sans-serif` are deliberately absent: they resolve through
-/// the host's platform UI face seeded into the loaded-family map, and only
-/// fall back to the bundled broad-coverage face when the platform has none.
-fn bundled_family_for_css_token(token: &str) -> Option<&'static str> {
-    let token = normalize_family_token(token);
-    if token.is_empty() {
-        return None;
-    }
-    if token == "monospace"
-        || token.contains("mono")
-        || token.contains("courier")
-        || token.contains("consol")
-        || token == "menlo"
-        || token == "monaco"
-        || token == "code"
-    {
-        return Some(MONO_FAMILY);
-    }
-    if token == "serif"
-        || token == "ui-serif"
-        || token == "georgia"
-        || token.contains("times")
-        || token == "cambria"
-        || token.contains("garamond")
-        || token.contains("liberation serif")
-        || token == "roman"
-    {
-        return Some(SERIF_FAMILY);
-    }
-    if token == "sans-serif"
-        || token == "ui-sans-serif"
-        || token.contains("sans")
-        || token == "arial"
-        || token == "helvetica"
-        || token == "helvetica neue"
-        || token == "-apple-system"
-        || token == "roboto"
-        || token == "segoe ui"
-        || token == "inter"
-        || token == "verdana"
-        || token == "tahoma"
-    {
-        return Some(FAMILY);
-    }
-    None
-}
-
-/// Normalize one CSS `font-family` token for case-insensitive matching.
-fn normalize_family_token(token: &str) -> String {
-    token
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim()
-        .to_ascii_lowercase()
-}
-
-/// CSS `system-ui`/`ui-sans-serif` are platform generic families, not the
-/// bundled `DejaVu Sans`.
-pub(crate) fn is_system_ui_family_token(token: &str) -> bool {
-    let token = normalize_family_token(token);
-    matches!(
-        token.as_str(),
-        "system-ui" | "ui-sans-serif" | "-apple-system" | "blinkmacsystemfont"
-    )
-}
-
-/// Bundled alias for a CSS family token, used where a rasterizer only accepts
-/// family names (SVG). Installed faces are checked before this mapping.
-pub(crate) fn bundled_family_alias(token: &str) -> Option<&'static str> {
-    bundled_family_for_css_token(token)
-}
-
-#[derive(Clone)]
-struct LoadedFamily {
-    faces: Vec<LoadedFace>,
-}
-
-#[derive(Clone)]
-struct LoadedFace {
-    name: Arc<str>,
-    font_id: Option<cosmic_text::fontdb::ID>,
-    /// Parsed only when this face is actually selected. Scanning installed
-    /// fonts stores family metadata alone; `with_face_data` on a large TTC is
-    /// too expensive to repeat for every face at startup.
-    metrics: Arc<OnceLock<FaceMetrics>>,
-    min_weight: u16,
-    max_weight: u16,
-    italic: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FaceMetrics {
-    ascent: f32,
-    descent: f32,
-    line_gap: f32,
-    units_per_em: f32,
-}
-
-/// One loaded face plus an optional author-declared family, weight range, and
-/// italic flag from an `@font-face` rule.
-type FontDeclaration = (
-    cosmic_text::fontdb::ID,
-    Option<String>,
-    Option<(u16, u16)>,
-    Option<bool>,
-);
-
-/// Authored fallback families plus the concrete face selected for each from
-/// the engine database. The face id is essential: an `@font-face` resource
-/// may be registered under a family whose internal name collides with a
-/// different installed face, so re-resolving by name in cosmic's fallback
-/// iterator would lose the authored descriptor/resource.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FallbackSet {
-    families: Vec<FamilyOwned>,
-    font_ids: Vec<Option<cosmic_text::fontdb::ID>>,
-}
-
-impl FallbackSet {
-    fn families(&self) -> &[FamilyOwned] {
-        &self.families
-    }
-
-    fn font_ids(&self) -> &[Option<cosmic_text::fontdb::ID>] {
-        &self.font_ids
-    }
-}
-
-#[derive(Clone)]
-struct ResolvedFont {
-    family: Arc<str>,
-    font_id: Option<cosmic_text::fontdb::ID>,
-    metrics: FaceMetrics,
-    synthetic_italic: bool,
-    /// Ordered concrete families after the primary, from the authored
-    /// `font-family` stack. `None` avoids an allocation for the common case.
-    fallbacks: Option<Arc<FallbackSet>>,
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct WebFont {
-    pub data: Arc<Vec<u8>>,
-    pub family: Option<String>,
-    pub weight: Option<(u16, u16)>,
-    pub italic: Option<bool>,
-}
-
-const WEB_FONT_CACHE_ENTRIES: usize = 8;
-const WEB_FONT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-
-struct CachedWebFontSet {
-    signature: u64,
-    load_emoji: bool,
-    fonts: Vec<WebFont>,
-    bytes: usize,
-    database: FontDatabase,
-}
-
-/// Process-wide font setup captured before the first render.
-#[derive(Clone, Debug)]
-struct FontConfiguration {
-    directories: Vec<PathBuf>,
-    system_fonts: bool,
-}
-
-#[derive(Clone)]
-struct FontDatabase {
-    db: cosmic_text::fontdb::Database,
-    loaded: HashMap<String, LoadedFamily>,
-    /// Concrete family `system-ui`/`ui-sans-serif` map to in this database.
-    system_ui: Arc<str>,
-    locale: String,
-}
-
-static FONT_CONFIGURATION: OnceLock<FontConfiguration> = OnceLock::new();
-static SYSTEM_LOCALE: OnceLock<String> = OnceLock::new();
-static BASE_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
-static EMOJI_FONT_DATABASE: OnceLock<FontDatabase> = OnceLock::new();
-static WEB_FONT_DATABASES: OnceLock<Mutex<VecDeque<Arc<CachedWebFontSet>>>> = OnceLock::new();
-
-/// Configure process-wide fonts before the first render.
-///
-/// `directories` are additive font directories loaded on top of the bundled
-/// faces. `system_fonts` enables the fonts installed on the operating system;
-/// it defaults to `true` when this function is never called. Pass `false` for
-/// the deterministic bundled-only mode (configured directories still apply).
-///
-/// Returns false when fonts have already been configured or initialized.
-pub fn configure_fonts(directories: Vec<PathBuf>, system_fonts: bool) -> bool {
-    if BASE_FONT_DATABASE.get().is_some() {
-        return false;
-    }
-    FONT_CONFIGURATION
-        .set(FontConfiguration {
-            directories,
-            system_fonts,
-        })
-        .is_ok()
-}
-
-fn font_configuration() -> &'static FontConfiguration {
-    FONT_CONFIGURATION.get_or_init(|| FontConfiguration {
-        directories: Vec::new(),
-        // Browser-like installed faces are the library default in every
-        // build. Tests that need deterministic geometry construct a bundled
-        // database through this same configuration seam instead of changing
-        // production behavior.
-        system_fonts: true,
-    })
-}
-
-fn system_locale() -> &'static str {
-    SYSTEM_LOCALE
-        .get_or_init(cosmic_text::FontSystem::system_locale)
-        .as_str()
-}
-
-/// Effective system-font policy for the renderer.
-pub(crate) fn effective_system_fonts() -> bool {
-    font_configuration().system_fonts
-}
-
-pub(crate) fn configured_font_directories() -> &'static [PathBuf] {
-    &font_configuration().directories
-}
-
-/// Concrete family the process resolved `system-ui` to.
-pub(crate) fn system_ui_family() -> Arc<str> {
-    Arc::clone(&base_font_database(false).system_ui)
-}
-
-fn load_font_directories(
-    database: &mut cosmic_text::fontdb::Database,
-    directories: &[PathBuf],
-) -> Vec<cosmic_text::fontdb::ID> {
-    let mut pending = directories.to_vec();
-    let mut files = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                pending.push(path);
-            } else if file_type.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| {
-                        matches!(
-                            extension.to_ascii_lowercase().as_str(),
-                            "ttf" | "ttc" | "otf" | "otc"
-                        )
-                    })
-            {
-                files.push(path);
-            }
-        }
-    }
-
-    files.sort_unstable();
-    files.dedup();
-    let mut ids = Vec::new();
-    for path in files {
-        let Ok(data) = std::fs::read(path) else {
-            continue;
-        };
-        ids.extend(database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data))));
-    }
-    ids
-}
-
-fn register_loaded_faces(
-    database: &cosmic_text::fontdb::Database,
-    declarations: Vec<FontDeclaration>,
-) -> HashMap<String, LoadedFamily> {
-    let mut loaded_families = HashMap::new();
-    for (id, declared_family, declared_weight, declared_italic) in declarations {
-        let Some(face) = database.face(id) else {
-            continue;
-        };
-        let names = face.families.clone();
-        let internal_name = names
-            .first()
-            .map(|(name, _)| Arc::<str>::from(name.as_str()))
-            .unwrap_or_else(|| Arc::from(FAMILY));
-        let shape_weight = face.weight.0;
-        let metrics = Arc::new(OnceLock::new());
-        let italic = declared_italic
-            .unwrap_or(!matches!(face.style, cosmic_text::fontdb::Style::Normal));
-        let weight = declared_weight.unwrap_or((shape_weight, shape_weight));
-        let declared_names: Vec<String> = declared_family
-            .map(|name| vec![name])
-            .unwrap_or_else(|| names.into_iter().map(|(name, _)| name).collect());
-        for name in declared_names {
-            let family = loaded_families
-                .entry(name.to_ascii_lowercase())
-                .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-            family.faces.push(LoadedFace {
-                name: Arc::clone(&internal_name),
-                font_id: Some(id),
-                metrics: Arc::clone(&metrics),
-                min_weight: weight.0,
-                max_weight: weight.1,
-                italic,
-            });
-        }
-    }
-    loaded_families
-}
-
-#[cfg(target_os = "windows")]
-fn platform_ui_font_family() -> Option<String> {
-    use std::mem::size_of;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
-    };
-
-    let mut metrics: NONCLIENTMETRICSW = unsafe { std::mem::zeroed() };
-    metrics.cbSize = size_of::<NONCLIENTMETRICSW>() as u32;
-    // This is the same shell message font Chromium asks Windows for when it
-    // resolves the CSS `system-ui` family; the process locale can disagree
-    // with the display language on multilingual installations.
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            metrics.cbSize,
-            &mut metrics as *mut NONCLIENTMETRICSW as *mut core::ffi::c_void,
-            0,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-    let face = &metrics.lfMessageFont.lfFaceName;
-    let len = face
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(face.len());
-    let name = String::from_utf16_lossy(&face[..len]);
-    (!name.trim().is_empty()).then_some(name)
-}
-
-fn platform_system_ui_candidates(locale: &str) -> &'static [&'static str] {
-    let locale = locale.to_ascii_lowercase();
-    #[cfg(target_os = "windows")]
-    {
-        if locale.starts_with("zh") {
-            if locale.contains("tw")
-                || locale.contains("hk")
-                || locale.contains("mo")
-                || locale.contains("hant")
-            {
-                return &[
-                    "Microsoft JhengHei UI",
-                    "Microsoft JhengHei",
-                    "Segoe UI",
-                    "Tahoma",
-                ];
-            }
-            return &[
-                "Microsoft YaHei UI",
-                "Microsoft YaHei",
-                "Segoe UI",
-                "Tahoma",
-            ];
-        }
-        if locale.starts_with("ja") {
-            return &[
-                "Yu Gothic UI",
-                "Yu Gothic",
-                "Meiryo UI",
-                "Meiryo",
-                "Segoe UI",
-                "Tahoma",
-            ];
-        }
-        if locale.starts_with("ko") {
-            return &["Malgun Gothic", "Segoe UI", "Tahoma"];
-        }
-        return &["Segoe UI", "Tahoma"];
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return &[".AppleSystemUIFont", "SF Pro Text", "Helvetica Neue"];
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
-    {
-        let _ = locale;
-        // fontdb populates this from fontconfig when system fonts are loaded;
-        // the configured sans family is used before the bundled fallback.
-        return &[];
-    }
-    #[allow(unreachable_code)]
-    &[]
-}
-
-fn resolve_system_ui_family(
-    loaded: &HashMap<String, LoadedFamily>,
-    locale: &str,
-    platform_sans: Option<&str>,
-) -> Arc<str> {
-    #[cfg(target_os = "windows")]
-    if let Some(ui_family) = platform_ui_font_family() {
-        if let Some(family) = loaded.get(&ui_family.to_ascii_lowercase()) {
-            if let Some(face) = family.faces.first() {
-                return Arc::clone(&face.name);
-            }
-        }
-    }
-    for candidate in platform_system_ui_candidates(locale) {
-        if let Some(family) = loaded.get(&candidate.to_ascii_lowercase()) {
-            if let Some(face) = family.faces.first() {
-                return Arc::clone(&face.name);
-            }
-        }
-    }
-    if let Some(candidate) = platform_sans {
-        if let Some(family) = loaded.get(&candidate.to_ascii_lowercase()) {
-            if let Some(face) = family.faces.first() {
-                return Arc::clone(&face.name);
-            }
-        }
-    }
-    Arc::from(SYSTEM_FAMILY)
-}
-
-fn seed_generic_families(loaded: &mut HashMap<String, LoadedFamily>, system_ui: &Arc<str>) {
-    let clone_named = |loaded: &HashMap<String, LoadedFamily>, name: &str| {
-        loaded.get(&name.to_ascii_lowercase()).cloned()
-    };
-    if let Some(sans) = clone_named(loaded, FAMILY) {
-        loaded.insert("sans-serif".to_string(), sans.clone());
-    }
-    if let Some(serif) = clone_named(loaded, SERIF_FAMILY) {
-        loaded.insert("serif".to_string(), serif.clone());
-        loaded.insert("ui-serif".to_string(), serif);
-    }
-    if let Some(mono) = clone_named(loaded, MONO_FAMILY) {
-        loaded.insert("monospace".to_string(), mono.clone());
-        loaded.insert("ui-monospace".to_string(), mono);
-    }
-    if let Some(ui) = clone_named(loaded, system_ui) {
-        loaded.insert("system-ui".to_string(), ui.clone());
-        loaded.insert("ui-sans-serif".to_string(), ui);
-    }
-}
-
-fn build_font_database(config: &FontConfiguration) -> FontDatabase {
-    let mut database = cosmic_text::fontdb::Database::new();
-    for bytes in [
-        SANS_R, SANS_B, SANS_O, SANS_BO, SERIF_R, SERIF_B, SERIF_O, SERIF_BO, MONO_R, MONO_B, MONO_O,
-        MONO_BO, SYSTEM_R, SYSTEM_B,
-    ] {
-        database.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
-    }
-    // Explicit directories are loaded before system faces so operator-supplied
-    // fonts win an equal-family comparison.
-    load_font_directories(&mut database, &config.directories);
-
-    let platform_sans = if config.system_fonts {
-        database.load_system_fonts();
-        // A platform font configuration may retarget the generic sans family
-        // while scanning (fontconfig). Read it after the scan so `system-ui`
-        // prefers the platform's own sans choice over the bundled fallback.
-        Some(
-            database
-                .family_name(&cosmic_text::fontdb::Family::SansSerif)
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
-    let declarations = database
-        .faces()
-        .map(|face| (face.id, None, None, None))
-        .collect();
-    let mut loaded = register_loaded_faces(&database, declarations);
-    let system_ui = resolve_system_ui_family(
-        &loaded,
-        system_locale(),
-        platform_sans.as_deref(),
-    );
-    seed_generic_families(&mut loaded, &system_ui);
-
-    // Keep generic queries deterministic in cosmic-text (the same generic
-    // names are also seeded into the loaded-family map above).
-    database.set_sans_serif_family(FAMILY);
-    database.set_serif_family(SERIF_FAMILY);
-    database.set_monospace_family(MONO_FAMILY);
-
-    FontDatabase {
-        db: database,
-        loaded,
-        system_ui,
-        locale: system_locale().to_string(),
-    }
-}
-
-#[cfg(test)]
-fn bundled_test_database(load_emoji: bool) -> FontDatabase {
-    let base = build_font_database(&FontConfiguration {
-        directories: Vec::new(),
-        system_fonts: false,
-    });
-    if load_emoji {
-        with_emoji_face(&base)
-    } else {
-        base
-    }
-}
-
-fn with_emoji_face(base: &FontDatabase) -> FontDatabase {
-    let mut database = base.db.clone();
-    let declarations = database
-        .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(EMOJI_R)))
-        .into_iter()
-        .map(|id| (id, None, None, None))
-        .collect();
-    let loaded_families = register_loaded_faces(&database, declarations);
-    let mut all_loaded_families = base.loaded.clone();
-    for (name, mut family) in loaded_families {
-        all_loaded_families
-            .entry(name)
-            .or_insert_with(|| LoadedFamily { faces: Vec::new() })
-            .faces
-            .append(&mut family.faces);
-    }
-    FontDatabase {
-        db: database,
-        loaded: all_loaded_families,
-        system_ui: Arc::clone(&base.system_ui),
-        locale: base.locale.clone(),
-    }
-}
-
-fn base_font_database(load_emoji: bool) -> &'static FontDatabase {
-    let base = BASE_FONT_DATABASE.get_or_init(|| build_font_database(font_configuration()));
-
-    if !load_emoji {
-        return base;
-    }
-    EMOJI_FONT_DATABASE.get_or_init(|| with_emoji_face(base))
-}
-
-fn web_font_signature(fonts: &[WebFont], load_emoji: bool) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    load_emoji.hash(&mut hasher);
-    fonts.len().hash(&mut hasher);
-    for font in fonts {
-        font.family.hash(&mut hasher);
-        font.weight.hash(&mut hasher);
-        font.italic.hash(&mut hasher);
-        let data = font.data.as_slice();
-        data.len().hash(&mut hasher);
-        data[..data.len().min(64)].hash(&mut hasher);
-        if data.len() > 64 {
-            data[data.len() - 64..].hash(&mut hasher);
-        }
-        if data.len() > 128 {
-            let middle = data.len() / 2;
-            data[middle - 32..middle + 32].hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
-fn cached_web_font_database(
-    fonts: &[WebFont],
-    load_emoji: bool,
-) -> Option<Arc<CachedWebFontSet>> {
-    let signature = web_font_signature(fonts, load_emoji);
-    let candidates: Vec<_> = WEB_FONT_DATABASES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .filter(|entry| entry.signature == signature && entry.load_emoji == load_emoji)
-        .cloned()
-        .collect();
-    candidates.into_iter().find(|entry| entry.fonts == fonts)
-}
-
-fn cache_web_font_database(
-    fonts: &[WebFont],
-    load_emoji: bool,
-    database: FontDatabase,
-) -> FontDatabase {
-    let bytes = fonts
-        .iter()
-        .fold(0usize, |total, font| total.saturating_add(font.data.len()));
-    if bytes > WEB_FONT_CACHE_BYTES {
-        return database;
-    }
-
-    let signature = web_font_signature(fonts, load_emoji);
-    let mut cache = WEB_FONT_DATABASES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = cache.iter().find(|entry| {
-        entry.signature == signature && entry.load_emoji == load_emoji && entry.fonts == fonts
-    }) {
-        return existing.database.clone();
-    }
-    while cache.len() >= WEB_FONT_CACHE_ENTRIES
-        || cache.iter().map(|entry| entry.bytes).sum::<usize>()
-            > WEB_FONT_CACHE_BYTES.saturating_sub(bytes)
-    {
-        cache.pop_front();
-    }
-    cache.push_back(Arc::new(CachedWebFontSet {
-        signature,
-        load_emoji,
-        fonts: fonts.to_vec(),
-        bytes,
-        database: database.clone(),
-    }));
-    database
-}
-
-fn resolve_loaded_font(
-    fam: Option<&str>,
-    requested_weight: u16,
-    requested_italic: bool,
-    loaded: &HashMap<String, LoadedFamily>,
-    database: &cosmic_text::fontdb::Database,
-) -> ResolvedFont {
-    let mut primary = None;
-    let mut fallbacks = FallbackSet {
-        families: Vec::new(),
-        font_ids: Vec::new(),
-    };
-
-    if let Some(stack) = fam {
-        for token in stack.split(',') {
-            let name = token.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            let family = loaded
-                .get(&name.to_ascii_lowercase())
-                .or_else(|| {
-                    if is_system_ui_family_token(name) {
-                        loaded.get("system-ui")
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    bundled_family_for_css_token(name)
-                        .and_then(|family| loaded.get(&family.to_ascii_lowercase()))
-                });
-            let Some(family) = family else {
-                continue;
-            };
-            if primary.is_none() {
-                if let Some(resolved) =
-                    select_loaded_face(family, requested_weight, requested_italic, database)
-                {
-                    primary = Some(resolved);
-                }
-                continue;
-            }
-            let Some(face) =
-                select_loaded_face(family, requested_weight, requested_italic, database)
-            else {
-                continue;
-            };
-            let duplicate = match face.font_id {
-                Some(id) => {
-                    primary
-                        .as_ref()
-                        .is_some_and(|font: &ResolvedFont| font.font_id == Some(id))
-                        || fallbacks.font_ids.contains(&Some(id))
-                }
-                None => {
-                    primary
-                        .as_ref()
-                        .is_some_and(|font: &ResolvedFont| {
-                            font.family.eq_ignore_ascii_case(&face.family)
-                        })
-                        || fallbacks.families.iter().any(|font| match font {
-                            FamilyOwned::Name(name) => name.eq_ignore_ascii_case(&face.family),
-                            _ => false,
-                        })
-                }
-            };
-            if duplicate {
-                continue;
-            }
-            fallbacks
-                .families
-                .push(FamilyOwned::Name(face.family.to_string().into()));
-            fallbacks.font_ids.push(face.font_id);
-        }
-    }
-
-    if let Some(mut resolved) = primary {
-        if !fallbacks.families.is_empty() {
-            resolved.fallbacks = Some(Arc::new(fallbacks));
-        }
-        return resolved;
-    }
-
-    let fallback = resolve_font_family(fam);
-    ResolvedFont {
-        family: Arc::from(fallback),
-        font_id: None,
-        metrics: bundled_face_metrics(fallback),
-        synthetic_italic: false,
-        fallbacks: None,
-    }
-}
-
-fn loaded_face_metrics(
-    database: &cosmic_text::fontdb::Database,
-    face: &LoadedFace,
-) -> FaceMetrics {
-    *face.metrics.get_or_init(|| {
-        face.font_id
-            .and_then(|id| font_metrics(database, id))
-            .unwrap_or_else(|| bundled_face_metrics(face.name.as_ref()))
-    })
-}
-
-fn select_loaded_face(
-    family: &LoadedFamily,
-    requested_weight: u16,
-    requested_italic: bool,
-    database: &cosmic_text::fontdb::Database,
-) -> Option<ResolvedFont> {
-    let exact_style: Vec<_> = family
-        .faces
-        .iter()
-        .filter(|face| face.italic == requested_italic)
-        .collect();
-    let candidates: Vec<_> = if exact_style.is_empty() {
-        family.faces.iter().collect()
-    } else {
-        exact_style
-    };
-    if let Some(face) = candidates
-        .iter()
-        .copied()
-        .find(|face| (face.min_weight..=face.max_weight).contains(&requested_weight))
-    {
-        // The named-family matcher uses fontdb's default weight for this
-        // resource, while a variable face commonly advertises `100 900` in
-        // CSS. Preserve the descriptor-selected file and its database weight;
-        // the authored coordinate enters the canonical axis tuple below.
-        return Some(ResolvedFont {
-            family: Arc::clone(&face.name),
-            font_id: face.font_id,
-            metrics: loaded_face_metrics(database, face),
-            synthetic_italic: requested_italic && !face.italic,
-            fallbacks: None,
-        });
-    }
-    let available: Vec<_> = candidates.iter().map(|face| face.min_weight).collect();
-    let matched = match_font_weight(requested_weight, &available);
-    candidates
-        .into_iter()
-        .find(|face| face.min_weight == matched)
-        .map(|face| ResolvedFont {
-            family: Arc::clone(&face.name),
-            font_id: face.font_id,
-            metrics: loaded_face_metrics(database, face),
-            synthetic_italic: requested_italic && !face.italic,
-            fallbacks: None,
-        })
-}
-
-/// CSS Fonts' asymmetric missing-weight search. In particular, 600 selects
-/// 700 (not 400) when a family only provides regular and bold faces.
-fn match_font_weight(requested: u16, available: &[u16]) -> u16 {
-    if available.contains(&requested) {
-        return requested;
-    }
-    let mut weights = available.to_vec();
-    weights.sort_unstable();
-    weights.dedup();
-    if weights.is_empty() {
-        return requested;
-    }
-    if (400..=500).contains(&requested) {
-        weights
-            .iter()
-            .copied()
-            .filter(|weight| *weight >= requested && *weight <= 500)
-            .min()
-            .or_else(|| {
-                weights
-                    .iter()
-                    .copied()
-                    .filter(|weight| *weight < requested)
-                    .max()
-            })
-            .or_else(|| weights.iter().copied().filter(|weight| *weight > 500).min())
-            .unwrap_or(requested)
-    } else if requested < 400 {
-        weights
-            .iter()
-            .copied()
-            .filter(|weight| *weight <= requested)
-            .max()
-            .or_else(|| {
-                weights
-                    .iter()
-                    .copied()
-                    .filter(|weight| *weight > requested)
-                    .min()
-            })
-            .unwrap_or(requested)
-    } else {
-        weights
-            .iter()
-            .copied()
-            .filter(|weight| *weight >= requested)
-            .min()
-            .or_else(|| {
-                weights
-                    .iter()
-                    .copied()
-                    .filter(|weight| *weight < requested)
-                    .max()
-            })
-            .unwrap_or(requested)
-    }
-}
-
-/// Resolve `line-height: normal` from the selected face's horizontal header.
-///
-/// Chromium's FreeType-backed Linux path grid-fits the ascent, descent, and
-/// line gap independently before adding them. Multiplying their sum by the
-/// font size (or rounding the final line height) is observably different at
-/// fractional and small sizes: Liberation Sans at 9.333px is 10px in
-/// Chromium, not 11px. Keep these metrics beside the embedded faces so normal
-/// line boxes follow the same device-pixel rhythm without consulting host
-/// fonts.
-fn bundled_face_metrics(family: &str) -> FaceMetrics {
-    let (ascent, descent, line_gap) = match family {
-        SERIF_FAMILY => (1825.0, 443.0, 87.0),
-        MONO_FAMILY => (1705.0, 615.0, 0.0),
-        SYSTEM_FAMILY => (1901.0, 483.0, 0.0),
-        _ => (1854.0, 434.0, 67.0),
-    };
-    FaceMetrics {
-        ascent,
-        descent,
-        line_gap,
-        units_per_em: 2048.0,
-    }
-}
 
 fn normal_line_height(font_size: f32, metrics: FaceMetrics) -> f32 {
     let scale = font_size / metrics.units_per_em.max(1.0);
@@ -998,21 +109,6 @@ fn fitted_font_box_metrics(font_size: f32, metrics: FaceMetrics) -> (f32, f32) {
     )
 }
 
-fn font_metrics(
-    db: &cosmic_text::fontdb::Database,
-    id: cosmic_text::fontdb::ID,
-) -> Option<FaceMetrics> {
-    db.with_face_data(id, |data, face_index| {
-        let face = cosmic_text::ttf_parser::Face::parse(data, face_index).ok()?;
-        Some(FaceMetrics {
-            ascent: face.ascender().max(0) as f32,
-            descent: -(face.descender().min(0) as f32),
-            line_gap: face.line_gap().max(0) as f32,
-            units_per_em: face.units_per_em() as f32,
-        })
-    })
-    .flatten()
-}
 
 fn used_line_height_for_font(style: &LayoutStyle, font: &ResolvedFont) -> f32 {
     used_line_height_with_metrics(style, font.metrics)
@@ -1125,6 +221,9 @@ pub struct InlineItem {
     /// Canonical axis tuples, populated only when this IFC actually contains
     /// variable text. Glyph metadata stores a one-based index.
     variation_sets: Vec<Arc<FontVariations>>,
+    /// Explicit decoration colors over collapsed source byte ranges. Empty
+    /// for the ordinary currentcolor path, without an allocation.
+    decoration_colors: Vec<(std::ops::Range<usize>, [u8; 4])>,
     /// Direct pure-text legacy clamp. Nested block descendants do not enter
     /// this IFC and are intentionally left to the future block-line iterator.
     line_clamp: Option<usize>,
@@ -1512,6 +611,9 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 #[derive(Clone, Copy)]
 struct ReplacedItem {
     independent_axes: bool,
+    /// Native single-line text controls expose their inner text baseline;
+    /// other replaced boxes retain the synthesized bottom-edge baseline.
+    content_baseline: Option<f32>,
     intrinsic_width: Option<f32>,
     intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
@@ -1573,6 +675,7 @@ impl ReplacedItem {
             .unwrap_or(2.0);
         ReplacedItem {
             independent_axes: false,
+            content_baseline: None,
             intrinsic_width: intrinsic
                 .width
                 .filter(|width| width.is_finite() && *width > 0.0),
@@ -1890,6 +993,26 @@ impl TextEngine {
             variations,
             optical_sizing,
         );
+        if crate::pdf::active() {
+            let explicit = variations.cloned().map(Arc::new);
+            for run in buffer.layout_runs() {
+                let mut previous_cluster = None;
+                for glyph in run.glyphs {
+                    let cluster = (glyph.start, glyph.end);
+                    let text = if previous_cluster == Some(cluster) { "" }
+                        else { run.text.get(glyph.start..glyph.end).unwrap_or("") };
+                    previous_cluster = Some(cluster);
+                    let axes = glyph.font_is_variable.then(|| self.variable_swash.effective_variations(
+                        &mut self.font_system, glyph.font_id, glyph.font_weight_axis_opt,
+                        glyph.font_optical_size_opt, glyph.font_italic_axis, explicit.clone())).flatten();
+                    crate::pdf::record_glyph(pixmap, &mut self.font_system, glyph, text,
+                        (x + glyph.x + glyph.font_size * glyph.x_offset,
+                         y + run.line_y + glyph.y - glyph.font_size * glyph.y_offset),
+                        glyph.color_opt.map(|color| color.as_rgba()).unwrap_or(color), clip_mask, clip, axes.as_deref(), None);
+                }
+            }
+            return;
+        }
         let clip_bounds = clip.map(|rect| {
             (
                 (rect.x * raster_scale).floor().max(0.0) as i32,
@@ -1980,7 +1103,7 @@ impl TextEngine {
 
     /// Deterministic engine for tests that assert face selection or glyph
     /// geometry: it opts into bundled-only faces through the same
-    /// [`configure_fonts`] seam production callers use, without changing the
+    /// [`crate::configure_fonts`] seam production callers use, without changing the
     /// process-wide default or production code.
     #[cfg(test)]
     pub(crate) fn bundled_test_engine() -> Self {
@@ -1999,44 +1122,9 @@ impl TextEngine {
     }
 
     pub(crate) fn new_with_web_fonts_and_emoji(fonts: &[WebFont], load_emoji: bool) -> Self {
-        let base = base_font_database(load_emoji);
-        let (db, loaded_families) = if fonts.is_empty() {
-            (base.db.clone(), base.loaded.clone())
-        } else if let Some(cached) = cached_web_font_database(fonts, load_emoji) {
-            (cached.database.db.clone(), cached.database.loaded.clone())
-        } else {
-            let mut db = base.db.clone();
-            let mut loaded_families = base.loaded.clone();
-            let mut declarations = Vec::new();
-            for font in fonts {
-                for id in db.load_font_source(cosmic_text::fontdb::Source::Binary(
-                    font.data.clone(),
-                )) {
-                    declarations.push((id, font.family.clone(), font.weight, font.italic));
-                }
-            }
-            for (name, mut family) in register_loaded_faces(&db, declarations) {
-                // Author @font-face declarations override an installed face of
-                // the same family; they precede it in selection order.
-                let entry = loaded_families
-                    .entry(name)
-                    .or_insert_with(|| LoadedFamily { faces: Vec::new() });
-                family.faces.append(&mut entry.faces);
-                entry.faces = family.faces;
-            }
-            let database = cache_web_font_database(
-                fonts,
-                load_emoji,
-                FontDatabase {
-                    db,
-                    loaded: loaded_families,
-                    system_ui: Arc::clone(&base.system_ui),
-                    locale: base.locale.clone(),
-                },
-            );
-            (database.db, database.loaded)
-        };
-        let font_system = FontSystem::new_with_locale_and_db(base.locale.clone(), db);
+        let database = font_database(fonts, load_emoji);
+        let loaded_families = database.loaded.clone();
+        let font_system = FontSystem::new_with_locale_and_db(database.locale.clone(), database.db.clone());
         TextEngine {
             font_system,
             loaded_families,
@@ -2054,6 +1142,17 @@ impl TextEngine {
     /// Number of inline formatting contexts collected (for debug/stats).
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// First selected face's design metrics, from this engine's exact shaping
+    /// database and descriptor-selected resource. Values are normalized to em.
+    pub fn selected_font_metrics(&self, style: &LayoutStyle) -> FontMetrics {
+        self.selected_font_metrics_for(style.font_family.as_deref(),
+            crate::style::used_font_weight(style), style.font_style_italic.unwrap_or(false))
+    }
+
+    pub fn selected_font_metrics_for(&self, family: Option<&str>, weight: u16, italic: bool) -> FontMetrics {
+        selected_metrics_from_database(family, weight, italic, &self.loaded_families, self.font_system.db())
     }
 
     /// Raw selected-font box used by ordinary inline fragments. This is
@@ -2294,6 +1393,7 @@ impl TextEngine {
             underline: context.underline,
             overline: context.overline,
             line_through: context.line_through,
+            decoration_color: context.decoration_color,
             color: context.color,
             family: context.family,
             fallbacks: context.fallbacks,
@@ -2458,7 +1558,9 @@ impl TextEngine {
         // with links ends up coloring the wrong glyphs), and shaping is a
         // small fraction of a page's CSS-cascade-dominated render time.
         let mut variation_sets = Vec::<Arc<FontVariations>>::new();
-        for (_, attrs) in &spans {
+        let mut decoration_colors = Vec::new();
+        let mut text_offset = 0;
+        for (text, attrs) in &spans {
             if let Some(variations) = attrs.variations.as_ref() {
                 if !variation_sets
                     .iter()
@@ -2467,6 +1569,12 @@ impl TextEngine {
                     variation_sets.push(Arc::clone(variations));
                 }
             }
+            if let Some(color) = attrs.decoration_color {
+                if attrs.underline || attrs.overline || attrs.line_through {
+                    decoration_colors.push((text_offset..text_offset + text.len(), color));
+                }
+            }
+            text_offset += text.len();
         }
         let line_clamp = (base.webkit_box_display.is_some() && base.webkit_box_orient_vertical)
             .then_some(base.webkit_line_clamp)
@@ -2572,6 +1680,7 @@ impl TextEngine {
             clip: None,
             clip_fills,
             variation_sets,
+            decoration_colors,
             line_clamp,
             ellipsis_overflow,
             marker_buffer,
@@ -2683,10 +1792,16 @@ impl TextEngine {
     }
 
     pub(crate) fn register_native_control(
-        &mut self, width: f32, height: f32, style: &LayoutStyle,
+        &mut self, width: f32, height: f32, style: &LayoutStyle, text_baseline: bool,
     ) -> usize {
         let mut item = ReplacedItem::from_style(width, height, style);
         item.independent_axes = true;
+        if text_baseline {
+            let (ascent, descent) = self.inline_font_box_metrics(style);
+            item.content_baseline = Some(
+                ascent + (self.selected_line_height(style) - ascent - descent) * 0.5,
+            );
+        }
         let index = self.replaced.len();
         self.replaced.push(item);
         REPLACED_CONTEXT_BIT | index
@@ -2752,6 +1867,20 @@ impl TextEngine {
         };
         let (width, height) = self.measure_text_with_wrap(idx, width, wrap);
         taffy::Size { width, height }
+    }
+
+    pub(crate) fn measured_baselines(&mut self, index: usize, width: f32) -> Option<(f32, f32)> {
+        if index & REPLACED_CONTEXT_BIT != 0 {
+            let baseline = self.replaced.get(index & !REPLACED_CONTEXT_BIT)?.content_baseline?;
+            return Some((baseline, baseline));
+        }
+        let Self { font_system, items, .. } = self;
+        let item = items.get_mut(index)?;
+        resolve_inline_edges(item, Some(width));
+        shape_with_text_indent(font_system, item, Some(width), item.layout_wrap);
+        let mut runs = item.buffer.layout_runs();
+        let first = runs.next()?.line_y;
+        Some((first, runs.last().map_or(first, |run| run.line_y)))
     }
 
     /// After layout, pin each context to its final content-box origin and
@@ -2984,14 +2113,23 @@ impl TextEngine {
         let mut spans = Vec::new();
         if let Some((first, last)) = item.caret_run {
             let mut children = crate::dom::rendered_children(tree, parent);
+            let mut segmented_edges = HashMap::new();
             if !children.contains(&first) || !children.contains(&last) {
                 let mut flattened = Vec::new();
-                crate::dom::flatten_boxless_inline_children(tree, &children, styles, &mut flattened);
+                crate::dom::flatten_boxless_inline_children(
+                    tree, &children, styles, &mut flattened, &mut segmented_edges,
+                );
                 children = flattened;
             }
             let start = children.iter().position(|id| *id == first)?;
             let end = children.iter().position(|id| *id == last)?;
-            for &id in children.get(start..=end)? {
+            let run = children.get(start..=end)?;
+            // build_mixed_block keeps edge-bearing runs in the native fallback;
+            // their provenance belongs to IfcRegistry, not this shaped item.
+            if run.iter().any(|id| segmented_edges.contains_key(id)) {
+                return None;
+            }
+            for &id in run {
                 collect_node_spans(tree, id, styles, ctx.clone(), &mut spans,
                     &mut collector, &self.loaded_families, self.font_system.db());
             }
@@ -3123,6 +2261,7 @@ struct SpanAttrs {
     underline: bool,
     overline: bool,
     line_through: bool,
+    decoration_color: Option<[u8; 4]>,
     color: [u8; 4],
     family: Arc<str>,
     fallbacks: Option<Arc<FallbackSet>>,
@@ -3261,6 +2400,7 @@ struct SpanCtx {
     underline: bool,
     overline: bool,
     line_through: bool,
+    decoration_color: Option<[u8; 4]>,
     transform: TextTransform,
     white_space: crate::WhiteSpace,
     overflow_wrap: crate::OverflowWrap,
@@ -3426,6 +2566,7 @@ fn base_span_ctx(base: &LayoutStyle, font: ResolvedFont, collector: &mut Collect
         underline: base.underline.unwrap_or(false),
         overline: base.overline.unwrap_or(false),
         line_through: base.line_through.unwrap_or(false),
+        decoration_color: base.text_decoration_color,
         transform: base.text_transform.unwrap_or(TextTransform::None),
         white_space: base.white_space.unwrap_or_default(),
         overflow_wrap: base.overflow_wrap.unwrap_or_default(),
@@ -3494,6 +2635,7 @@ fn collect_node_spans(
                 underline: ctx.underline,
                 overline: ctx.overline,
                 line_through: ctx.line_through,
+                decoration_color: ctx.decoration_color,
                 color: ctx.color,
                 family: Arc::clone(&ctx.family),
                 fallbacks: ctx.fallbacks.clone(),
@@ -3530,6 +2672,7 @@ fn collect_node_spans(
                         underline: ctx.underline,
                         overline: ctx.overline,
                         line_through: ctx.line_through,
+                        decoration_color: ctx.decoration_color,
                         color: ctx.color,
                         family: Arc::clone(&ctx.family),
                         fallbacks: ctx.fallbacks.clone(),
@@ -3616,6 +2759,11 @@ fn collect_node_spans(
                 underline: ctx.underline || style.and_then(|s| s.underline).unwrap_or(false),
                 overline: ctx.overline || style.and_then(|style| style.overline).unwrap_or(false),
                 line_through: ctx.line_through || style.and_then(|style| style.line_through).unwrap_or(false),
+                decoration_color: if ctx.underline || ctx.overline || ctx.line_through {
+                    ctx.decoration_color
+                } else {
+                    style.and_then(|style| style.text_decoration_color)
+                },
                 transform: style
                     .and_then(|s| s.text_transform)
                     .unwrap_or(ctx.transform),
@@ -4226,6 +3374,7 @@ pub(crate) fn inline_child_ok(
             // general path; so does an element with generated ::before/::after
             // content (lost if folded) or an overflow clip of its own.
             let foldable_inline = style.display == Display::Inline
+                && matches!(style.vertical_align, None | Some(crate::VerticalAlign::Baseline))
                 && !matches!(style.position, Some(taffy::Position::Absolute))
                 && style.float.is_none()
                 && !style.overflow_hidden
@@ -4583,10 +3732,10 @@ impl TextEngine {
                         });
                     }
                 }
-                let mut col = g
-                    .color_opt
-                    .map(|c| [c.r(), c.g(), c.b(), c.a()])
-                    .unwrap_or([0, 0, 0, 255]);
+                let mut col = item.decoration_colors.iter()
+                    .find(|(range, _)| range.contains(&(line_source_start + g.start)))
+                    .map(|(_, color)| *color)
+                    .unwrap_or_else(|| g.color_opt.map(|c| [c.r(), c.g(), c.b(), c.a()]).unwrap_or([0, 0, 0, 255]));
                 if print_economy {
                     col = crate::paint::print_economy_color(col);
                 }
@@ -4627,6 +3776,67 @@ impl TextEngine {
                     underlines.push(decoration_stroke(previous, base_y, flag));
                 }
             }
+        }
+        if crate::pdf::active() {
+            use crate::pdf::PdfPaint as _;
+            let fills = item.clip_fills.iter().enumerate().map(|(index, fill)| {
+                let (x0, y0, x1, y1) = fill_bounds.get(index).copied().flatten()?;
+                Some(Arc::new(crate::pdf::text_gradient(fill,
+                    (item.origin.0 + offset.0 + x0, item.origin.1 + offset.1 + y0,
+                     (x1-x0).max(1.), (y1-y0).max(1.)))))
+            }).collect::<Vec<_>>();
+            for (line_index, run) in item.buffer.layout_runs().enumerate() {
+                let line_offset = if line_index == 0 { item.first_line_offset } else { 0. };
+                let start = line_source_starts.get(run.line_i).copied().unwrap_or(0);
+                let end = start + run.text.len();
+                let alignment = line_edge_alignment_shift(item, start, end);
+                let mut previous_cluster = None;
+                for glyph in run.glyphs {
+                    if item.marker.is_some_and(|marker| marker.line_index == line_index
+                        && glyph.x + line_offset + glyph.w > marker.content_end) { continue; }
+                    if print_economy && metadata_fill(glyph.metadata).is_some() { continue; }
+                    let mut relative = glyph_relative_offset(&item.relative_owner_ranges, start, glyph.start, glyph.end);
+                    relative.0 += alignment + line_advance_before_text(item, start + glyph.start, start, end);
+                    let explicit = metadata_variation(glyph.metadata).and_then(|index| item.variation_sets.get(index)).map(Arc::clone);
+                    let axes = glyph.font_is_variable.then(|| variable_swash.effective_variations(
+                        font_system, glyph.font_id, glyph.font_weight_axis_opt, glyph.font_optical_size_opt,
+                        glyph.font_italic_axis, explicit)).flatten();
+                    let cluster = (glyph.start, glyph.end);
+                    let text = if previous_cluster == Some(cluster) { "" }
+                        else { run.text.get(glyph.start..glyph.end).unwrap_or("") };
+                    previous_cluster = Some(cluster);
+                    let mut color = glyph.color_opt.unwrap_or(Color::rgb(0, 0, 0)).as_rgba();
+                    if print_economy {
+                        let adjusted = crate::paint::print_economy_color(color);
+                        color = [adjusted[0], adjusted[1], adjusted[2], color[3]];
+                    }
+                    let fill = metadata_fill(glyph.metadata).and_then(|index| fills.get(index)).cloned().flatten();
+                    crate::pdf::record_glyph(pixmap, font_system, glyph, text,
+                        (item.origin.0 + offset.0 + line_offset + relative.0 + glyph.x + glyph.font_size * glyph.x_offset,
+                         item.origin.1 + offset.1 + run.line_y + relative.1 + glyph.y - glyph.font_size * glyph.y_offset),
+                        color, clip_mask, clip, axes.as_deref(), fill);
+                }
+            }
+            if let (Some(marker), Some(buffer)) = (item.marker, item.marker_buffer.as_ref()) {
+                for run in buffer.layout_runs() {
+                    for glyph in run.glyphs {
+                        crate::pdf::record_glyph(pixmap, font_system, glyph,
+                            run.text.get(glyph.start..glyph.end).unwrap_or(""),
+                            (item.origin.0 + offset.0 + marker.x + glyph.x + glyph.font_size * glyph.x_offset,
+                             item.origin.1 + offset.1 + marker.y + run.line_y + glyph.y - glyph.font_size * glyph.y_offset),
+                            glyph.color_opt.unwrap_or(Color::rgb(0, 0, 0)).as_rgba(), clip_mask, clip, None, None);
+                    }
+                }
+            }
+            for (x0, x1, y, thickness, color) in underlines {
+                if let Some(rect) = tiny_skia::Rect::from_xywh(item.origin.0 + offset.0 + x0,
+                    item.origin.1 + offset.1 + y, x1-x0, thickness.max(1.)) {
+                    let mut paint = tiny_skia::Paint::default();
+                    paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+                    pixmap.pdf_fill_rect(rect, &paint, tiny_skia::Transform::identity(), clip_mask);
+                }
+            }
+            return;
         }
 
         // Fallback color if a glyph carries none (shouldn't happen: every span
@@ -5040,32 +4250,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repeated_web_font_set_reuses_the_parsed_database() {
-        let font = WebFont {
-            data: Arc::new(FALLBACK.to_vec()),
-            family: Some("Issue 879 cache fixture".to_string()),
-            weight: Some((400, 400)),
-            italic: Some(false),
-        };
-        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_none());
-        let first = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
-        assert!(cached_web_font_database(std::slice::from_ref(&font), false).is_some());
-        let second = TextEngine::new_with_web_fonts(std::slice::from_ref(&font));
-        let first_face = &first.loaded_families["issue 879 cache fixture"].faces[0];
-        let second_face = &second.loaded_families["issue 879 cache fixture"].faces[0];
-        assert_eq!(first_face.font_id, second_face.font_id);
-        assert!(
-            Arc::ptr_eq(&first_face.metrics, &second_face.metrics),
-            "cached database clones must share lazy face metrics"
-        );
-
-        let mut different_descriptor = font;
-        different_descriptor.weight = Some((700, 700));
-        assert!(
-            cached_web_font_database(std::slice::from_ref(&different_descriptor), false).is_none()
-        );
-    }
 
     #[test]
     fn repeated_plain_text_reuses_the_attributed_buffer_template() {
@@ -5303,6 +4487,9 @@ mod tests {
                     descent: 350.0,
                     line_gap: 100.0,
                     units_per_em: 1000.0,
+                    x_height: 500.0,
+                    subscript_offset: None,
+                    superscript_offset: None,
                 },
             ),
             95.0
@@ -5695,6 +4882,7 @@ mod tests {
             underline: true,
             overline: true,
             line_through: true,
+            decoration_color: None,
             color: [1, 2, 3, 255],
             family: Arc::from(FAMILY),
             fallbacks: None,
@@ -5767,6 +4955,7 @@ mod tests {
             underline: false,
             overline: false,
             line_through: false,
+            decoration_color: None,
             color: [0, 0, 0, 255],
             family: Arc::from(FAMILY),
             fallbacks: None,

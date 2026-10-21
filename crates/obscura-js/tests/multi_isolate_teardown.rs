@@ -61,3 +61,19 @@ async fn module_loads_can_be_interleaved_on_one_thread() {
         serde_json::json!(22.0)
     );
 }
+
+#[test]
+fn incompatible_native_region_cannot_change_live_isolates() {
+    let mut first = ObscuraJsRuntime::new();
+    let mut second = ObscuraJsRuntime::new();
+    let identity = "[Intl.DateTimeFormat().resolvedOptions(),Intl.NumberFormat().resolvedOptions(),new Date(0).toString(),new Date(0).getTimezoneOffset()]";
+    let before_first = first.evaluate(identity).unwrap();
+    let before_second = second.evaluate(identity).unwrap();
+    let current = obscura_js::regional::current();
+    let other_locale = if current.locale == "ja-JP" { "en-US" } else { "ja-JP" };
+    assert!(obscura_js::regional::configure(other_locale, &current.timezone).unwrap_err().contains("conflict"));
+    let other_zone = if current.timezone == "Asia/Tokyo" { "UTC" } else { "Asia/Tokyo" };
+    assert!(obscura_js::regional::configure(&current.locale, other_zone).unwrap_err().contains("conflict"));
+    assert_eq!(first.evaluate(identity).unwrap(), before_first);
+    assert_eq!(second.evaluate(identity).unwrap(), before_second);
+}

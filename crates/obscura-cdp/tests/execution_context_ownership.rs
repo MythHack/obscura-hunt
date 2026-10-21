@@ -193,6 +193,8 @@ async fn navigation_context_events_preserve_order_for_every_runtime_attachment()
     let second = attached.result.unwrap()["sessionId"].as_str().unwrap().to_string();
     for (id, session) in [(10, &first), (11, &second)] {
         cdp(&mut ctx, id, "Runtime.enable", json!({}), Some(session)).await;
+        cdp(&mut ctx, id + 100, "Page.enable", json!({}), Some(session)).await;
+        cdp(&mut ctx, id + 200, "Page.setLifecycleEventsEnabled", json!({"enabled":true}), Some(session)).await;
     }
     cdp(
         &mut ctx, 12, "Page.createIsolatedWorld",

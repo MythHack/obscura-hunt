@@ -87,6 +87,7 @@ async fn page_close_runs_beforeunload_and_waits_for_dialog_resolution() {
     let page_id = ctx.create_page();
     let session = "close-confirmation";
     ctx.sessions.insert(session.into(), page_id.clone());
+    cdp(&mut ctx, 10, "Page.enable", json!({}), session).await;
     cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression":
         "globalThis.closeAttempts = 0; addEventListener('beforeunload', e => { closeAttempts++; e.preventDefault(); });"}), session).await;
     cdp(&mut ctx, 6, "Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "a", "code": "KeyA"}), session).await;
@@ -128,6 +129,7 @@ async fn page_close_honors_the_beforeunload_handler_return_value() {
     let page_id = ctx.create_page();
     let session = "close-handler-return";
     ctx.sessions.insert(session.into(), page_id.clone());
+    cdp(&mut ctx, 10, "Page.enable", json!({}), session).await;
     cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression":
         "onbeforeunload = e => { if (!e.isTrusted || !e.cancelable) throw new Error('not native'); return 'Unsaved'; };"}), session).await;
     cdp(&mut ctx, 2, "Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": 1, "y": 1, "button": "left"}), session).await;
@@ -144,6 +146,7 @@ async fn page_close_honors_an_empty_beforeunload_handler_return_value() {
     let page_id = ctx.create_page();
     let session = "close-empty-return";
     ctx.sessions.insert(session.into(), page_id.clone());
+    cdp(&mut ctx, 10, "Page.enable", json!({}), session).await;
     let synthetic = cdp(&mut ctx, 0, "Runtime.evaluate", json!({"expression": "globalThis.onbeforeunload = () => false; globalThis.dispatchEvent(new Event('beforeunload', {cancelable: true}))", "returnByValue": true}), session).await;
     assert_eq!(synthetic["result"]["value"], false, "generic events must keep ordinary false-return cancellation");
     cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression": "onbeforeunload = () => '';"}), session).await;
@@ -173,9 +176,7 @@ async fn assert_stop_loading_cancels_images(native: bool) {
             requested_tx.send(()).unwrap();
             assert_eq!(stream.read(&mut buffer).await.unwrap(), 0, "stop must close the HTTP request");
         });
-        let context = obscura_browser::context::BrowserContext::with_storage_and_network(
-            "stop-resources-test".into(), None, false, None, None, true,
-        );
+        let context = obscura_browser::context::BrowserContext::with_storage_and_network("stop-resources-test".into(), None, false, None, None, true,).unwrap();
         let mut ctx = CdpContext::new_with_shared_context(std::sync::Arc::new(context));
         let page_id = ctx.create_page();
         let session = "stop-resources";
@@ -231,9 +232,7 @@ async fn page_close_preserves_native_popup_proxy_and_parent_session_routing() {
             body.len(),
         ).as_bytes()).await.unwrap();
     });
-    let context = obscura_browser::context::BrowserContext::with_storage_and_network(
-        "popup-close-test".into(), None, false, None, None, true,
-    );
+    let context = obscura_browser::context::BrowserContext::with_storage_and_network("popup-close-test".into(), None, false, None, None, true,).unwrap();
     let mut ctx = CdpContext::new_with_shared_context(std::sync::Arc::new(context));
     let opener = ctx.create_page();
     let opener_session = "popup-opener";

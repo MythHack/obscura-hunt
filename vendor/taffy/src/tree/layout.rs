@@ -166,6 +166,8 @@ pub struct LayoutOutput {
     pub content_size: Size<f32>,
     /// The first baseline of the node in each dimension, if any
     pub first_baselines: Point<Option<f32>>,
+    /// Last in-flow baseline, retained for atomic inline formatting contexts.
+    pub last_baselines: Point<Option<f32>>,
     /// Top margin that can be collapsed with. This is used for CSS block layout and can be set to
     /// `CollapsibleMarginSet::ZERO` for other layout modes that don't support margin collapsing
     pub top_margin: CollapsibleMarginSet,
@@ -184,6 +186,7 @@ impl LayoutOutput {
         #[cfg(feature = "content_size")]
         content_size: Size::ZERO,
         first_baselines: Point::NONE,
+        last_baselines: Point::NONE,
         top_margin: CollapsibleMarginSet::ZERO,
         bottom_margin: CollapsibleMarginSet::ZERO,
         margins_can_collapse_through: false,
@@ -203,6 +206,7 @@ impl LayoutOutput {
             #[cfg(feature = "content_size")]
             content_size,
             first_baselines,
+            last_baselines: first_baselines,
             top_margin: CollapsibleMarginSet::ZERO,
             bottom_margin: CollapsibleMarginSet::ZERO,
             margins_can_collapse_through: false,

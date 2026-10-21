@@ -902,3 +902,59 @@ async fn radio_release_selects_only_the_target_in_its_group() {
         "the newly selected radio alone receives activation events"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn summary_and_range_share_cancellable_native_activation() {
+    let (mut ctx, sid) = setup().await;
+    let initial = evaluate(&mut ctx, 100, r#"(() => {
+        document.body.innerHTML = `<details id="disclosure"><summary id="summary">More <button id="inside">own</button></summary><summary id="later">Later</summary><p>Visible content</p></details><input id="slider" type="range" min="0" max="100" step="10" value="50" style="display:block;width:200px">`;
+        globalThis.changes = [];
+        const slider = document.getElementById('slider');
+        for (const type of ['input', 'change']) slider.addEventListener(type, e => changes.push([type, e.isTrusted, slider.value]));
+        document.getElementById('inside').click();
+        document.getElementById('later').click();
+        const details = document.getElementById('disclosure');
+        const untouched = details.open;
+        const summary = document.getElementById('summary');
+        summary.addEventListener('click', e => e.preventDefault(), {once:true});
+        summary.click();
+        const cancelled = details.open;
+        summary.click();
+        return [untouched, cancelled, details.open, slider.value, slider.valueAsNumber];
+    })()"#, &sid).await;
+    assert_eq!(initial["result"]["value"], json!([false, false, true, "50", 50]));
+    let point = evaluate(&mut ctx, 101, r#"(() => { const r = document.getElementById('slider').getBoundingClientRect(); return [r.left + r.width * .75, r.top + r.height / 2]; })()"#, &sid).await;
+    let x = point["result"]["value"][0].as_f64().unwrap();
+    let y = point["result"]["value"][1].as_f64().unwrap();
+    for (id, event_type) in [(102, "mousePressed"), (103, "mouseReleased")] {
+        cdp(&mut ctx, id, "Input.dispatchMouseEvent", json!({"type":event_type,"x":x,"y":y,"button":"left"}), &sid).await;
+    }
+    cdp(&mut ctx, 104, "Input.dispatchKeyEvent", json!({"type":"rawKeyDown","key":"ArrowRight","code":"ArrowRight"}), &sid).await;
+    let state = evaluate(&mut ctx, 105, "[document.getElementById('slider').value, changes]", &sid).await;
+    assert_eq!(state["result"]["value"], json!(["90", [["input",true,"80"],["change",true,"80"],["input",true,"90"],["change",true,"90"]]]));
+    evaluate(&mut ctx, 106, "document.getElementById('slider').addEventListener('keydown', e => e.preventDefault()); changes.length = 0", &sid).await;
+    cdp(&mut ctx, 107, "Input.dispatchKeyEvent", json!({"type":"rawKeyDown","key":"Home"}), &sid).await;
+    let cancelled = evaluate(&mut ctx, 108, "[document.getElementById('slider').value, changes]", &sid).await;
+    assert_eq!(cancelled["result"]["value"], json!(["90", []]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn range_script_numeric_domain_is_sanitized_without_user_events() {
+    let (mut ctx, sid) = setup().await;
+    let result = evaluate(&mut ctx, 100, r#"(() => {
+        const r = document.createElement('input'); r.type = 'range';
+        let events = 0; r.oninput = r.onchange = () => events++;
+        const results = [[r.value, r.valueAsNumber]];
+        r.min = '0'; r.max = '1'; r.step = '.1'; r.value = '.15'; results.push(r.value);
+        r.value = '0x1'; results.push(r.value);
+        r.value = ' 0.2'; results.push(r.value);
+        r.value = '+.2'; results.push(r.value);
+        r.value = '2e-1'; results.push(r.value);
+        r.step = 'any'; r.value = '.125'; results.push(r.value);
+        r.valueAsNumber = NaN; results.push(r.value);
+        r.min = '9'; r.max = '2'; results.push(r.value);
+        results.push(events);
+        return results;
+    })()"#, &sid).await;
+    assert_eq!(result["result"]["value"], json!([["50",50],"0.2","0.5","0.5","0.5","0.2","0.125","0.5","9",0]));
+}

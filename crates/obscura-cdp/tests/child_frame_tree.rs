@@ -91,10 +91,9 @@ async fn attached_session(ctx: &mut CdpContext) -> String {
     .await
     .result
     .expect("Target.attachToTarget produced no result");
-    attached["sessionId"]
-        .as_str()
-        .expect("no sessionId")
-        .to_string()
+    let session = attached["sessionId"].as_str().expect("no sessionId").to_string();
+    cdp(ctx, 902, "Page.enable", json!({}), &session).await;
+    session
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -144,11 +143,10 @@ async fn get_frame_tree_reports_nested_child_frames() {
     // Target.createTarget leaves a second session on the same page.
     let child_id = child["frame"]["id"].as_str().unwrap().to_string();
     let page_id = ctx.sessions.get(session.as_str()).cloned().unwrap();
-    // Announcing to one arbitrary session of the page is what the ordering of a
-    // HashMap decides, so require every session on the page to be told. That
-    // makes the client's own session covered whichever one it is.
+    // Only sessions that enabled Page subscribe to frame events. The managed
+    // session left by createTarget remains silent unless it opts in.
     for (candidate, owner) in &ctx.sessions {
-        if owner != &page_id {
+        if owner != &page_id || candidate != session {
             continue;
         }
         assert!(
@@ -211,6 +209,7 @@ async fn child_default_contexts_are_owned_by_their_exact_frame() {
         &mut ctx,
     ).await.result.unwrap();
     let second_session = attached["sessionId"].as_str().unwrap().to_string();
+    cdp(&mut ctx, 3, "Page.enable", json!({}), &second_session).await;
     for runtime_session in [&session, &second_session] {
         cdp(&mut ctx, 3, "Runtime.enable", json!({}), runtime_session).await;
     }

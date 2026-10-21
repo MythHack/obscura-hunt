@@ -72,5 +72,29 @@
   <div class="row hidden-row"><input type="hidden"><div class="marker hidden-marker"></div></div>
   <div class="row textarea-row"><textarea></textarea><div class="marker textarea-marker"></div></div>
   <div class="row textarea-rows8-row"><textarea rows="8"></textarea><div class="marker textarea-rows8-marker"></div></div>
+  <section style="position:absolute;left:0;top:380px;width:800px">
+    <details id="native-details">
+      <summary id="native-summary">Disclosure <button id="summary-button" type="button">Independent action</button></summary>
+      <summary id="later-summary">Not the activation summary</summary>
+      <p id="details-content" style="height:32px;background:#d3f9d8">Revealed content</p>
+    </details>
+    <label>Native range <input id="native-range" type="range" min="0" max="100" step="10" value="50" style="width:200px"></label>
+    <label>RTL <input id="rtl-range" type="range" min="0" max="100" step="10" value="50" style="width:200px;direction:rtl"></label>
+    <label>Disabled <input id="disabled-range" type="range" disabled value="50" style="width:200px"></label>
+    <label>No theme <input id="plain-range" type="range" min="0" max="100" step="10" value="50" style="width:200px;appearance:none"></label>
+    <input id="default-range" type="range">
+  </section>
+  <script>
+    window.nativeEvents = [];
+    for (const id of ['native-range', 'rtl-range', 'disabled-range', 'plain-range']) {
+      const control = document.getElementById(id);
+      for (const type of ['input', 'change']) control.addEventListener(type, event => {
+        nativeEvents.push({id, type, trusted:event.isTrusted, value:control.value});
+      });
+    }
+    document.getElementById('native-details').addEventListener('toggle', event => {
+      nativeEvents.push({id:'native-details', type:'toggle', oldState:event.oldState, newState:event.newState, trusted:event.isTrusted});
+    });
+  </script>
 </body>
 </html>

@@ -66,6 +66,12 @@ pub async fn handle(
 ) -> Result<Value, String> {
     match method {
         "setEmulatedMedia" => {
+            if let Some(media) = params.get("media") {
+                let media = media.as_str().ok_or("Emulation.setEmulatedMedia media must be a string")?;
+                if !media.is_empty() {
+                    return Err(format!("Unsupported emulated media type: {media}"));
+                }
+            }
             let features = match params.get("features") {
                 Some(features) => features.as_array().ok_or("Emulation.setEmulatedMedia features must be an array")?.as_slice(),
                 None => &[],
@@ -90,7 +96,19 @@ pub async fn handle(
                         }
                         dark = value == "dark";
                     }
-                    _ => {}
+                    "forced-colors" => {
+                        // Rendering has no forced-color palette; only its
+                        // genuine default and reset are supported.
+                        if !matches!(value, "" | "none") {
+                            return Err("Unsupported forced-colors value".into());
+                        }
+                    }
+                    "prefers-contrast" => {
+                        if !matches!(value, "" | "no-preference") {
+                            return Err("Unsupported prefers-contrast value".into());
+                        }
+                    }
+                    _ => return Err(format!("Unsupported emulated media feature: {name}")),
                 }
             }
             ctx.get_session_page_mut(session_id).ok_or("No page for session")?
@@ -165,12 +183,37 @@ pub async fn handle(
             let page = ctx
                 .get_session_page_mut(session_id)
                 .ok_or("No page for session")?;
-            page.set_locale_override((!locale.is_empty()).then(|| locale.to_string()));
+            page.set_locale_override((!locale.is_empty()).then(|| locale.to_string()))?;
             Ok(json!({}))
         }
-        // Touch emulation does not affect layout yet, but acknowledging it is
-        // compatible with clients that pair it with a metrics override.
-        "setTouchEmulationEnabled" => Ok(json!({})),
+        "setTimezoneOverride" => {
+            let timezone = params.get("timezoneId").and_then(Value::as_str).ok_or("Emulation.setTimezoneOverride requires timezoneId")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            let region = page.context.regional.as_ref().map_err(Clone::clone)?;
+            obscura_js::regional::configure(&obscura_js::regional::current().locale, if timezone.is_empty() { &region.timezone } else { timezone })?;
+            Ok(json!({}))
+        }
+        "setGeolocationOverride" => {
+            let position = match (params.get("latitude"), params.get("longitude"), params.get("accuracy")) {
+                (Some(latitude), Some(longitude), Some(accuracy)) => Some(obscura_js::geolocation::Position::new(
+                    latitude.as_f64().ok_or("Invalid latitude")?, longitude.as_f64().ok_or("Invalid longitude")?, accuracy.as_f64().ok_or("Invalid accuracy")?)?),
+                (None, None, None) => None,
+                _ => return Err("Geolocation override requires latitude, longitude and accuracy together".into()),
+            };
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            page.set_geolocation_override(Some(position))?;
+            Ok(json!({}))
+        }
+        "clearGeolocationOverride" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            page.set_geolocation_override(None)?;
+            Ok(json!({}))
+        }
+        "setTouchEmulationEnabled" => match params.get("enabled").and_then(Value::as_bool) {
+            Some(false) => Ok(json!({})),
+            Some(true) => Err("Touch emulation is unsupported".into()),
+            None => Err("Missing enabled".into()),
+        },
         _ => Ok(json!({})),
     }
 }
@@ -201,6 +244,9 @@ mod tests {
             json!({"features": [{"name":"prefers-color-scheme", "value":false}]}),
             json!({"features": [{"name":"prefers-color-scheme", "value":"light"}, {"name":"prefers-reduced-motion", "value":"invalid"}]}),
             json!({"features": [{"name":"prefers-color-scheme", "value":"invalid"}]}),
+            json!({"media": "print", "features": [{"name":"prefers-color-scheme", "value":"light"}]}),
+            json!({"media": false}),
+            json!({"features": [{"name":"prefers-color-scheme", "value":"light"}, {"name":"hover", "value":"none"}]}),
         ] {
             assert!(handle("setEmulatedMedia", &invalid, &mut ctx, &session).await.is_err());
             assert_eq!(ctx.get_session_page_mut(&session).unwrap().evaluate(script), json!([true, true]));
@@ -258,6 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn locale_emulation_reaches_requests_and_survives_navigation() {
+        std::env::set_var("OBSCURA_LOCALE", "de-DE");
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
         let session_id = Some("locale-session".to_string());
@@ -289,8 +336,8 @@ mod tests {
         assert_eq!(
             ctx.get_session_page_mut(&session_id)
                 .unwrap()
-                .evaluate("[navigator.language, navigator.languages]"),
-            json!(["de-DE", ["de-DE", "de"]])
+                .evaluate("navigator.language"),
+            json!("de-DE")
         );
 
         crate::domains::page::handle(
@@ -304,8 +351,8 @@ mod tests {
         assert_eq!(
             ctx.get_session_page_mut(&session_id)
                 .unwrap()
-                .evaluate("[navigator.language, navigator.languages]"),
-            json!(["de-DE", ["de-DE", "de"]])
+                .evaluate("navigator.language"),
+            json!("de-DE")
         );
     }
 

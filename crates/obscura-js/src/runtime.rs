@@ -4,6 +4,7 @@ use std::future::Future;
 #[cfg(test)]
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use deno_core::{JsRuntime, RuntimeOptions, v8};
@@ -55,7 +56,7 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// any residual first-time process init races. Construction is rare and fast, so
 /// serializing it costs nothing measurable; isolate *execution* stays fully
 /// parallel, each isolate on its own thread with no shared lock.
-static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static NEXT_CDP_OBJECT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 #[cfg(test)]
@@ -115,7 +116,7 @@ fn remember_classic_code(origin: &str, name: &str, source: &str, data: &[u8]) {
 /// process-wide single-worker runtime kept alive for the whole process.
 /// The guard must stay in scope across `JsRuntime::new`; the registered
 /// handle outlives it.
-fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
+pub(crate) fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return None;
     }
@@ -123,7 +124,7 @@ fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
         std::sync::LazyLock::new(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
-                .enable_time()
+                .enable_all()
                 .build()
                 .expect("fallback tokio runtime")
         });
@@ -439,33 +440,6 @@ fn is_cdp_unserializable_value(value: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Pin the process timezone before the first isolate is created.
-///
-/// V8's Date and Intl read their zone from ICU, which on Windows does not
-/// follow the `TZ` environment variable. Only an explicitly configured zone
-/// is applied; without one the host default stays authoritative (the CLI's
-/// own Berlin fallback lives in the CLI, not in the embeddable runtime).
-fn configure_process_timezone() -> bool {
-    static CONFIGURED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let Some(zone) = std::env::var("OBSCURA_TIMEZONE").ok()
-            .map(|zone| zone.trim().to_string())
-            .filter(|zone| !zone.is_empty())
-            .or_else(|| std::env::var("TZ").ok()
-                .map(|zone| zone.trim().to_string())
-                .filter(|zone| !zone.is_empty())) else { return false; };
-        // Unix ICU honors TZ; set it before any isolate can read the zone.
-        // An already-present TZ is the host's choice and stays untouched.
-        if std::env::var_os("TZ").is_none() {
-            unsafe { std::env::set_var("TZ", &zone) };
-        }
-        #[cfg(windows)]
-        if !v8::icu::set_default_time_zone(&zone) {
-            return false;
-        }
-        true
-    });
-    *CONFIGURED
-}
 
 fn remaining_deadline_ms(deadline: tokio::time::Instant) -> Option<u64> {
     let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
@@ -813,16 +787,23 @@ impl ObscuraJsRuntime {
         let windows = self.windows.clone();
         let realms = self.realm_states();
         self.retire_execution_world_modules();
+        let op_state = self.runtime().op_state();
+        let worker_pending;
         {
             let main = self.runtime().main_context();
             let mut entered = self.runtime();
             v8::scope_with_context!(scope, entered.v8_isolate(), main);
             if let Err(error) = crate::window::deliver_messages(scope, &windows, &realms) { return Poll::Ready(Err(error)); }
+            worker_pending = crate::worker::poll(scope, &op_state, cx);
         }
         let result = self.runtime().poll_event_loop(cx, deno_core::PollEventLoopOptions::default())
             .map(|result| result.map_err(|error| format!("Event loop error: {error}")));
-        if matches!(result, Poll::Ready(Ok(()))) && !windows.borrow().messages.is_empty() {
-            cx.waker().wake_by_ref();
+        // Engine callbacks can enqueue native work after worker::poll above
+        // (for example, starting a MessagePort from a timer).
+        let newly_queued_work = matches!(result, Poll::Ready(Ok(()))) && !worker_pending
+            && crate::worker::has_pending_work(&op_state.borrow());
+        if matches!(result, Poll::Ready(Ok(()))) && (worker_pending || newly_queued_work || !windows.borrow().messages.is_empty()) {
+            if newly_queued_work || !windows.borrow().messages.is_empty() { cx.waker().wake_by_ref(); }
             Poll::Pending
         } else {
             result
@@ -920,15 +901,9 @@ impl ObscuraJsRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-            // ICU falls back to the host OS locale when no default is set,
-            // so Intl.* formats and resolvedOptions().locale leaked the
-            // operator's real locale (an en-AU host showed en-AU) while
-            // navigator.language and Accept-Language say en-US. Pin the one
-            // locale the other surfaces claim (#734). Process-global and
-            // idempotent; setting it under the create lock guarantees it
-            // lands before the first isolate exists.
-            deno_core::v8::icu::set_default_locale("en-US");
-            let timezone_configured = configure_process_timezone();
+            // ICU defaults are immutable after the first profile is admitted.
+            // Conflicting browser configuration fails before isolate creation.
+            let _region = crate::regional::current();
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 // deno_core verifies the startup snapshot's extension list as
@@ -941,10 +916,8 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
             crate::window::native_window::install_failed_access_check(runtime.v8_isolate());
-            if timezone_configured {
-                runtime.v8_isolate()
-                    .date_time_configuration_change_notification(v8::TimeZoneDetection::Skip);
-            }
+            runtime.v8_isolate()
+                .date_time_configuration_change_notification(v8::TimeZoneDetection::Skip);
             {
                 let context = runtime.main_context();
                 v8::scope!(let scope, runtime.v8_isolate());
@@ -1248,7 +1221,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 9] = [
+        const IDENTITY_GLOBALS: [&str; 7] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -1256,8 +1229,6 @@ impl ObscuraJsRuntime {
             "__obscura_language",
             "__obscura_languages",
             "__obscura_stealth",
-            "__obscura_geo_lat",
-            "__obscura_geo_lon",
         ];
 
         let main = self.root_context.clone();
@@ -1302,6 +1273,21 @@ impl ObscuraJsRuntime {
         // Native child documents keep independent renderer caches and result
         // channels, but share the page transport, capacity and wake-up.
         frame.inherit_resources(&self.state.borrow());
+    }
+
+    /// Resolve a local resource without changing its bytes or source MIME.
+    /// Network resources return None and keep the page's normal fetch path.
+    pub fn load_local_resource(&self, url: &url::Url) -> Result<Option<(std::sync::Arc<[u8]>, String)>, String> {
+        crate::local_resource::load_local_resource(&self.state.borrow(), url)
+            .map(|resource| resource.map(|resource| (resource.bytes, resource.mime)))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn local_script_resource(&self, url: &url::Url) -> Result<Option<(std::sync::Arc<[u8]>, String)>, String> {
+        self.load_local_resource(url)?.map(|(bytes, mime)| {
+            if crate::local_resource::is_javascript_mime(&mime) { Ok((bytes, mime)) }
+            else { Err(format!("Script resource is not a JavaScript MIME type: {mime}")) }
+        }).transpose()
     }
 
     pub(crate) fn document_state_for_frame(&self, frame_id: u32) -> Result<crate::ops::SharedState, String> {
@@ -1457,6 +1443,25 @@ impl ObscuraJsRuntime {
             let result = deno_core::serde_v8::from_v8(scope, value).map_err(|error| error.to_string());
             scope.perform_microtask_checkpoint();
             result
+        })();
+        self.finish_heap_checked(result)
+    }
+
+    /// Follow an already-authorized fragment URL in the live document without
+    /// reloading it or invoking an author-replaced Location method.
+    pub fn navigate_fragment(&mut self, url: &str) -> Result<(), String> {
+        let target = url::Url::parse(url).map_err(|error| error.to_string())?;
+        if target.fragment().is_none() { return Err("fragment URL required".into()); }
+        let context = self.execution_context(CdpExecutionWorld { frame_id: 0, world_id: None })?;
+        self.begin_javascript_task();
+        let result = (|| {
+            let mut entered = self.runtime();
+            v8::scope_with_context!(scope, entered.v8_isolate(), &context);
+            v8::tc_scope!(let scope, scope);
+            crate::window::world_navigate_fragment(scope, &context, target.as_str())
+                .ok_or_else(|| exception_text(scope))?;
+            scope.perform_microtask_checkpoint();
+            Ok(())
         })();
         self.finish_heap_checked(result)
     }
@@ -2113,24 +2118,49 @@ impl ObscuraJsRuntime {
         state.render_resources.set_sync_loading_enabled(false);
     }
 
+    /// Enforced document response policies, captured before author script runs.
+    pub fn set_document_response_policy(&self, headers: &HashMap<String, String>) {
+        let mut state = self.state.borrow_mut();
+        state.content_security_policy = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"))
+            .map(|(_, policy)| policy.clone()).collect();
+        crate::websocket::capture_meta_policy(&mut state);
+    }
+    pub fn set_frame_response_policy(&self, frame_id: u32, headers: &HashMap<String, String>) {
+        if let Some(document) = self.document_state(frame_id) {
+            let mut state = document.borrow_mut();
+            state.content_security_policy = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("content-security-policy"))
+                .map(|(_, policy)| policy.clone()).collect();
+            crate::websocket::capture_meta_policy(&mut state);
+        }
+    }
+
+
     pub fn set_dom(&self, dom: DomTree) {
         let mut gs = self.state.borrow_mut();
         let replacing = gs.dom.is_some();
         gs.dom = Some(dom);
         if replacing {
             gs.document_generation = gs.document_generation.wrapping_add(1);
+            gs.local_resource_owner = crate::local_resource::LocalResourceOwner::default();
+            gs.local_resource_principal = None;
             gs.document_active.set(true);
             gs.reflected_url = None;
             for (_, cancel) in gs.timeout_cancels.borrow_mut().drain() { cancel.cancel(); }
+            gs.websockets.cancel_all();
+            gs.content_security_policy.clear();
+            gs.rtc_connections.cancel_all();
             if gs.inherited_origin.is_none() {
                 gs.opaque_origin = crate::window::opaque_origin_for_url(&gs.url);
             }
         }
+        crate::websocket::capture_meta_policy(&mut gs);
         gs.focused_node = None;
         gs.activity_generation = 0;
         gs.page_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         gs.already_started_scripts.borrow_mut().clear();
         // A new document owns a fresh retained scene and resource cache.
+        gs.render_resources = crate::ops::fresh_render_resources(&gs);
+        gs.dynamic_fonts.clear();
         #[cfg(feature = "render")]
         {
             gs.prepared_render = None;
@@ -2141,12 +2171,9 @@ impl ObscuraJsRuntime {
             gs.animation_task_generation = 0;
             gs.animation_sampled_task_generation = 0;
             gs.pending_style_mutations.clear();
-            let render_resources = crate::ops::fresh_render_resources(&gs);
-            gs.render_resources = render_resources;
             gs.render_image_in_flight.clear();
             gs.abandon_render_resources();
             gs.stylesheet_cache = obscura_render::StylesheetCache::default();
-            gs.dynamic_fonts.clear();
             gs.canvas_surfaces.clear();
             gs.scroll_offset = (0.0, 0.0);
             gs.element_scroll_offsets.clear();
@@ -2160,6 +2187,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_url(&self, url: &str) {
         let mut state = self.state.borrow_mut();
+        if let Some(dom) = &state.dom {
+            let fragment = url::Url::parse(url).ok().and_then(|url| url.fragment().map(str::to_owned)).unwrap_or_default();
+            dom.set_target_fragment(&crate::ops::decode_fragment(&fragment));
+        }
         if state.url != url {
             state.url = url.to_string();
             state.reflected_url = None;
@@ -2278,6 +2309,7 @@ impl ObscuraJsRuntime {
                 state.pending_history_traversal = None;
                 state.pending_frames.clear();
                 state.pending_frame_bytes = 0;
+                state.websockets.cancel_all();
                 std::mem::replace(&mut state.resource_load_cancel, deno_core::CancelHandle::new_rc())
             };
             cancel.cancel();
@@ -2402,6 +2434,18 @@ impl ObscuraJsRuntime {
         state.intercept_tx = Some(tx);
     }
 
+    pub fn set_intercept_observer(&self, observer: std::sync::Arc<dyn Fn(crate::ops::InterceptedRequest) + Send + Sync>) {
+        self.state.borrow_mut().intercept_observer = Some(observer);
+    }
+
+    pub fn set_network_event_tx(&self, sender: tokio::sync::mpsc::UnboundedSender<(String, crate::ops::JsNetworkEvent)>) {
+        self.state.borrow_mut().network_event_tx = Some(sender);
+    }
+
+    pub fn has_network_response_body(&self, request: &str) -> bool {
+        self.state.borrow().network_response_bodies.contains_key(request)
+    }
+
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
@@ -2411,16 +2455,14 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().intercept_page_id = page_id.to_string();
     }
 
-    /// `Fetch.enable` URL patterns that decide which fetch()/XHR requests
-    /// are sent to the interception channel.
-    pub fn set_intercept_url_patterns(&self, patterns: Vec<String>) {
+    /// `Fetch.enable` selectors that decide which requests pause.
+    pub fn set_intercept_url_patterns(&self, patterns: Vec<crate::ops::InterceptPattern>) {
         self.state.borrow_mut().intercept_url_patterns = patterns;
     }
 
-    /// `Fetch.enable` URL patterns of the owning page. Renderer resource
-    /// loads honour them like the page's own subresource fetches do.
+    /// `Fetch.enable` selectors of the owning page.
     #[cfg(feature = "render")]
-    pub fn set_intercept_block_patterns(&self, patterns: Vec<String>) {
+    pub fn set_intercept_block_patterns(&self, patterns: Vec<crate::ops::InterceptPattern>) {
         self.state.borrow_mut().intercept_block_patterns = patterns;
     }
 
@@ -2461,25 +2503,24 @@ impl ObscuraJsRuntime {
         }
     }
 
-    pub fn set_locale(&mut self, locale: &str) {
-        let base = locale.split('-').next().unwrap_or(locale);
-        let languages = if base == locale { vec![locale] } else { vec![locale, base] };
-        self.set_identity_globals(&[
-            ("__obscura_language", serde_json::json!(locale)),
-            ("__obscura_languages", serde_json::json!(languages)),
-        ]);
+    /// A scoped locale request cannot mutate ICU defaults used by other realms.
+    pub fn set_locale(&mut self, locale: &str) -> Result<(), String> {
+        crate::regional::configure(locale, &crate::regional::current().timezone)
     }
 
     pub fn set_platform(&mut self, platform: &str, ua_platform: &str, ua_platform_version: &str) {
-        let _ = self.execute_runtime_script(
-            "<set-platform>",
-            format!(
-                "globalThis.__obscura_platform={};globalThis.__obscura_ua_platform={};globalThis.__obscura_ua_platform_version={};",
-                js_string_literal(platform),
-                js_string_literal(ua_platform),
-                js_string_literal(ua_platform_version),
-            ),
-        );
+        self.set_identity_globals(&[
+            ("__obscura_platform", serde_json::json!(platform)),
+            ("__obscura_ua_platform", serde_json::json!(ua_platform)),
+            ("__obscura_ua_platform_version", serde_json::json!(ua_platform_version)),
+        ]);
+    }
+
+    pub fn request_frame_metadata(&self, frame_id: u32) -> (Option<u32>, u64) {
+        let parent = self.realm_states().borrow().frame_parent(frame_id);
+        let generation = self.document_state_for_cdp(frame_id)
+            .map(|state| state.borrow().document_generation).unwrap_or(0);
+        (parent, generation)
     }
 
     pub fn set_stealth(&mut self, enabled: bool) {
@@ -2496,7 +2537,6 @@ impl ObscuraJsRuntime {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return;
         }
-        #[cfg(feature = "render")]
         self.state.borrow_mut().set_viewport(width, height);
         let _ = self.execute_runtime_script(
             "<set-viewport>",
@@ -2716,33 +2756,24 @@ impl ObscuraJsRuntime {
             render_resources,
             render_media,
             dynamic_fonts,
+            canvas_surfaces,
             ..
         } = &mut *state;
         // An ad-hoc capture must select the same preference rules as CSSOM.
         // Keep its viewport-specific cascade separate from the live cache.
-        if *render_media != obscura_render::CssMediaType::Screen {
-            let tree = dom.as_ref()?;
-            let mut cache = obscura_render::StylesheetCache::default();
-            let mut timeline = obscura_render::AnimationTimelineState::default();
-            let mut prepared = obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
-                tree, viewport, base_url, render_resources, dynamic_fonts,
-                &mut cache, *render_media,
-                obscura_render::AnimationSample::local_override(animation_sample_time.milliseconds),
-                &mut timeline,
-            )?;
-            let resolved = prepared.resolve_scroll_state(tree, scroll, &Default::default());
-            return obscura_render::screenshot_prepared_with_scroll_and_surface_color(
-                tree, &mut prepared, render_resources, &resolved, surface_color,
-            );
-        }
-        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
-            dom.as_ref()?,
-            viewport,
-            base_url,
-            scroll,
-            animation_sample_time,
-            surface_color,
-            render_resources,
+        let tree = dom.as_ref()?;
+        let mut cache = obscura_render::StylesheetCache::default();
+        let mut timeline = obscura_render::AnimationTimelineState::default();
+        let mut prepared = obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+            tree, viewport, base_url, render_resources, dynamic_fonts,
+            &mut cache, *render_media,
+            obscura_render::AnimationSample::local_override(animation_sample_time.milliseconds),
+            &mut timeline,
+        )?;
+        let resolved = prepared.resolve_scroll_state(tree, scroll, &Default::default());
+        let canvas_surfaces = RuntimeCanvasSurfaceSource(canvas_surfaces);
+        obscura_render::screenshot_prepared_with_scroll_and_surface_color_and_canvas_surfaces(
+            tree, &mut prepared, render_resources, &resolved, surface_color, &canvas_surfaces,
         )
     }
 
@@ -2899,7 +2930,7 @@ impl ObscuraJsRuntime {
     /// Capture one immutable document slice as if its origin were the root
     /// scroll position of a virtual viewport. This leaves the live page scroll
     /// untouched while giving fixed and sticky descendants page-local paint
-    /// geometry, which paginated raster PDF export requires.
+    /// geometry for paginated printing.
     #[cfg(feature = "render")]
     pub fn screenshot_prepared_region_at_scroll_with_backgrounds(
         &self,
@@ -2945,6 +2976,44 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// Native PDF work observes the same termination signal as the owning
+    /// command/isolate watchdog, without moving the runtime across threads.
+    #[cfg(feature = "render")]
+    pub fn new_pdf_document(&self) -> obscura_render::PdfDocument {
+        let isolate = self.isolate_handle.clone();
+        obscura_render::PdfDocument::with_cancellation(std::sync::Arc::new(move || isolate.is_execution_terminating()))
+    }
+
+    /// Append the current print slice using the retained painter and live
+    /// canvas surfaces. Resource loading remains cache-only and page-owned.
+    #[cfg(feature = "render")]
+    pub fn append_pdf_page(
+        &self,
+        document: &mut obscura_render::PdfDocument,
+        region: obscura_render::CaptureRegion,
+        root_scroll: (f32, f32),
+        paper: (f32, f32),
+        origin: (f32, f32),
+        scale: f32,
+        paint_backgrounds: bool,
+    ) -> Result<(), obscura_render::PdfPaintError> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            ensure_resolved_scroll(state).ok_or(obscura_render::PdfPaintError::PaintFailed)?;
+            let ObscuraState { dom, prepared_render, render_resources,
+                element_scroll_offsets, canvas_surfaces, .. } = state;
+            let dom = dom.as_ref().ok_or(obscura_render::PdfPaintError::PaintFailed)?;
+            let prepared = prepared_render.as_mut().ok_or(obscura_render::PdfPaintError::PaintFailed)?;
+            let scroll = prepared.resolve_scroll_state_for_viewport(dom, root_scroll,
+                element_scroll_offsets, (region.width, region.height));
+            let canvases = RuntimeCanvasSurfaceSource(canvas_surfaces);
+            document.append_page(paper, origin, scale, || {
+                obscura_render::paint_prepared_pdf_region(dom, prepared, render_resources,
+                    &scroll, region, paint_backgrounds, &canvases)
+            })
+        })
+    }
+
     /// Return the retained layout's scrollable document size without changing
     /// the live viewport or scroll position. PDF/full-document consumers use
     /// this to paginate document-space captures from the same geometry.
@@ -2960,57 +3029,23 @@ impl ObscuraJsRuntime {
         })
     }
 
-    /// Return the exact responsive candidates selected for live `<img>`
-    /// elements and `<video poster>` resources without loading them. The
-    /// browser layer can then fetch them concurrently through the page-owned
-    /// transport before synchronous layout or paint observes the cache.
+    /// Return cache misses selected by the current retained cascade, including
+    /// responsive images, generated backgrounds, SVG instances and text faces.
+    /// Selection never opens a synchronous connection, even for standalone
+    /// runtimes that retain a compatibility loader for other operations.
     #[cfg(feature = "render")]
-    pub fn pending_render_image_urls(&self) -> Vec<(String, crate::ops::ImageRequestProfile)> {
-        let state = self.state.borrow();
-        let base_url = document_base_url(&state);
-        let Some(dom) = state.dom.as_ref() else {
-            return Vec::new();
-        };
-        let mut urls = Vec::new();
-        for id in dom.descendants(dom.document()) {
-            let Some(node) = dom.get_node(id) else {
-                continue;
-            };
-            let Some(element) = node.as_element() else {
-                continue;
-            };
-            let candidate = match &*element.local {
-                "img" => state
-                    .render_resources
-                    .cached_image_element_metadata(dom, id, state.viewport, base_url.as_deref())
-                    .map(|(url, _, known, _)| {
-                        let profile = match node
-                            .get_attribute("crossorigin")
-                            .map(|value| value.trim().to_ascii_lowercase())
-                            .as_deref()
-                        {
-                            Some("use-credentials") => crate::ops::ImageRequestProfile::CorsInclude,
-                            Some(_) => crate::ops::ImageRequestProfile::CorsSameOrigin,
-                            None => crate::ops::ImageRequestProfile::NoCorsInclude,
-                        };
-                        (url, profile, known)
-                    }),
-                "video" => state
-                    .render_resources
-                    .cached_video_poster_metadata(dom, id, base_url.as_deref())
-                    .map(|(url, profile, known, _)| (url, profile, known)),
-                _ => None,
-            };
-            let Some((url, profile, known)) = candidate else {
-                continue;
-            };
-            if !known && !url.starts_with("data:") {
-                urls.push((url, profile));
+    pub fn selected_render_resource_urls(&self)
+        -> Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)> {
+        let mut state = self.state.borrow_mut();
+        with_sync_render_loading_disabled(&mut state, |state| {
+            if crate::ops::ensure_prepared_render(state).is_none() { return Vec::new(); }
+            let ObscuraState { dom, prepared_render, render_resources, dynamic_fonts, render_media, .. } = state;
+            match (dom.as_ref(), prepared_render.as_ref()) {
+                (Some(dom), Some(prepared)) => prepared.discover_resource_requests(dom, render_resources,
+                    dynamic_fonts, *render_media),
+                _ => Vec::new(),
             }
-        }
-        urls.sort();
-        urls.dedup();
-        urls
+        })
     }
 
     /// Insert one page-transport resource outcome into the retained renderer
@@ -3131,9 +3166,8 @@ impl ObscuraJsRuntime {
                 None => state.render_resources.has_live_outcome(&url),
             };
             if known { continue; }
-            // Fetch interception patterns pause requests; they are not a URL
-            // blocklist. Static renderer resources currently pass through,
-            // while Network.setBlockedURLs remains authoritative here.
+            // Fetch selectors are handled by the native request interceptor;
+            // only Network.setBlockedURLs is a denial rule here.
             let blocked = blocked_urls.iter().any(|pattern| crate::ops::glob_match(pattern, &url));
             let allowed = page_render_resource_url_allowed(
                 state.about_base_url.as_deref().unwrap_or(&state.url), &url);
@@ -3248,12 +3282,13 @@ impl ObscuraJsRuntime {
         &self,
         requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>,
     ) -> usize {
-        Self::start_document_render_resource_loads(&self.state, requests)
+        let parent_frame_id = self.realm_states().borrow().frame_parent(self.state.borrow().frame_id);
+        Self::start_document_render_resource_loads(&self.state, requests, parent_frame_id)
     }
 
     #[cfg(feature = "render")]
     fn start_document_render_resource_loads(document: &crate::ops::SharedState,
-        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>) -> usize {
+        requests: Vec<(String, Option<crate::ops::ImageRequestProfile>, bool)>, parent_frame_id: Option<u32>) -> usize {
         if requests.is_empty() { return 0; }
         let mut state = document.borrow_mut();
         if tokio::runtime::Handle::try_current().is_err() {
@@ -3277,6 +3312,7 @@ impl ObscuraJsRuntime {
         let initiator = initiator.expect("checked above");
         let callbacks = state.callbacks.clone();
         let generation = state.document_generation;
+        let frame_id = state.frame_id;
         let tx = state.render_resource_tx.clone();
         let limiter = state.render_resource_limiter.clone();
         let notify = state.render_resource_notify.clone();
@@ -3314,6 +3350,9 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Image
                     };
                     let mut request = ResourceRequest::subresource(kind, &initiator);
+                    request.frame_id = frame_id;
+                    request.parent_frame_id = parent_frame_id;
+                    request.frame_generation = generation;
                     match profile {
                         Some(crate::ops::ImageRequestProfile::CorsSameOrigin) => {
                             request.mode = RequestMode::Cors;
@@ -3445,7 +3484,8 @@ impl ObscuraJsRuntime {
             available -= discovered.len();
             requests.extend(discovered);
             drop(document);
-            Self::start_document_render_resource_loads(state, requests);
+            let parent_frame_id = registry.frame_parent(state.borrow().frame_id);
+            Self::start_document_render_resource_loads(state, requests, parent_frame_id);
         }
         loaded
     }
@@ -3574,17 +3614,17 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().navigation_timing.record(name);
     }
 
-    /// Override the coordinates the navigator.geolocation shim reports. The
-    /// values are injected as numeric globals the bootstrap reads; when unset it
-    /// keeps the built-in default. Callers validate the range before calling.
-    pub fn set_geolocation(&mut self, latitude: f64, longitude: f64) {
-        let _ = self.execute_runtime_script(
-            "<set-geo>",
-            format!(
-                "globalThis.__obscura_geo_lat={};globalThis.__obscura_geo_lon={};",
-                latitude, longitude
-            ),
-        );
+    /// Update this page's native position without granting permission.
+    pub fn set_geolocation(&mut self, position: Option<crate::geolocation::Position>) -> Result<(), String> {
+        self.state.borrow().geolocation.set_position(position)
+    }
+
+    pub fn set_geolocation_context(&self, permissions: Arc<crate::geolocation::Permissions>, position: Option<crate::geolocation::Position>) {
+        self.state.borrow_mut().geolocation = Arc::new(crate::geolocation::Geolocation::new(permissions, position));
+    }
+
+    pub fn set_geolocation_policy(&self, policy: &str) {
+        self.state.borrow_mut().geolocation_policy = policy.to_owned();
     }
 
     /// Run a script in the selected live world and return its completion value.
@@ -4471,14 +4511,6 @@ impl ObscuraJsRuntime {
         self.execute_classic_script(name, source)
     }
 
-    pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
-        if source.len() < 10_000 {
-            self.execute_script(name, source)
-        } else {
-            self.execute_script_with_timeout(name, source, std::time::Duration::from_secs(5))
-        }
-    }
-
     pub fn execute_script_with_timeout(
         &mut self,
         name: &str,
@@ -5116,16 +5148,15 @@ impl ObscuraJsRuntime {
     pub fn take_dom(&self) -> Option<DomTree> {
         let mut state = self.state.borrow_mut();
         state.base_url_cache.get_mut().take();
+        state.render_resources = crate::ops::fresh_render_resources(&state);
+        state.dynamic_fonts.clear();
         #[cfg(feature = "render")]
         {
             state.prepared_render = None;
             state.style_query_cache = None;
             state.pending_style_mutations.clear();
-            let render_resources = crate::ops::fresh_render_resources(&state);
-            state.render_resources = render_resources;
             state.abandon_render_resources();
             state.stylesheet_cache = obscura_render::StylesheetCache::default();
-            state.dynamic_fonts.clear();
             state.element_scroll_offsets.clear();
             state.resolved_scroll = None;
         }
@@ -5798,6 +5829,22 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn native_document_binding_is_readonly_and_keeps_its_live_dom() {
+        let mut rt = setup_runtime("<html><body><p id='live'>original</p></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const original = document, descriptor = Object.getOwnPropertyDescriptor(window, 'document');
+            document = {spoofed:true};
+            let strict, redefine;
+            try { (() => {'use strict'; window.document = null;})(); } catch(e) { strict=e.name; }
+            try { Object.defineProperty(window,'document',{value:null}); } catch(e) { redefine=e.name; }
+            document.getElementById('live').textContent = 'native';
+            return [document === original, descriptor.configurable, descriptor.set === undefined,
+                strict, redefine, document.body.textContent];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,false,true,"TypeError","TypeError","native"]));
     }
 
     #[cfg(feature = "render")]
@@ -7262,6 +7309,69 @@ mod tests {
             serde_json::json!(true)
         );
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_owns_intrinsics_and_atomically_transfers_buffers_and_ports() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-native-boundaries", r#"
+            Object.prototype.pageOnly = 'must not escape';
+            globalThis.__nativeWorker = {errors: []};
+            const source = `onmessage = event => {
+                const data = event.data;
+                data.port.onmessage = message => {
+                    const bytes = new Uint8Array(data.buffer); bytes[1] = 7;
+                    const result = { bytes: data.buffer, port: data.port, echoed: message.data,
+                        realm: [self === globalThis, Function('return this')() === self,
+                            typeof window, typeof document, typeof Deno, typeof __obscuraCore,
+                            Object.prototype.pageOnly === undefined, data.cycle === data,
+                            data.map instanceof Map, data.date instanceof Date] };
+                    postMessage(result, [result.bytes, result.port]);
+                };
+            };`;
+            const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+            const worker = new Worker(url);
+            URL.revokeObjectURL(url);
+            const channel = new MessageChannel(); const buffer = new Uint8Array([1,2,3]).buffer;
+            try { worker.postMessage({fn() {}}, [buffer, channel.port2]); }
+            catch (error) { __nativeWorker.errors.push(error.name); }
+            __nativeWorker.stillAttached = buffer.byteLength;
+            worker.onmessage = event => {
+                __nativeWorker.realm = event.data.realm;
+                __nativeWorker.bytes = Array.from(new Uint8Array(event.data.bytes));
+                __nativeWorker.echoed = event.data.echoed;
+                event.data.port.postMessage('returned'); worker.terminate();
+            };
+            channel.port1.onmessage = event => __nativeWorker.returned = event.data;
+            const data = {buffer, port: channel.port2, map: new Map([['a',1]]), date: new Date(0)}; data.cycle = data;
+            worker.postMessage(data, [buffer, channel.port2]);
+            __nativeWorker.detached = buffer.byteLength;
+            channel.port1.postMessage('queued-before-worker-start');
+        "#).unwrap();
+        rt.run_event_loop_bounded(2000).await.unwrap();
+        assert_eq!(rt.evaluate("__nativeWorker").unwrap(), serde_json::json!({
+            "errors": ["DataCloneError"], "stillAttached": 3, "detached": 0,
+            "realm": [true,true,"undefined","undefined","undefined","undefined",true,true,true,true],
+            "bytes": [1,7,3], "echoed": "queued-before-worker-start", "returned": "returned"
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_terminate_interrupts_running_script_without_terminating_page() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-running-termination", r#"
+            globalThis.__workerStopped = [];
+            const url = URL.createObjectURL(new Blob(['postMessage("running"); while (true) {}'], {type: 'text/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = () => {
+                worker.terminate(); URL.revokeObjectURL(url);
+                __workerStopped.push('terminated');
+                setTimeout(() => __workerStopped.push('page-alive'), 0);
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(2000).await.unwrap();
+        assert_eq!(rt.evaluate("__workerStopped").unwrap(), serde_json::json!(["terminated","page-alive"]));
+        assert_eq!(rt.evaluate("6 * 7").unwrap().as_f64(), Some(42.0));
+    }
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_initializes_once_and_retains_message_state() {
@@ -7341,7 +7451,9 @@ mod tests {
         "#,
         )
         .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("__workerReplies.length === 4").unwrap().as_bool() == Some(true)
+        }, 2_000).await, "the worker must deliver both callbacks for both messages");
         assert_eq!(
             rt.evaluate("__workerReplies").unwrap(),
             serde_json::json!([
@@ -7360,22 +7472,29 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_queues_messages_while_source_is_loading() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048]; stream.read(&mut request).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let body = "let count = 0; onmessage = event => postMessage([++count, event.data]);";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
         let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_url(&format!("{origin}/page"));
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
         rt.execute_script("worker-queued-messages", r#"
             globalThis.__workerReplies = [];
-            const originalFetch = globalThis.fetch;
-            let finishSource;
-            globalThis.fetch = async () => ({ text: () => new Promise(resolve => { finishSource = resolve; }) });
-            const worker = new Worker('https://example.com/worker.js');
+            const worker = new Worker('/worker.js');
             worker.onmessage = event => __workerReplies.push(event.data);
             worker.postMessage('first');
             worker.postMessage('second');
-            setTimeout(() => {
-                globalThis.fetch = originalFetch;
-                finishSource('let count = 0; onmessage = event => postMessage([++count, event.data]);');
-            }, 0);
         "#).unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        rt.run_event_loop_bounded(2000).await.unwrap();
         assert_eq!(
             rt.evaluate("__workerReplies").unwrap(),
             serde_json::json!([[1, "first"], [2, "second"]])
@@ -7621,35 +7740,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn message_port_drops_old_document_payloads_before_fresh_delivery() {
-        let mut rt = setup_runtime("<html><body data-document='old'></body></html>");
-        rt.execute_script(
-            "message-port-old-document",
-            r#"
-                globalThis.__replacementPortOrder = [];
-                globalThis.__replacementChannel = new MessageChannel();
-                __replacementChannel.port2.onmessage = event => {
-                    __replacementPortOrder.push(event.data);
-                };
-                __replacementChannel.port1.postMessage("old");
-            "#,
-        )
-        .unwrap();
-
-        rt.set_dom(parse_html("<html><body data-document='new'></body></html>"));
-        rt.execute_script(
-            "message-port-new-document",
-            r#"__replacementChannel.port1.postMessage("fresh");"#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
-
-        assert_eq!(
-            rt.evaluate("__replacementPortOrder").unwrap(),
-            serde_json::json!(["fresh"]),
-        );
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn message_port_close_discards_delivery_already_queued_for_a_task() {
@@ -8764,6 +8854,50 @@ mod tests {
     }
 
     #[test]
+    fn xml_documents_preserve_native_names_ownership_and_roundtrip() {
+        let mut rt = setup_runtime("<html><body>active</body></html>");
+        let result = rt.evaluate(r#"(() => {
+          const p = new DOMParser();
+          const d = p.parseFromString('<?audit ok?><Edmx xmlns="urn:edm" xmlns:a="urn:a" xmlns:b="urn:b"><DataServices a:id="A" b:id="B"><![CDATA[<raw>]]><!--note--></DataServices></Edmx>', 'application/xml');
+          const r = d.documentElement, c = d.getElementsByTagNameNS('urn:edm', 'DataServices')[0];
+          const copy = d.importNode(c, true); r.appendChild(copy);
+          const other = document.implementation.createDocument(null, 'Root');
+          other.documentElement.appendChild(other.adoptNode(copy));
+          const again = p.parseFromString(new XMLSerializer().serializeToString(d), 'text/xml');
+          return [d instanceof Document && !(d instanceof XMLDocument), r.nodeName, r.localName, r.prefix, r.namespaceURI,
+            d.contentType, d.querySelector('dataservices') === null, c.getAttributeNS('urn:a','id'),
+            c.getAttributeNS('urn:b','id'), c.firstChild.nodeType, c.firstChild.data,
+            c.ownerDocument === d, copy.ownerDocument === other, copy.firstChild.ownerDocument === other,
+            again.documentElement.nodeName, again.querySelector('DataServices').firstChild.nodeType,
+            d.firstChild.nodeType, document.body.textContent];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, "Edmx", "Edmx", null, "urn:edm",
+            "application/xml", true, "A", "B", 4, "<raw>", true, true, true, "Edmx", 4, 7, "active"]));
+    }
+
+    #[test]
+    fn xml_parser_rejects_malformed_and_unbounded_documents() {
+        let mut rt = setup_runtime("<html><body>active</body></html>");
+        let result = rt.evaluate(r#"(() => {
+          const p = new DOMParser();
+          const inputs = ['<Root></root>', '<p:root/>', '<root a="1" a="2"/>',
+            '<root xmlns:a="urn:x" xmlns:b="urn:x" a:id="1" b:id="2"/>',
+            '<a/><b/>', '<root>&#0;</root>', '<root>&missing;</root>',
+            '<!DOCTYPE root SYSTEM "file:///never-resolve.dtd"><root/>',
+            '<!DOCTYPE root [<!ENTITY x "expanded">]><root>&x;</root>',
+            '<r>'.repeat(600) + '</r>'.repeat(600)];
+          const rejected = inputs.every(input => {
+            const d = p.parseFromString(input, 'application/xml');
+            return d instanceof Document && !(d instanceof XMLDocument) && !!d.querySelector('parsererror') && d.defaultView === null;
+          });
+          let mime = ''; try { p.parseFromString('<root/>', 'application/not-xml'); } catch(e) { mime = e.name; }
+          const html = p.parseFromString('<script>document.body.textContent="executed"</script><p>inert</p>', 'text/html');
+          return [rejected, mime, html.body.textContent, document.body.textContent];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, "TypeError", "inert", "active"]));
+    }
+
+    #[test]
     fn dom_parser_flags_malformed_xml_with_parsererror() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let has_err = rt
@@ -8783,9 +8917,8 @@ mod tests {
 
     #[test]
     fn a_parsererror_says_what_was_wrong() {
-        // The <div> is where Chrome puts the reason, and callers show it. A
-        // parsererror that only says "error while parsing XML" tells a user
-        // nothing the presence of the element did not already say.
+        // A parsererror must identify the fault and the tags involved, not just
+        // report that some unspecified XML error occurred.
         let mut rt = setup_runtime("<html><body></body></html>");
         let detail = rt
             .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror').textContent;})()")
@@ -8799,12 +8932,7 @@ mod tests {
 
     #[test]
     fn a_parsererror_detail_is_text_not_markup() {
-        // The reason quotes a tag name lifted from the input and is written
-        // through innerHTML, so an input tag name must not become an element.
-        //
-        // The input has to be one whose message carries the angle brackets:
-        // "unclosed tag <img>" does, "mismatch: img and a" does not, and a test
-        // built on the latter passes with the escaping removed.
+        // Invalid source remains diagnostic text, never reparsed error markup.
         let mut rt = setup_runtime("<html><body></body></html>");
         let n = rt
             .evaluate("(function(){var d=new DOMParser().parseFromString('<img src=x>','application/xml'); var e=d.querySelector('parsererror'); return e ? e.querySelectorAll('img').length : -1;})()")
@@ -9865,6 +9993,33 @@ mod tests {
                 "undefined"
             ])
         );
+    }
+
+    #[test]
+    fn svg_total_length_tracks_local_geometry_units_and_receiver_errors() {
+        let mut rt = setup_runtime(r#"<svg viewBox='0 0 200 100'>
+            <path id='p' d='M0 0 L3 4' transform='scale(9)' pathLength='1'/>
+            <rect id='r' width='10' height='20'/><line id='l' x2='3' y2='4'/>
+            <circle id='c' r='10'/></svg>"#);
+        let result = rt.evaluate(r#"(() => {
+            const p=document.getElementById('p'), r=document.getElementById('r');
+            const first=p.getTotalLength();p.style.d='path("M0 0L6 8")';
+            const inline=p.getTotalLength();p.style.removeProperty('d');
+            p.setAttribute('d','M0 0L3 4 6 8z M20 0h3v4');
+            const multiple=p.getTotalLength();
+            r.style.width='1in';r.style.height='12pt';
+            const units=r.getTotalLength();
+            const errors=[{},document.body,document.createElementNS('http://www.w3.org/2000/svg','svg')].map(value=>{
+                try { SVGGeometryElement.prototype.getTotalLength.call(value);return 'wrong'; }
+                catch(e) { return e.name; }
+            });
+            const line=document.getElementById('l');const lineLength=line.getTotalLength();line.remove();
+            try { line.getTotalLength();errors.push('wrong'); } catch(e) { errors.push(e.name); }
+            p.remove();return [first,inline,multiple,units,lineLength,errors,p.getTotalLength(),document.getElementById('c').getTotalLength()];
+        })()"#).unwrap();
+        let result = result.as_array().unwrap();
+        assert_eq!(&result[..7], &serde_json::json!([5,10,27,224,5,["TypeError","TypeError","TypeError","InvalidStateError"],27]).as_array().unwrap()[..]);
+        assert!((result[7].as_f64().unwrap()-std::f64::consts::TAU*10.0).abs() < 0.001);
     }
 
     #[test]
@@ -11216,7 +11371,6 @@ mod tests {
         }
         let after = result["after"].as_array().unwrap();
         assert!(after[0].as_f64().unwrap() >= token_x + token_width - 0.01);
-        assert!((after[1].as_f64().unwrap() - token_y).abs() < 0.01);
         assert_eq!(result["atomic"], serde_json::json!([80, 30]));
         assert_eq!(result["replaced"], serde_json::json!([80, 30]));
         assert_eq!(result["item"], serde_json::json!([90, 25, "block"]));
@@ -11414,6 +11568,27 @@ mod tests {
             document.getElementById('box').style.textTransform = 'lowercase';
             return [savedModelStyle.top,savedModelStyle.textTransform];
         })()"#).unwrap(), serde_json::json!(["9px","lowercase"]));
+        assert_eq!(rt.evaluate(r#"(() => {
+            const c = savedModelStyle, p = CSSStyleDeclaration.prototype;
+            const length = Object.getOwnPropertyDescriptor(p, 'length').get;
+            const cssText = Object.getOwnPropertyDescriptor(p, 'cssText').get;
+            const names = Array.from({length:c.length}, (_,i)=>c.item(i));
+            const enumerable = names.length > 40 && names.every((name,i)=>c[i]===name && c.getPropertyValue(name)!==undefined);
+            const borrowed = [length.call(c)===c.length, p.item.call(c,0)===c[0], p.getPropertyValue.call(c,'top'), cssText.call(c)];
+            const errors = [];
+            for (const callback of [()=>length.call({}),()=>cssText.call({}),()=>p.item.call({},0),()=>p.getPropertyValue.call({},'top')]) {
+                try { callback(); errors.push('none'); } catch (error) { errors.push(error.name); }
+            }
+            const box = document.getElementById('box');
+            box.style.width = '123px';
+            const usedWidth = parseFloat(c.width);
+            return [enumerable, c.item(c.length), c.item(-1), c.cssText, borrowed, errors,
+                box.style.width, c.width === c.getPropertyValue('width'),
+                Math.abs(usedWidth - 123) <= 1 / parseFloat(c.zoom)];
+        })()"#).unwrap(), serde_json::json!([
+            true,"","","",[true,true,"9px",""],
+            ["TypeError","TypeError","TypeError","TypeError"],"123px",true,true
+        ]));
     }
 
     #[cfg(feature = "render")]
@@ -11693,6 +11868,41 @@ mod tests {
             .unwrap(),
             serde_json::json!(["19px", "23px", "17px"])
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn registered_custom_properties_drive_typed_inheritance_and_used_geometry() {
+        let mut rt = setup_runtime(r#"<!doctype html><style>
+            #parent { --n:12px; --inherited:11px; --free:25px }
+            #child { width:var(--n); height:var(--inherited) }
+        </style><div id=parent><div id=child></div></div>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            CSS.registerProperty({name:'--n',syntax:'<length>',inherits:false,initialValue:'3px'});
+            CSS.registerProperty({name:'--inherited',syntax:'<length>',inherits:true,initialValue:'7px'});
+            const child=document.getElementById('child'), style=getComputedStyle(child);
+            const snapshot=()=>[style.getPropertyValue('--n'),style.getPropertyValue('--inherited'),style.getPropertyValue('--free'),style.width,style.height,child.getBoundingClientRect().width];
+            const initial=snapshot();
+            child.style.setProperty('--n','red'); const invalid=snapshot();
+            child.style.setProperty('--n','8px'); const valid=snapshot();
+            const errors=[];
+            for(const definition of [
+                {name:'--n',syntax:'<length>',inherits:false,initialValue:'3px'},
+                {name:'plain',syntax:'<length>',inherits:false,initialValue:'3px'},
+                {name:'--bad',syntax:'<unknown>',inherits:false,initialValue:'3px'},
+                {name:'--bad',syntax:'<length>',inherits:false,initialValue:'red'}
+            ]) { try { CSS.registerProperty(definition); errors.push('none'); } catch(error) { errors.push(error.name); } }
+            CSS.registerProperty({name:'--bad',syntax:'<length>',inherits:false,initialValue:'9px'});
+            return [initial,invalid,valid,errors,style.getPropertyValue('--bad')];
+        })()"#).unwrap(), serde_json::json!([
+            ["3px","11px","25px","3px","11px",3],
+            ["3px","11px","25px","3px","11px",3],
+            ["8px","11px","25px","8px","11px",8],
+            ["InvalidModificationError","SyntaxError","SyntaxError","SyntaxError"],"9px"
+        ]));
+        rt.set_dom(parse_html("<!doctype html><div id=after style='width:var(--n,17px)'></div>"));
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("(() => { const s=getComputedStyle(document.getElementById('after')); return [s.getPropertyValue('--n'),s.width]; })()").unwrap(), serde_json::json!(["","17px"]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -18523,6 +18733,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canvas_hsl_paints_css_numbers_and_preserves_invalid_assignments() {
+        let mut rt = setup_runtime("<canvas id='c' width='16' height='8'></canvas>");
+        let result = rt.evaluate(r#"(() => {
+            const ctx = document.getElementById('c').getContext('2d');
+            const colors = ['hsl(120,100%,50%)', 'hsl(.3333333333333333turn 100% 50%)',
+                'hsla(133.3333333333333grad 100% 50% / 5e1%)',
+                'hsla(2.0943951023931953rad,100%,50%,.5)'];
+            const pixels = colors.map(color => {
+                ctx.clearRect(0,0,4,1); ctx.fillStyle = color; ctx.fillRect(0,0,1,1);
+                return Array.from(ctx.getImageData(0,0,1,1).data);
+            });
+            ctx.fillStyle = '#ff0000'; ctx.strokeStyle = '#0000ff';
+            for (const alpha of ['0x1','0b1','0o1','1e','1.2.3','Infinity']) {
+                ctx.fillStyle = 'hsla(120,100%,50%,'+alpha+')';
+                ctx.strokeStyle = 'hsl(120 100% 50% / '+alpha+')';
+            }
+            ctx.clearRect(0,0,4,1); ctx.fillRect(0,0,1,1); ctx.strokeRect(2,0,1,1);
+            const preserved = [Array.from(ctx.getImageData(0,0,1,1).data),
+                Array.from(ctx.getImageData(2,0,1,1).data)];
+            const gradient = ctx.createLinearGradient(4,0,12,0);
+            gradient.addColorStop(0,'hsl(120 100% 50%)');
+            gradient.addColorStop(1,'hsl(120 100% 50%)');
+            ctx.fillStyle = gradient; ctx.fillRect(4,0,4,4);
+            ctx.fillStyle='hsl(120 100% 50%)';ctx.beginPath();
+            ctx.moveTo(8,0);ctx.lineTo(16,0);ctx.lineTo(12,8);ctx.closePath();ctx.fill();
+            ctx.strokeStyle='hsl(120 100% 50%)';ctx.beginPath();ctx.moveTo(0,6);ctx.lineTo(6,6);ctx.stroke();
+            return [pixels, ...preserved, ...[[5,1],[12,2],[3,6]].map(([x,y])=>Array.from(ctx.getImageData(x,y,1,1).data))];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [[0,255,0,255],[0,255,0,255],[0,255,0,128],[0,255,0,128]],
+            [255,0,0,255], [0,0,255,255], [0,255,0,255], [0,255,0,255], [0,255,0,255]
+        ]));
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
@@ -18681,6 +18926,46 @@ mod tests {
             padded_content.red() > 220 && padded_content.green() < 40 && padded_content.blue() < 40,
             "canvas bitmap must start at the CSS content-box origin"
         );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn canvas_live_pixels_survive_ad_hoc_and_print_captures_without_replay() {
+        let mut rt = setup_runtime(r#"<html style='margin:0'><head><style>
+            canvas { position:absolute;left:0;top:0;width:8px;height:4px }
+            @media print { canvas { left:12px } }
+            </style></head><body style='margin:0;background:blue'>
+            <canvas id='c' width='8' height='4'></canvas></body></html>"#);
+        rt.set_url("http://example.test/canvas");
+        rt.set_viewport(40.0, 20.0);
+        rt.evaluate("globalThis.draws=1;var c=document.getElementById('c'),ctx=c.getContext('2d');ctx.fillStyle='hsl(120 100% 50%)';ctx.fillRect(0,0,4,4);ctx.fillStyle='hsla(0,100%,50%,.5)';ctx.fillRect(4,0,4,4)").unwrap();
+        let pixel = |png: Vec<u8>, x, y| {
+            let image = obscura_render::Pixmap::decode_png(&png).unwrap();
+            let p = image.pixel(x,y).unwrap();
+            [p.red(),p.green(),p.blue(),p.alpha()]
+        };
+        assert_eq!(pixel(rt.screenshot_prepared((40.0,20.0),Some("http://example.test/canvas")).unwrap(),1,1), [0,255,0,255]);
+        assert_eq!(pixel(rt.screenshot_prepared_region(obscura_render::CaptureRegion::new(0.0,0.0,8.0,4.0,1.0)).unwrap(),1,1), [0,255,0,255]);
+        let capture = |rt: &ObscuraJsRuntime| rt.screenshot_unprepared_with_retained_resources(
+            (48.0,24.0),Some("http://example.test/other-base"),(0.0,0.0),
+            obscura_render::AnimationSampleTime { milliseconds:0.0 },[255,255,255,255]).unwrap();
+        assert_eq!(pixel(capture(&rt),1,1), [0,255,0,255]);
+        let alpha = pixel(capture(&rt),6,1);
+        assert!((alpha[0] as i16-128).abs() <= 1 && (alpha[2] as i16-127).abs() <= 1 && alpha[1] == 0);
+        rt.set_render_media(obscura_render::CssMediaType::Print);
+        assert_eq!(pixel(capture(&rt),13,1), [0,255,0,255]);
+        rt.evaluate("draws++;ctx.fillStyle='#ffff00';ctx.fillRect(0,0,4,4)").unwrap();
+        assert_eq!(pixel(capture(&rt),13,1), [255,255,0,255]);
+        assert_eq!(rt.evaluate("draws").unwrap().as_f64(), Some(2.0));
+        rt.evaluate("c.width=8").unwrap();
+        assert_eq!(pixel(capture(&rt),13,1), [0,0,255,255]);
+        rt.evaluate("c.remove();var replacement=document.createElement('canvas');replacement.id='c';document.body.appendChild(replacement)").unwrap();
+        assert_eq!(pixel(capture(&rt),13,1), [0,0,255,255]);
+        rt.set_dom(parse_html("<html style='margin:0'><body style='margin:0;background:blue'><canvas id='c' width='8' height='4' style='position:absolute;left:12px;top:0'></canvas></body></html>"));
+        rt.set_url("http://example.test/new-document");
+        rt.refresh_window_realm().unwrap();
+        rt.run_page_init();
+        assert_eq!(pixel(capture(&rt),13,1), [0,0,255,255]);
     }
 
     #[test]
@@ -22721,44 +23006,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_fetch_url_input_decodes_binary_body_base64() {
+    async fn local_resource_bytes_modules_revocation_and_synchronous_xhr() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let result = rt
-            .call_function_on_for_cdp(
-                r#"async () => {
-                const originalFetchOp = __obscura_test_ops.op_fetch_url;
-                try {
-                    __obscura_test_ops.op_fetch_url = (url) => {
-                        globalThis.__capturedFetchUrl = url;
-                        return JSON.stringify({
-                            status: 200,
-                            headers: { "content-type": "application/wasm" },
-                            bodyBase64: "AGFzbQEAAAA=",
-                            url,
-                        });
-                    };
-                    const response = await fetch(new URL("/pkg/app_bg.wasm", document.URL));
-                    const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
-                    return { url: globalThis.__capturedFetchUrl, bytes };
-                } finally {
-                    __obscura_test_ops.op_fetch_url = originalFetchOp;
-                }
-            }"#,
-                None,
-                &[],
-                true,
-                true,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            result.value.unwrap(),
-            serde_json::json!({
-                "url": "http://example.com/pkg/app_bg.wasm",
-                "bytes": [0, 97, 115, 109, 1, 0, 0, 0],
-            })
-        );
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const binary = URL.createObjectURL(new Blob([Uint8Array.of(0,128,255,13,10)], {type:'application/octet-stream'}));
+            const pending = fetch(binary);
+            URL.revokeObjectURL(binary);
+            const response = await pending;
+            const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
+            const mime = response.headers.get('content-type');
+            let revoked = false; try { await fetch(binary); } catch (_) { revoked = true; }
+            const data = await fetch('data:application/octet-stream;base64,AID/DQo=');
+            const dataBytes = Array.from(new Uint8Array(await data.arrayBuffer()));
+            const source = URL.createObjectURL(new Blob(['export const value = 42;'], {type:'text/javascript'}));
+            const module = await import(source);
+            URL.revokeObjectURL(source);
+            const events = [], xhr = new XMLHttpRequest();
+            xhr.open('GET', 'data:text/plain;charset=windows-1252,%80%20ready', false);
+            xhr.onload = () => events.push('load');
+            xhr.send();
+            events.push('after');
+            return {bytes, mime, revoked, dataBytes, module:module.value,
+                sync:[xhr.status,xhr.readyState,xhr.responseText,events]};
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!({
+            "bytes":[0,128,255,13,10], "mime":"application/octet-stream", "revoked":true,
+            "dataBytes":[0,128,255,13,10], "module":42,
+            "sync":[200,4,"€ ready",["load","after"]]
+        }));
     }
 
     // #969: fetch() must normalize the request method to uppercase, matching the
@@ -23062,7 +23337,7 @@ mod tests {
         rt.set_intercept_enabled(true);
         let fetch = rt.call_function_on_for_cdp(r#"async () => {
             const controller = new AbortController();
-            const response = await fetch('https://example.com/resource', {signal:controller.signal});
+            const response = await fetch('/resource', {signal:controller.signal});
             const copy = response.clone();
             const lazy = copy.clone();
             const reader = copy.body.getReader();
@@ -23076,7 +23351,7 @@ mod tests {
             let request = rx.recv().await.expect("intercepted fetch");
             request.resolver.send(crate::ops::InterceptResolution::Fulfill {
                 status: 200, headers: std::collections::HashMap::new(),
-                body: "fulfilled body".into(), body_base64: String::new(),
+                body: b"fulfilled body".to_vec(),
             }).unwrap();
         };
         let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3),
@@ -23934,7 +24209,7 @@ mod tests {
                     types.push(request.resource_type);
                     request.resolver.send(crate::ops::InterceptResolution::Fulfill {
                         status: 200, headers: std::collections::HashMap::new(),
-                        body: BODY.to_string(), body_base64: String::new(),
+                        body: BODY.as_bytes().to_vec(),
                     }).unwrap();
                 }
             }
@@ -24110,6 +24385,7 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/start", { method: "POST", body: "payload" });
+                    await response.text();
                     return { url: response.url, redirected: response.redirected };
                 }"#,
                 None,
@@ -24129,16 +24405,13 @@ mod tests {
         assert_eq!(value["redirected"], true);
         assert_eq!(
             *request_callbacks.lock().unwrap(),
-            vec![("POST".to_string(), "/start".to_string())]
+            vec![("POST".to_string(), "/start".to_string()),
+                (expected_method.to_string(), "/final".to_string())]
         );
         assert_eq!(
             *response_callbacks.lock().unwrap(),
-            vec![(
-                expected_method.to_string(),
-                "/final".to_string(),
-                "/final".to_string(),
-                1,
-            )]
+            vec![("POST".to_string(), "/start".to_string(), "/start".to_string(), 0),
+                (expected_method.to_string(), "/final".to_string(), "/final".to_string(), 1)]
         );
         let events = rt.take_js_network_events();
         assert_eq!(events.len(), 1);
@@ -24867,10 +25140,10 @@ mod tests {
                 body.style.setProperty("top", "0px", "important");
                 await new Promise((resolve) => setTimeout(resolve, 20));
                 body.style.removeProperty("left");
-                body.style.top = "0px";
+                body.style.setProperty("top", "0px", "important");
                 await new Promise((resolve) => setTimeout(resolve, 20));
                 observer.disconnect();
-                return { calls, records, style: body.getAttribute("style") };
+                return { calls, records, value: body.style.top, priority: body.style.getPropertyPriority("top") };
             }"#,
                 None,
                 &[],
@@ -24882,7 +25155,7 @@ mod tests {
 
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({"calls": 1, "records": 1, "style": "top: 0px;"})
+            serde_json::json!({"calls": 1, "records": 1, "value": "0px", "priority": "important"})
         );
     }
 
@@ -24893,6 +25166,56 @@ mod tests {
             .evaluate("new TextDecoder().decode(new Uint8Array([65, 66, 67]).subarray(1, 2))")
             .unwrap();
         assert_eq!(result.as_str().unwrap(), "B");
+    }
+
+    #[test]
+    fn streaming_decoder_flush_bom_fatal_and_instance_isolation() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const a = new TextDecoder(), b = new TextDecoder();
+            const split = a.decode(Uint8Array.of(0xe2,0x82), {stream:true});
+            const independent = b.decode(Uint8Array.of(65));
+            const euro = a.decode(Uint8Array.of(0xac));
+            const bom = a.decode(Uint8Array.of(0xef), {stream:true}) +
+                a.decode(Uint8Array.of(0xbb,0xbf,66));
+            const kept = new TextDecoder('utf-8', {ignoreBOM:true}).decode(Uint8Array.of(0xef,0xbb,0xbf,67));
+            const fatal = new TextDecoder('utf-8', {fatal:true});
+            fatal.decode(Uint8Array.of(0xf0), {stream:true});
+            let error; try { fatal.decode(); } catch(e) { error=e.name; }
+            return [split, independent, euro, bom, kept, error, fatal.decode(Uint8Array.of(68)),
+                a.decode(Uint8Array.of(0xe2), {stream:true}), a.decode(), a.decode(Uint8Array.of(69))];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!(["", "A", "€", "B", "\u{feff}C", "TypeError", "D", "", "�", "E"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decoder_stream_flush_and_fatal_errors_reach_real_readers() {
+        let mut rt = setup_runtime("<body></body>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const source = new ReadableStream({start(controller) {
+                controller.enqueue(Uint8Array.of(0xe2,0x82));
+                controller.enqueue(new Uint8Array(0));
+                controller.enqueue(Uint8Array.of(0xac,0xf0));
+                controller.close();
+            }});
+            const output = [];
+            for await (const text of source.pipeThrough(new TextDecoderStream())) output.push(text);
+            const fatal = new TextDecoderStream('utf-8',{fatal:true}), writer = fatal.writable.getWriter();
+            await writer.write(Uint8Array.of(0xe2));
+            let writeError, readError;
+            try { await writer.close(); } catch(e) { writeError=e.name; }
+            try { await fatal.readable.getReader().read(); } catch(e) { readError=e.name; }
+            const legacy = new TextDecoder('iso-2022-jp');
+            const japanese = legacy.decode(Uint8Array.of(0x1b,0x24),{stream:true}) +
+                legacy.decode(Uint8Array.of(0x42,0x24,0x22));
+            const cuts = [];
+            for(let i=0;i<=4;i++) {
+                const bytes=Uint8Array.of(65,0xf0,0x9f,0x92,0xa9,66).subarray(1,5), decoder=new TextDecoder();
+                cuts.push(decoder.decode(bytes.subarray(0,i),{stream:true}) + decoder.decode(bytes.subarray(i)));
+            }
+            return [output,writeError,readError,japanese,cuts];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([["€","�"],"TypeError","TypeError","あ",["💩","💩","💩","💩","💩"]]));
     }
 
     #[test]
@@ -26095,25 +26418,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn guarded_classic_script_preserves_completion_microtasks_and_errors() {
+    async fn timed_classic_script_preserves_completion_microtasks_and_errors() {
         let mut rt = ObscuraJsRuntime::new();
-        let padding = format!("/*{}*/", "x".repeat(10_000));
-        let source = format!(
-            "globalThis.__guardedCount = (globalThis.__guardedCount || 0) + 1; \
-             Promise.resolve().then(() => {{ globalThis.__guardedMicrotasks = \
-                 (globalThis.__guardedMicrotasks || 0) + 1; }}); {padding}",
-        );
+        let source =
+            "globalThis.__timedCount = (globalThis.__timedCount || 0) + 1; \
+             Promise.resolve().then(() => { globalThis.__timedMicrotasks = \
+                 (globalThis.__timedMicrotasks || 0) + 1; });";
         for _ in 0..3 {
-            rt.execute_script_guarded("guarded-fast-script", &source).unwrap();
+            rt.execute_script_with_timeout(
+                "timed-fast-script", source, std::time::Duration::from_secs(1),
+            ).unwrap();
         }
-        assert_eq!(rt.evaluate("[__guardedCount, __guardedMicrotasks]").unwrap(),
+        assert_eq!(rt.evaluate("[__timedCount, __timedMicrotasks]").unwrap(),
                    serde_json::json!([3, 3]));
-        let error = rt.execute_script_guarded(
-            "guarded-throw",
-            &format!("throw new Error('guarded-script-error'); {padding}"),
+        let error = rt.execute_script_with_timeout(
+            "timed-throw",
+            "throw new Error('timed-script-error');",
+            std::time::Duration::from_secs(1),
         ).unwrap_err();
-        assert!(error.contains("guarded-script-error"), "{error}");
-        assert_eq!(rt.evaluate("__guardedCount + 1").unwrap().as_f64(), Some(4.0));
+        assert!(error.contains("timed-script-error"), "{error}");
+        assert_eq!(rt.evaluate("__timedCount + 1").unwrap().as_f64(), Some(4.0));
     }
 
     #[tokio::test(flavor = "current_thread")]

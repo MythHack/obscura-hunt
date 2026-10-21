@@ -6,11 +6,16 @@ Top-level flags apply to every subcommand.
 -v, --verbose                Enable info logging
 -p, --port <PORT>            CDP port (default 9222)
     --proxy <URL>            HTTP or SOCKS5 proxy
+    --regional-config <FILE> Regional identity JSON resolved before startup
+    --geoip <MODE_OR_IP>     off | auto | literal IPv4/IPv6; override GeoIP mode
+    --regional-info          Print resolved regional identity/provenance and exit
     --stealth                Consistent browser fingerprint + tracker blocking
     --obey-robots            Respect robots.txt
     --user-agent <UA>        Override the User-Agent
     --storage-dir <DIR>      Persistent cookies and localStorage
     --allow-private-network  Permit loopback / RFC1918 / link-local
+    --allow-network <CIDR>   Narrow private-address exemption (repeatable/comma-separated)
+    --allow-file-access      Permit explicitly requested local file navigation
     --v8-flags <FLAGS>       Raw V8 flags, applied at startup
     --font-dir <DIR>         Add a font directory (repeatable; render builds)
     --no-system-fonts       Use only bundled and explicitly added fonts
@@ -26,6 +31,19 @@ without disabling explicit directories or bundled fallbacks. Both options work
 before or after `fetch`, `serve`, `scrape`, and `mcp`; scrape workers inherit the
 same policy. Body text, text measurement, form controls, and SVG share that policy.
 No-render builds reject either font option.
+
+`--allow-network` adds CIDRs to `OBSCURA_ALLOW_NETWORK`; it exempts only those
+ranges from the private/reserved-address deny-set, not from other request
+permissions. It is not a public-address allowlist. Invalid ranges fail startup.
+See [file and address permissions](Configure-stealth-and-proxies.md#local-file-and-address-permissions).
+
+Regional configuration is resolved before the first request and V8 isolate.
+GeoIP defaults to `off`, so it does not probe the network unless selected.
+`--regional-config FILE` loads JSON, `--geoip` overrides its mode, and
+`--regional-info` reports the resolved profile without opening a page. Auto
+mode needs explicitly configured local data/provenance and a discovery route;
+setting coordinates does not grant geolocation permission. See
+[regional identity and routing](Configure-stealth-and-proxies.md#regional-identity-location-permission-and-rtc-routing).
 
 ## `obscura fetch <URL>`
 
@@ -93,7 +111,7 @@ Run the CDP server. Puppeteer and Playwright connect over WebSocket.
 -v, --verbose                Enable info logging
 ```
 
-Default endpoint is `ws://127.0.0.1:9222`.
+Default browser endpoint is `ws://127.0.0.1:9222/devtools/browser`.
 
 ## `obscura scrape [URLS]...`
 

@@ -165,7 +165,7 @@ connect().catch(retry);
 
 - **Why captureScreenshot polling instead of screencast.** `Page.startScreencast` frames stream to the CDP session that drives the page, so once an agent session takes over, a passive viewer session stops receiving frames. It also only produces frames when the page paints something new. An explicit `Page.captureScreenshot` always reflects the current page state regardless of which session navigated, which makes it the reliable choice for watching someone else's session.
 - **Acknowledge every frame.** Without `Page.screencastFrameAck`, frame delivery stops.
-- **One client per page socket.** If an agent's CDP client already holds the page's `webSocketDebuggerUrl`, connecting to it again fails with `503`. Attach through the browser endpoint instead (`ws://127.0.0.1:9222/devtools/browser`) using `Target.attachToTarget` with `flatten: true`, then pass the returned session id as `sessionId` on every command.
+- **Independent sessions.** Page sockets bind directly to the advertised target. Browser sockets can attach to the same target with `Target.attachToTarget` and `flatten: true`; pass the returned `sessionId` on commands. Enable each session's required domains independently.
 - **Still images vs continuous view.** The MCP server exposes `browser_screenshot` for one-shot captures. Screencast is the right tool when you want to watch continuously; it stays CDP-only by design.
 
 ## Verifying

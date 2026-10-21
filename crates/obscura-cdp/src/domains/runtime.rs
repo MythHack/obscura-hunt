@@ -121,7 +121,7 @@ async fn emit_post_eval_nav(
         )
     };
     if navigation == PendingNavigationOutcome::SameDocument {
-        super::page::emit_same_document_navigation(ctx, session_id, &frame_id, &page_url);
+        super::page::emit_same_document_navigation(ctx, session_id, &frame_id, &page_url, "historyApi");
         return Ok(());
     }
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
@@ -426,9 +426,7 @@ pub async fn handle(
             Ok(json!({}))
         }
         "runIfWaitingForDebugger" => {
-            if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.set_window_debugger_wait(false);
-            }
+            if let Some(session) = session_id { ctx.resume_debugger_session(session); }
             Ok(json!({}))
         }
         "getExceptionDetails" => Ok(json!({ "exceptionDetails": null })),

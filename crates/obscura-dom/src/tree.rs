@@ -1,6 +1,6 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -270,6 +270,115 @@ pub struct FormControlState {
     pub indeterminate: bool,
 }
 
+/// HTML range's numeric domain, shared by script, native input and paint.
+#[derive(Clone, Copy, Debug)]
+pub struct InputRangeState {
+    pub min: f64,
+    pub max: f64,
+    pub step: Option<f64>,
+    pub base: f64,
+    pub value: f64,
+}
+
+fn html_float(raw: &str) -> Option<f64> {
+    let bytes = raw.as_bytes();
+    let mut i = usize::from(bytes.first() == Some(&b'-'));
+    let start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+    let integer = i > start;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let fraction = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+        if i == fraction { return None; }
+    } else if !integer { return None; }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) { i += 1; }
+        let exponent = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+        if i == exponent { return None; }
+    }
+    if i != bytes.len() { return None; }
+    raw.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+// Attribute number conversion follows HTML's permissive parsing algorithm;
+// range values themselves must satisfy the stricter valid-number grammar.
+fn html_attribute_float(raw: &str) -> Option<f64> {
+    let raw = raw.trim_start_matches(['\t', '\n', '\x0c', '\r', ' ']);
+    let bytes = raw.as_bytes();
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let integer_start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+    let mut digits = i - integer_start;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        let fraction_start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+        digits += i - fraction_start;
+    }
+    if digits == 0 { return None; }
+    let significand_end = i;
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) { i += 1; }
+        let exponent_start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) { i += 1; }
+        if i == exponent_start { i = significand_end; }
+    }
+    raw[..i].parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+impl InputRangeState {
+    fn from_node(node: &Node, value: Option<&str>) -> Option<Self> {
+        if !matches!(&node.data, NodeData::Element { name, .. } if &*name.local == "input" && &*name.ns == "http://www.w3.org/1999/xhtml")
+            || !node.get_attribute("type").is_some_and(|t| t.eq_ignore_ascii_case("range")) { return None; }
+        let parsed_min = node.get_attribute("min").and_then(html_attribute_float);
+        let min = parsed_min.unwrap_or(0.0);
+        let max = node.get_attribute("max").and_then(html_attribute_float).unwrap_or(100.0).max(min);
+        let step_attr = node.get_attribute("step").unwrap_or("");
+        let step = if step_attr.eq_ignore_ascii_case("any") { None }
+            else { Some(html_attribute_float(step_attr).filter(|step| *step > 0.0).unwrap_or(1.0)) };
+        let base = parsed_min.or_else(|| node.get_attribute("value").and_then(html_attribute_float)).unwrap_or(0.0);
+        let mut state = Self { min, max, step, base, value: min };
+        let raw = value.or_else(|| node.get_attribute("value"));
+        state.value = state.sanitize(raw.and_then(html_float));
+        Some(state)
+    }
+
+    pub fn sanitize(self, number: Option<f64>) -> f64 {
+        let default = self.min / 2.0 + self.max / 2.0;
+        let mut value = number.filter(|n| n.is_finite()).unwrap_or(default).clamp(self.min, self.max);
+        if let Some(step) = self.step {
+            let offset = (value - self.base) / step;
+            if offset.is_finite() {
+                let lower = self.base + offset.floor() * step;
+                let upper = self.base + offset.ceil() * step;
+                let epsilon = f64::EPSILON * value.abs().max(lower.abs()).max(upper.abs()).max(step) * 4.0;
+                let lower_ok = lower >= self.min - epsilon && lower <= self.max + epsilon;
+                let upper_ok = upper >= self.min - epsilon && upper <= self.max + epsilon;
+                value = if lower_ok && (!upper_ok || value - lower + epsilon < upper - value) { lower }
+                    else if upper_ok { upper } else { value };
+                // Remove arithmetic noise without truncating meaningful digits.
+                let precision = (0..=15).find(|digits| {
+                    let scale = 10_f64.powi(*digits);
+                    [step, self.base].iter().all(|n| {
+                        let scaled = n * scale;
+                        (*n == 0.0 || scaled.abs() >= 1.0) && (scaled - scaled.round()).abs() <= f64::EPSILON * scaled.abs().max(1.0) * 4.0
+                    })
+                });
+                if let Some(digits) = precision {
+                    let scale = 10_f64.powi(digits);
+                    if (value * scale).abs() < 9e15 { value = (value * scale).round() / scale; }
+                }
+            }
+        }
+        value = value.clamp(self.min, self.max);
+        if value == 0.0 { 0.0 } else { value }
+    }
+}
+
 pub(crate) struct DomTreeInner {
     pub(crate) nodes: Vec<Option<Node>>,
     pub(crate) free_list: Vec<u32>,
@@ -282,6 +391,12 @@ pub(crate) struct DomTreeInner {
     /// Successful native topology changes, including detached subtrees.
     topology_generation: u64,
     hovered: Option<NodeId>,
+    focused: Option<NodeId>,
+    target_fragment: String,
+    property_registrations: BTreeMap<String, String>,
+    pub(crate) xml_documents: HashSet<NodeId>,
+    pub(crate) node_documents: HashMap<NodeId, NodeId>,
+    pub(crate) cdata_nodes: HashSet<NodeId>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -319,6 +434,12 @@ impl DomTree {
                 external_stylesheet_generation: 0,
                 topology_generation: 0,
                 hovered: None,
+                focused: None,
+                target_fragment: String::new(),
+                property_registrations: BTreeMap::new(),
+                xml_documents: HashSet::new(),
+                node_documents: HashMap::new(),
+                cdata_nodes: HashSet::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -329,6 +450,72 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn mark_xml_document(&self, document: NodeId) {
+        let mut inner = self.inner.borrow_mut();
+        inner.xml_documents.insert(document);
+        inner.node_documents.insert(document, document);
+    }
+
+    pub fn node_document(&self, node: NodeId) -> NodeId {
+        let inner = self.inner.borrow();
+        inner.node_documents.get(&node).copied().unwrap_or(inner.document)
+    }
+
+    pub fn is_xml_node(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let document = inner.node_documents.get(&node).copied().unwrap_or(inner.document);
+        inner.xml_documents.contains(&document)
+    }
+
+    pub fn set_node_document(&self, root: NodeId, document: NodeId) {
+        if self.node_document(root) == document { return; }
+        if self.with_node(root, |node| node.first_child.is_none() && !matches!(node.data, NodeData::Element { template_contents: Some(_), .. })).unwrap_or(false) {
+            let mut inner = self.inner.borrow_mut();
+            if document == inner.document { inner.node_documents.remove(&root); }
+            else { inner.node_documents.insert(root, document); }
+            return;
+        }
+        let mut stack = vec![root];
+        let mut remaining = self.node_slot_count();
+        while let Some(node) = stack.pop() {
+            if remaining == 0 { break; }
+            remaining -= 1;
+            stack.extend(self.children(node));
+            if let Some(contents) = self.with_node(node, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            }).flatten() { stack.push(contents); }
+            let mut inner = self.inner.borrow_mut();
+            if document == inner.document { inner.node_documents.remove(&node); }
+            else { inner.node_documents.insert(node, document); }
+        }
+    }
+
+    pub fn is_cdata(&self, node: NodeId) -> bool {
+        self.inner.borrow().cdata_nodes.contains(&node)
+    }
+
+    pub fn create_cdata(&self, contents: String) -> NodeId {
+        let node = self.new_node(NodeData::Text { contents });
+        self.inner.borrow_mut().cdata_nodes.insert(node);
+        node
+    }
+
+    fn copy_xml_metadata(&self, source: &DomTree, from: NodeId, to: NodeId) {
+        let cdata = source.is_cdata(from);
+        let document = source.node_document(from);
+        let is_document = source.borrow_inner().xml_documents.contains(&from);
+        let mut inner = self.inner.borrow_mut();
+        if cdata { inner.cdata_nodes.insert(to); }
+        if std::ptr::eq(self, source) && document != inner.document {
+            inner.node_documents.insert(to, document);
+        }
+        if is_document {
+            inner.xml_documents.insert(to);
+            inner.node_documents.insert(to, to);
+        }
     }
 
     pub fn topology_generation(&self) -> u64 {
@@ -474,6 +661,22 @@ impl DomTree {
         self.inner.borrow().form_controls.get(&node).cloned()
     }
 
+    pub fn input_range_state(&self, node: NodeId) -> Option<InputRangeState> {
+        let inner = self.inner.borrow();
+        let element = inner.nodes.get(node.index())?.as_ref()?;
+        let value = inner.form_controls.get(&node).and_then(|control| control.value.as_deref());
+        InputRangeState::from_node(element, value)
+    }
+
+    fn sanitize_range_value(inner: &mut DomTreeInner, node: NodeId) {
+        let Some(value) = inner.form_controls.get(&node).and_then(|control| control.value.as_deref()) else { return; };
+        let range = inner.nodes.get(node.index()).and_then(Option::as_ref)
+            .and_then(|element| InputRangeState::from_node(element, Some(value)));
+        if let Some(range) = range {
+            inner.form_controls.get_mut(&node).unwrap().value = Some(range.value.to_string());
+        }
+    }
+
     pub fn form_control_value_matches(&self, node: NodeId, value: &str) -> bool {
         self.inner
             .borrow()
@@ -541,10 +744,68 @@ impl DomTree {
         false
     }
 
+    pub fn set_focused(&self, node: Option<NodeId>) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.focused == node { return false; }
+        inner.focused = node;
+        true
+    }
+
+    pub fn is_focused(&self, node: NodeId) -> bool {
+        self.inner.borrow().focused == Some(node) && self.is_connected(node)
+    }
+
+    /// Focus-within follows the flat-tree ancestry, including slot and host edges.
+    /// Query traversal itself remains scoped to its ordinary/shadow tree.
+    pub fn is_focus_within(&self, node: NodeId) -> bool {
+        let mut current = self.inner.borrow().focused;
+        if current.is_none_or(|id| !self.is_connected(id)) { return false; }
+        let mut remaining = self.inner.borrow().nodes.len();
+        while let Some(id) = current {
+            if id == node { return true; }
+            if remaining == 0 { break; }
+            remaining -= 1;
+            current = self.assigned_slot(id).or_else(|| {
+                let inner = self.inner.borrow();
+                inner.shadow_roots.get(&id).map(|root| root.host)
+                    .or_else(|| inner.nodes.get(id.index()).and_then(Option::as_ref).and_then(|n| n.parent))
+            });
+        }
+        false
+    }
+
+    pub fn set_target_fragment(&self, fragment: &str) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.target_fragment == fragment { return false; }
+        inner.target_fragment.clear();
+        inner.target_fragment.push_str(fragment);
+        true
+    }
+
+    pub fn is_target(&self, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        !inner.target_fragment.is_empty() && inner.id_index.get(&inner.target_fragment) == Some(&node)
+            && inner.nodes.get(node.index()).and_then(Option::as_ref).is_some_and(|node| node.connected)
+    }
+
+    /// Script registrations are document-local and outrank stylesheet @property.
+    pub fn register_custom_property(&self, name: &str, source: String) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.property_registrations.contains_key(name) { return false; }
+        inner.property_registrations.insert(name.to_string(), source);
+        inner.external_stylesheet_generation = inner.external_stylesheet_generation.wrapping_add(1);
+        true
+    }
+
+    pub fn custom_property_registration_sources(&self) -> Vec<String> {
+        self.inner.borrow().property_registrations.values().cloned().collect()
+    }
+
     pub fn update_form_control_state(&self, node: NodeId, update: impl FnOnce(&mut FormControlState)) {
         let mut inner = self.inner.borrow_mut();
         if inner.nodes.get(node.index()).is_some_and(|entry| entry.as_ref().is_some_and(Node::is_element)) {
             update(inner.form_controls.entry(node).or_default());
+            Self::sanitize_range_value(&mut inner, node);
         }
     }
 
@@ -918,7 +1179,9 @@ impl DomTree {
             .is_some_and(|node| matches!(node.data, NodeData::Text { .. })) {
             Self::invalidate_cssom_source(&mut inner, id);
         }
-        inner.nodes.get_mut(id.index())?.as_mut().map(f)
+        let result = inner.nodes.get_mut(id.index())?.as_mut().map(f);
+        Self::sanitize_range_value(&mut inner, id);
+        result
     }
 
     pub fn append_child(&self, parent_id: NodeId, child_id: NodeId) {
@@ -975,6 +1238,7 @@ impl DomTree {
                 .is_some_and(|child| child.connected);
             (parent_connected, child_connected)
         };
+        self.set_node_document(child_id, self.node_document(parent_id));
         self.detach_for_reparent(child_id, child_connected && !parent_connected);
 
         let mut inner = self.inner.borrow_mut();
@@ -1049,6 +1313,7 @@ impl DomTree {
                 return;
             }
         }
+        self.set_node_document(new_sibling_id, self.node_document(parent_id));
 
         let child_connected = self.is_connected(new_sibling_id);
         self.detach_for_reparent(
@@ -1226,6 +1491,9 @@ impl DomTree {
             if matches!(inner.nodes.get(id.index()), Some(Some(_))) {
                 inner.form_controls.remove(&id);
                 inner.open_popovers.remove(&id);
+                inner.xml_documents.remove(&id);
+                inner.node_documents.remove(&id);
+                inner.cdata_nodes.remove(&id);
                 inner.nodes[id.index()] = None;
                 inner.free_list.push(id.0);
             }
@@ -1313,11 +1581,11 @@ impl DomTree {
         Some(self.children(root))
     }
 
-    /// Internal preorder traversal for synchronous reads such as selectors.
+    /// Preorder traversal for synchronous reads such as selectors.
     /// Unlike `descendants`, this does not allocate a snapshot of the subtree
     /// before the first result. Only deferred siblings on the current ancestor
     /// path are retained, and no RefCell borrow survives an iterator step.
-    pub(crate) fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    pub fn descendants_iter(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let mut next = self.with_node(node_id, |node| node.first_child).flatten();
         let mut siblings = Vec::new();
         let mut remaining = self.node_slot_count();
@@ -1649,15 +1917,12 @@ impl DomTree {
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
         let indexed = self.inner.borrow().id_index.get(id).copied();
-        if indexed.is_some_and(|node| self.containing_shadow_root(node).is_none()) {
+        if indexed.is_some_and(|node| self.is_connected(node) && self.containing_shadow_root(node).is_none()) {
             return indexed;
         }
 
-        // Creation happens before insertion, so the O(1) best-effort index can
-        // point at a shadow descendant. Never expose that node through
-        // document.getElementById; recover the first matching light-tree
-        // element in document order instead. Detached and template-content
-        // nodes retain the legacy best-effort lookup behavior used internally.
+        // Creation precedes insertion. A detached XML/HTML tree or shadow root
+        // must not leak through the active document's best-effort id index.
         self.descendants(self.document()).into_iter().find(|node_id| {
             self.with_node(*node_id, |node| node.get_attribute("id") == Some(id))
                 .unwrap_or(false)
@@ -1770,6 +2035,7 @@ impl DomTree {
         }
         let source_data = self.get_node(source_node_id)?.data;
         let cloned_root = self.new_node(source_data);
+        self.copy_xml_metadata(self, source_node_id, cloned_root);
         if let Some(mut state) = self.form_control_state(source_node_id) {
             state.indeterminate = false;
             self.update_form_control_state(cloned_root, |control| *control = state);
@@ -1783,6 +2049,7 @@ impl DomTree {
                 None => continue,
             };
             let cloned_node = self.new_node(source_data);
+            self.copy_xml_metadata(self, source_node, cloned_node);
             if let Some(mut state) = self.form_control_state(source_node) {
                 state.indeterminate = false;
                 self.update_form_control_state(cloned_node, |control| *control = state);
@@ -1855,6 +2122,7 @@ impl DomTree {
             };
 
             let new_id = self.new_node(node_data);
+            self.copy_xml_metadata(source, src_id, new_id);
             self.append_child(dest_parent, new_id);
             // The first node off the stack is source_node_id itself.
             if imported_root.is_none() {

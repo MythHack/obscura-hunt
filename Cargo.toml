@@ -68,6 +68,13 @@ cosmic-text = { path = "vendor/cosmic-text" }
 deno_core = { path = "vendor/deno_core-0.412.0" }
 # Keep core and serde on the same V8 version as the native SDK and snapshots.
 deno_v8 = { path = "vendor/deno_v8-0.4.0" }
+# Keep native verification in-policy and expose the prepared BoringSSL hook.
+rustls-platform-verifier = { path = "vendor/rustls-platform-verifier-0.7.1" }
+wreq = { path = "vendor/wreq-6.0.0-rc.31" }
+# Native symbol prefixing also isolates BoringSSL on Windows and Apple targets.
+btls-sys = { path = "vendor/btls-sys-0.5.6" }
+# Keep vendored MSVC OpenSSL debug records inside each object after rlib packing.
+openssl-sys = { path = "vendor/openssl-sys-0.9.117" }
 
 # Unwinding (the Rust default) is REQUIRED for the anti-panic protocol: ops wrap
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return

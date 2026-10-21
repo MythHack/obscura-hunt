@@ -83,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cookies_is_scoped_to_browser_context() {
         let mut ctx = CdpContext::new();
-        let browser_context_id = ctx.create_browser_context();
+        let browser_context_id = ctx.create_browser_context().unwrap();
         ctx.browser_context(&browser_context_id)
             .unwrap()
             .cookie_jar

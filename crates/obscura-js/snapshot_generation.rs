@@ -97,12 +97,16 @@ pub struct GeneratedSnapshot {
 }
 
 /// The bootstrap source for this checkout, stitched exactly like the runtime
-/// expects. `bootstrap.js` holds the Window facade and IndexedDB shim inside
-/// its private closure through these two markers.
+/// expects. Component sources stay inside bootstrap's private closure; Workers
+/// install the same WebCrypto source in their own native realm.
 fn bootstrap_js() -> String {
     include_str!("js/bootstrap.js")
         .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"))
+        .replace("/* WEBCRYPTO */", include_str!("js/webcrypto.js"))
         .replace("/* OBSCURA_WINDOWS */", include_str!("js/windows.js"))
+        .replace("/* OBSCURA_WORKERS */", &format!("{}(__obscuraCore.ops, null);", include_str!("js/worker.js")))
+        .replace("/* TEXT_DECODER */", &format!("{}(globalThis, __obscuraCore.ops);", include_str!("js/text_decoder.js")))
+        .replace("/* STREAMS */", &format!("{}(globalThis);", include_str!("js/streams.js")))
 }
 
 pub fn sidecar_path(blob: &Path) -> PathBuf {

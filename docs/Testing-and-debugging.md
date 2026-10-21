@@ -23,6 +23,27 @@ Use `cargo nextest`, not `cargo test`. Runtime tests require process isolation
 because the engine owns one V8 isolate per process. Render tests must run in
 release mode; debug builds are not a fidelity or performance gate.
 
+The default nextest profile stops an individual test after 120 seconds and
+writes `target/nextest/default/junit.xml` under the workspace directory. Keep that
+report when terminal output is truncated. The test deadline does not include
+compilation and must not be replaced by an unbounded command-level wait.
+
+For CDP fragment navigation, check the server's interception entry as well as
+the ordinary `Page.navigate` handler. A same-document fragment keeps the current
+DOM and JavaScript state, returns no new `loaderId`, and emits
+`Page.navigatedWithinDocument`. Reloading the fixture can look like a stale
+screenshot because it restores the initial DOM; do not bypass render caches to
+hide that navigation error.
+
+The October 2026 browser-contract remediation integration completed with 2552
+release/render tests passing, zero failing and five skipped. The final CSS and
+CDP fragment corrections were then checked through the affected real browser
+consumer, without repeating the full suite. Release CLI/worker pairs built for
+`render`, `render,stealth` and `--no-default-features`; the no-render build still
+reports eight non-blocking dead-code warnings. The scoped delivery record and
+remaining historical investigation limits are in
+[`remediate-upstream-browser-contracts`](../openspec/changes/remediate-upstream-browser-contracts/tasks.md).
+
 The PR checks workflow sets `RUSTC_WRAPPER` to an empty string: it uses the Rust
 dependency cache without installing `sccache`. This overrides the repository's
 wrapper default for cache repair, builds and tests. The release workflow installs
@@ -712,7 +733,7 @@ obscura serve --port 9222 --verbose
 In another shell:
 
 ```bash
-wscat -c ws://127.0.0.1:9222
+wscat -c ws://127.0.0.1:9222/devtools/browser
 > {"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}
 > {"id":2,"method":"Target.attachToTarget","params":{"targetId":"...","flatten":true}}
 > {"id":3,"sessionId":"...-session","method":"Page.navigate","params":{"url":"https://example.com"}}
@@ -762,7 +783,11 @@ Two pages tried to use V8 concurrently. The `v8_lock` was bypassed, or direct `J
 
 ### Test hangs
 
-A handler is awaiting something that never resolves. Run with `RUST_LOG=obscura=trace` and check the last log line before the hang.
+A slow test may be awaiting work or spending time in native CPU code. Inspect
+the failing test and its retained output before rerunning it. Use tracing only
+for that focused repro, not the full suite. Do not manufacture scheduling races
+with huge documents or arbitrary sleeps; keep the consumer-visible assertion
+and use a deterministic completion boundary where the test needs one.
 
 ## Reproducing user bug reports
 

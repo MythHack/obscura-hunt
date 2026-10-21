@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-10-20
+goal: 保留已批准的浏览器修复，补齐完整公钥 WebCrypto 与区域身份，并对 102 个开放 Issue 建立无虚假完成的追踪。

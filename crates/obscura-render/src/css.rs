@@ -1929,6 +1929,7 @@ fn compare_rule_cascade(
 }
 
 const PROPERTY_REGISTRATION_SELECTOR_PREFIX: &str = "\0property:";
+const FONT_FACE_SELECTOR: &str = "\0font-face";
 const KEYFRAMES_SELECTOR_PREFIX: &str = "\0keyframes:";
 const WEBKIT_KEYFRAMES_SELECTOR_PREFIX: &str = "\0webkit-keyframes:";
 
@@ -2845,6 +2846,7 @@ impl Stylesheet {
                     }
                     continue;
                 }
+                if selector == FONT_FACE_SELECTOR { continue; }
                 let sel_trim = selector.trim();
                 if let Some(base) = strip_pseudo_element(sel_trim, "before") {
                     if let Some(sel) = tree.compile_rule_selector(base) {
@@ -3083,7 +3085,7 @@ impl Stylesheet {
         Option<LayoutStyle>,
         Option<LayoutStyle>,
     ) {
-        let mut build = |rules: &PseudoRuleMap, matcher: &mut Matcher, is_placeholder: bool| {
+        let mut build = |rules: &PseudoRuleMap, matcher: &mut Matcher, is_placeholder: bool, before: bool| {
             let mut normal_matched: Vec<(u32, usize, usize)> = Vec::new();
             let mut important_matched: Vec<(u32, usize, usize)> = Vec::new();
             if rules.candidate_slot_count != 0 {
@@ -3173,7 +3175,8 @@ impl Stylesheet {
                 &mut important_matched,
             );
 
-            if normal_matched.is_empty() && important_matched.is_empty() {
+            let quoted = !is_placeholder && tree.with_node(nid, |node| node.as_element().is_some_and(|name| &*name.local == "q")).unwrap_or(false);
+            if !quoted && normal_matched.is_empty() && important_matched.is_empty() {
                 return None;
             }
             if normal_matched.len() > 1 {
@@ -3217,7 +3220,7 @@ impl Stylesheet {
                 style.color = Some([117, 117, 117, 255]);
             }
             let inherited_color_scheme_dark = host_style.color_scheme_dark;
-            let mut generated_content = None;
+            let mut generated_content = quoted.then(|| vec![crate::GeneratedContentItem::Quote { open: before, emit: true }]);
             for &(_, _, index) in &normal_matched {
                 let rule = &rules.rules[index];
                 if !rule.normal_flags.has_color_scheme {
@@ -3294,10 +3297,10 @@ impl Stylesheet {
                 })
             });
         (
-            build(&self.before_rules, matcher, false),
-            build(&self.after_rules, matcher, false),
+            build(&self.before_rules, matcher, false, true),
+            build(&self.after_rules, matcher, false, false),
             supports_placeholder
-                .then(|| build(&self.placeholder_rules, matcher, true))
+                .then(|| build(&self.placeholder_rules, matcher, true, false))
                 .flatten(),
         )
     }
@@ -3932,15 +3935,7 @@ impl Stylesheet {
                     }
                     "unset" | "revert" | "revert-layer" => inherit(&mut resolved_props),
                     _ => {
-                        let valid = registration.is_none_or(|entry| {
-                            substitute_var_value(&v, &resolved_props, 0)
-                                .is_some_and(|value| registered_value_matches(entry, &value))
-                        });
-                        if valid {
-                            resolved_props.insert(k, v);
-                        } else {
-                            set_initial(&mut resolved_props);
-                        }
+                        resolved_props.insert(k, v);
                     }
                 }
             }
@@ -3955,12 +3950,11 @@ impl Stylesheet {
                 let Some(value) = resolution_environment.get(&name) else {
                     continue;
                 };
-                if let Some(computed) = substitute_var_value(value, &resolution_environment, 0) {
+                if let Some(computed) = substitute_var_value(value, &resolution_environment, 0)
+                    .filter(|value| self.registered_custom_properties.get(&name).is_none_or(|entry| registered_value_matches(entry, value))) {
                     resolved_props.insert(name, computed);
-                } else if let Some(initial) = self
-                    .registered_custom_properties
-                    .get(&name)
-                    .and_then(|entry| entry.initial_value.clone())
+                } else if let Some(initial) = self.registered_custom_properties.get(&name)
+                    .and_then(|entry| entry.inherits.then(|| parent_props.get(&name).cloned()).flatten().or_else(|| entry.initial_value.clone()))
                 {
                     resolved_props.insert(name, initial);
                 } else {
@@ -5685,6 +5679,7 @@ fn generated_content_with_zero_counters(items: &[crate::GeneratedContentItem]) -
     for item in items {
         match item {
             crate::GeneratedContentItem::Text(value) => text.push_str(value),
+            crate::GeneratedContentItem::Quote { .. } => {},
             crate::GeneratedContentItem::Counter { style, .. } => {
                 text.push_str(&format_counter_value(0, *style));
             }
@@ -5722,12 +5717,13 @@ fn parse_generated_content_items(
         let name = &rest[..name_end];
         let after_name = rest[name_end..].trim_start();
         if !after_name.starts_with('(') {
-            // Quote-control keywords are valid generated-content items, but
-            // they do not contribute text in the current renderer.
+            // Quote depth is evaluated in flattened tree order after cascade.
             if matches!(
                 name.to_ascii_lowercase().as_str(),
                 "open-quote" | "close-quote" | "no-open-quote" | "no-close-quote"
             ) {
+                let keyword = name.to_ascii_lowercase();
+                items.push(crate::GeneratedContentItem::Quote { open: keyword.ends_with("open-quote"), emit: !keyword.starts_with("no-") });
                 rest = after_name;
                 continue;
             }
@@ -6032,9 +6028,24 @@ fn parse_stylesheet_for_viewport(css: &str, viewport: (f32, f32)) -> Vec<(String
             && !rule
                 .selector
                 .starts_with(PROPERTY_REGISTRATION_SELECTOR_PREFIX)
+            && rule.selector != FONT_FACE_SELECTOR
     })
     .map(|rule| (rule.selector, rule.declarations))
     .collect()
+}
+
+/// Font descriptors use the same conditional-rule parser as the author cascade.
+#[cfg(feature = "font-metadata")]
+pub(crate) fn font_face_blocks_for_viewport_and_media(
+    css: &str, viewport: (f32, f32), media_type: CssMediaType,
+) -> Vec<String> {
+    let mut conditions = vec![ContainerConditionNode {
+        parent: ContainerConditionId::NONE, alternatives: Vec::new(),
+    }];
+    parse_stylesheet_for_viewport_preserving_containers(
+        css, viewport, media_type, &mut conditions, ContainerConditionId::NONE,
+    ).into_iter().filter(|rule| rule.selector == FONT_FACE_SELECTOR)
+        .map(|rule| rule.declarations).collect()
 }
 
 fn parse_stylesheet_for_viewport_preserving_containers(
@@ -6240,6 +6251,13 @@ fn flush_at_rule(
                 layer: current_layer.cloned(),
             });
         }
+    } else if at_rule_prelude(at, "font-face").is_some_and(|prelude| prelude.is_empty()) {
+        rules.push(ParsedRule {
+            selector: FONT_FACE_SELECTOR.to_string(),
+            declarations: inner.to_string(),
+            container_condition_id: ContainerConditionId::NONE,
+            layer: current_layer.cloned(),
+        });
     } else if let Some(name) = at_rule_prelude(at, "property") {
         if name.starts_with("--") {
             rules.push(ParsedRule {
@@ -6272,8 +6290,28 @@ fn flush_at_rule(
             ),
         );
     }
-    // Other at-rules (@font-face, @import, ...) carry no
-    // layout-relevant rules for us, so drop them.
+    // Other at-rules (@import, ...) carry no layout-relevant rules here.
+}
+
+/// Validate the script registration before publishing any document state.
+pub fn register_custom_property(
+    tree: &DomTree, name: &str, syntax: &str, inherits: bool, initial: Option<&str>,
+) -> Result<(), &'static str> {
+    let mut parser = cssparser::Parser::new(name);
+    if !name.starts_with("--") || name == "--" || parser.expect_ident().is_err() || !parser.is_exhausted() {
+        return Err("SyntaxError");
+    }
+    // Serialize descriptors once, then run the same validator as @property.
+    // The supplied strings cannot introduce extra declarations or rules.
+    if syntax.contains(['"', '\\', ';', '{', '}']) || initial.is_some_and(|value| value.contains([';', '{', '}'])) {
+        return Err("SyntaxError");
+    }
+    let mut descriptors = format!("syntax:\"{syntax}\";inherits:{inherits};");
+    if let Some(initial) = initial { descriptors.push_str("initial-value:"); descriptors.push_str(initial); descriptors.push(';'); }
+    parse_property_registration(&descriptors).ok_or("SyntaxError")?;
+    let source = format!("@property {name} {{{descriptors}}}");
+    if !tree.register_custom_property(name, source) { return Err("InvalidModificationError"); }
+    Ok(())
 }
 
 fn parse_property_registration(descriptors: &str) -> Option<RegisteredCustomProperty> {
@@ -6328,7 +6366,10 @@ fn parse_property_registration(descriptors: &str) -> Option<RegisteredCustomProp
     if registration
         .initial_value
         .as_deref()
-        .is_some_and(|value| !registered_value_matches(&registration, value))
+        .is_some_and(|value| !registered_value_matches(&registration, value)
+            || value.to_ascii_lowercase().contains("var(")
+            || value.eq_ignore_ascii_case("currentcolor")
+            || (registration.syntax == "<length>" && ["em", "ex", "ch", "lh"].iter().any(|unit| value.ends_with(unit))))
     {
         return None;
     }

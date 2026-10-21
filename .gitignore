@@ -4,3 +4,4 @@ target/
 /obscura-*.tar.gz
 /obscura-*.zip
 /smoke.png
+*.log

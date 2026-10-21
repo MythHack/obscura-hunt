@@ -271,6 +271,29 @@ fn cors_header(origin: Option<&str>, allowlist: Option<&str>) -> String {
     }
 }
 
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut interrupt = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = interrupt.recv() => {},
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
 /// MCP Streamable HTTP transport (POST /mcp → JSON response).
 ///
 pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
@@ -287,15 +310,22 @@ pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Opt
         tracing::info!("MCP bearer authentication enabled");
     }
 
-    let mut state = BrowserState::new(proxy, user_agent, stealth);
+    let mut state = BrowserState::new(proxy, user_agent, stealth)?;
     let allowed_origins = Arc::new(allowed_origins_env());
     let auth_token = Arc::new(auth_token);
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let (request_tx, mut request_rx) = mpsc::channel::<PendingRequest>(MAX_PENDING_REQUESTS);
     let mut runtime_pump_armed = false;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                state.shutdown().await?;
+                return Ok(());
+            }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
@@ -332,10 +362,7 @@ pub async fn run(host: String, port: u16, proxy: Option<String>, user_agent: Opt
                 };
                 match pump_result {
                     Ok(reached_idle) => runtime_pump_armed = !reached_idle,
-                    Err(error) => {
-                        runtime_pump_armed = false;
-                        tracing::warn!("MCP page task failed: {error}");
-                    }
+                    Err(error) => return Err(anyhow::anyhow!("MCP page task failed: {error}")),
                 }
             }
         }

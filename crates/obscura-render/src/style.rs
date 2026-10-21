@@ -25,6 +25,18 @@ pub fn compute_style(tag: &str, inline_css: Option<&str>) -> LayoutStyle {
 /// inline/text layout arrives with the text/paint phase.
 pub fn ua_style(tag: &str) -> LayoutStyle {
     let mut style = LayoutStyle::default();
+    style.appearance = Some(if matches!(tag, "button" | "input" | "select" | "textarea" | "meter" | "progress") { "auto" } else { "none" });
+    // HTML block containers isolate bidi runs independently of author display.
+    if matches!(tag, "address" | "article" | "aside" | "blockquote" | "body" | "caption"
+        | "center" | "dd" | "details" | "dir" | "div" | "dl" | "dt" | "fieldset"
+        | "figcaption" | "figure" | "footer" | "form" | "h1" | "h2" | "h3" | "h4"
+        | "h5" | "h6" | "header" | "hgroup" | "hr" | "html" | "legend" | "li"
+        | "listing" | "main" | "menu" | "nav" | "ol" | "p" | "plaintext" | "pre"
+        | "section" | "summary" | "table" | "tbody" | "td" | "tfoot" | "th" | "thead"
+        | "tr" | "ul" | "xmp" | "bdi")
+    {
+        set_cssom_property(&mut style, "unicode-bidi", "isolate".to_string());
+    }
     if tag == "b" || tag == "strong" {
         style.font_weight = Some("bold".into());
     }
@@ -38,8 +50,8 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         // (e.g. `code{display:block}`) still overrides this in the cascade.
         "span" | "a" | "b" | "i" | "strong" | "em" | "font" | "code" | "small" | "sub" | "sup"
         | "mark" | "abbr" | "cite" | "var" | "dfn" | "kbd" | "samp" | "q" | "time" | "s" | "u"
-        | "del" | "ins" | "tt" | "big" | "bdi" | "bdo" | "br" | "wbr" | "data" | "output"
-        | "label" | "ruby" | "rt" | "rp" | "svg" => Display::Inline,
+        | "del" | "ins" | "strike" | "tt" | "big" | "bdi" | "bdo" | "br" | "wbr" | "data" | "output"
+        | "label" | "ruby" | "rt" | "rp" | "svg" | "picture" => Display::Inline,
         "tr" => Display::Flex,
         _ => Display::Block,
     };
@@ -103,6 +115,10 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
     } else if tag == "pre" {
         // HTML's UA sheet preserves source whitespace in preformatted blocks.
         style.white_space = Some(crate::WhiteSpace::Pre);
+        style.display = Display::Block;
+        style.font_family = Some("monospace".to_string());
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.0));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.0));
     } else if tag == "body" {
         style.margin = Edges {
             top: 8.0,
@@ -171,15 +187,34 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.underline = Some(true); // UA default: links are underlined
     } else if tag == "iframe" {
         // HTML's UA sheet gives frames a two-pixel inset border. The paint
-        // and geometry models share the same four-side used state.
+        // border is retained unless author CSS replaces it.
         style.border = Edges {
             top: 2.0,
             right: 2.0,
             bottom: 2.0,
             left: 2.0,
         };
-        style.border_model.specified_widths = crate::Sides::all(2.0);
         style.border_model.styles = crate::Sides::all(crate::BorderStyle::Inset);
+    } else if matches!(tag, "small" | "sub" | "sup") {
+        style.font_size_raw = Some(crate::Dimension::Percent(5.0 / 6.0));
+        style.vertical_align = match tag { "sub" => Some(crate::VerticalAlign::Sub), "sup" => Some(crate::VerticalAlign::Super), _ => None };
+    } else if matches!(tag, "s" | "strike" | "del") {
+        style.line_through = Some(true);
+    } else if tag == "big" {
+        style.font_size_raw = Some(crate::Dimension::Percent(1.2));
+    } else if matches!(tag, "code" | "kbd" | "samp") {
+        style.font_family = Some("monospace".to_string());
+    } else if tag == "blockquote" {
+        style.display = Display::Block;
+        style.margin.left = 40.0;
+        style.margin.right = 40.0;
+        style.margin_relative[0] = Some(crate::Dimension::Em(1.0));
+        style.margin_relative[2] = Some(crate::Dimension::Em(1.0));
+    } else if tag == "mark" {
+        style.color = Some([0, 0, 0, 255]);
+        style.background_color = Some([255, 255, 0, 255]);
+    } else if matches!(tag, "u" | "ins") {
+        style.underline = Some(true);
     } else if tag == "button" {
         // HTML buttons are inline-block controls whose anonymous inner
         // content is centered by the browser UA sheet. Keep the atomic outer
@@ -300,6 +335,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
                                                               // grows to fit unshrinkable content, needs real table layout.)
         style.min_width = crate::Dimension::Px(0.0);
         if tag == "table" {
+            style.text_indent = Some(crate::Dimension::Px(0.0));
             style.is_table_box = true;
             // Chromium's HTML UA sheet makes the table grid border-box and
             // supplies the traditional two-pixel separate-border spacing.
@@ -316,6 +352,7 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         }
     } else if tag == "tr" {
         style.internal_flex_container = true;
+        style.vertical_align = None;
         // Rows fill the table width and can shrink below content min-content;
         // this is exactly why Wikipedia's own responsive CSS uses
         // `tr{min-width:100%}`. `align-items:stretch` alone did not pin them
@@ -837,6 +874,7 @@ fn unitless_math_tokens(
 }
 
 fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
+    apply_cssom_value(style, name, value);
     match name {
         "direction" => {
             match value.trim().to_ascii_lowercase().as_str() {
@@ -1709,11 +1747,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         }
         "vertical-align" => {
             style.vertical_align = match value.trim().to_ascii_lowercase().as_str() {
-                "top" | "baseline" | "text-top" => Some(crate::VerticalAlign::Top),
+                "baseline" => Some(crate::VerticalAlign::Baseline),
+                "top" => Some(crate::VerticalAlign::Top),
+                "text-top" => Some(crate::VerticalAlign::TextTop),
                 "middle" => Some(crate::VerticalAlign::Middle),
-                "bottom" | "text-bottom" => Some(crate::VerticalAlign::Bottom),
-                // sub/super/lengths are text-level; leave the cell default.
-                _ => style.vertical_align,
+                "bottom" => Some(crate::VerticalAlign::Bottom),
+                "text-bottom" => Some(crate::VerticalAlign::TextBottom),
+                "sub" => Some(crate::VerticalAlign::Sub),
+                "super" => Some(crate::VerticalAlign::Super),
+                _ => { let length = dimension_value(value); (length != crate::Dimension::Auto).then_some(crate::VerticalAlign::Length(length)).or(style.vertical_align) },
             };
         }
         "list-style-type" => {
@@ -1856,6 +1898,16 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             style.underline = Some(underline && !none);
             style.overline = Some(!none && toks.iter().any(|token| token == "overline"));
             style.line_through = Some(!none && toks.iter().any(|token| token == "line-through"));
+            if name == "text-decoration" {
+                style.text_decoration_color = split_ws_paren(value).into_iter().find_map(parse_color);
+            }
+        }
+        "text-decoration-color" => {
+            if matches!(value.trim().to_ascii_lowercase().as_str(), "currentcolor" | "initial" | "unset") {
+                style.text_decoration_color = None;
+            } else if let Some(color) = parse_color(value) {
+                style.text_decoration_color = Some(color);
+            }
         }
         "gap" | "grid-gap" => {
             let values = split_ws_paren(value);
@@ -2004,6 +2056,171 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
         _ => {}
     }
     normalize_webkit_line_clamp_display(style);
+}
+
+pub(crate) const CSSOM_LONGHANDS: &[(&str, &str, bool)] = &[
+    ("animation-timing-function", "ease", false),
+    ("background-attachment", "scroll", false),
+    ("background-clip", "border-box", false),
+    ("background-origin", "padding-box", false),
+    ("caption-side", "top", true),
+    ("contain", "none", false),
+    ("content", "normal", false),
+    ("filter", "none", false),
+    ("isolation", "auto", false),
+    ("list-style-position", "outside", true),
+    ("mix-blend-mode", "normal", false),
+    ("resize", "none", false),
+    ("text-shadow", "none", true),
+    ("transition-property", "all", false),
+    ("transition-duration", "0s", false),
+    ("transition-timing-function", "ease", false),
+    ("transition-delay", "0s", false),
+    ("unicode-bidi", "normal", false),
+    ("user-select", "auto", false),
+    ("writing-mode", "horizontal-tb", true),
+];
+
+fn set_cssom_property(style: &mut LayoutStyle, name: &'static str, value: String) {
+    if let Some((_, old)) = style.cssom_properties.iter_mut().find(|(key, _)| *key == name) { *old = value; }
+    else { style.cssom_properties.push((name, value)); }
+}
+
+fn timing_function(value: &str) -> bool {
+    if matches!(value, "ease" | "linear" | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end") { return true; }
+    if let Some(args) = value.strip_prefix("cubic-bezier(").and_then(|v| v.strip_suffix(')')) {
+        let values: Vec<_> = args.split(',').map(|v| v.trim().parse::<f32>()).collect();
+        return values.len() == 4 && values.iter().all(|v| v.as_ref().is_ok_and(|n| n.is_finite()))
+            && values[0].as_ref().is_ok_and(|v| (0.0..=1.0).contains(v))
+            && values[2].as_ref().is_ok_and(|v| (0.0..=1.0).contains(v));
+    }
+    if let Some(args) = value.strip_prefix("steps(").and_then(|v| v.strip_suffix(')')) {
+        let mut args = args.split(',').map(str::trim);
+        let Some(count) = args.next().and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0) else { return false; };
+        let position = args.next().unwrap_or("end");
+        return args.next().is_none() && matches!(position, "start" | "end" | "jump-start" | "jump-end" | "jump-both" | "jump-none")
+            && (position != "jump-none" || count > 1);
+    }
+    false
+}
+
+fn valid_text_shadow(value: &str) -> bool {
+    value == "none" || split_top_commas(value).iter().all(|shadow| {
+        let mut lengths = 0;
+        let mut colors = 0;
+        for token in split_ws_paren(shadow) {
+            if parse_color(token).is_some() || token.eq_ignore_ascii_case("currentcolor") { colors += 1; }
+            else if !token.contains('%') && dimension_value(token) != crate::Dimension::Auto {
+                lengths += 1;
+                if lengths == 3 && px(token).is_some_and(|v| v < 0.0) { return false; }
+            } else { return false; }
+        }
+        (2..=3).contains(&lengths) && colors <= 1
+    })
+}
+
+fn apply_cssom_value(style: &mut LayoutStyle, name: &str, value: &str) {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(name, "appearance" | "-webkit-appearance") {
+        style.appearance = match lower.as_str() {
+            "none" | "initial" | "unset" => Some("none"), "auto" | "revert" | "revert-layer" => Some("auto"),
+            "inherit" => None, _ => style.appearance,
+        };
+        return;
+    }
+    if name == "quotes" {
+        if lower == "none" { style.quote_pairs = Some(Vec::new()); }
+        else if matches!(lower.as_str(), "auto" | "initial") { style.quote_pairs = None; }
+        else {
+            let mut parser = cssparser::Parser::new(value);
+            let mut pairs = Vec::new();
+            while !parser.is_exhausted() {
+                let (Ok(open), Ok(close)) = (parser.expect_string_cloned(), parser.expect_string_cloned()) else { return; };
+                pairs.push((open.to_string(), close.to_string()));
+            }
+            if !pairs.is_empty() { style.quote_pairs = Some(pairs); }
+        }
+        return;
+    }
+    if name == "transition" {
+        let mut properties = Vec::new(); let mut durations = Vec::new(); let mut delays = Vec::new(); let mut timings = Vec::new();
+        for transition in split_top_commas(&lower) {
+            let mut property = "all"; let mut duration = None; let mut delay = None; let mut timing = "ease";
+            for token in split_ws_paren(transition) {
+                if let Some(time) = parse_animation_time_ms(token) {
+                    if duration.is_none() { if time < 0.0 { return; } duration = Some(time); }
+                    else if delay.is_none() { delay = Some(time); } else { return; }
+                } else if timing_function(token) { timing = token; }
+                else if valid_counter_name(token) || token == "all" || token == "none" { property = token; }
+                else { return; }
+            }
+            properties.push(property.to_string()); durations.push(format!("{}s", duration.unwrap_or(0.0) / 1000.0));
+            delays.push(format!("{}s", delay.unwrap_or(0.0) / 1000.0)); timings.push(timing.to_string());
+        }
+        for (name, values) in [("transition-property", properties), ("transition-duration", durations), ("transition-delay", delays), ("transition-timing-function", timings)] {
+            set_cssom_property(style, name, values.join(", "));
+        }
+        return;
+    }
+    if name == "animation" {
+        if let Some(timing) = split_ws_paren(&lower).into_iter().find(|token| timing_function(token)) {
+            set_cssom_property(style, "animation-timing-function", timing.to_string());
+        }
+    }
+    let Some(&(key, initial, inherited)) = CSSOM_LONGHANDS.iter().find(|(key, _, _)| *key == name) else { return; };
+    if matches!(lower.as_str(), "initial" | "unset" | "inherit" | "revert" | "revert-layer") {
+        let value = if lower == "inherit" || (inherited && lower == "unset") { "inherit" } else { initial };
+        set_cssom_property(style, key, value.to_string()); return;
+    }
+    let valid = match name {
+        "animation-timing-function" | "transition-timing-function" => split_top_commas(&lower).iter().all(|v| timing_function(v.trim())),
+        "transition-duration" | "transition-delay" => split_top_commas(&lower).iter().all(|v| parse_animation_time_ms(v).is_some_and(|n| name == "transition-delay" || n >= 0.0)),
+        "transition-property" => split_top_commas(value).iter().all(|v| valid_counter_name(v.trim()) || matches!(v.trim(), "all" | "none")),
+        "caption-side" => matches!(lower.as_str(), "top" | "bottom"),
+        "isolation" => matches!(lower.as_str(), "auto" | "isolate"),
+        "list-style-position" => matches!(lower.as_str(), "inside" | "outside"),
+        "resize" => matches!(lower.as_str(), "none" | "both" | "horizontal" | "vertical" | "block" | "inline"),
+        "unicode-bidi" => matches!(lower.as_str(), "normal" | "embed" | "isolate" | "bidi-override" | "isolate-override" | "plaintext"),
+        "user-select" => matches!(lower.as_str(), "auto" | "none" | "text" | "all"),
+        "writing-mode" => matches!(lower.as_str(), "horizontal-tb" | "vertical-rl" | "vertical-lr" | "sideways-rl" | "sideways-lr"),
+        "mix-blend-mode" => matches!(lower.as_str(), "normal" | "multiply" | "screen" | "overlay" | "darken" | "lighten" | "color-dodge" | "color-burn" | "hard-light" | "soft-light" | "difference" | "exclusion" | "hue" | "saturation" | "color" | "luminosity" | "plus-lighter"),
+        "background-attachment" => split_top_commas(&lower).iter().all(|v| matches!(v.trim(), "scroll" | "fixed" | "local")),
+        "background-origin" => parse_background_origin(value).is_some(),
+        "background-clip" => parse_background_clip(value).is_some(),
+        "contain" => parse_containment(value).is_some(),
+        "content" => supports_content_value(value),
+        "text-shadow" => valid_text_shadow(value),
+        "filter" => lower == "none" || split_ws_paren(&lower).iter().all(|v| {
+            let Some((function, args)) = v.split_once('(').and_then(|(f, a)| a.strip_suffix(')').map(|a| (f, a))) else { return false; };
+            match function {
+                "blur" => !args.contains('%') && px(args).is_some_and(|n| n >= 0.0),
+                "hue-rotate" => angle_degrees(args).is_some(),
+                "brightness" | "contrast" | "grayscale" | "invert" | "opacity" | "saturate" | "sepia" => args.trim_end_matches('%').parse::<f32>().is_ok_and(|n| n.is_finite() && n >= 0.0),
+                "drop-shadow" => valid_text_shadow(args) && !args.contains(','),
+                _ => false,
+            }
+        }),
+        _ => false,
+    };
+    if valid {
+        let computed = if matches!(name, "transition-duration" | "transition-delay") {
+            split_top_commas(value).iter().map(|v| format!("{}s", parse_animation_time_ms(v).unwrap() / 1000.0)).collect::<Vec<_>>().join(", ")
+        } else { value.trim().to_string() };
+        set_cssom_property(style, key, computed);
+    }
+}
+
+pub(crate) fn inherit_cssom_values(style: &mut LayoutStyle, parent: Option<&LayoutStyle>) {
+    for &(name, initial, inherited) in CSSOM_LONGHANDS {
+        let own = style.cssom_properties.iter().position(|(key, _)| *key == name);
+        if own.is_some_and(|i| style.cssom_properties[i].1 != "inherit") { continue; }
+        if own.is_some() || inherited {
+            let value = parent.and_then(|p| p.cssom_properties.iter().find(|(key, _)| *key == name))
+                .map(|(_, value)| value.as_str()).unwrap_or(initial);
+            if value != initial || own.is_some() { set_cssom_property(style, name, value.to_string()); }
+        }
+    }
+    if style.quote_pairs.is_none() { style.quote_pairs = parent.and_then(|p| p.quote_pairs.clone()); }
 }
 
 /// Apply the legacy WebKit line-clamp display adjustment from specified
@@ -2211,6 +2428,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "text-transform"
             | "text-decoration"
             | "text-decoration-line"
+            | "text-decoration-color"
             | "line-height"
             | "white-space"
             | "text-overflow"
@@ -3185,7 +3403,10 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
             lower.as_str(),
             "none" | "uppercase" | "lowercase" | "capitalize"
         ),
-        "text-decoration" | "text-decoration-line" => lower
+        "text-decoration" => split_ws_paren(value).into_iter().all(|token|
+            matches!(token, "none" | "underline" | "overline" | "line-through" | "solid" | "currentcolor") || parse_color(token).is_some()),
+        "text-decoration-color" => lower == "currentcolor" || parse_color(value).is_some(),
+        "text-decoration-line" => lower
             .split_whitespace()
             .all(|token| matches!(token, "none" | "underline" | "overline" | "line-through")),
         "line-height" => lower == "normal" || finite_number(value) || dimension(value, false),
@@ -6584,7 +6805,7 @@ fn deferred_length_expression(value: &str) -> Option<String> {
 /// `vw`/`vh` are one-percent viewport units and `percent_base` is the relevant
 /// containing-block dimension. Custom properties have already been substituted
 /// by the cascade before this function sees the expression.
-pub(crate) fn resolve_contextual_length(
+pub fn resolve_contextual_length(
     value: &str,
     em_px: f32,
     rem_px: f32,
@@ -7230,6 +7451,12 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
         // the already-applied lower-origin value instead of treating revert
         // as inherit or initial.
         "revert" | "revert-layer" => return,
+        "smaller" | "larger" => {
+            style.font_size = None;
+            style.font_size_raw = Some(crate::Dimension::Percent(if value.eq_ignore_ascii_case("smaller") { 5.0 / 6.0 } else { 1.2 }));
+            style.font_size_expression = None;
+            return;
+        }
         _ => {}
     }
     if value.contains('(') {
@@ -7515,7 +7742,7 @@ fn specified_font_weight(value: &str) -> Option<String> {
 /// Resolve `font-weight` to the numeric computed value defined by CSS Fonts.
 /// Relative keywords use the inherited weight table rather than a binary
 /// normal/bold threshold.
-pub(crate) fn computed_font_weight(specified: Option<&str>, inherited: u16) -> u16 {
+pub fn computed_font_weight(specified: Option<&str>, inherited: u16) -> u16 {
     match specified {
         None => inherited,
         Some("inherit" | "unset") => inherited,
@@ -9366,6 +9593,9 @@ mod tests {
         assert_eq!(table.box_sizing, crate::BoxSizing::BorderBox);
         assert_eq!(table.border_spacing, Some((2.0, 2.0)));
         assert_eq!(table.border_collapse, Some(false));
+        assert_eq!(table.font_size, None);
+        assert_eq!(table.font_weight, None);
+        assert_eq!(table.color, None);
 
         let cell = compute_style("td", None);
         assert_eq!(

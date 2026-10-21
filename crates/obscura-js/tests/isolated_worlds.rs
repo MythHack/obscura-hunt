@@ -129,3 +129,39 @@ fn explicit_isolated_grant_upgrades_only_live_related_dom_access() {
     let fresh = world(&mut runtime, 42, "dom-access");
     assert_eq!(runtime.evaluate_in_cdp_frame(fresh, inspect).unwrap(), json!("SecurityError"));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn geolocation_permission_and_position_watches_follow_the_native_document() {
+    use obscura_js::geolocation::{Decision, Permissions, Position};
+    use std::sync::Arc;
+    let mut runtime = page();
+    runtime.set_url("https://world.example/page");
+    let permissions = Arc::new(Permissions::default());
+    runtime.set_geolocation_context(permissions.clone(),Some(Position::new(58.4167,15.6167,76_000.0).unwrap()));
+    let world = CdpExecutionWorld::default();
+    let prompt = runtime.evaluate_for_cdp_in_frame(world,
+        "navigator.permissions.query({name:'geolocation'}).then(status => {globalThis.locationPermission=status;return status.state})", true,true,2_000).await.unwrap();
+    assert_eq!(prompt.value,Some(json!("prompt")));
+    let denied = runtime.evaluate_for_cdp_in_frame(world,
+        "new Promise(resolve => {let synchronous=true;navigator.geolocation.getCurrentPosition(() => resolve('leaked'),error => resolve([error.code,synchronous]));synchronous=false})", true,true,2_000).await.unwrap();
+    assert_eq!(denied.value,Some(json!([1,false])));
+    runtime.execute_script("observe-permission","globalThis.permissionChange=new Promise(resolve=>locationPermission.addEventListener('change',()=>resolve(locationPermission.state),{once:true}))").unwrap();
+    permissions.set(Some("https://world.example"),Decision::Granted).unwrap();
+    let changed = runtime.evaluate_for_cdp_in_frame(world,"permissionChange",true,true,2_000).await.unwrap();
+    assert_eq!(changed.value,Some(json!("granted")));
+    let first = runtime.evaluate_for_cdp_in_frame(world,
+        "new Promise(resolve=>{globalThis.locationCalls=0;globalThis.locationWatch=navigator.geolocation.watchPosition(position=>{locationCalls++;if(locationCalls===1)resolve(position.toJSON());else if(globalThis.nextPosition)nextPosition(position.coords.latitude)},error=>resolve({error:error.code}))})",true,true,2_000).await.unwrap();
+    assert_eq!(first.value.as_ref().unwrap()["coords"]["accuracy"].as_f64(),Some(76_000.0));
+    assert_eq!(first.value.as_ref().unwrap()["coords"]["latitude"].as_f64(),Some(58.4167));
+    runtime.execute_script("next-position","globalThis.positionChanged=new Promise(resolve=>globalThis.nextPosition=resolve)").unwrap();
+    runtime.set_geolocation(Some(Position::new(59.0,16.0,80_000.0).unwrap())).unwrap();
+    let updated = runtime.evaluate_for_cdp_in_frame(world,"positionChanged",true,true,2_000).await.unwrap();
+    assert_eq!(updated.value.and_then(|value| value.as_f64()),Some(59.0));
+    runtime.evaluate("navigator.geolocation.clearWatch(locationWatch)").unwrap();
+    runtime.set_geolocation(Some(Position::new(60.0,17.0,80_000.0).unwrap())).unwrap();
+    let cleared = runtime.evaluate_for_cdp_in_frame(world,"new Promise(resolve=>setTimeout(()=>resolve(locationCalls),0))",true,true,2_000).await.unwrap();
+    assert_eq!(cleared.value.and_then(|value| value.as_f64()),Some(2.0));
+    permissions.reset().unwrap();
+    let reset = runtime.evaluate_for_cdp_in_frame(world,"new Promise(resolve=>navigator.geolocation.getCurrentPosition(()=>resolve('leaked'),error=>resolve([locationPermission.state,error.code])))",true,true,2_000).await.unwrap();
+    assert_eq!(reset.value,Some(json!(["prompt",1])));
+}

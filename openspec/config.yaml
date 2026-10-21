@@ -1,0 +1,21 @@
+schema: spec-driven
+
+context: |
+  Language: zh-CN
+  All artifacts must be written in zh-CN.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: Obscura-Hunt, a native Rust/V8 browser with render and stealth features.
+  Preserve native realm ownership, frame/document-scoped IDs, watchdogs, SSRF/TLS/proxy boundaries.
+  Root-cause groups are not mandates for new runtime modules; reuse existing owning boundaries.
+  Planning is not implementation. Static source coverage and historical probes do not complete tasks.
+  Run release nextest (never cargo test), exact release build and offline obstacle course for code changes.
+  Rendering changes additionally require deterministic and matched top/bottom capture acceptance.
+
+rules:
+  proposal:
+    - 区分已批准修复、已覆盖约束、待定位风险和明确不纳入项。
+  specs:
+    - 每项 Requirement 必须使用 SHALL/MUST 和可观察的正反 Scenario，不写实现步骤。
+  tasks:
+    - 编号任务绑定唯一根因 owner、真实消费者、旧路径移除义务和实跑验收。
+    - 未取得对应构建的真实验收证据前，所有实现与验收复选框保持未勾选。

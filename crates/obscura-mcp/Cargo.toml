@@ -14,6 +14,7 @@ render = ["obscura-browser/render", "dep:base64"]
 obscura-browser = { workspace = true }
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
+obscura-js = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
@@ -21,3 +22,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+lopdf = "0.39"

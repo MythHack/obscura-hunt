@@ -19,7 +19,7 @@ The latest upstream integration reaches `8b49681`. Its
 extends the engine-upgrade record above.
 
 Rendering builds support screenshots, scroll-aware layout, CDP screencasting
-and raster PDF export. Rendering and the optional transport feature are selected
+and text/vector PDF export. Rendering and the optional transport feature are selected
 independently; see [Installation](Installation.md) for all four configurations.
 
 ## Quickstart
@@ -54,6 +54,7 @@ independently; see [Installation](Installation.md) for all four configurations.
 - [Architecture overview](Architecture-overview.md)
 - [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 - [Testing and debugging](Testing-and-debugging.md)
+- [Upstream browser remediation plan (OpenSpec)](Upstream-remediation-plan.md)
 
 ## Links
 

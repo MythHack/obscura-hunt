@@ -31,7 +31,37 @@ For MCP, put the profile flag before the subcommand:
 obscura --storage-dir ./obscura-data mcp
 ```
 
-The MCP server also accepts `OBSCURA_STORAGE_DIR` and flushes the profile on exit.
+Both MCP transports accept `OBSCURA_STORAGE_DIR`; explicit `--storage-dir`
+takes precedence. Without either setting, storage remains in memory and no
+profile is written. Existing cookies and origin localStorage load before the
+first request or page script. A corrupt, unreadable, invalid-origin or
+over-quota profile is a startup error, not an empty replacement session.
+
+## Rust context construction and saves
+
+The lower-level `obscura_browser::BrowserContext::with_storage`,
+`with_storage_full`, and `with_storage_and_network` constructors return
+`std::io::Result<BrowserContext>`. Handle or propagate the result before creating
+pages; invalid profiles are not silently replaced with empty state. The
+memory-only `BrowserContext::new` constructor still returns the context directly.
+
+```rust
+let context = obscura_browser::BrowserContext::with_storage(
+    "profile".into(),
+    Some(std::path::PathBuf::from("./obscura-data")),
+)?;
+// After the embedding application's page work has completed:
+context.save_storage()?;
+```
+
+`save_storage()`, `save_cookies()` and `save_local_storage()` return
+`std::io::Result<()>`; callers must handle commit failures. `save_storage()`
+attempts both stores, but is not an all-or-nothing transaction across files.
+Successful units remain committed, failed localStorage origins remain dirty,
+and an error does not roll back the live browser state. Embedders must explicitly
+order their final save after page work; dropping a Rust context is not a
+fallible clean-shutdown API. The `obscura::Browser` builder's `.build()` also
+propagates persistent-profile startup failures.
 
 ## Layout
 
@@ -57,11 +87,37 @@ jq '.[] | select(.domain == "example.com")' ./obscura-data/cookies.json
 
 ## When state is written
 
-- After every navigation completes (CDP `Page.navigate`, MCP `browser_navigate`),
-  and only when something actually changed.
-- On clean process exit (Ctrl-C, SIGTERM). Forced process termination is not a
-  persistence guarantee.
-- Manually via CDP `Network.setCookie` and `Network.deleteCookies`.
+- After a successful navigation, cookies and origin `localStorage` are committed
+  before the navigation operation reports success. Unchanged localStorage
+  origins are not rewritten.
+- On clean process exit: MCP stdio EOF, and handled Ctrl-C/SIGTERM for MCP HTTP
+  and the CDP server. Completed page work and post-navigation evaluation changes
+  are ordered before this final commit. Future timers and infinite tasks are
+  not an unbounded shutdown barrier.
+- Existing CDP cookie/storage mutations and explicit storage-state imports
+  report commit errors through the operation that requested them.
+
+Each storage file is replaced atomically, not truncated in place. A failed
+write or replacement leaves the previous committed unit loadable, and an
+unsaved origin stays dirty for a later normal commit. This is not a transaction
+across cookies and every origin file. Deleting cookies, removing items and
+clearing an origin are persisted too, so deleted data does not return on restart.
+
+Profile load, creation, write, replacement, removal and permission failures are
+operator-visible errors. CLI and clean-exit failures return nonzero and print
+an error to stderr; MCP/CDP operations return an error. A commit failure means
+the page's memory may already have changed but was not fully saved. Error
+messages identify the affected file without printing cookie values.
+
+Managed profile directories use mode `0700` and files `0600` on Unix. Windows
+uses a protected DACL granting only the current user and LocalSystem access,
+including replacement of existing permissive files. Permissions are established
+and checked explicitly; unsupported mounts or denied permission changes fail
+rather than silently retaining broad access. Unrelated parent directories are
+not repermissioned. Use a dedicated profile directory, not a shared data folder.
+
+An unhandleable forced kill only preserves units whose commit already
+succeeded. It does not guarantee uncommitted memory changes.
 
 `sessionStorage` is deliberately not written to disk. It belongs to one tab and
 is dropped when the tab goes away, the same as a real browser, but it does

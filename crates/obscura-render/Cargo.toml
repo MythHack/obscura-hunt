@@ -8,10 +8,12 @@ description = "Optional scoped render layer for Obscura: layout (taffy) and, wit
 
 [features]
 default = []
+# Native face registration and design metrics, without shaping or raster output.
+font-metadata = ["dep:fontdb-metadata", "dep:ttf-parser", "dep:sys-locale", "dep:windows-sys", "dep:base64", "dep:url", "dep:wuff", "dep:brotli-decompressor"]
 # Rasterize the laid-out tree to a pixmap (tiny-skia) with text (cosmic-text
 # shaping + line breaking and per-cluster font fallback) and images.
 # Off by default; the layout core (getBoundingClientRect etc.) works without it.
-paint = ["dep:obscura-ssrf", "dep:tiny-skia", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:base64", "dep:resvg", "dep:usvg", "dep:fontdb", "dep:url", "dep:wuff", "dep:brotli-decompressor", "dep:windows-sys"]
+paint = ["font-metadata", "dep:obscura-ssrf", "dep:tiny-skia", "dep:cosmic-text", "dep:swash", "dep:image", "dep:ureq", "dep:resvg", "dep:usvg", "dep:fontdb", "dep:krilla", "dep:krilla-svg", "dep:usvg-pdf"]
 
 [dependencies]
 taffy = { workspace = true }
@@ -22,6 +24,11 @@ tiny-skia = { workspace = true, optional = true }
 # unification applies this to usvg's own fontdb 0.24 instance; system and
 # operator-supplied font directories are discovered once per process.
 fontdb = { version = "0.24", default-features = false, features = ["fs", "memmap"], optional = true }
+# The metadata registry is the exact fontdb/ttf-parser family used by cosmic.
+# Keep usvg's separate 0.24 IDs confined to its own SVG rasterizer database.
+fontdb-metadata = { package = "fontdb", version = "0.16", default-features = false, features = ["std", "memmap"], optional = true }
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "opentype-layout", "apple-layout", "variable-fonts", "glyph-names"], optional = true }
+sys-locale = { version = "0.3.1", optional = true }
 # Real inline text layout: HarfBuzz-class shaping (rustybuzz) + UAX#14 line
 # breaking, the same algorithms browsers use. Bundled faces remain available
 # as deterministic fallbacks; installed faces are enabled by default and can
@@ -47,6 +54,11 @@ wuff = { version = "0.2.7", optional = true }
 # Reuse wuff's locked Brotli backend with a fixed output buffer so transformed
 # table bounds are checked before wuff allocates reconstructed sfnt tables.
 brotli-decompressor = { version = "=5.0.3", optional = true }
+# Encode retained paint primitives and shaped glyphs; krilla subsets fonts.
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images"], optional = true }
+krilla-svg = { version = "0.8.1", optional = true }
+# krilla-svg's maintained SVG adapter currently uses usvg 0.47.
+usvg-pdf = { package = "usvg", version = "0.47", default-features = false, features = ["text", "system-fonts"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows exposes the shell message face separately from the process locale;

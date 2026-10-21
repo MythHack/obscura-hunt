@@ -1,4 +1,4 @@
-//! Response-header frame-ancestors matching, not a general CSP implementation.
+//! Native response-header frame-ancestors and WebSocket connection policies.
 //!
 //! CSP3's navigation response check parses each serialized ancestor ORIGIN as a
 //! URL and matches it with redirect count zero. A response redirect therefore
@@ -110,6 +110,57 @@ impl<'a> FrameEmbeddingPolicy<'a> {
     }
 }
 
+/// Multiple enforced policies are conjunctive. Report-only headers never enter
+/// this path. The caller supplies its ordered CSP directive fallback chain.
+pub(crate) fn allows_source(header: &str, origin: &str, target: &Url, directives: &[&str]) -> bool {
+    let protected = Url::parse(origin).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+    header.split(',').all(|policy| {
+        let selected = directives.iter().find_map(|wanted| policy.split(';').find_map(|directive| {
+            let directive = directive.trim_matches(is_csp_whitespace);
+            let end = directive.find(is_csp_whitespace).unwrap_or(directive.len());
+            let (name, value) = directive.split_at(end);
+            name.eq_ignore_ascii_case(wanted).then_some(value)
+        }));
+        selected.is_none_or(|sources| sources.split(is_csp_whitespace)
+            .filter(|source| !source.is_empty()).any(|source| connection_source_matches(source, target, &protected)))
+    })
+}
+
+fn connection_source_matches(source: &str, target: &Url, protected: &Url) -> bool {
+    if source == "*" { return matches!(target.scheme(), "http" | "https" | "ws" | "wss") || target.scheme() == protected.scheme(); }
+    if source.eq_ignore_ascii_case("'self'") {
+        if target.scheme() == "blob" { return false; }
+        return target.origin() == protected.origin()
+            || (target.host().is_some() && target.host() == protected.host()
+                && target.port() == protected.port()
+                && (matches!(target.scheme(), "https" | "wss")
+                    || protected.scheme() == "http" && matches!(target.scheme(), "http" | "ws")));
+    }
+    // Reuse the native host/scheme/port matcher; only path matching differs
+    // from frame-ancestors, whose targets are serialized origins.
+    let authority_start = source.find("://").map_or(0, |index| index + 3);
+    let Some(path_start) = source[authority_start..].find('/').map(|index| index + authority_start) else {
+        return source_matches(source, target, protected);
+    };
+    let path = &source[path_start..];
+    if !valid_path(path) || !source_matches(&source[..path_start], target, protected) { return false; }
+    fn decoded(path: &str) -> impl Iterator<Item = u8> + '_ {
+        let mut bytes = path.bytes();
+        std::iter::from_fn(move || {
+            let byte = bytes.next()?;
+            if byte != b'%' { return Some(byte); }
+            let high = (bytes.next()? as char).to_digit(16)? as u8;
+            let low = (bytes.next()? as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+    }
+    let mut actual = decoded(target.path());
+    for expected in decoded(path) {
+        if actual.next() != Some(expected) { return false; }
+    }
+    path.ends_with('/') || actual.next().is_none()
+}
+
 fn is_csp_whitespace(value: char) -> bool {
     matches!(value, '\t' | '\n' | '\u{000c}' | '\r' | ' ')
 }
@@ -137,7 +188,8 @@ fn valid_scheme(scheme: &str) -> bool {
 fn scheme_matches(source: &str, target: &str) -> bool {
     source.eq_ignore_ascii_case(target)
         || (source.eq_ignore_ascii_case("http") && target == "https")
-        || (source.eq_ignore_ascii_case("ws") && target == "wss")
+        || (source.eq_ignore_ascii_case("ws") && matches!(target, "wss" | "http" | "https"))
+        || (source.eq_ignore_ascii_case("wss") && target == "https")
 }
 
 fn self_matches(ancestor: &Url, protected: &Url) -> bool {
@@ -198,23 +250,18 @@ enum SourcePort {
     Explicit(u16),
 }
 
-fn port_matches(port: SourcePort, scheme: &str, ancestor: &Url) -> bool {
-    let upgrade = !scheme.eq_ignore_ascii_case(ancestor.scheme());
+fn port_matches(port: SourcePort, ancestor: &Url, source_scheme: &str) -> bool {
     match port {
         SourcePort::Any => true,
         SourcePort::Default => ancestor.port().is_none(),
         SourcePort::Explicit(port) => {
             let target = ancestor.port_or_known_default();
-            // A host-source's insecure scheme and port upgrade together. A
-            // scheme-only source has no port restriction. Retain browser CSP
-            // behavior: http://host:80 can authorize https://host:443, not
-            // https://host:80 or an unrelated custom port.
-            if upgrade {
-                port == 80 && target == Some(443)
-                    && matches!(ancestor.scheme(), "https" | "wss")
-            } else {
-                target == Some(port)
-            }
+            // Explicit ports and schemes must upgrade together. An exact
+            // explicit port match cannot authorize a scheme-only upgrade.
+            let scheme_upgraded = !source_scheme.eq_ignore_ascii_case(ancestor.scheme());
+            (target == Some(port) && !scheme_upgraded)
+                || (port == 80 && target == Some(443) && scheme_upgraded
+                    && matches!(ancestor.scheme(), "https" | "wss"))
         }
     }
 }
@@ -252,7 +299,7 @@ fn source_matches(source: &str, ancestor: &Url, protected: &Url) -> bool {
     valid_host(host) && (path.is_empty() || path == "/")
         && scheme_matches(scheme, ancestor.scheme())
         && host_matches(host, ancestor)
-        && port_matches(port, scheme, ancestor)
+        && port_matches(port, ancestor, scheme)
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ npm install playwright
 ```js
 const { chromium } = require('playwright');
 
-const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222');
+const browser = await chromium.connectOverCDP('ws://127.0.0.1:9222/devtools/browser');
 const context = browser.contexts()[0] || await browser.newContext();
 const page = await context.newPage();
 ```
@@ -121,8 +121,10 @@ Popup loading and messages continue while a CDP evaluation awaits a promise.
 `postMessage` uses structured clone and native source/origin checks; cross-origin
 DOM access is denied. `noopener` returns no handle and creates no opener link.
 CDP target discovery and attachment reflect these native windows, rather than
-creating substitute page objects. Debugger-start pausing is not supported and
-is not advertised as active.
+creating substitute page objects. An auto-attached debugger-start popup waits
+for its owning session's `Runtime.runIfWaitingForDebugger`; detaching that
+session releases the wait. Navigation, load and opener messages then advance
+without further client commands.
 
 ## Application timing
 
@@ -175,7 +177,8 @@ await page.pdf({ path: 'page.pdf', format: 'A4', printBackground: true });
 ```
 
 A normal screenshot captures the live viewport and scroll position;
-`fullPage: true` captures document space. PDF output is raster-backed.
+`fullPage: true` captures document space. PDF export uses print-media layout,
+shaped text with embedded subset fonts, vector paint and images.
 
 ## Screencasting
 
@@ -253,4 +256,4 @@ early parent abort listener, before dependent abort steps run.
   [Persist cookies and storage](Persist-cookies-and-storage.md).
 - Service workers, native media, some Web APIs, long-tail CSS, and compositor
   behavior remain incomplete relative to Chromium.
-- PDF text is not selectable/searchable and tagged PDF is not yet available.
+- Tagged PDF, headers/footers, outlines and full CSS paged media are not implemented.

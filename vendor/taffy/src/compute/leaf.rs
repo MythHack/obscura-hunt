@@ -106,6 +106,7 @@ where
                 #[cfg(feature = "content_size")]
                 content_size: Size::ZERO,
                 first_baselines: Point::NONE,
+                last_baselines: Point::NONE,
                 top_margin: CollapsibleMarginSet::ZERO,
                 bottom_margin: CollapsibleMarginSet::ZERO,
                 margins_can_collapse_through: false,
@@ -161,6 +162,7 @@ where
         #[cfg(feature = "content_size")]
         content_size: measured_size + padding.sum_axes(),
         first_baselines: Point::NONE,
+        last_baselines: Point::NONE,
         top_margin: CollapsibleMarginSet::ZERO,
         bottom_margin: CollapsibleMarginSet::ZERO,
         margins_can_collapse_through: !has_styles_preventing_being_collapsed_through

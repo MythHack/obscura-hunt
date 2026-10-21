@@ -25,6 +25,9 @@ deno_core = { path = "../obscura-hunt/vendor/deno_core-0.412.0" }
 deno_v8 = { path = "../obscura-hunt/vendor/deno_v8-0.4.0" }
 taffy = { path = "../obscura-hunt/vendor/taffy" }
 cosmic-text = { path = "../obscura-hunt/vendor/cosmic-text" }
+rustls-platform-verifier = { path = "../obscura-hunt/vendor/rustls-platform-verifier-0.7.1" }
+wreq = { path = "../obscura-hunt/vendor/wreq-6.0.0-rc.31" }
+btls-sys = { path = "../obscura-hunt/vendor/btls-sys-0.5.6" }
 ```
 
 Cargo ignores patches declared in a dependency's workspace root, including
@@ -32,10 +35,11 @@ when the dependency is fetched through git. Selecting the fork alone therefore
 does not inherit its patches. The consumer root must explicitly select both
 `deno_core` (the browser-realm integration) and `deno_v8` (the facade pinning raw
 `v8` to `=152.2.0`). The `taffy` and `cosmic-text` patches preserve this fork's
-layout and font behavior when `obscura`'s `render` feature is enabled; keep all
-four entries when using rendering. These paths refer to the explicit checkout
-above, not to an assumed `vendor/` directory inside your application or Cargo's
-git cache.
+layout and font behavior when `obscura`'s `render` feature is enabled. The verifier,
+`wreq` and `btls-sys` patches retain network validation, certificate-chain recovery
+and stealth/OpenSSL symbol isolation. Keep the complete patch table for the
+corresponding features. These paths refer to the explicit checkout above, not to
+an assumed `vendor/` directory inside your application or Cargo's git cache.
 
 The locked engine family is `deno_core 0.412.0`, `serde_v8 0.321.0`,
 `deno_v8 0.4.0` and raw `v8 152.2.0` (V8 `15.2.124.1-rusty`). `deno_v8` is a facade,
@@ -43,7 +47,7 @@ not Deno CLI `2.9.7`; that CLI uses the same facade family but raw V8 `150.4.0`.
 Keep the fork checkout at a recorded commit and commit the consumer's own
 `Cargo.lock` with the patched versions selected; the dependency's lockfile does
 not pin your application's resolution. Use the same checkout for the library
-and all four patches.
+and every patch.
 
 The first build includes native dependencies and needs the tools described in
 [Build from source](Build-from-source.md). The native SDK, snapshot producer and
@@ -80,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## API surface
 
-`Browser::builder()` configures the engine: `.stealth(bool)`, `.proxy(url)`, `.user_agent(ua)`, `.storage_dir(dir)`, then `.build()`. `Browser::new()` uses defaults.
+`Browser::builder()` configures the engine: `.stealth(bool)`, `.proxy(url)`, `.user_agent(ua)`, `.storage_dir(dir)`, `.regional(RegionalConfig)`, then `.build()`. `Browser::new()` uses defaults. Both construction paths return a `Result`; profile load and permission errors propagate from `.build()` instead of opening an empty replacement profile. See [persistent context construction and saves](Persist-cookies-and-storage.md#rust-context-construction-and-saves) for the lower-level `BrowserContext` API.
 
 `Page`:
 - `goto(url).await` navigate and wait for load
@@ -125,7 +129,7 @@ page.settle(2000).await;   // let in-page fetch() calls resolve
 
 ### Active interception
 
-`enable_interception()` returns a channel of every JS `fetch()`/XHR request. Resolve each through its `resolver` to pass, block, mock, or rewrite it.
+`enable_interception()` returns a channel of native page requests, including document navigation, subresources and JS `fetch()`/XHR, paused before target I/O. Resolve each through its `resolver` to pass, block, mock, or rewrite it. `Fail` and `Fulfill` do not send the target request; a disconnected or unanswered interceptor fails closed.
 
 ```rust
 use obscura::{Browser, InterceptResolution};
@@ -141,7 +145,7 @@ tokio::spawn(async move {
             InterceptResolution::Fulfill {
                 status: 200,
                 headers: Default::default(),
-                body: r#"{"newDashboard":true}"#.into(),
+                body: br#"{"newDashboard":true}"#.to_vec(),
             }
         } else {
             // Pass through, or rewrite by setting url/method/headers/body.
@@ -155,9 +159,13 @@ page.goto("https://example.com").await?;
 page.settle(2000).await;
 ```
 
-A `Continue` with `url: Some(...)` rewrites the target. The new URL is re-checked against the SSRF / private-network gate, so a rewrite cannot reach an internal address that would otherwise need `--allow-private-network`.
+A `Continue` with `url: Some(...)` rewrites the target. The new URL and each redirect are re-checked against the file/address permissions; rewriting cannot bypass the configured CIDR exemptions or private-network gate.
 
 `Continue.body` takes raw bytes as `Option<Vec<u8>>`, not a base64 string. Migrate text overrides from `Some(text)` to `Some(text.into_bytes())`. `None` preserves the original request body; `Some(Vec::new())` replaces it with an empty body. CDP clients still send base64 `postData` as specified by the protocol; Obscura decodes it before sending the request.
+
+`Fulfill.body` is also raw `Vec<u8>`. Use `text.into_bytes()` for text or pass
+binary bytes directly; do not base64-encode the public Rust body. Only CDP
+`Fetch.fulfillRequest` uses a base64 body on the wire.
 
 ### Preload scripts
 
@@ -169,7 +177,7 @@ page.add_preload_script("window.__patched = true;");
 page.goto("https://example.com").await?;
 ```
 
-`resource_type` reports `Fetch` for JS-initiated requests and does not yet split `Xhr` from `Fetch`.
+Passive `RequestInfo.resource_type` distinguishes `ResourceType::Fetch` from `ResourceType::Xhr`. The active `InterceptedRequest.resource_type` uses CDP-style strings such as `"Fetch"`, `"XHR"`, `"Document"` and `"Script"`.
 
 ## When to use which interface
 

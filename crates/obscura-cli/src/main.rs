@@ -33,6 +33,18 @@ struct Args {
 
     #[arg(long, global = true)]
     proxy: Option<String>,
+    /// Regional profile JSON (GeoIP/data provenance, locale, timezone,
+    /// languages, position and stable seed), resolved before the first request.
+    #[arg(long, global = true, value_name = "FILE")]
+    regional_config: Option<std::path::PathBuf>,
+
+    /// off, auto, or a literal IPv4/IPv6 address; overrides regional-config.
+    #[arg(long, global = true, value_name = "MODE_OR_IP")]
+    geoip: Option<String>,
+
+    /// Print resolved regional identity and data/egress provenance, then exit.
+    #[arg(long, global = true)]
+    regional_info: bool,
 
     /// Enable stealth mode (consistent browser fingerprint, and with the
     /// `stealth` build feature, TLS impersonation plus tracker blocking).
@@ -50,6 +62,10 @@ struct Args {
 
     #[arg(long)]
     storage_dir: Option<std::path::PathBuf>,
+
+    /// Allow explicitly requested local file navigation. Off by default.
+    #[arg(long, global = true)]
+    allow_file_access: bool,
 
     /// Recursively load TTF, TTC, OTF, and OTC files from this directory
     /// before the first render. Repeat for multiple directories. These fonts
@@ -73,6 +89,10 @@ struct Args {
     /// and survives in command pipelines.
     #[arg(long, global = true)]
     allow_private_network: bool,
+
+    /// Exempt only these CIDRs from the private-address deny-set.
+    #[arg(long, value_name = "CIDR", value_delimiter = ',', global = true)]
+    allow_network: Vec<String>,
 
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
@@ -136,12 +156,6 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         ready_file: Option<std::path::PathBuf>,
 
-        /// Allow CDP clients to navigate to file:// URLs. Off by
-        /// default so a CDP connection cannot read arbitrary local
-        /// files. Enable only when serving local HTML for testing
-        /// and the port is on a trusted network.
-        #[arg(long)]
-        allow_file_access: bool,
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
@@ -495,6 +509,48 @@ async fn run_cli() -> anyhow::Result<()> {
             std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
         }
     }
+    let mut allowed_networks = obscura_ssrf::env_allowed_networks().map_err(anyhow::Error::msg)?;
+    for value in &args.allow_network {
+        allowed_networks.push(value.parse().map_err(anyhow::Error::msg)?);
+    }
+    if allowed_networks.iter().any(|range| range.is_unrestricted()) {
+        eprintln!("Warning: --allow-network /0 grants access to every address in its address family");
+    }
+    if !args.allow_network.is_empty() {
+        let previous = std::env::var("OBSCURA_ALLOW_NETWORK").unwrap_or_default();
+        let value = if previous.trim().is_empty() { args.allow_network.join(",") }
+            else { format!("{previous},{}", args.allow_network.join(",")) };
+        // Before workers or network clients exist; every entry was parsed above.
+        unsafe { std::env::set_var("OBSCURA_ALLOW_NETWORK", value); }
+    }
+    let global_user_agent = args.user_agent.clone();
+    if let Some(user_agent) = &global_user_agent {
+        unsafe { std::env::set_var("OBSCURA_USER_AGENT", user_agent); }
+    }
+
+    // Resolve the native identity before even the initial about:blank isolate.
+    // Subprocess workers inherit this exact draw and do not rediscover egress.
+    let mut regional = if let Some(path) = &args.regional_config {
+        let bytes = std::fs::read(path).map_err(|error| anyhow::anyhow!("Cannot read regional configuration {}: {error}", path.display()))?;
+        serde_json::from_slice::<obscura_browser::regional::RegionalConfig>(&bytes)?
+    } else { obscura_browser::regional::RegionalConfig::from_env().map_err(anyhow::Error::msg)? };
+    if let Some(mode) = &args.geoip { regional.geoip.clone_from(mode); }
+    unsafe { std::env::set_var("OBSCURA_REGIONAL_CONFIG", serde_json::to_string(&regional)?); }
+    let regional_proxy = match &args.command {
+        Some(Command::Serve { proxy, .. }) | Some(Command::Mcp { proxy, .. }) => proxy.clone().or_else(|| args.proxy.clone()),
+        _ => args.proxy.clone(),
+    }.or_else(|| std::env::var("OBSCURA_PROXY").ok());
+    let regional = if args.regional_config.is_none() && args.geoip.is_none() && std::env::var_os("OBSCURA_RESOLVED_REGION").is_some() {
+        let profile = obscura_browser::regional::context_region(regional_proxy, args.stealth, args.allow_private_network || obscura_net::env_allows_private_network())
+            .map_err(anyhow::Error::msg)?;
+        obscura_browser::regional::install_process_region(profile.as_ref().clone()).map_err(anyhow::Error::msg)?
+    } else {
+        let regional = regional.resolve(regional_proxy.as_deref(), args.stealth, args.allow_private_network
+            || obscura_net::env_allows_private_network()).await.map_err(anyhow::Error::msg)?;
+        obscura_browser::regional::install_process_region(regional).map_err(anyhow::Error::msg)?
+    };
+    if args.regional_info { println!("{}", serde_json::to_string_pretty(regional.as_ref())?); return Ok(()); }
+    unsafe { std::env::set_var("OBSCURA_RESOLVED_REGION", serde_json::to_string(regional.as_ref())?); }
 
     let global_proxy = args.proxy.clone();
     let global_storage_dir = args.storage_dir.clone();
@@ -514,10 +570,11 @@ async fn run_cli() -> anyhow::Result<()> {
             worker_max_age,
             worker_drain_timeout,
             ready_file,
-            allow_file_access,
             storage_dir,
             quiet: _,
         }) => {
+            let user_agent = user_agent.or_else(|| global_user_agent.clone());
+            let allow_file_access = args.allow_file_access;
             // `--storage-dir` is accepted globally (before the subcommand) and
             // on `serve` itself; both name the same profile directory.
             let storage_dir = storage_dir.or_else(|| global_storage_dir.clone());
@@ -612,6 +669,7 @@ async fn run_cli() -> anyhow::Result<()> {
             concurrency,
             screenshot,
         }) => {
+            let user_agent = user_agent.or_else(|| global_user_agent.clone());
             if let Some(file) = file {
                 if url.is_some() {
                     anyhow::bail!("Pass URLs via a positional argument or --file, not both.");
@@ -636,7 +694,8 @@ async fn run_cli() -> anyhow::Result<()> {
                     global_proxy,
                     output,
                     quiet,
-                    stealth
+                    stealth,
+                    args.allow_file_access,
                 )
                 .await?;
             } else {
@@ -666,6 +725,7 @@ async fn run_cli() -> anyhow::Result<()> {
                     args.allow_private_network,
                     obey_robots,
                     screenshot,
+                    args.allow_file_access,
                 )
                 .await?;
             }
@@ -700,6 +760,7 @@ async fn run_cli() -> anyhow::Result<()> {
             proxy,
             user_agent,
         }) => {
+            let user_agent = user_agent.or_else(|| global_user_agent.clone());
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             // `obscura mcp` builds its BrowserContext from the environment, so
             // the global profile flag has to be handed over explicitly.
@@ -720,7 +781,11 @@ async fn run_cli() -> anyhow::Result<()> {
             if let Some(ref proxy) = args.proxy {
                 tracing::info!("Using proxy: {}", proxy);
             }
-            obscura_cdp::start_with_options(args.port, args.proxy, stealth).await?;
+            obscura_cdp::start_with_serve_options_limit_and_ready_file(
+                args.port, "127.0.0.1", args.proxy, stealth, global_user_agent,
+                args.allow_file_access, global_storage_dir, args.allow_private_network,
+                obscura_cdp::DEFAULT_MAX_CONNECTIONS, None,
+            ).await?;
         }
     }
 
@@ -1226,6 +1291,7 @@ async fn run_fetch(
     allow_private_network: bool,
     obey_robots: bool,
     screenshot: Option<std::path::PathBuf>,
+    allow_file_access: bool,
 ) -> anyhow::Result<()> {
     // Whether the user explicitly passed --dump. With --eval also present this
     // decides whether we return the eval value or read the page after the
@@ -1244,6 +1310,8 @@ async fn run_fetch(
             user_agent.clone(),
             timeout_secs,
             stealth,
+            storage_dir.or_else(|| std::env::var_os("OBSCURA_STORAGE_DIR").map(std::path::PathBuf::from)),
+            allow_file_access,
         )
         .await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
@@ -1257,12 +1325,10 @@ async fn run_fetch(
         user_agent.clone(),
         storage_dir.clone(),
         allow_private_network,
-    );
+    )?;
     context.obey_robots = obey_robots;
-    // The browser layer refuses file:// unless the context opts in. A local
-    // user running `obscura fetch file://...` on their own files is the
-    // intended case; only network-facing servers (serve, mcp) keep it off.
-    context.allow_file_access = true;
+    // Both the browser and low-level transport require the explicit file grant.
+    context.set_allow_file_access(allow_file_access);
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI
@@ -1422,7 +1488,7 @@ async fn run_fetch(
                     other => other.to_string(),
                 };
                 write_or_print(rendered, output.as_ref()).await?;
-                context.save_storage();
+                context.save_storage()?;
                 return Ok(());
             }
             #[cfg(feature = "render")]
@@ -1597,7 +1663,7 @@ async fn run_fetch(
                     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
                 );
             }
-            context.save_storage();
+            context.save_storage()?;
             return Ok(());
         }
         #[cfg(not(feature = "render"))]
@@ -1622,7 +1688,7 @@ async fn run_fetch(
     write_or_print(rendered, output.as_ref()).await?;
 
     // Save cookies to disk if storage_dir is configured
-    context.save_storage();
+    context.save_storage()?;
 
     Ok(())
 }
@@ -1633,51 +1699,55 @@ async fn fetch_original_response(
     user_agent: Option<String>,
     timeout_secs: u64,
     stealth: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_file_access: bool,
 ) -> anyhow::Result<obscura_net::Response> {
     let url = url::Url::parse(url_str)
         .map_err(|e| anyhow::anyhow!("Invalid URL '{}': {}", url_str, e))?;
 
-    // `--dump original` short-circuits the browser stack (see run_fetch) and
-    // builds its own client here instead of going through BrowserContext /
-    // Page::do_fetch, which is where --stealth is normally applied. Without
-    // this, the request stays on plain HTTP/1.1 with no TLS impersonation
-    // regardless of --stealth (issue #482). file:// has no TLS handshake to
-    // impersonate and the wreq client only speaks http(s), so it is excluded
-    // here the same way ObscuraHttpClient::fetch_with_method excludes it
-    // internally.
+    let mut context = if storage_dir.is_some() {
+        BrowserContext::with_storage_full(
+            "original-fetch".into(), proxy.clone(), stealth, user_agent.clone(), storage_dir,
+        )?
+    } else {
+        // Batch/raw callers explicitly pass no profile. Do not turn scrape or
+        // concurrent batch fetch into an implicit shared-profile writer.
+        BrowserContext::with_full_options("original-fetch".into(), proxy.clone(), stealth, user_agent.clone())
+    };
+    context.regional.as_ref().map_err(|error| anyhow::anyhow!(error.clone()))?;
+    context.set_allow_file_access(allow_file_access);
     if stealth && url.scheme() != "file" {
         #[cfg(feature = "stealth")]
         {
-            // `false` matches the reqwest path below (`with_options`); the
-            // CLI mirrors --allow-private-network into
-            // OBSCURA_ALLOW_PRIVATE_NETWORK at startup, which this client
-            // honours.
-            let client = obscura_net::StealthHttpClient::with_proxy(
-                Arc::new(obscura_net::CookieJar::new()),
+            let mut client = obscura_net::StealthHttpClient::with_network_policy(
+                context.cookie_jar.clone(),
                 proxy.as_deref(),
-                false,
+                context.allow_private_network,
+                context.http_client.allow_network.clone(),
+                allow_file_access,
             );
-            return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
-                Ok(Ok(resp)) => Ok(resp),
+            *client.user_agent.get_mut() = context.user_agent.clone();
+            *client.accept_language.get_mut() = context.http_client.accept_language.read().await.clone();
+            *client.platform.get_mut() = context.ua_platform.clone();
+            let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+                Ok(Ok(resp)) => resp,
                 Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
                 Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
             };
+            context.save_storage()?;
+            return Ok(response);
         }
     }
 
-    let client = obscura_net::ObscuraHttpClient::with_options(
-        Arc::new(obscura_net::CookieJar::new()),
-        proxy.as_deref(),
-    );
-    if let Some(ua) = user_agent {
-        client.set_user_agent(&ua).await;
-    }
+    let client = &context.http_client;
 
-    match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
-        Ok(Ok(resp)) => Ok(resp),
+    let response = match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
+        Ok(Ok(resp)) => resp,
         Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
-    }
+    };
+    context.save_storage()?;
+    Ok(response)
 }
 
 async fn fetch_original_bytes(
@@ -1686,9 +1756,11 @@ async fn fetch_original_bytes(
     user_agent: Option<String>,
     timeout_secs: u64,
     stealth: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_file_access: bool,
 ) -> anyhow::Result<Vec<u8>> {
     Ok(
-        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth)
+        fetch_original_response(url_str, proxy, user_agent, timeout_secs, stealth, storage_dir, allow_file_access)
             .await?
             .body,
     )
@@ -1731,6 +1803,7 @@ async fn run_batch_fetch(
     output: Option<std::path::PathBuf>,
     quiet: bool,
     stealth: bool,
+    allow_file_access: bool,
 ) -> anyhow::Result<()> {
     let total = urls.len();
     if total == 0 {
@@ -1760,6 +1833,8 @@ async fn run_batch_fetch(
                 (*user_agent).clone(),
                 timeout_secs,
                 stealth,
+                None,
+                allow_file_access,
             )
             .await;
             let elapsed_ms = task_start.elapsed().as_millis();
@@ -2611,7 +2686,7 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, false)
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, false, None, true)
             .await
             .expect("fetch_original_bytes should round-trip the file body");
 
@@ -2647,7 +2722,7 @@ mod tests {
             .expect("seed temp PNG fixture");
 
         let file_url = format!("file://{}", path.display());
-        let bytes = fetch_original_bytes(&file_url, None, None, 5, true)
+        let bytes = fetch_original_bytes(&file_url, None, None, 5, true, None, true)
             .await
             .expect("fetch_original_bytes should still round-trip file:// with stealth=true");
 
@@ -2965,7 +3040,7 @@ mod tests {
                 None,
                 None,
                 true,
-            ),
+            ).unwrap(),
         );
         let mut page = obscura_browser::Page::new("cli-timeout-test".to_string(), context);
         configure_fetch_navigation_timeout(&mut page, timeout);

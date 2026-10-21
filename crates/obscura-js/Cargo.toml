@@ -14,7 +14,7 @@ stealth = ["obscura-net/stealth"]
 # Builds the obscura-render layout layer and exposes real box geometry to JS
 # (getBoundingClientRect, elementFromPoint, offset*), and with paint enabled,
 # rasterizes screenshots. Off by default so the scraping build stays lean.
-render = ["dep:obscura-render", "obscura-render/paint"]
+render = ["obscura-render/paint"]
 # Mirror deno_core's supported V8 pointer-compression configuration into the
 # native helper compile. deno_core 0.412 does not expose a sandbox feature.
 v8_enable_pointer_compression = [
@@ -46,11 +46,18 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 html5ever = { workspace = true }
+# SVG geometry is available without the optional rasterizer. Reuse the same
+# path parser and adaptive curve geometry already used by usvg.
+svgtypes = "0.16.1"
+kurbo = "0.13.1"
+cssparser = { workspace = true }
 # deno_core 0.412.0 pins deno_error (and its derive macro) to 0.7.1.
 deno_error = "=0.7.1"
 base64 = { workspace = true }
 # Fetch-standard data URL parsing and streaming, bounded byte decoding.
 data-url = "0.3.2"
+encoding_rs = "0.8"
+percent-encoding = "2"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 # WebCrypto (crypto.subtle) primitives. RustCrypto, pure Rust, no CMake/OpenSSL,
@@ -63,6 +70,24 @@ cbc = { version = "0.2.1", features = ["alloc"] }
 ctr = "0.10.1"
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 hkdf = "0.13.0"
+# Public-key WebCrypto needs static-key import/export, RSA key generation and
+# OAEP/PSS plus all NIST curves and Ed25519/X25519. OpenSSL 3 is built from
+# maintained vendored sources; Windows needs Perl, NASM and the C toolchain.
+openssl = { version = "0.10.81", features = ["vendored"] }
 # CSPRNG for getRandomValues / randomUUID (replaces Math.random).
 getrandom = "0.4.3"
-obscura-render = { workspace = true, optional = true }
+language-tags = "0.3"
+chrono-tz = "0.10"
+webrtc = { version = "=0.21.1", features = ["runtime-tokio"] }
+async-trait = "0.1"
+bytes = "1"
+obscura-ssrf = { workspace = true }
+hickory-proto = { version = "0.25", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+# SVG font-relative geometry shares native face selection without paint/shaping.
+obscura-render = { workspace = true, features = ["font-metadata"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = { workspace = true }

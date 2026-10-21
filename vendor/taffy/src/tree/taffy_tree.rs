@@ -21,6 +21,21 @@ use crate::compute::{
     compute_cached_layout, compute_hidden_layout, compute_leaf_layout, compute_root_layout, round_layout,
 };
 use crate::CacheTree;
+use crate::util::ResolveOrZero;
+
+/// Baseline supplied by an atomic formatting context or its border box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BaselineAlignment {
+    /// Uses the node's last in-flow baseline, falling back to the laid-out box's bottom, plus this offset in pixels.
+    Content(f32),
+    /// Places the baseline at a fraction of the border-box height, then applies an offset in pixels.
+    BorderBox {
+        /// Fraction of the border-box height at which to place the baseline.
+        factor: f32,
+        /// Additive baseline adjustment in pixels.
+        offset: f32,
+    },
+}
 
 #[cfg(feature = "block_layout")]
 use crate::{compute::compute_block_layout, LayoutBlockContainer};
@@ -118,6 +133,9 @@ struct NodeData {
 
     /// Whether the node has context data associated with it or not
     pub(crate) has_context: bool,
+    /// CSS atomic inline participation uses the last in-flow baseline.
+    inline_baseline: Option<BaselineAlignment>,
+    resolved_baselines: (Option<f32>, Option<f32>),
 
     /// The cached results of the layout computation
     pub(crate) cache: Cache,
@@ -137,6 +155,8 @@ impl NodeData {
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
+            inline_baseline: None,
+            resolved_baselines: (None, None),
             #[cfg(feature = "detailed_layout_info")]
             detailed_layout_info: DetailedLayoutInfo::None,
         }
@@ -283,6 +303,7 @@ where
     pub(crate) taffy: &'t mut TaffyTree<NodeContext>,
     /// The context provided for passing to measure functions if layout is run over this struct
     pub(crate) measure_function: MeasureFunction,
+    baseline_function: Option<&'t mut dyn FnMut(NodeId, Option<&mut NodeContext>, &Style, Size<f32>) -> Option<(f32, f32)>>,
 }
 
 impl<NodeContext, MeasureFunction> TaffyView<'_, NodeContext, MeasureFunction>
@@ -311,7 +332,7 @@ where
         //   - Else call the passed closure (below) to compute the result
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
-        compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+        let output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             let display_mode = tree.taffy.nodes[node_id.into()].style.display;
             let has_children = tree.child_count(node_id) > 0;
 
@@ -319,7 +340,7 @@ where
             debug_log_node!(inputs);
 
             // Dispatch to a layout algorithm based on the node's display style and whether the node has children or not.
-            match (display_mode, has_children) {
+            let mut output = match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(tree, node_id),
                 #[cfg(feature = "block_layout")]
                 (Display::Block, true) => compute_block_layout(tree, node_id, inputs, block_ctx),
@@ -341,10 +362,45 @@ where
                     let measure_function = |known_dimensions, available_space| {
                         (tree.measure_function)(known_dimensions, available_space, node_id, node_context, style)
                     };
-                    compute_leaf_layout(inputs, style, |_, _| 0.0, measure_function)
+                    let mut output = compute_leaf_layout(inputs, style, |_, _| 0.0, measure_function);
+                    let edges = style.padding.resolve_or_zero(inputs.parent_size.width, &|_, _| 0.0)
+                        + style.border.resolve_or_zero(inputs.parent_size.width, &|_, _| 0.0);
+                    let content_size = (output.size - edges.sum_axes()).map(|value| value.max(0.0));
+                    if let Some(baselines) = tree.baseline_function.as_mut().and_then(|baseline| {
+                        let context = has_context.then(|| tree.taffy.node_context_data.get_mut(node_key)).flatten();
+                        baseline(node_id, context, style, content_size)
+                    }) {
+                        output.first_baselines.y = Some(baselines.0 + edges.top);
+                        output.last_baselines.y = Some(baselines.1 + edges.top);
+                    }
+                    output
+                }
+            };
+            if has_children && inputs.run_mode == RunMode::PerformLayout {
+                for &child in tree.taffy.children[node_id.into()].iter() {
+                    let child_data = &tree.taffy.nodes[child.into()];
+                    if child_data.style.display == Display::None || child_data.style.position == crate::style::Position::Absolute { continue; }
+                    let y = child_data.unrounded_layout.location.y;
+                    if output.first_baselines.y.is_none() {
+                        output.first_baselines.y = child_data.resolved_baselines.0.map(|baseline| y + baseline);
+                    }
+                    if let Some(baseline) = child_data.resolved_baselines.1 {
+                        output.last_baselines.y = Some(y + baseline);
+                    }
                 }
             }
-        })
+            if let Some(alignment) = tree.taffy.nodes[node_id.into()].inline_baseline {
+                let baseline = match alignment {
+                    BaselineAlignment::Content(offset) => output.last_baselines.y.unwrap_or(output.size.height) + offset,
+                    BaselineAlignment::BorderBox { factor, offset } => output.size.height * factor + offset,
+                };
+                output.first_baselines.y = Some(baseline);
+                output.last_baselines.y = Some(baseline);
+            }
+            output
+        });
+        self.taffy.nodes[node_id.into()].resolved_baselines = (output.first_baselines.y, output.last_baselines.y);
+        output
     }
 }
 
@@ -682,6 +738,17 @@ impl<NodeContext> TaffyTree<NodeContext> {
         Ok(())
     }
 
+    /// Select the CSS atomic inline last-baseline policy for this node.
+    pub fn set_inline_baseline(&mut self, node: NodeId, alignment: BaselineAlignment) -> TaffyResult<()> {
+        self.nodes[node.into()].inline_baseline = Some(alignment);
+        self.mark_dirty(node)
+    }
+
+    /// The used first/last baseline of a measured or laid out node.
+    pub fn baselines(&self, node: NodeId) -> TaffyResult<(Option<f32>, Option<f32>)> {
+        self.nodes.get(node.into()).map(|node| node.resolved_baselines).ok_or(TaffyError::InvalidInputNode(node))
+    }
+
     /// Gets a reference to the the context data associated with the node
     #[inline]
     pub fn get_node_context(&self, node: NodeId) -> Option<&NodeContext> {
@@ -941,11 +1008,27 @@ impl<NodeContext> TaffyTree<NodeContext> {
             FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
     {
         let use_rounding = self.config.use_rounding;
-        let mut taffy_view = TaffyView { taffy: self, measure_function };
+        let mut taffy_view = TaffyView { taffy: self, measure_function, baseline_function: None };
         compute_root_layout(&mut taffy_view, node_id, available_space);
         if use_rounding {
             round_layout(&mut taffy_view, node_id);
         }
+        Ok(())
+    }
+
+    /// Layout with font baselines from the same native shaper as measurement.
+    pub fn compute_layout_with_measure_and_baseline<MeasureFunction, BaselineFunction>(
+        &mut self, node_id: NodeId, available_space: Size<AvailableSpace>, measure_function: MeasureFunction,
+        mut baseline_function: BaselineFunction,
+    ) -> Result<(), TaffyError>
+    where
+        MeasureFunction: FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> Size<f32>,
+        BaselineFunction: FnMut(NodeId, Option<&mut NodeContext>, &Style, Size<f32>) -> Option<(f32, f32)>,
+    {
+        let use_rounding = self.config.use_rounding;
+        let mut view = TaffyView { taffy: self, measure_function, baseline_function: Some(&mut baseline_function) };
+        compute_root_layout(&mut view, node_id, available_space);
+        if use_rounding { round_layout(&mut view, node_id); }
         Ok(())
     }
 
@@ -963,7 +1046,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// Returns an instance of LayoutTree representing the TaffyTree
     #[cfg(test)]
     pub(crate) fn as_layout_tree(&mut self) -> impl LayoutPartialTree + CacheTree + '_ {
-        TaffyView { taffy: self, measure_function: |_, _, _, _, _| Size::ZERO }
+        TaffyView { taffy: self, measure_function: |_, _, _, _, _| Size::ZERO, baseline_function: None }
     }
 }
 

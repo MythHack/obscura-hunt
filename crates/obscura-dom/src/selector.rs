@@ -103,6 +103,7 @@ pub enum PseudoClass {
     Focus,
     FocusVisible,
     FocusWithin,
+    Target,
     Enabled,
     Disabled,
     Checked,
@@ -143,6 +144,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Focus => dest.write_str(":focus"),
             PseudoClass::FocusVisible => dest.write_str(":focus-visible"),
             PseudoClass::FocusWithin => dest.write_str(":focus-within"),
+            PseudoClass::Target => dest.write_str(":target"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
@@ -196,6 +198,8 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    fn parse_nth_child_of(&self) -> bool { true }
+
     // `:host` is parsed by the selectors crate itself. Ordinary document
     // matching still cannot match it because those contexts deliberately have
     // no `current_host`.
@@ -220,6 +224,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "focus" => Ok(PseudoClass::Focus),
             "focus-visible" => Ok(PseudoClass::FocusVisible),
             "focus-within" => Ok(PseudoClass::FocusWithin),
+            "target" => Ok(PseudoClass::Target),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
@@ -384,7 +389,7 @@ impl<'a> Element for DomElement<'a> {
         self.tree
             .with_node(self.node_id, |n| {
                 n.as_element()
-                    .map(|name| name.ns == ns!(html))
+                    .map(|name| name.ns == ns!(html) && !self.tree.is_xml_node(self.node_id))
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -494,11 +499,10 @@ impl<'a> Element for DomElement<'a> {
             }
             PseudoClass::Hover => self.tree.is_hovered(self.node_id),
             PseudoClass::PopoverOpen => self.tree.is_popover_open(self.node_id),
-            // These dynamic states are not tracked yet.
-            PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::FocusVisible
-            | PseudoClass::FocusWithin => false,
+            PseudoClass::Focus | PseudoClass::FocusVisible => self.tree.is_focused(self.node_id),
+            PseudoClass::FocusWithin => self.tree.is_focus_within(self.node_id),
+            PseudoClass::Target => self.tree.is_target(self.node_id),
+            PseudoClass::Active => false,
         }
     }
 
@@ -721,7 +725,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            self.selector_quirks_mode(),
+            if self.is_xml_node(root) { QuirksMode::NoQuirks } else { self.selector_quirks_mode() },
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -770,7 +774,7 @@ impl DomTree {
             MatchingMode::Normal,
             None,
             &mut caches,
-            self.selector_quirks_mode(),
+            if self.is_xml_node(root) { QuirksMode::NoQuirks } else { self.selector_quirks_mode() },
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -1267,6 +1271,33 @@ mod tests {
     use crate::tree_sink::parse_html;
 
     use super::{DomElement, SelectorKey};
+
+    #[test]
+    fn filtered_nth_and_document_states_share_query_and_rule_matching() {
+        let tree = parse_html("<main id=group><li id=a class=a></li><li class=b></li><li id=c class=a></li></main>");
+        let group = tree.get_element_by_id("group").unwrap();
+        let a = tree.get_element_by_id("a").unwrap();
+        let c = tree.get_element_by_id("c").unwrap();
+        assert_eq!(tree.query_selector_all("li:nth-child(2 of .a)").unwrap(), vec![c]);
+        assert_eq!(tree.query_selector_all("li:nth-child(odd of .a, .b)").unwrap(), vec![a, c]);
+        assert!(tree.query_selector_all("li:nth-child(2 of)").is_err());
+        tree.set_focused(Some(c));
+        assert!(tree.matches_selector(group, ":focus-within").unwrap());
+        let selector = tree.compile_rule_selector("main:focus-within > li:nth-child(2 of .a)").unwrap();
+        let mut matcher = tree.matcher();
+        for ancestor in tree.ancestors(c).into_iter().rev() {
+            matcher.push_ancestor(&tree, ancestor);
+        }
+        assert!(matcher.matches(&tree, c, &selector));
+        tree.set_target_fragment("c");
+        assert_eq!(tree.query_selector_all(":target").unwrap(), vec![c]);
+        tree.detach(c);
+        assert!(!tree.matches_selector(group, ":focus-within").unwrap());
+        assert!(tree.query_selector_all(":target").unwrap().is_empty());
+        tree.set_focused(None);
+        tree.set_target_fragment("");
+        assert!(tree.query_selector_all(":focus-within, :target").unwrap().is_empty());
+    }
 
     #[test]
     fn streaming_selectors_keep_scope_order_and_see_reparented_matches() {

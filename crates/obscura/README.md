@@ -27,6 +27,9 @@ deno_core = { path = "../obscura-hunt/vendor/deno_core-0.412.0" }
 deno_v8 = { path = "../obscura-hunt/vendor/deno_v8-0.4.0" }
 taffy = { path = "../obscura-hunt/vendor/taffy" }
 cosmic-text = { path = "../obscura-hunt/vendor/cosmic-text" }
+rustls-platform-verifier = { path = "../obscura-hunt/vendor/rustls-platform-verifier-0.7.1" }
+wreq = { path = "../obscura-hunt/vendor/wreq-6.0.0-rc.31" }
+btls-sys = { path = "../obscura-hunt/vendor/btls-sys-0.5.6" }
 ```
 
 The patch table belongs in the consumer's **workspace root** manifest, with
@@ -36,6 +39,8 @@ supplies browser realms, and `deno_v8 0.4.0` pins raw `v8` to `=152.2.0` (engine
 V8 `15.2.124.1-rusty`), shared with `serde_v8 0.321.0`. `deno_v8` is a Rust facade,
 not a Deno CLI version. Keep the `taffy` and `cosmic-text` patches when enabling
 `render` to retain this fork's layout and font behavior.
+The network patches retain certificate validation/recovery and isolate the
+stealth BoringSSL symbols from the public-key WebCrypto OpenSSL backend.
 
 Record the checkout commit, use that same checkout for every path above, and
 commit the consumer's own `Cargo.lock`. The first build is large; V8 normally
@@ -66,6 +71,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+`.build()` returns an error if the persistent profile cannot be loaded or its
+private permissions cannot be established; it does not silently start an empty
+session. For lower-level context constructors and explicit fallible saves, see
+[persistent Rust contexts](../../docs/Persist-cookies-and-storage.md#rust-context-construction-and-saves).
 
 See [examples/basic.rs](examples/basic.rs) for a runnable version. From the
 workspace root, run:
