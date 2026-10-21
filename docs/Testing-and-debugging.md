@@ -37,6 +37,13 @@ promise evaluation. A fixed 100 ms event-loop pump is not a load-completion
 signal. Keep the exact payload, event order and request-profile assertions;
 do not increase production deadlines to accommodate CI scheduling.
 
+For a deadline test on an in-flight resource, acknowledge the actual request
+before starting the measured interval and explicitly hold the response body.
+Keep the page and Tokio progressing during bounded admission; a blocking receive
+after the page pump stops cannot establish that precondition. Release the body
+after the unchanged deadline and pending-state assertions, then verify that the
+resource still completes.
+
 For CDP fragment navigation, check the server's interception entry as well as
 the ordinary `Page.navigate` handler. A same-document fragment keeps the current
 DOM and JavaScript state, returns no new `loaderId`, and emits

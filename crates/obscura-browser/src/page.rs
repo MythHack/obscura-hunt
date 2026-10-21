@@ -9973,10 +9973,37 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn load_delaying_script_driver_respects_absolute_deadline() {
-        let (base, requests) = spawn_delayed_classic_script_server(
-            std::time::Duration::from_secs(1),
-            "globalThis.__lateDynamicRan = true;",
-        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, requests) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() < 16384);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            let path = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            let body = b"globalThis.__lateDynamicRan = true;";
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            request_tx.send(path).expect("request observer must remain alive");
+            release_rx.await.expect("test must explicitly release the script body");
+            socket.write_all(body).await.unwrap();
+        });
         let mut page = import_map_test_page(
             "load-delayer-deadline",
             "http://127.0.0.1:9",
@@ -10000,6 +10027,24 @@ mod tests {
             .as_mut()
             .unwrap()
             .has_pending_load_delaying_scripts());
+        // Request admission is setup, not part of the response deadline. Keep
+        // both the page and Tokio progressing until the real request arrives;
+        // the fixture holds its body through every deadline assertion below.
+        let request = tokio::select! {
+            request = tokio::time::timeout(std::time::Duration::from_secs(2), requests) => {
+                request
+                    .expect("script request must reach the fixture before the admission deadline")
+                    .expect("script fixture must acknowledge the request")
+            },
+            completed = super::Page::drive_load_delaying_scripts(
+                page.js.as_mut().unwrap(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            ) => {
+                panic!("held script driver stopped before request admission; completed={completed}");
+            },
+        };
+        assert_eq!(request, "/slow-dynamic.js");
+
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(125);
 
@@ -10021,11 +10066,22 @@ mod tests {
             .as_mut()
             .unwrap()
             .has_pending_load_delaying_scripts());
+        release_tx.send(()).expect("script fixture must still hold the body");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("released script fixture must finish")
+            .expect("script fixture task must succeed");
+        assert!(
+            super::Page::drive_load_delaying_scripts(
+                page.js.as_mut().unwrap(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await,
+            "the released script body must complete",
+        );
         assert_eq!(
-            requests
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap(),
-            "/slow-dynamic.js",
+            page.js.as_mut().unwrap().evaluate("globalThis.__lateDynamicRan === true").unwrap(),
+            serde_json::json!(true),
         );
     }
 
