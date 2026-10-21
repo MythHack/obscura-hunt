@@ -28,6 +28,15 @@ writes `target/nextest/default/junit.xml` under the workspace directory. Keep th
 report when terminal output is truncated. The test deadline does not include
 compilation and must not be replaced by an unbounded command-level wait.
 
+Await the completion boundary required by an asynchronous assertion. `fetch()`
+resolves after response headers, before body completion and its final network
+event; consume the body before checking completed-response events. Image cache
+and CORS tests must register a `load`/`error` promise before each source or
+credentials change, including cache hits, and await it through bounded CDP
+promise evaluation. A fixed 100 ms event-loop pump is not a load-completion
+signal. Keep the exact payload, event order and request-profile assertions;
+do not increase production deadlines to accommodate CI scheduling.
+
 For CDP fragment navigation, check the server's interception entry as well as
 the ordinary `Page.navigate` handler. A same-document fragment keeps the current
 DOM and JavaScript state, returns no new `loaderId`, and emits

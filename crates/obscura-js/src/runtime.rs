@@ -19629,81 +19629,121 @@ mod tests {
             ),
         ));
         rt.run_page_init();
-        rt.execute_script(
-            "observe-profiled-image",
-            r#"
-                globalThis.image = document.getElementById("image");
-                globalThis.__profileEvents = [];
-                image.addEventListener("load", () => __profileEvents.push("load"));
-                image.addEventListener("error", () => __profileEvents.push("error"));
-                void image.complete;
-            "#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    globalThis.image = document.getElementById("image");
+                    globalThis.__profileEvents = [];
+                    image.addEventListener("load", () => __profileEvents.push("load"));
+                    image.addEventListener("error", () => __profileEvents.push("error"));
+                    image.onload = image.onerror = resolve;
+                    void image.complete;
+                }).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 2, ["load"]])
         );
 
-        rt.execute_script(
-            "require-anonymous-cors",
-            r#"image.crossOrigin = "anonymous";"#,
-        )
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    image.onload = image.onerror = resolve;
+                    image.crossOrigin = "anonymous";
+                }).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                "#,
+                true,
+                true,
+            )
+            .await
             .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 0, ["load", "error"]]),
             "URL-keyed no-CORS bytes must not satisfy an anonymous CORS request"
         );
 
-        rt.execute_script("restore-no-cors", "image.removeAttribute('crossorigin');")
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    image.onload = image.onerror = resolve;
+                    image.removeAttribute("crossorigin");
+                }).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                "#,
+                true,
+                true,
+            )
+            .await
             .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 2, ["load", "error", "load"]]),
             "a CORS failure must not poison the earlier no-CORS success"
         );
 
-        rt.execute_script(
-            "load-anonymous-cors",
-            &format!(r#"image.crossOrigin = "anonymous"; image.src = "{base}/cors.png";"#),
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                &format!(
+                    r#"
+                    new Promise(resolve => {{
+                        image.onload = image.onerror = resolve;
+                        image.crossOrigin = "anonymous";
+                        image.src = "{base}/cors.png";
+                    }}).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                    "#
+                ),
+                true,
+                true,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 2, ["load", "error", "load", "load"]])
         );
 
-        rt.execute_script(
-            "require-credentialed-cors",
-            r#"image.crossOrigin = "use-credentials";"#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    image.onload = image.onerror = resolve;
+                    image.crossOrigin = "use-credentials";
+                }).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 0, ["load", "error", "load", "load", "error"]]),
             "anonymous CORS success must not satisfy use-credentials"
         );
 
-        rt.execute_script(
-            "restore-anonymous-cors",
-            r#"image.crossOrigin = "anonymous";"#,
-        )
-        .unwrap();
-        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt
+            .evaluate_for_cdp(
+                r#"
+                new Promise(resolve => {
+                    image.onload = image.onerror = resolve;
+                    image.crossOrigin = "anonymous";
+                }).then(() => [image.complete, image.naturalWidth, __profileEvents])
+                "#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            rt.evaluate("[image.complete, image.naturalWidth, __profileEvents]")
-                .unwrap(),
+            result.value.unwrap(),
             serde_json::json!([true, 2, ["load", "error", "load", "load", "error", "load"]]),
             "credentialed CORS failure must not poison anonymous success"
         );
@@ -24266,6 +24306,8 @@ mod tests {
                         redirected: response.redirected,
                         cloneUrl: response.clone().url,
                         directRedirected: direct.redirected,
+                        body: await response.text(),
+                        directBody: await direct.text(),
                     };
                 }"#,
                 None,
@@ -24287,6 +24329,8 @@ mod tests {
         assert_eq!(value["redirected"], true);
         assert_eq!(value["cloneUrl"], value["url"]);
         assert_eq!(value["directRedirected"], false);
+        assert_eq!(value["body"], "arrived");
+        assert_eq!(value["directBody"], "arrived");
 
         let events = rt.take_js_network_events();
         assert_eq!(events.len(), 2);
