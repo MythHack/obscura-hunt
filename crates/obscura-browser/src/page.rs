@@ -9296,67 +9296,86 @@ mod tests {
     async fn module_graph_and_evaluation_share_one_active_budget() {
         use std::io::{Read as _, Write as _};
 
+        const MODULE_BUDGET_MS: u64 = 4_000;
+        const GRAPH_DELAY_MS: u64 = 2_000;
+        const EVALUATION_MS: u64 = 3_000;
+
+        // Graph accounting and the V8 watchdog use std::time::Instant, so a
+        // paused Tokio clock cannot exercise their shared wall-clock budget.
+        // A 2s graph hold leaves at most 2s for 3s of evaluation: both the
+        // shared-budget overrun and the fresh-budget headroom have 1s margins,
+        // with 2s left for graph overhead before evaluation could be skipped.
+        // The no-hold control runs the identical module to prove it completes
+        // with a full allowance instead of merely assuming that it would.
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (request_tx, request_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 2048];
-            let length = stream.read(&mut request).unwrap();
-            let path = String::from_utf8_lossy(&request[..length])
-                .lines()
-                .next()
-                .and_then(|line| line.split_ascii_whitespace().nth(1))
-                .unwrap_or("/")
-                .to_string();
-            request_tx.send(path).unwrap();
+        let server = std::thread::spawn(move || {
+            for graph_delay_ms in [0, GRAPH_DELAY_MS] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let path = String::from_utf8_lossy(&request[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
 
-            // Spend part of the module's allowance loading its graph. The
-            // synchronous top-level work then fits in a freshly reset budget,
-            // but cannot fit in the shared active load+evaluation budget.
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let body = "export const delayed = true;";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len(),
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+                // Start only after the real import request arrives, and record
+                // the interval during which its response is still unavailable.
+                let graph_started = std::time::Instant::now();
+                std::thread::sleep(std::time::Duration::from_millis(graph_delay_ms));
+                request_tx.send((path, graph_started.elapsed())).unwrap();
+                let body = "export const delayed = true;";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
         });
 
         let base = format!("http://{address}");
-        let mut page = import_map_test_page(
-            "shared-module-budget",
-            &base,
-            r#"<html><head><script type="module">
-                import "./delayed.js";
-                globalThis.__shared_deadline_started = true;
-                const until = Date.now() + 300;
-                while (Date.now() < until) {}
-                globalThis.__shared_deadline_completed = true;
-            </script></head><body></body></html>"#,
-        );
-        page.execute_scripts_with_module_budget(Some(350)).await;
+        let html = format!(r#"<html><head><script type="module">
+            import {{ delayed }} from "./delayed.js";
+            globalThis.__shared_deadline_started = delayed;
+            const until = performance.now() + {EVALUATION_MS};
+            while (performance.now() < until) {{}}
+            globalThis.__shared_deadline_completed = true;
+        </script></head><body></body></html>"#);
+        for (name, graph_delay_ms, expected_completed) in [
+            ("fresh-module-budget", 0, true),
+            ("shared-module-budget", GRAPH_DELAY_MS, false),
+        ] {
+            let mut page = import_map_test_page(name, &base, &html);
+            page.execute_scripts_with_module_budget(Some(MODULE_BUDGET_MS)).await;
 
-        assert_eq!(
-            request_rx
+            let (path, graph_wait) = request_rx
                 .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap(),
-            "/app/delayed.js",
-        );
-        let state = page
-            .js
-            .as_mut()
-            .unwrap()
-            .evaluate(
-                "[globalThis.__shared_deadline_started === true, \
-                  globalThis.__shared_deadline_completed === true]",
-            )
-            .unwrap();
-        assert_eq!(
-            state,
-            serde_json::json!([true, false]),
-            "evaluation must be terminated at the remaining shared deadline",
-        );
+                .unwrap();
+            assert_eq!(path, "/app/delayed.js");
+            assert!(
+                graph_wait >= std::time::Duration::from_millis(graph_delay_ms),
+                "{name}: graph loading must include the held response interval",
+            );
+            let state = page
+                .js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__shared_deadline_started === true, \
+                      globalThis.__shared_deadline_completed === true]",
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                serde_json::json!([true, expected_completed]),
+                "{name}: evaluation must start and complete only with a full allowance",
+            );
+        }
+        server.join().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

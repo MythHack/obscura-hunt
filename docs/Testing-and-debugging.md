@@ -44,6 +44,13 @@ after the page pump stops cannot establish that precondition. Release the body
 after the unchanged deadline and pending-state assertions, then verify that the
 resource still completes.
 
+Module graph accounting and the V8 watchdog use real monotonic clocks. The
+shared-budget regression therefore pairs the same module with an immediate
+import response and a measured delayed response: a 4 s allowance, a 2 s graph
+hold and 3 s of evaluation distinguish completion under a fresh allowance from
+termination under the remainder. Both paths must enter evaluation; exhausting
+the graph budget before entry is not evidence that evaluation shares it.
+
 For CDP fragment navigation, check the server's interception entry as well as
 the ordinary `Page.navigate` handler. A same-document fragment keeps the current
 DOM and JavaScript state, returns no new `loaderId`, and emits
