@@ -122,8 +122,11 @@ btls build first compiles bootstrap archives, uses the bundled Go
 `read_symbols.go` utility to collect symbols, then rebuilds through BoringSSL's
 native CMake prefix mechanism, including assembly symbols. No external
 `objcopy` replacement is used on those platforms. Linux/Android retain the
-existing `nm`/`objcopy` path. This describes the build implementation, not a
-claim of runtime verification on each platform.
+existing `nm`/`objcopy` path. After prefixing, the btls build exposes only
+`btls_crypto` and `btls_ssl` archives in a dedicated link directory. It does not
+publish BoringSSL's generic `libcrypto`/`libssl` search paths, which would shadow
+system OpenSSL when `OPENSSL_NO_VENDOR=1`. This describes the build
+implementation, not a claim of runtime verification on each platform.
 
 ### V8 version, SDK and snapshots
 

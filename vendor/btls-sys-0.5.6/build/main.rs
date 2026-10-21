@@ -673,7 +673,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     ensure_patches_applied(&config)?;
     if !config.env.docs_rs {
-        emit_link_directives(&config);
+        build_boringssl_or_get_prebuilt(&config);
     }
 
     if config.features.prefix_symbols {
@@ -690,6 +690,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    if !config.env.docs_rs {
+        emit_link_directives(&config)?;
+    }
     generate_bindings(&config).map_err(|e| format!("could not generate bindings: {e}"))?;
     if let Some(install_dir) = &config.env.export_to_install_dir {
         install_artifacts(&config, install_dir)
@@ -698,7 +701,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn emit_link_directives(config: &Config) {
+fn emit_link_directives(config: &Config) -> io::Result<()> {
     let bssl_dir = build_boringssl_or_get_prebuilt(config);
     let msvc_lib_subdir = msvc_lib_subdir(config);
 
@@ -709,25 +712,59 @@ fn emit_link_directives(config: &Config) {
             &["lib", "crypto", "ssl", ""][..]
         };
 
-    for subdir in subdirs {
-        let dir = bssl_dir.join(subdir);
-        let dir = msvc_lib_subdir
-            .map(|s| dir.join(s))
-            .filter(|d| d.exists())
-            .unwrap_or(dir);
-        println!("cargo:rustc-link-search=native={}", dir.display());
+    // Never expose BoringSSL's generic archive names to downstream -lssl/-lcrypto.
+    // Even a dynamic OpenSSL link can select these archives before system libraries.
+    // Stage only after symbol prefixing, which may replace the original archives.
+    let link_dir = config.out_dir.join("link");
+    fs::create_dir_all(&link_dir)?;
+    for name in ["crypto", "ssl"] {
+        let (filename, link_filename) = if config.target.ends_with("-msvc") {
+            (format!("{name}.lib"), format!("btls_{name}.lib"))
+        } else {
+            (format!("lib{name}.a"), format!("libbtls_{name}.a"))
+        };
+        let library = subdirs
+            .iter()
+            .map(|subdir| {
+                let dir = bssl_dir.join(subdir);
+                let dir = msvc_lib_subdir
+                    .map(|s| dir.join(s))
+                    .filter(|d| d.exists())
+                    .unwrap_or(dir);
+                dir.join(&filename)
+            })
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "BoringSSL library {filename} not found in {}",
+                        bssl_dir.display()
+                    ),
+                )
+            })?;
+        let staged = link_dir.join(link_filename);
+        match fs::remove_file(&staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::hard_link(&library, &staged)
+            .or_else(|_| fs::copy(&library, &staged).map(|_| ()))?;
     }
+    println!("cargo:rustc-link-search=native={}", link_dir.display());
 
     if let Some(cpp_lib) = get_cpp_runtime_lib(config) {
         println!("cargo:rustc-link-lib={cpp_lib}");
     }
-    println!("cargo:rustc-link-lib=static=crypto");
-    println!("cargo:rustc-link-lib=static=ssl");
+    println!("cargo:rustc-link-lib=static=btls_crypto");
+    println!("cargo:rustc-link-lib=static=btls_ssl");
 
     if config.target_os == "windows" {
         // Rust 1.87.0 compat - https://github.com/rust-lang/rust/pull/138233
         println!("cargo:rustc-link-lib=advapi32");
     }
+    Ok(())
 }
 
 fn check_include_path(path: PathBuf) -> Result<PathBuf, String> {
