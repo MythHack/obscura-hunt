@@ -122,6 +122,7 @@ pub(crate) fn is_system_ui_family_token(token: &str) -> bool {
     )
 }
 
+#[cfg(feature = "paint")]
 /// Bundled alias for a CSS family token, used where a rasterizer only accepts
 /// family names (SVG). Installed faces are checked before this mapping.
 pub(crate) fn bundled_family_alias(token: &str) -> Option<&'static str> {
@@ -189,9 +190,11 @@ impl FallbackSet {
 
 #[derive(Clone)]
 pub(crate) struct ResolvedFont {
+    #[cfg(feature = "paint")]
     pub(crate) family: Arc<str>,
     pub(crate) font_id: Option<fontdb::ID>,
     pub(crate) metrics: FaceMetrics,
+    #[cfg(feature = "paint")]
     pub(crate) synthetic_italic: bool,
     /// Ordered authored fallbacks are only needed by the shaper.
     #[cfg(feature = "paint")]
@@ -267,15 +270,18 @@ fn system_locale() -> &'static str {
     SYSTEM_LOCALE.as_str()
 }
 
+#[cfg(feature = "paint")]
 /// Effective system-font policy for the renderer.
 pub(crate) fn effective_system_fonts() -> bool {
     font_configuration().system_fonts
 }
 
+#[cfg(feature = "paint")]
 pub(crate) fn configured_font_directories() -> &'static [PathBuf] {
     &font_configuration().directories
 }
 
+#[cfg(feature = "paint")]
 /// Concrete family the process resolved `system-ui` to.
 pub(crate) fn system_ui_family() -> Arc<str> {
     Arc::clone(&base_font_database(false).system_ui)
@@ -688,7 +694,11 @@ fn default_font(fam: Option<&str>, weight: u16, italic: bool,
         return font;
     }
     ResolvedFont {
-        family: Arc::from(fallback), font_id: None, metrics: bundled_face_metrics(fallback),
+        #[cfg(feature = "paint")]
+        family: Arc::from(fallback),
+        font_id: None,
+        metrics: bundled_face_metrics(fallback),
+        #[cfg(feature = "paint")]
         synthetic_italic: false,
         #[cfg(feature = "paint")]
         fallbacks: None,
@@ -774,8 +784,12 @@ pub(crate) fn select_loaded_face(
     let face = candidates().find(|face| (face.min_weight..=face.max_weight).contains(&requested_weight))
         .or_else(|| candidates().min_by_key(|face| weight_rank(requested_weight, face.min_weight)))?;
     Some(ResolvedFont {
-        family: Arc::clone(&face.name), font_id: face.font_id,
-        metrics: loaded_face_metrics(database, face), synthetic_italic: requested_italic && !face.italic,
+        #[cfg(feature = "paint")]
+        family: Arc::clone(&face.name),
+        font_id: face.font_id,
+        metrics: loaded_face_metrics(database, face),
+        #[cfg(feature = "paint")]
+        synthetic_italic: requested_italic && !face.italic,
         #[cfg(feature = "paint")]
         fallbacks: None,
     })

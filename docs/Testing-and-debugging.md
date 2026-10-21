@@ -62,9 +62,10 @@ The October 2026 browser-contract remediation integration completed with 2552
 release/render tests passing, zero failing and five skipped. The final CSS and
 CDP fragment corrections were then checked through the affected real browser
 consumer, without repeating the full suite. Release CLI/worker pairs built for
-`render`, `render,stealth` and `--no-default-features`; the no-render build still
-reports eight non-blocking dead-code warnings. The scoped delivery record and
-remaining historical investigation limits are in
+`render`, `render,stealth` and `--no-default-features`; that integration's
+no-render build reported eight dead-code warnings, subsequently resolved by
+restricting paint-only font and resource code to `paint`. The scoped delivery
+record and remaining historical investigation limits are in
 [`remediate-upstream-browser-contracts`](../openspec/changes/remediate-upstream-browser-contracts/tasks.md).
 
 The PR checks workflow sets `RUSTC_WRAPPER` to an empty string: it uses the Rust
@@ -91,6 +92,40 @@ The layout-only renderer is separate from a CLI no-render build. Check it with
 font box stays font-sized; ascent/descent exclude CSS line-height and leading.
 Keep paint-only retained metadata separate from shared layout work, including
 generated content, tables, transforms and scrolling.
+
+For metadata-only production coverage, also run
+`cargo check --release -p obscura-render --no-default-features --features font-metadata`.
+Run full-fidelity renderer behavior tests with `paint`: their shaped text,
+replaced-element and table geometry assertions require those implementations,
+not the lightweight no-paint layout path. A focused font/resource selection is:
+
+```bash
+cargo nextest run --release -p obscura-render --features paint \
+  -E 'test(font) | test(resource) | test(cache)' --no-fail-fast
+```
+
+The October 21 warning cleanup passed both layout-only and metadata-only release
+checks, no-render and render CLI builds, and 74 focused paint tests without
+compiler warnings. Local HTTP CLI smokes verified loaded web-font status and
+equal monospace advances without rendering, then dynamic-font reuse, image
+intrinsics and screenshot pixels with rendering. The offline obstacle course
+passed 33/33, and all 77 deterministic render fixture pairs passed their
+behavior checks. Chromium driver teardown assertions required recovery of two
+missing references with an alternate Node runtime. The full render workspace
+run was not green: 2549 tests passed, one screencast assertion
+observed the final state of a 100 ms animation in its first frame, and two
+`obscura-net` private-CA tests aborted with Windows status `0xc0000409`; five
+tests were skipped. These failures are not hidden by the warning cleanup.
+An additional metadata-only renderer test run had 418 passing, 33 failing and
+one skipped test, plus three test-only dead-code warnings. Its failures assert
+full-fidelity shaping, replaced-element or table geometry unavailable without
+`paint`; that command is not a substitute for paint-enabled behavioral coverage.
+
+The broad top/bottom live-site comparison remained incomplete: both the bundled
+and alternate Node drivers aborted during Playwright teardown with
+`new_time >= loop->time` in `src/win/core.c`. The first run retained five valid
+top comparisons and one bottom comparison; these partial captures are not a
+complete fidelity verdict.
 
 Native C++ builds classify the pinned V8 SDK as external/system headers while
 retaining warnings for local shims. Linux validation covers both normal and

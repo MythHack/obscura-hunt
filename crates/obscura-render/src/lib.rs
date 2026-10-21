@@ -38,7 +38,9 @@ pub use font_resources::{decode_font_bytes, font_face_source_urls, font_data_url
 #[cfg(feature = "font-metadata")]
 mod resources;
 #[cfg(feature = "font-metadata")]
-pub use resources::{ImageRequestProfile, RenderResourceCache, RenderResourceLoader};
+pub use resources::{ImageRequestProfile, RenderResourceCache};
+#[cfg(feature = "paint")]
+pub use resources::RenderResourceLoader;
 pub mod style;
 pub use style::compute_style;
 

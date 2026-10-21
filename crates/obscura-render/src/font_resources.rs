@@ -284,6 +284,7 @@ fn font_resource_key(src: &str, base_url: Option<&str>) -> String {
         .unwrap_or_else(|| src.to_string())
 }
 
+#[cfg(feature = "paint")]
 pub(crate) fn fetch_and_decode_font(
     src: &str,
     base_url: Option<&str>,

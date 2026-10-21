@@ -189,6 +189,20 @@ That layout-only build does not load page fonts. Its ascent/descent proportions
 come from the bundled sans fallback, normalized to the existing one-em font box;
 CSS line-height and leading remain separate. Paint builds use selected-face metrics.
 
+The no-render CLI still enables the renderer's `font-metadata` feature for
+FontFace loading and native face metrics, without text shaping or raster output:
+
+```bash
+cargo check --release -p obscura-render --no-default-features --features font-metadata
+```
+
+`RenderResourceCache` remains available to store page-transport font bytes and
+decoded faces. `RenderResourceLoader` and the cache's `with_loader` and
+`with_loader_and_limits` constructors require `paint`; metadata-only consumers
+use `RenderResourceCache::default()` and seed bytes from their own transport.
+SVG font aliases, synthetic-italic shaping state and synchronous resource fetches
+are also compiled only with `paint`.
+
 The stealth feature builds BoringSSL and generates Rust bindings. In addition
 to the default requirements, install CMake, Clang, and the libclang/LLVM
 development libraries. On Ubuntu/Debian:

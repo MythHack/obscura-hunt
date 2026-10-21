@@ -9,12 +9,14 @@ use crate::paint::{CachedRasterPaint, RememberedContentImageIntrinsic, HttpResou
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
 pub(crate) const DEFAULT_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MISSING_RESOURCE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(feature = "paint")]
 /// Synchronous byte loader used by [`RenderResourceCache`]. The default
 /// implementation uses Obscura's pooled image agent; tests and embedding
 /// callers can provide a local loader without changing preparation or paint.
 pub trait RenderResourceLoader {
     fn load(&mut self, url: &str) -> Option<Vec<u8>>;
 }
+#[cfg(feature = "paint")]
 impl<F> RenderResourceLoader for F
 where
     F: FnMut(&str) -> Option<Vec<u8>>,
@@ -88,20 +90,25 @@ pub struct RenderResourceCache {
     sync_loading_enabled: bool,
     sync_misses: Vec<(String, Option<ImageRequestProfile>, bool)>,
     sync_miss_keys: HashSet<String>,
+    #[cfg(feature = "paint")]
     loader: Option<Box<dyn RenderResourceLoader>>,
 }
 
 impl Default for RenderResourceCache {
     fn default() -> Self {
         #[cfg(feature = "paint")]
-        let loader = Some(Box::new(HttpResourceLoader) as Box<dyn RenderResourceLoader>);
+        {
+            Self::with_loader_and_limits(HttpResourceLoader, DEFAULT_RESOURCE_CACHE_ENTRIES, DEFAULT_RESOURCE_CACHE_BYTES)
+        }
         #[cfg(not(feature = "paint"))]
-        let loader = None;
-        Self::with_optional_loader(loader, DEFAULT_RESOURCE_CACHE_ENTRIES, DEFAULT_RESOURCE_CACHE_BYTES)
+        {
+            Self::with_limits(DEFAULT_RESOURCE_CACHE_ENTRIES, DEFAULT_RESOURCE_CACHE_BYTES)
+        }
     }
 }
 
 impl RenderResourceCache {
+    #[cfg(feature = "paint")]
     pub fn with_loader(loader: impl RenderResourceLoader + 'static) -> Self {
         Self::with_loader_and_limits(
             loader,
@@ -110,15 +117,19 @@ impl RenderResourceCache {
         )
     }
 
+    #[cfg(feature = "paint")]
     pub fn with_loader_and_limits(
         loader: impl RenderResourceLoader + 'static,
         max_entries: usize,
         max_bytes: usize,
     ) -> Self {
-        Self::with_optional_loader(Some(Box::new(loader)), max_entries, max_bytes)
+        let mut cache = Self::with_limits(max_entries, max_bytes);
+        cache.loader = Some(Box::new(loader));
+        cache.sync_loading_enabled = true;
+        cache
     }
 
-    fn with_optional_loader(loader: Option<Box<dyn RenderResourceLoader>>, max_entries: usize, max_bytes: usize) -> Self {
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             stopped: HashSet::new(),
@@ -138,10 +149,11 @@ impl RenderResourceCache {
             max_content_image_intrinsics: max_entries.min(DEFAULT_CONTENT_IMAGE_INTRINSIC_ENTRIES),
             #[cfg(all(test, feature = "paint"))]
             content_image_layout_retries: 0,
-            sync_loading_enabled: loader.is_some(),
+            sync_loading_enabled: false,
             sync_misses: Vec::new(),
             sync_miss_keys: HashSet::new(),
-            loader,
+            #[cfg(feature = "paint")]
+            loader: None,
         }
     }
 
@@ -184,6 +196,7 @@ impl RenderResourceCache {
         !self.sync_misses.is_empty()
     }
 
+    #[cfg(feature = "paint")]
     fn record_sync_miss(
         &mut self,
         key: String,
@@ -288,6 +301,7 @@ impl RenderResourceCache {
         self.insert_missing(url);
     }
 
+    #[cfg(feature = "paint")]
     pub(crate) fn get_or_load(&mut self, url: &str, is_font: bool) -> Option<Arc<[u8]>> {
         let url = network_resource_url(url);
         if self.stopped.contains(&url) { return None; }
@@ -319,6 +333,7 @@ impl RenderResourceCache {
         }
     }
 
+    #[cfg(feature = "paint")]
     pub(crate) fn get_or_load_image(&mut self, url: &str, profile: ImageRequestProfile) -> Option<Arc<[u8]>> {
         if profile == ImageRequestProfile::NoCorsInclude {
             return self.get_or_load(url, false);
