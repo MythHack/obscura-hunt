@@ -24,6 +24,13 @@ What `--stealth` changes:
 - Loads a tracker blocklist that drops requests to known analytics and fingerprinting endpoints.
 - Bundles webpki roots instead of relying on the system store.
 
+Navigating directly to a blocked tracker fails with a request-blocked error;
+it does not produce a successful empty page or contact the proxy or origin.
+Scripted fetches also reject with `TypeError`, including `mode: "no-cors"`;
+a blocked request is not a successful opaque response.
+Set [`OBSCURA_BLOCK_TRACKERS=0`](Environment-variables.md#obscura_block_trackers)
+to allow these requests while retaining the stealth transport.
+
 Requires a build that includes the stealth feature. Use a `-stealth` archive
 with rendering or a `-no-render-stealth` archive without it. To build the
 rendering variant yourself:

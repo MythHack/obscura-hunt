@@ -562,11 +562,7 @@ impl StealthHttpClient {
         self.validate_destination(url).await?;
         if is_tracker_blocked(url, self.block_trackers) {
             tracing::debug!("Blocked tracker: {}", url);
-            return Ok(StealthResponseHeaders {
-                status: 0,
-                headers: HashMap::new(),
-                body: Box::pin(async { Ok(Vec::new()) }),
-            });
+            return Err(ObscuraNetError::Blocked(url.to_string()));
         }
 
         let req_method = method
@@ -758,9 +754,8 @@ mod tests {
                 .await
         } else {
             client.fetch(&url).await
-        }.expect("blocked tracker returns an empty response");
-        assert_eq!(blocked.status, 0);
-        assert!(blocked.body.is_empty());
+        }.expect_err("blocked tracker must fail the request");
+        assert!(matches!(blocked, ObscuraNetError::Blocked(blocked_url) if blocked_url == url.as_str()));
         assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept())
             .await.is_err());
 
