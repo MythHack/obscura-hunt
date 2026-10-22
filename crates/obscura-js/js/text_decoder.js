@@ -1,4 +1,5 @@
 (function installTextDecoder(global, ops) {
+  const TypeError = global.TypeError, RangeError = global.RangeError;
   const states = new WeakMap();
   const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
   const sharedBufferLength = typeof SharedArrayBuffer === 'function'
@@ -33,7 +34,15 @@
         }
         bytes = new Uint8Array(input);
       }
-      return ops.op_text_decoder_decode(state.native, bytes, !!options?.stream);
+      const stream = !!options?.stream;
+      try { return ops.op_text_decoder_decode(state.native, bytes, stream); }
+      catch (error) {
+        // Shared native ops throw in their control realm; the WebIDL method
+        // must expose decoding failures branded by this document's realm.
+        if (error?.name === 'TypeError') throw new TypeError(error.message);
+        if (error?.name === 'RangeError') throw new RangeError(error.message);
+        throw error;
+      }
     }
   };
   Object.defineProperty(global.TextDecoder.prototype, Symbol.toStringTag, {value:'TextDecoder', configurable:true});

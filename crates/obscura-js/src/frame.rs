@@ -596,6 +596,22 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_style_getter_keeps_the_elements_declaration() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body style='color: red'>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const element = document.body;
+            const getter = Object.getOwnPropertyDescriptor(parent.Element.prototype, 'style').get;
+            const borrowed = getter.call(element);
+            const same = borrowed === element.style;
+            element.setAttribute('style', 'color: blue');
+            return [same, borrowed.color, element.style.color];
+        })()"#).unwrap(), serde_json::json!([true, "blue", "blue"]));
+    }
+
+    #[test]
     fn borrowed_content_type_getter_reads_the_frame_document() {
         let mut parent = ObscuraJsRuntime::new();
         parent.set_dom(parse_html("<html><body><iframe id='child'></iframe></body></html>"));

@@ -1284,6 +1284,14 @@ pub(crate) async fn finalize_command_after_reply(ctx: &mut CdpContext, method: &
 /// Dispatch the command itself: domain handler, command-caused event drains,
 /// and the response. Does not run renderer work; see [`dispatch`].
 pub async fn dispatch_command(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    dispatch_with_deferred(req, ctx, None).await
+}
+
+pub(crate) async fn dispatch_with_deferred(
+    req: &CdpRequest,
+    ctx: &mut CdpContext,
+    deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
+) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
     // per-connection V8 lock — the recursive dispatch will acquire it for the
@@ -1365,6 +1373,18 @@ pub async fn dispatch_command(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResp
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
             domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
+        }
+        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn")
+            && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true) => {
+            match domains::runtime::start_awaited_evaluation(method, &req.params, ctx, &req.session_id, cmd_budget_ms).await {
+                Ok(Some(evaluation)) if evaluation.ready(ctx) => evaluation.finish(ctx, &req.session_id).await,
+                Ok(Some(evaluation)) => {
+                    *deferred.unwrap() = Some(evaluation);
+                    Ok(json!({}))
+                }
+                Ok(None) => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
+                Err(error) => Err(error),
+            }
         }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,

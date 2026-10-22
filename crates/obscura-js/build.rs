@@ -20,6 +20,7 @@ enum ArtifactSource {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(obscura_external_bootstrap)");
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=js/webcrypto.js");

@@ -158,6 +158,43 @@ pub fn generate_artifact(
     let bootstrap = bootstrap_js();
     let bootstrap_sha256 = sha256_hex(bootstrap.as_bytes());
     let source_sha256 = source_sha256();
+    assert!(bootstrap.is_ascii(), "bootstrap source must be ASCII; use Unicode escapes in literals");
+    // Compiler intrinsics exist only in this producer, never in page runtimes.
+    deno_core::v8::V8::set_flags_from_string("--allow-natives-syntax");
+    let compiler = r#""use strict";
+Object.defineProperty(globalThis, '__obscura_snapshot_compile', {
+  configurable: true,
+  value(helpers) {
+    const functions = new Set(helpers);
+    const targets = [
+      [Node, ['nodeType', 'textContent', 'parentNode', 'isConnected', 'getRootNode', 'appendChild', 'insertBefore']],
+      [Element, ['tagName', 'innerHTML', 'getAttribute', 'setAttribute', 'querySelector', 'querySelectorAll', 'id']],
+      [Document, ['documentElement', 'getElementById', 'querySelector', 'querySelectorAll', 'createElement', 'createTextNode']],
+      [HTMLImageElement, ['src']],
+      [Response, ['text', 'json']],
+      [Headers, ['get', 'set']],
+      [URL, ['href', 'toString']],
+    ];
+    for (const [constructor, names] of targets) {
+      functions.add(constructor);
+      for (const name of names) {
+        const descriptor = Object.getOwnPropertyDescriptor(constructor.prototype, name);
+        if (!descriptor) throw Error('Missing snapshot member: ' + constructor.name + '.' + name);
+        for (const fn of [descriptor.value, descriptor.get, descriptor.set]) {
+          if (typeof fn === 'function') functions.add(fn);
+        }
+      }
+    }
+    for (const fn of functions) %EnsureFeedbackVectorForFunction(fn);
+  },
+});
+"#;
+    let mut extension = native_window::native_window_extension();
+    // Keep the native callback schema and extension order unchanged. Deno stores
+    // these source bytes outside the V8 heap and shares them across isolates.
+    extension.js_files = vec![deno_core::ExtensionFileSource::new_computed(
+        "<obscura:bootstrap>", format!("{compiler}{bootstrap}").into(),
+    )].into();
     let schema = extension_schema();
 
     // Exactly one extension: the native Window template middleware and its
@@ -168,17 +205,16 @@ pub fn generate_artifact(
             cargo_manifest_dir: manifest_dir,
             startup_snapshot: None,
             skip_op_registration: true,
-            extensions: vec![native_window::native_window_extension()],
+            extensions: vec![extension],
             extension_transpiler: None,
             with_runtime_cb: Some(Box::new(move |runtime| {
-                // The named/indexed handlers are part of the serialized global
-                // template; the failed-access handler is isolate state and is
-                // not encoded in the blob. Install it here too so bootstrap
-                // runs under the same security behavior as the target runtime.
+                // The failed-access handler is isolate state, not serialized
+                // template state. Install it in the producer as in the runtime.
                 native_window::install_failed_access_check(runtime.v8_isolate());
                 runtime
-                    .execute_script("<obscura:bootstrap>", bootstrap.clone())
-                    .expect("bootstrap.js should not fail during snapshot creation");
+                    .execute_script("<obscura:snapshot-check>",
+                        "if ('__obscura_snapshot_compile' in globalThis) throw Error('Snapshot compiler hook was retained');")
+                    .expect("snapshot compiler hook must not reach page realms");
             })),
         },
         None,

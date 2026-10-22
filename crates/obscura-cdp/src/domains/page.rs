@@ -3121,7 +3121,7 @@ mod tests {
         handle(
             "navigate",
             &json!({
-                "url": "data:text/html,<html style='margin:0'><head><style>@keyframes hide{from{opacity:1}to{opacity:0}}#cover{width:80px;height:60px;background:red;animation:hide 100ms linear forwards}</style></head><body style='margin:0;background:lime'><div id=cover></div></body></html>",
+                "url": "data:text/html,<html style='margin:0'><head><style>@keyframes hide{from{opacity:1}to{opacity:0}}#cover{width:80px;height:60px;background:red;animation:hide 100ms linear forwards;animation-play-state:paused}</style></head><body style='margin:0;background:lime'><div id=cover></div></body></html>",
                 "waitUntil": "load",
             }),
             &mut ctx,
@@ -3148,6 +3148,21 @@ mod tests {
         let initial_pixel = initial_raster.get_pixel(40, 30).0;
         let final_pixel = [0, 255, 0, 255];
         assert_ne!(initial_pixel, final_pixel, "initial capture must precede the CSS final state");
+
+        handle(
+            "screencastFrameAck",
+            &json!({"sessionId": initial_session_id}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("ack initial frame");
+
+        // Admit the animation only after the initial frame is captured and
+        // acknowledged; navigation and PNG decoding must not consume its 100ms.
+        ctx.get_session_page_mut(&session).unwrap().evaluate(
+            "const cover = document.getElementById('cover'); cover.style.animationPlayState = 'running'; cover.getBoundingClientRect()",
+        );
         let generation = ctx
             .get_session_page_mut(&session)
             .unwrap()
@@ -3159,17 +3174,8 @@ mod tests {
             ctx.get_session_page_mut(&session)
                 .unwrap()
                 .prepared_has_active_css_animations(),
-            "the initial frame must retain the active CSS timeline"
+            "the resumed frame must retain the active CSS timeline"
         );
-
-        handle(
-            "screencastFrameAck",
-            &json!({"sessionId": initial_session_id}),
-            &mut ctx,
-            &session,
-        )
-        .await
-        .expect("ack initial frame");
 
         let mut saw_changed_frame = false;
         let mut saw_final_frame = false;

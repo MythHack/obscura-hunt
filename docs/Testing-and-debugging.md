@@ -261,6 +261,74 @@ engine speedup.
 These results describe the October 19 source revision, not the earlier
 `v0.1.2` tag or October 11 README benchmark binaries.
 
+### Upstream sync: `0979094`
+
+The October 22 sync adds 27 upstream commits after `a754dce`, through
+[`0979094`](https://github.com/h4ckf0r0day/obscura/commit/09790944a405ba81a7df27bc2577c6b0db283900).
+It integrates shared bootstrap source and precompiled browser methods, bounded
+parallel isolate startup, lazy inline styles, weak native-function metadata,
+native CDP evaluation and argument decoding, concurrent pending evaluations,
+global User-Agent selection, visibility queries, and table display/hidden-row fixes.
+
+The fork retains V8 152, its native WindowProxy and independent document realms,
+isolated-world object ownership, streaming decoding, native input, navigation
+cancellation, and same-document fragment behavior. Shared source is registered
+on the existing native Window snapshot extension, preserving extension order
+and external references for both snapshot producers. Native CDP function
+compilation retains an internal script origin so dynamic imports resolve through
+the owning document's module loader. TextDecoder translates native-op failures
+into the calling document's error constructors.
+
+The argument-decoding acceptance case replaces page `eval` and `JSON.parse`.
+It does not promise immunity to a replaced `JSON.stringify` during by-value
+result serialization; that existing limitation is separate from argument decoding.
+
+Local validation uses Windows release builds with `render`. The pre-existing
+working-tree `Cargo.lock` updates are retained for these checks and are not part
+of the merge. Generated captures and command logs remain outside the repository.
+
+Validation results:
+
+- Final release CLI/worker build with `--features render`: passed without compiler
+  warnings. Actual CLI/CDP smoke passed **11/11**, covering global User-Agent
+  propagation, Script completion, native argument decoding, blob-module imports,
+  decoder error brands, second-command promise resolution, native popup/iframe
+  identity, same-document DOM retention, and both cold-navigation cancellation
+  boundaries. The final executable SHA-256 is
+  `9a778c02b34f21c629f1fd2cba11473c23666f5f04a2625de3fde7ede3ebac7f`;
+  it was built from the pre-commit merged working tree, not a published release.
+
+- The focused selection ran 54 tests: 52 passed initially. The decoder error-brand
+  failure was repaired at the WebIDL boundary; the isolated-world deferred-result
+  test was given the native microtask checkpoint that the real server supplies.
+  Both then passed.
+- Full workspace nextest ran 2,590 tests: 2,588 passed, two failed, and five existing
+  tests were skipped. The failures were the lost dynamic-import referrer in native
+  CDP function compilation and a screencast fixture whose 100 ms animation could
+  finish before its initial capture. The latter now starts paused and resumes after
+  that capture. A final four-test selection passed both repairs and the two earlier
+  boundary cases. The unaffected full suite was not repeated.
+- The offline obstacle course passed **33/33**, using benchmark revision
+  `2d7bc304fbb7ebefc44f770938192e3cede87dbd`, one run, no warmup, three-second settle,
+  profile `0`, and timezone `Europe/Berlin`.
+- All **79 deterministic fixture pairs** captured successfully and passed behavior
+  checks. The new hidden-row and table-display fixtures matched Chromium pixels
+  exactly; their geometry was also visually inspected. The zero-count checker
+  regression suite passed all four tests.
+- Representative top/bottom captures attempted all 15 sites at 1440x1000 with
+  three-second settle and animation sampling at zero. Ten top and nine bottom
+  candidate/Chromium pairs were eligible. Sixteen of the eighteen eligible pairs
+  with a usable pre-sync baseline were pixel-identical to that baseline. Angular's
+  two captures differed, with no structural change visible in the inspected views.
+  Solid, Bulma, and Brave failed navigation at both positions; Qwik also failed at
+  the bottom. Retained errors report connection, navigation, or response-body
+  timeouts. Blank, unstable, and unequal live states are excluded, not counted as
+  fidelity passes. These live-site runs therefore returned nonzero status.
+
+The capture and obstacle results precede only the final decoder error-constructor
+and native CDP function-origin repairs. Those changes do not alter the rendering
+path; their targeted tests were rerun instead of repeating unrelated captures.
+
 ### Upstream sync: `a754dce`
 
 The October 20 sync adds two upstream commits after `8b49681`, through

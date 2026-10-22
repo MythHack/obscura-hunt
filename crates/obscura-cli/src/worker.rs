@@ -109,8 +109,12 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let user_agent = std::env::var("OBSCURA_USER_AGENT").ok().filter(|value| !value.is_empty());
-    let mut context = BrowserContext::with_full_options("worker".to_string(), proxy, stealth, user_agent);
+    let user_agent = std::env::var("OBSCURA_USER_AGENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut context =
+        BrowserContext::with_full_options("worker".to_string(), proxy, stealth, user_agent);
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);

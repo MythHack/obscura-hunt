@@ -1,6 +1,9 @@
 ## `obscura`
 
-Top-level flags apply to every subcommand.
+Global flags work before or after a subcommand. `--storage-dir` is also
+accepted before `serve` or `fetch`, or directly on those subcommands; a
+subcommand value takes precedence. `mcp` reads the top-level value and exports
+it to `OBSCURA_STORAGE_DIR`. `--port` and `--v8-flags` are not global flags.
 
 ```
 -v, --verbose                Enable info logging
@@ -23,6 +26,11 @@ Top-level flags apply to every subcommand.
 -V, --version                Version
     --build-info             Print JSON source revision, dirty state, target and features
 ```
+
+`--user-agent` applies to `fetch` (including raw/batch fetch), `serve`, `scrape`,
+and `mcp`, whether passed before or after the subcommand. A subcommand-specific
+value overrides a preceding top-level value. Scrape and serve workers receive
+the same override.
 
 Render builds use installed system fonts by default, with bundled fallback faces.
 `--font-dir` recursively adds TTF, TTC, OTF, and OTC files; invalid directories fail
@@ -123,13 +131,14 @@ Run a JS expression across many URLs in parallel.
     --format <FORMAT>        Output format (default json)
     --timeout <SECONDS>      Per-URL timeout (default 60)
     --proxy <URL>            HTTP or SOCKS5 proxy
+    --user-agent <UA>        Override the User-Agent (global; forwarded to workers)
     --stealth                Consistent browser fingerprint + tracker blocking (global)
     --allow-private-network  Permit loopback / RFC1918 / link-local
 -q, --quiet                  Suppress info logging
 -v, --verbose                Enable verbose logging
 ```
 
-`--stealth`, `--proxy`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits stealth too.
+`--stealth`, `--proxy`, `--user-agent`, and `--allow-private-network` are global flags: they work before or after any subcommand, so each worker in a `scrape` run inherits the same settings.
 
 Read URLs from stdin with `-`:
 

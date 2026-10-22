@@ -5,6 +5,95 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+pub(crate) struct DeferredEvaluation {
+    pub(crate) page_id: String,
+    pending: obscura_js::runtime::PendingCdpEvaluation,
+    return_by_value: bool,
+    pub(crate) deadline: tokio::time::Instant,
+    command_deadline: Option<tokio::time::Instant>,
+    timeout_ms: u64,
+    method: String,
+}
+
+impl DeferredEvaluation {
+    pub(crate) fn ready(&self, ctx: &mut CdpContext) -> bool {
+        if tokio::time::Instant::now() >= self.deadline { return true; }
+        let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) else { return true; };
+        !js.has_cdp_evaluation(&self.pending) || js.cdp_evaluation_ready(&self.pending)
+    }
+
+    pub(crate) async fn finish(self, ctx: &mut CdpContext, session_id: &Option<String>) -> Result<Value, String> {
+        let js = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut())
+            .ok_or("Execution context was destroyed")?;
+        if !js.has_cdp_evaluation(&self.pending) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err("Execution context was destroyed".into());
+        }
+        let remaining = self.command_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if remaining.is_some_and(|budget| budget.is_zero()) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err("Runtime evaluation exceeded its command budget".into());
+        }
+        if !js.cdp_evaluation_ready(&self.pending) {
+            js.cancel_cdp_evaluation(self.pending);
+            return Err(format!("Runtime.{} promise did not settle within {}ms", self.method, self.timeout_ms));
+        }
+        let watchdog = remaining.map(|budget| obscura_js::runtime::spawn_watchdog(js.isolate_handle(), budget));
+        let result = match js.finish_cdp_evaluation(self.pending, self.return_by_value) {
+            Ok(info) => emit_post_eval_nav(ctx, session_id).await.map(|_| evaluation_reply(&info)),
+            Err(error) => Err(error),
+        };
+        if watchdog.is_some_and(|watchdog| watchdog.stop()) {
+            if let Some(js) = ctx.get_page_mut(&self.page_id).and_then(|page| page.js.as_mut()) {
+                js.cancel_termination();
+            }
+            return Err("Runtime result serialization exceeded its task budget".into());
+        }
+        result
+    }
+}
+
+pub(crate) async fn start_awaited_evaluation(
+    method: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    command_budget_ms: u64,
+) -> Result<Option<DeferredEvaluation>, String> {
+    let arguments = params.get("arguments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    let world = if method == "evaluate" {
+        validate_context(params, "contextId", ctx, session_id, method)?.unwrap_or_default()
+    } else {
+        call_function_world(params, ctx, session_id, arguments)?
+    };
+    let return_by_value = params.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
+    let timeout_ms = params.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let command_deadline = (command_budget_ms != 0).then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(command_budget_ms));
+    let deadline = command_deadline.map_or(deadline, |command| deadline.min(command));
+    let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+    let Some(js) = page.js.as_mut() else { return Ok(None); };
+    let evaluation = if method == "evaluate" {
+        js.start_cdp_evaluation_in_world(world, params.get("expression").and_then(Value::as_str).ok_or("expression required")?, return_by_value, true)?
+    } else {
+        js.start_cdp_call_in_world(
+            world,
+            params.get("functionDeclaration").and_then(Value::as_str).unwrap_or("() => undefined"),
+            params.get("objectId").and_then(Value::as_str),
+            arguments,
+            return_by_value, true,
+        )?
+    };
+    let obscura_js::runtime::CdpEvaluation::Pending(pending) = evaluation else {
+        return Err("Awaited evaluation did not create a pending record".into());
+    };
+    // Finish this task's promise reactions before a script-initiated navigation.
+    js.resolve_promises_until(|js| js.cdp_evaluation_ready(&pending), 0).await;
+    Ok(Some(DeferredEvaluation {
+        page_id: page.id.clone(), pending, return_by_value, deadline, command_deadline, timeout_ms, method: method.into(),
+    }))
+}
+
 async fn with_live_peers<'a, F, Fut>(
     ctx: &'a mut CdpContext,
     session_id: &Option<String>,
@@ -269,25 +358,10 @@ pub async fn handle(
             let arguments = params
                 .get("arguments")
                 .and_then(|v| v.as_array())
-                .map(|a| a.to_vec())
-                .unwrap_or_default();
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
 
-            let requested_world = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let object_world = object_id.map(|id| page.object_world(id)).transpose()?;
-            let mut argument_world = None;
-            for argument in &arguments {
-                let Some(id) = argument.get("objectId").and_then(Value::as_str) else { continue };
-                let candidate = page.object_world(id)?;
-                if argument_world.is_some_and(|world| world != candidate) {
-                    return Err("Object belongs to a different execution context".to_string());
-                }
-                argument_world = Some(candidate);
-            }
-            let world = requested_world.or(object_world).or(argument_world).unwrap_or_default();
-            if [requested_world, object_world, argument_world].into_iter().flatten().any(|candidate| candidate != world) {
-                return Err("Object belongs to a different execution context".to_string());
-            }
+            let world = call_function_world(params, ctx, session_id, arguments)?;
 
             // Keep awaitPromise alive for the same command budget as evaluate.
             // Playwright implements waits with callFunctionOn on some utility
@@ -304,7 +378,7 @@ pub async fn handle(
                     world,
                     function_declaration,
                     object_id,
-                    &arguments,
+                    arguments,
                     return_by_value,
                     await_promise,
                     timeout_ms,
@@ -469,6 +543,32 @@ pub(crate) fn validate_context(
     Err(format!("Cannot find context with specified id: {identity}"))
 }
 
+fn call_function_world(
+    params: &Value,
+    ctx: &CdpContext,
+    session_id: &Option<String>,
+    arguments: &[Value],
+) -> Result<CdpExecutionWorld, String> {
+    let requested_world = validate_context(params, "executionContextId", ctx, session_id, "callFunctionOn")?;
+    let page = ctx.get_session_page(session_id).ok_or("No page")?;
+    let object_world = params.get("objectId").and_then(Value::as_str)
+        .map(|id| page.object_world(id)).transpose()?;
+    let mut argument_world = None;
+    for argument in arguments {
+        let Some(id) = argument.get("objectId").and_then(Value::as_str) else { continue };
+        let candidate = page.object_world(id)?;
+        if argument_world.is_some_and(|world| world != candidate) {
+            return Err("Object belongs to a different execution context".to_string());
+        }
+        argument_world = Some(candidate);
+    }
+    let world = requested_world.or(object_world).or(argument_world).unwrap_or_default();
+    if [requested_world, object_world, argument_world].into_iter().flatten().any(|candidate| candidate != world) {
+        return Err("Object belongs to a different execution context".to_string());
+    }
+    Ok(world)
+}
+
 /// Shape one `Runtime.evaluate` or `Runtime.callFunctionOn` reply.
 ///
 /// A thrown value, or the value a promise rejected with, is not a protocol
@@ -530,6 +630,62 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_evaluations_keep_their_isolated_world_and_object_owners() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let frame_id = ctx.get_page(&page_id).unwrap().frame_id.clone();
+        let session = Some("pending-world".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id.clone());
+        let (context, _) = ctx.create_isolated_context(
+            &page_id, &frame_id, "about:blank", "pending-world", false, false,
+        ).unwrap();
+        let object = handle("evaluate", &json!({
+            "expression": "({answer: 42})", "contextId": context.id,
+        }), &mut ctx, &session).await.unwrap();
+        let object_id = object["result"]["objectId"].as_str().unwrap();
+
+        for (method, params) in [
+            ("evaluate", json!({
+                "expression": "new Promise(resolve => globalThis.releasePending = () => resolve({answer: 42}))",
+                "contextId": context.id, "awaitPromise": true, "returnByValue": true,
+            })),
+            ("callFunctionOn", json!({
+                "functionDeclaration": "function(other) { return new Promise(resolve => globalThis.releasePending = () => resolve({answer: this.answer + other.answer})) }",
+                "objectId": object_id, "arguments": [{"objectId": object_id}],
+                "awaitPromise": true, "returnByValue": true,
+            })),
+        ] {
+            let pending = start_awaited_evaluation(method, &params, &mut ctx, &session, 1_000)
+                .await.unwrap().unwrap();
+            assert!(!pending.ready(&mut ctx));
+            let main = handle("evaluate", &json!({
+                "expression": "typeof releasePending", "returnByValue": true,
+            }), &mut ctx, &session).await.unwrap();
+            assert_eq!(main["result"]["value"], "undefined");
+            handle("evaluate", &json!({
+                "expression": "releasePending()", "contextId": context.id,
+            }), &mut ctx, &session).await.unwrap();
+            // A synchronous resolver reply precedes the intrinsic await
+            // reaction that marks the deferred record done. The wire server
+            // supplies this checkpoint through its autonomous renderer turn;
+            // a direct domain-handler call does not drive that turn.
+            ctx.get_page_mut(&page_id).unwrap().js.as_mut().unwrap()
+                .resolve_promises_until(|js| js.cdp_evaluation_ready(&pending.pending), 0).await;
+            assert!(pending.ready(&mut ctx));
+            let reply = pending.finish(&mut ctx, &session).await.unwrap();
+            assert_eq!(reply["result"]["value"]["answer"].as_f64(),
+                Some(if method == "evaluate" { 42.0 } else { 84.0 }));
+        }
+
+        let error = start_awaited_evaluation("callFunctionOn", &json!({
+            "functionDeclaration": "function() {}", "objectId": object_id,
+            "executionContextId": ctx.ensure_default_context(&page_id).unwrap().id,
+            "awaitPromise": true,
+        }), &mut ctx, &session, 1_000).await.err().unwrap();
+        assert!(error.contains("different execution context"));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn indexeddb_awaited_commands_deliver_peer_versionchange_and_delayed_close() {
